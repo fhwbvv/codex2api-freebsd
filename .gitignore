@@ -12,7 +12,6 @@ codex2api
 # Frontend
 frontend/node_modules/
 frontend/dist/
-dist/
 
 # IDE
 .vscode/

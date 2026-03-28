@@ -116,6 +116,40 @@ func convertMessagesToInput(messages gjson.Result) []byte {
 		role := msg.Get("role").String()
 		content := msg.Get("content")
 
+		// tool 角色: 转换为 function_call_output
+		if role == "tool" {
+			callID := msg.Get("tool_call_id").String()
+			output := content.String()
+			item := fmt.Sprintf(`{"type":"function_call_output","call_id":%s,"output":%s}`,
+				escapeJSON(callID), escapeJSON(output))
+			items = append(items, item)
+			return true
+		}
+
+		// assistant 消息带 tool_calls: 转换为 function_call 项
+		if role == "assistant" {
+			toolCalls := msg.Get("tool_calls")
+			if toolCalls.Exists() && toolCalls.IsArray() {
+				// 如有非空文本内容，先输出 assistant message
+				if content.Type == gjson.String && content.String() != "" {
+					item := fmt.Sprintf(`{"type":"message","role":"assistant","content":[{"type":"output_text","text":%s}]}`,
+						escapeJSON(content.String()))
+					items = append(items, item)
+				}
+				// 每个 tool_call 生成一个 function_call 项
+				toolCalls.ForEach(func(_, tc gjson.Result) bool {
+					callID := tc.Get("id").String()
+					name := tc.Get("function.name").String()
+					arguments := tc.Get("function.arguments").String()
+					item := fmt.Sprintf(`{"type":"function_call","call_id":%s,"name":%s,"arguments":%s}`,
+						escapeJSON(callID), escapeJSON(name), escapeJSON(arguments))
+					items = append(items, item)
+					return true
+				})
+				return true
+			}
+		}
+
 		// 角色映射
 		switch role {
 		case "system":
@@ -398,6 +432,176 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 	}
 
 	return result
+}
+
+// ==================== 有状态流式转换器（支持 Function Calling） ====================
+
+// ToolCallResult 表示一个完整的工具调用结果（用于非流式收集）
+type ToolCallResult struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+// StreamTranslator 有状态的流式响应翻译器，跟踪 function_call 索引映射
+type StreamTranslator struct {
+	Model        string
+	ChunkID      string
+	HasToolCalls bool
+	toolCallMap  map[string]int // Codex item.id → OpenAI tool_calls index
+	nextIdx      int
+}
+
+// NewStreamTranslator 创建流式翻译器实例
+func NewStreamTranslator(chunkID, model string) *StreamTranslator {
+	return &StreamTranslator{
+		Model:       model,
+		ChunkID:     chunkID,
+		toolCallMap: make(map[string]int),
+	}
+}
+
+// Translate 将单个 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式
+func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
+	eventType := gjson.GetBytes(eventData, "type").String()
+
+	switch eventType {
+	case "response.output_text.delta":
+		delta := gjson.GetBytes(eventData, "delta").String()
+		return buildOpenAIChunk(st.ChunkID, st.Model, delta, "", ""), false
+
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		delta := gjson.GetBytes(eventData, "delta").String()
+		return buildOpenAIChunk(st.ChunkID, st.Model, "", delta, ""), false
+
+	case "response.output_item.added":
+		// 检查是否为 function_call 类型的输出项
+		itemType := gjson.GetBytes(eventData, "item.type").String()
+		if itemType == "function_call" {
+			itemID := gjson.GetBytes(eventData, "item.id").String()
+			callID := gjson.GetBytes(eventData, "item.call_id").String()
+			name := gjson.GetBytes(eventData, "item.name").String()
+
+			tcIdx := st.nextIdx
+			st.toolCallMap[itemID] = tcIdx
+			st.nextIdx++
+			st.HasToolCalls = true
+
+			return buildOpenAIToolCallChunk(st.ChunkID, st.Model, tcIdx, callID, name), false
+		}
+		return nil, false
+
+	case "response.function_call_arguments.delta":
+		itemID := gjson.GetBytes(eventData, "item_id").String()
+		tcIdx, ok := st.toolCallMap[itemID]
+		if !ok {
+			return nil, false
+		}
+		delta := gjson.GetBytes(eventData, "delta").String()
+		return buildOpenAIToolCallDeltaChunk(st.ChunkID, st.Model, tcIdx, delta), false
+
+	case "response.function_call_arguments.done":
+		// 参数已通过 delta 发送完毕，忽略
+		return nil, false
+
+	case "response.content_part.done":
+		return nil, false
+
+	case "response.output_item.done":
+		return nil, false
+
+	case "response.completed":
+		usage := extractUsage(eventData)
+		finishReason := "stop"
+		if st.HasToolCalls {
+			finishReason = "tool_calls"
+		}
+		chunk := buildOpenAIFinalChunkWithReason(st.ChunkID, st.Model, usage, finishReason)
+		return chunk, true
+
+	case "response.failed":
+		errMsg := gjson.GetBytes(eventData, "response.error.message").String()
+		if errMsg == "" {
+			errMsg = "Codex upstream error"
+		}
+		return buildOpenAIError(errMsg), true
+
+	case "response.created", "response.in_progress",
+		"response.content_part.added",
+		"response.reasoning_summary_text.done",
+		"response.reasoning.encrypted_content.delta", "response.reasoning.encrypted_content.done",
+		"response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		return nil, false
+
+	default:
+		if delta := gjson.GetBytes(eventData, "delta"); delta.Exists() && delta.Type == gjson.String {
+			return buildOpenAIChunk(st.ChunkID, st.Model, delta.String(), "", ""), false
+		}
+		return nil, false
+	}
+}
+
+// buildOpenAIToolCallChunk 构建 tool call 首块（含 id、type、function.name）
+func buildOpenAIToolCallChunk(id, model string, tcIndex int, callID, funcName string) []byte {
+	chunk := []byte(`{}`)
+	chunk, _ = sjson.SetBytes(chunk, "id", id)
+	chunk, _ = sjson.SetBytes(chunk, "object", "chat.completion.chunk")
+	chunk, _ = sjson.SetBytes(chunk, "created", 0)
+	chunk, _ = sjson.SetBytes(chunk, "model", model)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.index", 0)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.role", "assistant")
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.tool_calls.0.index", tcIndex)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.tool_calls.0.id", callID)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.tool_calls.0.type", "function")
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.tool_calls.0.function.name", funcName)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments", "")
+	chunk, _ = sjson.SetRawBytes(chunk, "choices.0.finish_reason", []byte("null"))
+	return chunk
+}
+
+// buildOpenAIToolCallDeltaChunk 构建 tool call 参数增量块
+func buildOpenAIToolCallDeltaChunk(id, model string, tcIndex int, argsDelta string) []byte {
+	chunk := []byte(`{}`)
+	chunk, _ = sjson.SetBytes(chunk, "id", id)
+	chunk, _ = sjson.SetBytes(chunk, "object", "chat.completion.chunk")
+	chunk, _ = sjson.SetBytes(chunk, "created", 0)
+	chunk, _ = sjson.SetBytes(chunk, "model", model)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.index", 0)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.tool_calls.0.index", tcIndex)
+	chunk, _ = sjson.SetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments", argsDelta)
+	chunk, _ = sjson.SetRawBytes(chunk, "choices.0.finish_reason", []byte("null"))
+	return chunk
+}
+
+// buildOpenAIFinalChunkWithReason 构建带自定义 finish_reason 的最终流式块
+func buildOpenAIFinalChunkWithReason(id, model string, usage *UsageInfo, finishReason string) []byte {
+	chunk := buildOpenAIChunk(id, model, "", "", finishReason)
+	if usage != nil {
+		chunk, _ = sjson.SetBytes(chunk, "usage.prompt_tokens", usage.PromptTokens)
+		chunk, _ = sjson.SetBytes(chunk, "usage.completion_tokens", usage.CompletionTokens)
+		chunk, _ = sjson.SetBytes(chunk, "usage.total_tokens", usage.TotalTokens)
+	}
+	return chunk
+}
+
+// ExtractToolCallsFromOutput 从 response.completed 事件的 output 数组中提取 function_call 项
+func ExtractToolCallsFromOutput(eventData []byte) []ToolCallResult {
+	var toolCalls []ToolCallResult
+	output := gjson.GetBytes(eventData, "response.output")
+	if !output.IsArray() {
+		return nil
+	}
+	output.ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() == "function_call" {
+			toolCalls = append(toolCalls, ToolCallResult{
+				ID:        item.Get("call_id").String(),
+				Name:      item.Get("name").String(),
+				Arguments: item.Get("arguments").String(),
+			})
+		}
+		return true
+	})
+	return toolCalls
 }
 
 // escapeJSON 安全转义 JSON 字符串

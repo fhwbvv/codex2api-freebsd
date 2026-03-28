@@ -734,6 +734,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		created := time.Now().Unix()
 
 		if isStream {
+			streamTranslator := NewStreamTranslator(chunkID, model)
 			c.Header("Content-Type", "text/event-stream")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
@@ -750,15 +751,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-				chunk, done := TranslateStreamChunk(data, model, chunkID)
+				chunk, done := streamTranslator.Translate(data)
 
 				eventType := gjson.GetBytes(data, "type").String()
 				if !ttftRecorded && strings.Contains(eventType, ".delta") {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
-				// 累计 delta 字符数
-				if eventType == "response.output_text.delta" {
+				// 累计 delta 字符数（文本 + function call 参数）
+				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
 					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
 				}
 				if eventType == "response.completed" {
@@ -794,6 +795,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			})
 		} else {
 			var fullContent strings.Builder
+			var toolCalls []ToolCallResult
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				eventType := gjson.GetBytes(data, "type").String()
@@ -805,11 +807,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				case "response.output_text.delta":
 					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
 					fullContent.WriteString(gjson.GetBytes(data, "delta").String())
+				case "response.function_call_arguments.delta":
+					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
 				case "response.completed":
 					usage = extractUsage(data)
 					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					// 从 response.output 提取 function_call 项
+					toolCalls = ExtractToolCallsFromOutput(data)
 					gotTerminal = true
 					return false
 				case "response.failed":
@@ -826,8 +832,27 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			result, _ = sjson.SetBytes(result, "model", model)
 			result, _ = sjson.SetBytes(result, "choices.0.index", 0)
 			result, _ = sjson.SetBytes(result, "choices.0.message.role", "assistant")
-			result, _ = sjson.SetBytes(result, "choices.0.message.content", fullContent.String())
-			result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "stop")
+
+			if len(toolCalls) > 0 {
+				// 有工具调用: 设置 tool_calls 和对应的 finish_reason
+				contentStr := fullContent.String()
+				if contentStr != "" {
+					result, _ = sjson.SetBytes(result, "choices.0.message.content", contentStr)
+				} else {
+					result, _ = sjson.SetRawBytes(result, "choices.0.message.content", []byte("null"))
+				}
+				for i, tc := range toolCalls {
+					prefix := fmt.Sprintf("choices.0.message.tool_calls.%d", i)
+					result, _ = sjson.SetBytes(result, prefix+".id", tc.ID)
+					result, _ = sjson.SetBytes(result, prefix+".type", "function")
+					result, _ = sjson.SetBytes(result, prefix+".function.name", tc.Name)
+					result, _ = sjson.SetBytes(result, prefix+".function.arguments", tc.Arguments)
+				}
+				result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "tool_calls")
+			} else {
+				result, _ = sjson.SetBytes(result, "choices.0.message.content", fullContent.String())
+				result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "stop")
+			}
 
 			if usage != nil {
 				result, _ = sjson.SetBytes(result, "usage.prompt_tokens", usage.PromptTokens)

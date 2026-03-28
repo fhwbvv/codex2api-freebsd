@@ -89,13 +89,18 @@ func TestShouldRecyclePooledClient(t *testing.T) {
 		want bool
 	}{
 		{
-			name: "goaway calm",
-			err:  errors.New(`http2: server sent GOAWAY and closed the connection; ErrCode=ENHANCE_YOUR_CALM`),
+			name: "connection shutting down",
+			err:  errors.New("http2: client connection is shutting down"),
 			want: true,
 		},
 		{
-			name: "connection shutting down",
-			err:  errors.New("http2: client connection is shutting down"),
+			name: "connection reset",
+			err:  errors.New("read tcp: connection reset by peer"),
+			want: true,
+		},
+		{
+			name: "broken pipe",
+			err:  errors.New("write: broken pipe"),
 			want: true,
 		},
 		{

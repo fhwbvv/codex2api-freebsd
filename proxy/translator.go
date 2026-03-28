@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -50,6 +51,8 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 
 	// 6. 转换 tools 格式: OpenAI Chat {type, function:{name,description,parameters}} → Codex {type, name, description, parameters}
 	result = convertToolsFormat(result)
+	// 清理 function tool parameters 中上游不支持的 JSON Schema 关键字
+	result = sanitizeToolSchemas(result)
 
 	// 7. 删除 Codex 不支持的 tool 相关字段
 	result, _ = sjson.DeleteBytes(result, "tool_choice")
@@ -250,6 +253,127 @@ func convertToolsFormat(rawJSON []byte) []byte {
 	}
 
 	return result
+}
+
+// ensureToolDescriptions 为缺少 description 的客户端执行工具补充默认描述
+// 例如 tool_search 类型要求必须有 description，否则上游会返回 400
+func ensureToolDescriptions(rawJSON []byte) []byte {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return rawJSON
+	}
+
+	// 客户端执行工具类型 → 默认描述
+	defaults := map[string]string{
+		"tool_search": "Search through available tools to find the most relevant one for the task.",
+	}
+
+	result := rawJSON
+	for i := 0; i < int(tools.Get("#").Int()); i++ {
+		toolType := gjson.GetBytes(result, fmt.Sprintf("tools.%d.type", i)).String()
+		desc := gjson.GetBytes(result, fmt.Sprintf("tools.%d.description", i))
+		if defaultDesc, ok := defaults[toolType]; ok && (!desc.Exists() || desc.String() == "") {
+			result, _ = sjson.SetBytes(result, fmt.Sprintf("tools.%d.description", i), defaultDesc)
+		}
+	}
+
+	return result
+}
+
+// sanitizeToolSchemas 递归清理 function tool parameters 中上游不支持的 JSON Schema 关键字
+// 例如 uniqueItems、minItems、maxItems、pattern 等验证约束会导致 Codex API 返回 400
+func sanitizeToolSchemas(rawJSON []byte) []byte {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return rawJSON
+	}
+
+	result := rawJSON
+	for i := 0; i < int(tools.Get("#").Int()); i++ {
+		params := gjson.GetBytes(result, fmt.Sprintf("tools.%d.parameters", i))
+		if !params.Exists() || params.Type != gjson.JSON {
+			continue
+		}
+
+		var schema map[string]interface{}
+		if err := json.Unmarshal([]byte(params.Raw), &schema); err != nil {
+			continue
+		}
+
+		stripUnsupportedSchemaKeys(schema)
+
+		sanitized, err := json.Marshal(schema)
+		if err != nil {
+			continue
+		}
+		result, _ = sjson.SetRawBytes(result, fmt.Sprintf("tools.%d.parameters", i), sanitized)
+	}
+
+	return result
+}
+
+// 上游不支持的 JSON Schema 验证约束关键字（仅影响校验，不影响结构）
+var unsupportedSchemaKeys = map[string]bool{
+	"uniqueItems":      true,
+	"minItems":         true,
+	"maxItems":         true,
+	"minimum":          true,
+	"maximum":          true,
+	"exclusiveMinimum": true,
+	"exclusiveMaximum": true,
+	"multipleOf":       true,
+	"pattern":          true,
+	"minLength":        true,
+	"maxLength":        true,
+	"format":           true,
+	"minProperties":    true,
+	"maxProperties":    true,
+}
+
+// stripUnsupportedSchemaKeys 递归删除 schema 中上游不支持的关键字
+func stripUnsupportedSchemaKeys(schema map[string]interface{}) {
+	for key := range unsupportedSchemaKeys {
+		delete(schema, key)
+	}
+
+	// 递归处理 properties
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]interface{}); ok {
+				stripUnsupportedSchemaKeys(sub)
+			}
+		}
+	}
+
+	// 递归处理 items
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		stripUnsupportedSchemaKeys(items)
+	}
+
+	// 递归处理 allOf / anyOf / oneOf
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					stripUnsupportedSchemaKeys(sub)
+				}
+			}
+		}
+	}
+
+	// 递归处理 additionalProperties（为 object 时）
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		stripUnsupportedSchemaKeys(addProps)
+	}
+
+	// 递归处理 $defs
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, v := range defs {
+			if sub, ok := v.(map[string]interface{}); ok {
+				stripUnsupportedSchemaKeys(sub)
+			}
+		}
+	}
 }
 
 // ==================== 响应翻译: Codex SSE → OpenAI SSE ====================

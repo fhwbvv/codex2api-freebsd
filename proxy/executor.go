@@ -3,13 +3,12 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -18,11 +17,50 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-// ==================== HTTP 连接池 ====================
+// ==================== HTTP 连接池（按账号隔离 + TTL 淘汰） ====================
+//
+// 设计要点：
+//   - 按账号隔离：避免同一 TCP 连接被不同 token 复用（会被服务端检测）
+//   - TTL 淘汰：只有活跃账号持有连接，不活跃的自动清理，几万账号也不爆内存
+//   - 空闲连接极简：每账号只保留 1 条空闲连接，空闲 30s 后自动关闭
 
-// 全局连接池：按账号维度缓存 *http.Client
-// 避免同一代理下的多个账号共用同一条 HTTP/2 连接，降低 GOAWAY 连带影响范围。
-var clientPool sync.Map // map[string]*http.Client, key = account-scoped pool key
+// poolEntry 包装 http.Client，追踪最后使用时间用于 TTL 淘汰
+type poolEntry struct {
+	client   *http.Client
+	lastUsed atomic.Int64 // UnixNano 时间戳
+}
+
+func (e *poolEntry) touch() {
+	e.lastUsed.Store(time.Now().UnixNano())
+}
+
+var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL
+
+// clientPoolTTL 未使用超过此时间的 Client 将被淘汰
+const clientPoolTTL = 2 * time.Minute
+
+func init() {
+	// 后台清理：每 30 秒扫描一次，淘汰过期的 Client
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			evictExpiredClients()
+		}
+	}()
+}
+
+func evictExpiredClients() {
+	cutoff := time.Now().Add(-clientPoolTTL).UnixNano()
+	clientPool.Range(func(key, value any) bool {
+		entry := value.(*poolEntry)
+		if entry.lastUsed.Load() < cutoff {
+			clientPool.Delete(key)
+			entry.client.CloseIdleConnections()
+		}
+		return true
+	})
+}
 
 func clientPoolKey(account *auth.Account, proxyURL string) string {
 	return fmt.Sprintf("%d|%s", account.ID(), proxyURL)
@@ -34,16 +72,15 @@ func shouldRecyclePooledClient(err error) bool {
 	}
 
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "goaway") ||
-		strings.Contains(msg, "enhance_your_calm") ||
-		strings.Contains(msg, "too_many_pings") ||
-		strings.Contains(msg, "connection is shutting down")
+	return strings.Contains(msg, "connection is shutting down") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe")
 }
 
 func recyclePooledClient(account *auth.Account, proxyURL string) {
 	key := clientPoolKey(account, proxyURL)
 	if v, ok := clientPool.LoadAndDelete(key); ok {
-		v.(*http.Client).CloseIdleConnections()
+		v.(*poolEntry).client.CloseIdleConnections()
 	}
 }
 
@@ -58,54 +95,36 @@ func recyclePooledClientForAccount(account *auth.Account) {
 	recyclePooledClient(account, proxyURL)
 }
 
-// getPooledClient 获取或创建连接池中的 HTTP Client
+// getPooledClient 获取或创建连接池中的 HTTP Client（按账号隔离，TTL 自动淘汰）
 func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 	key := clientPoolKey(account, proxyURL)
 	if v, ok := clientPool.Load(key); ok {
-		return v.(*http.Client)
+		entry := v.(*poolEntry)
+		entry.touch()
+		return entry.client
 	}
 
-	transport := &http.Transport{
-		// 连接池配置
-		MaxIdleConns:        32,               // 账号级别池不需要过大的空闲连接
-		MaxIdleConnsPerHost: 16,               // 单账号最多只需维持少量空闲连接
-		MaxConnsPerHost:     16,               // 降低单连接池过热概率
-		IdleConnTimeout:     90 * time.Second, // 空闲连接超时
-		TLSHandshakeTimeout: 10 * time.Second, // TLS 握手超时
-		// 启用 HTTP/2
-		ForceAttemptHTTP2: true,
-		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
-	}
-	baseDialer := &net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-	transport.DialContext = baseDialer.DialContext
+	transport := NewRustlsTransport(proxyURL)
 
-	// 设置代理
-	if proxyURL != "" {
-		_ = auth.ConfigureTransportProxy(transport, proxyURL, baseDialer)
+	entry := &poolEntry{
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   0,
+		},
 	}
+	entry.touch()
 
-	client := &http.Client{
-		Transport: transport,
-		// 流式响应不能使用 Client.Timeout，否则长时间生成会被整条链路硬切断。
-		// 取消控制改由请求 context 和底层连接超时完成。
-		Timeout: 0,
+	if v, loaded := clientPool.LoadOrStore(key, entry); loaded {
+		e := v.(*poolEntry)
+		e.touch()
+		return e.client
 	}
-
-	// CAS 存储，确保相同账号池只创建一个 Client
-	if v, loaded := clientPool.LoadOrStore(key, client); loaded {
-		return v.(*http.Client)
-	}
-	return client
+	return entry.client
 }
 
 // Codex 上游常量
 const (
 	CodexBaseURL = "https://chatgpt.com/backend-api/codex"
-	UserAgent    = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
-	Version      = "0.116.0"
 	Originator   = "codex_cli_rs"
 )
 
@@ -161,11 +180,14 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 
 	// ==================== 请求头（伪装 Codex CLI） ====================
+	// 每个账号使用确定性的 ClientProfile（UA + Version），模拟真实用户多样性
+	profile := ProfileForAccount(account.ID())
+
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("User-Agent", UserAgent)
-	req.Header.Set("Version", Version)
+	req.Header.Set("User-Agent", profile.UserAgent)
+	req.Header.Set("Version", profile.Version)
 	req.Header.Set("Originator", Originator)
 	req.Header.Set("Connection", "Keep-Alive")
 	if accountID != "" {

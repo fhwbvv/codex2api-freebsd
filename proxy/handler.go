@@ -326,6 +326,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	codexBody = sanitizeServiceTierForUpstream(codexBody)
 
+	// 为缺少 description 的客户端执行工具补充默认描述（如 tool_search）
+	codexBody = ensureToolDescriptions(codexBody)
+	// 清理 function tool parameters 中上游不支持的 JSON Schema 关键字
+	codexBody = sanitizeToolSchemas(codexBody)
+
 	// 删除 Codex 不支持的参数
 	unsupportedFields := []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",

@@ -224,8 +224,7 @@ export default function DashboardUsageCharts({
                 </defs>
                 <CartesianGrid vertical={false} stroke={gridColor} strokeDasharray="4 4" />
                 <XAxis dataKey="label" tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} minTickGap={20} tickMargin={8} />
-                <YAxis yAxisId="left" tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} allowDecimals={false} />
-                <YAxis yAxisId="right" orientation="right" tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} allowDecimals={false} />
+                <YAxis tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} allowDecimals={false} tickCount={8} />
                 <Tooltip
                   position={{ y: 10 }}
                   formatter={(value) => formatNumber(value)}
@@ -233,10 +232,10 @@ export default function DashboardUsageCharts({
                   contentStyle={tooltipContentStyle}
                   labelStyle={tooltipLabelStyle}
                   itemStyle={tooltipItemStyle}
+                  itemSorter={(item) => (item.dataKey === 'requests' ? -1 : 1)}
                 />
                 <Legend wrapperStyle={{ paddingTop: 4, fontSize: 12 }} />
                 <Area
-                  yAxisId="left"
                   type="monotone"
                   dataKey="requests"
                   name={t('dashboard.seriesRequests')}
@@ -245,7 +244,6 @@ export default function DashboardUsageCharts({
                   strokeWidth={2.5}
                 />
                 <Line
-                  yAxisId="right"
                   type="monotone"
                   dataKey="errors401"
                   name={t('dashboard.series401Errors')}

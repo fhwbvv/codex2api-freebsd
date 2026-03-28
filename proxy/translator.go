@@ -31,6 +31,7 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	if re := gjson.GetBytes(result, "reasoning_effort"); re.Exists() && !gjson.GetBytes(result, "reasoning.effort").Exists() {
 		result, _ = sjson.SetBytes(result, "reasoning.effort", re.String())
 	}
+	result = clampReasoningEffort(result)
 
 	// 4. 统一 service tier 字段命名，保留给上游用于 fast 调度
 	result = normalizeServiceTierField(result)
@@ -64,6 +65,23 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	result, _ = sjson.SetBytes(result, "include", []string{"reasoning.encrypted_content"})
 
 	return result, nil
+}
+
+// clampReasoningEffort 将 reasoning.effort 钳位到上游支持的值（low/medium/high）
+// 不支持的值（如 xhigh）映射到最接近的合法值
+func clampReasoningEffort(body []byte) []byte {
+	effort := gjson.GetBytes(body, "reasoning.effort").String()
+	if effort == "" {
+		return body
+	}
+	switch strings.ToLower(effort) {
+	case "low", "medium", "high":
+		return body // 合法值，不修改
+	default:
+		// xhigh / very_high 等超出范围的值 → 钳位到 high
+		body, _ = sjson.SetBytes(body, "reasoning.effort", "high")
+		return body
+	}
 }
 
 func normalizeServiceTierField(body []byte) []byte {

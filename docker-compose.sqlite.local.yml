@@ -10,6 +10,7 @@ services:
       - .env
     volumes:
       - sqlite-data-local:/data
+      - ./logs:/app/logs
     restart: unless-stopped
 
 volumes:

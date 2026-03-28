@@ -8,6 +8,8 @@ services:
       - "${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
     env_file:
       - .env
+    volumes:
+      - ./logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy

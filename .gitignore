@@ -29,3 +29,6 @@ Thumbs.db
 USAGE_WINDOW_LOGIC.md
 .claude/settings.local.json
 scripts
+
+# Logs
+logs/

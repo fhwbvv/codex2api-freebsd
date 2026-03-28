@@ -273,7 +273,7 @@ const (
 
 // isRetryableStatus 检查是否可重试的上游状态码
 func isRetryableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized
+	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
 }
 
 // Responses 处理 /v1/responses 请求（原生透传，无需协议翻译）
@@ -324,12 +324,18 @@ func (h *Handler) Responses(c *gin.Context) {
 	if re := gjson.GetBytes(codexBody, "reasoning_effort"); re.Exists() && !gjson.GetBytes(codexBody, "reasoning.effort").Exists() {
 		codexBody, _ = sjson.SetBytes(codexBody, "reasoning.effort", re.String())
 	}
+	codexBody = clampReasoningEffort(codexBody)
 	codexBody = sanitizeServiceTierForUpstream(codexBody)
 
 	// 为缺少 description 的客户端执行工具补充默认描述（如 tool_search）
 	codexBody = ensureToolDescriptions(codexBody)
 	// 清理 function tool parameters 中上游不支持的 JSON Schema 关键字
 	codexBody = sanitizeToolSchemas(codexBody)
+
+	// 展开 previous_response_id（将缓存的历史对话上下文注入 input）
+	codexBody, _ = expandPreviousResponse(codexBody)
+	// 保存展开后的 input，用于在 response.completed 时缓存完整上下文
+	expandedInputRaw := gjson.GetBytes(codexBody, "input").Raw
 
 	// 删除 Codex 不支持的参数
 	unsupportedFields := []string{
@@ -390,6 +396,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.Release(account)
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
 			h.logUsage(&database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses",
@@ -469,6 +476,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					// 缓存响应上下文，供后续 previous_response_id 展开使用
+					cacheCompletedResponse([]byte(expandedInputRaw), data)
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -501,6 +510,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					// 缓存响应上下文，供后续 previous_response_id 展开使用
+					cacheCompletedResponse([]byte(expandedInputRaw), data)
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -693,6 +704,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.Release(account)
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
 			h.logUsage(&database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/chat/completions",

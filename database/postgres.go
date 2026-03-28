@@ -270,6 +270,16 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_ip VARCHAR(100) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_location VARCHAR(255) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_latency_ms INT DEFAULT 0;
+
+	CREATE TABLE IF NOT EXISTS account_events (
+		id         SERIAL PRIMARY KEY,
+		account_id INT NOT NULL DEFAULT 0,
+		event_type VARCHAR(20) NOT NULL,
+		source     VARCHAR(30) DEFAULT '',
+		created_at TIMESTAMP DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);
+	CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);
 	`
 	_, err := db.conn.ExecContext(ctx, query)
 	return err
@@ -899,6 +909,7 @@ type ChartTimelinePoint struct {
 	OutputTokens    int64   `json:"output_tokens"`
 	ReasoningTokens int64   `json:"reasoning_tokens"`
 	CachedTokens    int64   `json:"cached_tokens"`
+	Errors401       int64   `json:"errors_401"`
 }
 
 // ChartModelPoint 模型排行聚合点
@@ -911,6 +922,13 @@ type ChartModelPoint struct {
 type ChartAggregation struct {
 	Timeline []ChartTimelinePoint `json:"timeline"`
 	Models   []ChartModelPoint    `json:"models"`
+}
+
+// AccountEventPoint 账号事件趋势数据点
+type AccountEventPoint struct {
+	Bucket  string `json:"bucket"`
+	Added   int    `json:"added"`
+	Deleted int    `json:"deleted"`
 }
 
 // AccountModelStat 单个模型的使用统计
@@ -955,7 +973,8 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 		COALESCE(SUM(input_tokens), 0)        AS input_tokens,
 		COALESCE(SUM(output_tokens), 0)       AS output_tokens,
 		COALESCE(SUM(reasoning_tokens), 0)    AS reasoning_tokens,
-		COALESCE(SUM(cached_tokens), 0)       AS cached_tokens
+		COALESCE(SUM(cached_tokens), 0)       AS cached_tokens,
+		COALESCE(SUM(CASE WHEN status_code = 401 THEN 1 ELSE 0 END), 0) AS errors_401
 	FROM usage_logs
 	WHERE created_at >= $1 AND created_at <= $2
 	  AND status_code <> 499
@@ -970,7 +989,7 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 
 	for rows.Next() {
 		var p ChartTimelinePoint
-		if err := rows.Scan(&p.Bucket, &p.Requests, &p.AvgLatency, &p.InputTokens, &p.OutputTokens, &p.ReasoningTokens, &p.CachedTokens); err != nil {
+		if err := rows.Scan(&p.Bucket, &p.Requests, &p.AvgLatency, &p.InputTokens, &p.OutputTokens, &p.ReasoningTokens, &p.CachedTokens, &p.Errors401); err != nil {
 			return nil, err
 		}
 		result.Timeline = append(result.Timeline, p)
@@ -1458,6 +1477,72 @@ func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) 
 		if rt != "" {
 			result[rt] = true
 		}
+	}
+	return result, rows.Err()
+}
+
+// ==================== 账号事件 ====================
+
+// InsertAccountEvent 插入一条账号事件记录
+func (db *DB) InsertAccountEvent(ctx context.Context, accountID int64, eventType string, source string) error {
+	_, err := db.conn.ExecContext(ctx,
+		`INSERT INTO account_events (account_id, event_type, source) VALUES ($1, $2, $3)`,
+		accountID, eventType, source,
+	)
+	return err
+}
+
+// InsertAccountEventAsync 异步插入账号事件（不阻塞调用方）
+func (db *DB) InsertAccountEventAsync(accountID int64, eventType string, source string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := db.InsertAccountEvent(ctx, accountID, eventType, source); err != nil {
+			log.Printf("[账号事件] 记录失败: account=%d type=%s source=%s err=%v", accountID, eventType, source, err)
+		}
+	}()
+}
+
+// GetAccountEventTrend 按时间桶聚合账号增删事件
+func (db *DB) GetAccountEventTrend(ctx context.Context, start, end time.Time, bucketMinutes int) ([]AccountEventPoint, error) {
+	if db.isSQLite() {
+		return db.getAccountEventTrendSQLite(ctx, start, end, bucketMinutes)
+	}
+
+	if bucketMinutes < 1 {
+		bucketMinutes = 60
+	}
+
+	query := `
+	SELECT
+		TO_CHAR(
+			date_trunc('minute', created_at)
+			- (EXTRACT(MINUTE FROM created_at)::int % $3) * INTERVAL '1 minute',
+			'YYYY-MM-DD"T"HH24:MI:SS'
+		) AS bucket,
+		COALESCE(SUM(CASE WHEN event_type = 'added' THEN 1 ELSE 0 END), 0) AS added,
+		COALESCE(SUM(CASE WHEN event_type = 'deleted' THEN 1 ELSE 0 END), 0) AS deleted
+	FROM account_events
+	WHERE created_at >= $1 AND created_at <= $2
+	GROUP BY 1
+	ORDER BY 1`
+
+	rows, err := db.conn.QueryContext(ctx, query, start, end, bucketMinutes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []AccountEventPoint
+	for rows.Next() {
+		var p AccountEventPoint
+		if err := rows.Scan(&p.Bucket, &p.Added, &p.Deleted); err != nil {
+			return nil, err
+		}
+		result = append(result, p)
+	}
+	if result == nil {
+		result = []AccountEventPoint{}
 	}
 	return result, rows.Err()
 }

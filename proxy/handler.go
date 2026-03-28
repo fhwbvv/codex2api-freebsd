@@ -31,6 +31,13 @@ type Handler struct {
 	dbKeysUntil time.Time
 }
 
+type usageLimitDetails struct {
+	message         string
+	planType        string
+	resetsAt        int64
+	resetsInSeconds int64
+}
+
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB) *Handler {
 	return &Handler{
@@ -276,6 +283,21 @@ func isRetryableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
 }
 
+func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
+	if len(body) == 0 {
+		return usageLimitDetails{}, false
+	}
+	if gjson.GetBytes(body, "error.type").String() != "usage_limit_reached" {
+		return usageLimitDetails{}, false
+	}
+	return usageLimitDetails{
+		message:         gjson.GetBytes(body, "error.message").String(),
+		planType:        gjson.GetBytes(body, "error.plan_type").String(),
+		resetsAt:        gjson.GetBytes(body, "error.resets_at").Int(),
+		resetsInSeconds: gjson.GetBytes(body, "error.resets_in_seconds").Int(),
+	}, true
+}
+
 // Responses 处理 /v1/responses 请求（原生透传，无需协议翻译）
 func (h *Handler) Responses(c *gin.Context) {
 	// 1. 读取请求体
@@ -362,6 +384,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 排队等待可用账号（最多 30s）
 			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
 			if account == nil {
+				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
 				c.JSON(http.StatusServiceUnavailable, gin.H{
 					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
 				})
@@ -417,7 +443,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				continue
 			}
 
-			h.sendUpstreamError(c, resp.StatusCode, errBody)
+			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
 
@@ -622,7 +648,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
 		})
 	} else if lastStatusCode != 0 {
-		h.sendUpstreamError(c, lastStatusCode, lastBody)
+		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 	}
 }
 
@@ -670,6 +696,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 排队等待可用账号（最多 30s）
 			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
 			if account == nil {
+				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
 				c.JSON(http.StatusServiceUnavailable, gin.H{
 					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
 				})
@@ -725,7 +755,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				continue
 			}
 
-			h.sendUpstreamError(c, resp.StatusCode, errBody)
+			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
 
@@ -970,7 +1000,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
 		})
 	} else if lastStatusCode != 0 {
-		h.sendUpstreamError(c, lastStatusCode, lastBody)
+		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 	}
 }
 
@@ -1263,6 +1293,41 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 			"code":    fmt.Sprintf("upstream_%d", statusCode),
 		},
 	})
+}
+
+// sendFinalUpstreamError 重试用尽后的最终错误响应：识别 usage_limit_reached 改写为 503，其余透传
+func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []byte) {
+	if statusCode == http.StatusTooManyRequests {
+		if details, ok := parseUsageLimitDetails(body); ok {
+			if details.resetsInSeconds > 0 {
+				c.Header("Retry-After", fmt.Sprintf("%d", details.resetsInSeconds))
+			}
+
+			message := "账号池额度已耗尽，请稍后重试"
+			if details.message != "" {
+				message = fmt.Sprintf("%s：%s", message, details.message)
+			}
+
+			errInfo := gin.H{
+				"message": message,
+				"type":    "server_error",
+				"code":    "account_pool_usage_limit_reached",
+			}
+			if details.planType != "" {
+				errInfo["plan_type"] = details.planType
+			}
+			if details.resetsAt != 0 {
+				errInfo["resets_at"] = details.resetsAt
+			}
+			if details.resetsInSeconds != 0 {
+				errInfo["resets_in_seconds"] = details.resetsInSeconds
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errInfo})
+			return
+		}
+	}
+
+	h.sendUpstreamError(c, statusCode, body)
 }
 
 // handleUpstreamError 统一处理上游错误（兼容旧调用）

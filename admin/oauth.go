@@ -222,6 +222,7 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "账号写入数据库失败: "+err.Error())
 		return
 	}
+	h.db.InsertAccountEventAsync(id, "added", "oauth")
 
 	newAcc := &auth.Account{
 		DBID:         id,

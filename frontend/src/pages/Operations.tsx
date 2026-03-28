@@ -16,6 +16,7 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
+import AccountTrendChart from '../components/AccountTrendChart'
 import { useDataLoader } from '../hooks/useDataLoader'
 import type { OpsOverviewResponse } from '../types'
 import { Button } from '@/components/ui/button'
@@ -171,6 +172,7 @@ export default function Operations() {
             </Card>
           </>
         ) : null}
+        <AccountTrendChart />
       </>
     </StateShell>
   )

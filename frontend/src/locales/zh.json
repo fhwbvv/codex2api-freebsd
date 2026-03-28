@@ -105,6 +105,7 @@
     "modelRanking": "模型调用排行",
     "modelRankingDesc": "按请求量展示选定范围内最常用的模型。",
     "seriesRequests": "请求数",
+    "series401Errors": "401 错误",
     "seriesAvgLatency": "平均耗时",
     "seriesInputTokens": "输入 Token",
     "seriesOutputTokens": "输出 Token",
@@ -349,7 +350,12 @@
     "justStarted": "刚刚启动",
     "days": "天",
     "hours": "小时",
-    "minutes": "分钟"
+    "minutes": "分钟",
+    "accountTrendTitle": "账号增删趋势",
+    "accountTrendDesc": "选定范围内新增 {{added}} 个，删除 {{deleted}} 个账号",
+    "accountTrendAdded": "新增账号",
+    "accountTrendDeleted": "删除账号",
+    "accountTrendEmpty": "选定范围内暂无账号增删记录"
   },
   "scheduler": {
     "title": "调度面板",

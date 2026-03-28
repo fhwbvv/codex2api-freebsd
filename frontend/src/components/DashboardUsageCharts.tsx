@@ -3,10 +3,10 @@ import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Area,
-  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
+  ComposedChart,
   Legend,
   Line,
   LineChart,
@@ -39,6 +39,7 @@ interface TimelinePoint {
   outputTokens: number
   reasoningTokens: number
   cachedTokens: number
+  errors401: number
 }
 
 interface ModelRankingPoint {
@@ -48,16 +49,16 @@ interface ModelRankingPoint {
 }
 
 const chartMargin = { top: 8, right: 12, left: -12, bottom: 0 }
-const gridColor = 'hsl(var(--border))'
-const axisColor = 'hsl(var(--muted-foreground))'
+const gridColor = 'var(--color-border)'
+const axisColor = 'var(--color-muted-foreground)'
 const tooltipContentStyle = {
-  backgroundColor: 'hsl(var(--card))',
-  border: '1px solid hsl(var(--border))',
+  backgroundColor: 'var(--color-card)',
+  border: '1px solid var(--color-border)',
   borderRadius: '16px',
   boxShadow: '0 18px 40px rgba(0, 0, 0, 0.12)',
 }
-const tooltipLabelStyle = { color: 'hsl(var(--foreground))', fontWeight: 600 }
-const tooltipItemStyle = { color: 'hsl(var(--foreground))' }
+const tooltipLabelStyle = { color: 'var(--color-foreground)', fontWeight: 600 }
+const tooltipItemStyle = { color: 'var(--color-foreground)' }
 const tokenBreakdownTooltipPosition = { y: -160 }
 const compactNumberFormatter = new Intl.NumberFormat(undefined, {
   notation: 'compact',
@@ -115,6 +116,7 @@ export default function DashboardUsageCharts({
         outputTokens: point.output_tokens,
         reasoningTokens: point.reasoning_tokens,
         cachedTokens: point.cached_tokens,
+        errors401: point.errors_401,
       }
     })
 
@@ -213,16 +215,17 @@ export default function DashboardUsageCharts({
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
           <ChartCard title={t('dashboard.requestTrend')} description={t('dashboard.requestTrendDesc')}>
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={displayData.timelineData} margin={chartMargin}>
+              <ComposedChart data={displayData.timelineData} margin={chartMargin}>
                 <defs>
                   <linearGradient id="dashboard-request-gradient" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="hsl(var(--primary))" stopOpacity={0.28} />
-                    <stop offset="95%" stopColor="hsl(var(--primary))" stopOpacity={0} />
+                    <stop offset="5%" stopColor="var(--color-primary)" stopOpacity={0.28} />
+                    <stop offset="95%" stopColor="var(--color-primary)" stopOpacity={0} />
                   </linearGradient>
                 </defs>
                 <CartesianGrid vertical={false} stroke={gridColor} strokeDasharray="4 4" />
                 <XAxis dataKey="label" tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} minTickGap={20} tickMargin={8} />
-                <YAxis tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} allowDecimals={false} />
+                <YAxis yAxisId="left" tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} allowDecimals={false} />
+                <YAxis yAxisId="right" orientation="right" tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} allowDecimals={false} />
                 <Tooltip
                   position={{ y: 10 }}
                   formatter={(value) => formatNumber(value)}
@@ -231,15 +234,27 @@ export default function DashboardUsageCharts({
                   labelStyle={tooltipLabelStyle}
                   itemStyle={tooltipItemStyle}
                 />
+                <Legend wrapperStyle={{ paddingTop: 4, fontSize: 12 }} />
                 <Area
+                  yAxisId="left"
                   type="monotone"
                   dataKey="requests"
                   name={t('dashboard.seriesRequests')}
-                  stroke="hsl(var(--primary))"
+                  stroke="var(--color-primary)"
                   fill="url(#dashboard-request-gradient)"
                   strokeWidth={2.5}
                 />
-              </AreaChart>
+                <Line
+                  yAxisId="right"
+                  type="monotone"
+                  dataKey="errors401"
+                  name={t('dashboard.series401Errors')}
+                  stroke="var(--color-destructive)"
+                  strokeWidth={2}
+                  dot={false}
+                  activeDot={{ r: 4 }}
+                />
+              </ComposedChart>
             </ResponsiveContainer>
           </ChartCard>
 

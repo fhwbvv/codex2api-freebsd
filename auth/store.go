@@ -1125,6 +1125,9 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 
 		s.RemoveAccount(acc.DBID)
 		cleaned++
+		if s.db != nil {
+			s.db.InsertAccountEventAsync(acc.DBID, "deleted", "auto_clean")
+		}
 	}
 
 	return cleaned
@@ -1615,6 +1618,9 @@ func (s *Store) CleanFullUsageAccounts(ctx context.Context) int {
 
 		s.RemoveAccount(acc.DBID)
 		log.Printf("[账号 %d] 用量 %.1f%% 已满，已自动清理 (email=%s)", acc.DBID, pct, acc.Email)
+		if s.db != nil {
+			s.db.InsertAccountEventAsync(acc.DBID, "deleted", "clean_full_usage")
+		}
 		cleaned++
 	}
 

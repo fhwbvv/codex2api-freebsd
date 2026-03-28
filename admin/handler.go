@@ -95,6 +95,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/clean-error", h.CleanError)
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
+	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
@@ -395,6 +396,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		}
 
 		successCount++
+		h.db.InsertAccountEventAsync(id, "added", "manual")
 
 		// 热加载：直接加入内存池
 		newAcc := &auth.Account{
@@ -684,6 +686,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 			atomic.AddInt64(&successCount, 1)
 			atomic.AddInt64(&current, 1)
+			h.db.InsertAccountEventAsync(id, "added", "import")
 
 			newAcc := &auth.Account{
 				DBID:         id,
@@ -758,6 +761,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 
 	// 从内存池移除
 	h.store.RemoveAccount(id)
+	h.db.InsertAccountEventAsync(id, "deleted", "manual")
 
 	writeMessage(c, http.StatusOK, "账号已删除")
 }
@@ -1513,6 +1517,47 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 // ListModels 返回支持的模型列表（供前端设置页使用）
 func (h *Handler) ListModels(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"models": proxy.SupportedModels})
+}
+
+// ==================== 账号趋势 ====================
+
+// GetAccountEventTrend 获取账号增删趋势聚合数据
+func (h *Handler) GetAccountEventTrend(c *gin.Context) {
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+	if startStr == "" || endStr == "" {
+		writeError(c, http.StatusBadRequest, "start 和 end 参数为必填")
+		return
+	}
+
+	start, err := time.Parse(time.RFC3339, startStr)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "start 时间格式无效（需 RFC3339）")
+		return
+	}
+	end, err := time.Parse(time.RFC3339, endStr)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "end 时间格式无效（需 RFC3339）")
+		return
+	}
+
+	bucketMinutes := 60
+	if bStr := c.Query("bucket_minutes"); bStr != "" {
+		if b, err := strconv.Atoi(bStr); err == nil && b > 0 {
+			bucketMinutes = b
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	trend, err := h.db.GetAccountEventTrend(ctx, start, end, bucketMinutes)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"trend": trend})
 }
 
 // ==================== 清理 ====================

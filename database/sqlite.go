@@ -95,6 +95,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			test_location TEXT DEFAULT '',
 			test_latency_ms INTEGER DEFAULT 0
 		);`,
+		`CREATE TABLE IF NOT EXISTS account_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			account_id INTEGER NOT NULL DEFAULT 0,
+			event_type TEXT NOT NULL,
+			source TEXT DEFAULT '',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -147,6 +154,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);`,
 	}
 	for _, stmt := range indexStatements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -255,7 +264,7 @@ func (db *DB) getTrafficSnapshotSQLite(ctx context.Context) (*TrafficSnapshot, e
 
 func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Time, bucketMinutes int) (*ChartAggregation, error) {
 	rows, err := db.conn.QueryContext(ctx, `
-		SELECT created_at, duration_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, model
+		SELECT created_at, duration_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, model, status_code
 		FROM usage_logs
 		WHERE created_at >= $1 AND created_at <= $2
 		  AND status_code <> 499
@@ -272,6 +281,7 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		outputTokens    int64
 		reasoningTokens int64
 		cachedTokens    int64
+		errors401       int64
 	}
 
 	result := &ChartAggregation{}
@@ -286,7 +296,8 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		var reasoningTokens int64
 		var cachedTokens int64
 		var model sql.NullString
-		if err := rows.Scan(&createdRaw, &durationMs, &inputTokens, &outputTokens, &reasoningTokens, &cachedTokens, &model); err != nil {
+		var statusCode int
+		if err := rows.Scan(&createdRaw, &durationMs, &inputTokens, &outputTokens, &reasoningTokens, &cachedTokens, &model, &statusCode); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
@@ -306,6 +317,9 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		agg.outputTokens += outputTokens
 		agg.reasoningTokens += reasoningTokens
 		agg.cachedTokens += cachedTokens
+		if statusCode == 401 {
+			agg.errors401++
+		}
 
 		modelName := "unknown"
 		if model.Valid && model.String != "" {
@@ -336,6 +350,7 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 			OutputTokens:    agg.outputTokens,
 			ReasoningTokens: agg.reasoningTokens,
 			CachedTokens:    agg.cachedTokens,
+			Errors401:       agg.errors401,
 		})
 	}
 	if result.Timeline == nil {
@@ -369,5 +384,75 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		result.Models = []ChartModelPoint{}
 	}
 
+	return result, nil
+}
+
+// getAccountEventTrendSQLite SQLite 版账号事件趋势聚合（内存分桶）
+func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Time, bucketMinutes int) ([]AccountEventPoint, error) {
+	if bucketMinutes < 1 {
+		bucketMinutes = 60
+	}
+
+	rows, err := db.conn.QueryContext(ctx,
+		`SELECT created_at, event_type FROM account_events WHERE created_at >= $1 AND created_at <= $2`,
+		start, end,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type bucketAgg struct {
+		added   int
+		deleted int
+	}
+	bucketMap := make(map[string]*bucketAgg)
+
+	for rows.Next() {
+		var createdRaw interface{}
+		var eventType string
+		if err := rows.Scan(&createdRaw, &eventType); err != nil {
+			return nil, err
+		}
+		createdAt, err := parseDBTimeValue(createdRaw)
+		if err != nil || createdAt.IsZero() {
+			continue
+		}
+
+		// 对齐到桶
+		minute := createdAt.Minute()
+		aligned := minute - (minute % bucketMinutes)
+		bucketTime := time.Date(createdAt.Year(), createdAt.Month(), createdAt.Day(),
+			createdAt.Hour(), aligned, 0, 0, createdAt.Location())
+		key := bucketTime.Format("2006-01-02T15:04:05")
+
+		agg, ok := bucketMap[key]
+		if !ok {
+			agg = &bucketAgg{}
+			bucketMap[key] = agg
+		}
+		switch eventType {
+		case "added":
+			agg.added++
+		case "deleted":
+			agg.deleted++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 排序输出
+	keys := make([]string, 0, len(bucketMap))
+	for k := range bucketMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	result := make([]AccountEventPoint, 0, len(keys))
+	for _, k := range keys {
+		agg := bucketMap[k]
+		result = append(result, AccountEventPoint{Bucket: k, Added: agg.added, Deleted: agg.deleted})
+	}
 	return result, nil
 }

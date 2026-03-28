@@ -1,4 +1,5 @@
 import type {
+  AccountEventTrendPoint,
   AccountUsageDetail,
   AddAccountRequest,
   AdminErrorResponse,
@@ -133,6 +134,13 @@ export const api = {
     searchParams.set('end', params.end)
     searchParams.set('bucket_minutes', String(params.bucketMinutes))
     return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`)
+  },
+  getAccountEventTrend: (params: { start: string; end: string; bucketMinutes: number }) => {
+    const sp = new URLSearchParams()
+    sp.set('start', params.start)
+    sp.set('end', params.end)
+    sp.set('bucket_minutes', String(params.bucketMinutes))
+    return request<{ trend: AccountEventTrendPoint[] }>(`/accounts/event-trend?${sp.toString()}`)
   },
   getAPIKeys: () => request<APIKeysResponse>('/keys'),
   createAPIKey: (name: string, key?: string) =>

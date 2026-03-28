@@ -105,6 +105,7 @@
     "modelRanking": "Model Ranking",
     "modelRankingDesc": "Top models by request volume in the selected range.",
     "seriesRequests": "Requests",
+    "series401Errors": "401 Errors",
     "seriesAvgLatency": "Avg Latency",
     "seriesInputTokens": "Input Tokens",
     "seriesOutputTokens": "Output Tokens",
@@ -349,7 +350,12 @@
     "justStarted": "Just started",
     "days": "d",
     "hours": "h",
-    "minutes": "m"
+    "minutes": "m",
+    "accountTrendTitle": "Account Add / Delete Trend",
+    "accountTrendDesc": "{{added}} added, {{deleted}} deleted in the selected range",
+    "accountTrendAdded": "Added",
+    "accountTrendDeleted": "Deleted",
+    "accountTrendEmpty": "No account events in the selected range"
   },
   "scheduler": {
     "title": "Scheduler Board",

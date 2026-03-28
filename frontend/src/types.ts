@@ -94,6 +94,12 @@ export interface HealthResponse {
   total: number
 }
 
+export interface AccountEventTrendPoint {
+  bucket: string
+  added: number
+  deleted: number
+}
+
 export interface OpsOverviewResponse {
   updated_at: ISODateString
   uptime_seconds: number
@@ -238,6 +244,7 @@ export interface ChartTimelinePoint {
   output_tokens: number
   reasoning_tokens: number
   cached_tokens: number
+  errors_401: number
 }
 
 export interface ChartModelPoint {

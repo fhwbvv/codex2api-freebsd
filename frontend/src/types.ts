@@ -163,6 +163,7 @@ export interface SystemSettings {
   admin_secret: string
   admin_auth_source: 'env' | 'database' | 'disabled' | string
   auto_clean_full_usage: boolean
+  auto_clean_error: boolean
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   max_retries: number

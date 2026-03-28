@@ -678,6 +678,7 @@ type Store struct {
 	autoCleanUnauthorized atomic.Bool
 	autoCleanRateLimited  atomic.Bool
 	autoCleanFullUsage    atomic.Bool
+	autoCleanError        atomic.Bool
 	autoCleanupBatch      atomic.Bool
 	maxRetries            int64 // 请求失败最大重试次数（换号重试）
 	stopCh                chan struct{}
@@ -736,6 +737,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
+	s.autoCleanError.Store(settings.AutoCleanError)
 	retries := int64(settings.MaxRetries)
 	if retries <= 0 {
 		retries = 2 // 默认重试 2 次
@@ -929,6 +931,16 @@ func (s *Store) GetAutoCleanFullUsage() bool {
 // SetAutoCleanFullUsage 设置是否自动清理用量满的账号
 func (s *Store) SetAutoCleanFullUsage(enabled bool) {
 	s.autoCleanFullUsage.Store(enabled)
+}
+
+// GetAutoCleanError 获取是否自动清理 error 账号
+func (s *Store) GetAutoCleanError() bool {
+	return s.autoCleanError.Load()
+}
+
+// SetAutoCleanError 设置是否自动清理 error 账号
+func (s *Store) SetAutoCleanError(enabled bool) {
+	s.autoCleanError.Store(enabled)
 }
 
 // Init 初始化：从数据库加载账号
@@ -1547,7 +1559,7 @@ func (s *Store) TriggerAutoCleanupAsync() {
 }
 
 func (s *Store) runAutoCleanupSweep(ctx context.Context) {
-	if !s.GetAutoCleanUnauthorized() && !s.GetAutoCleanRateLimited() {
+	if !s.GetAutoCleanUnauthorized() && !s.GetAutoCleanRateLimited() && !s.GetAutoCleanError() {
 		return
 	}
 
@@ -1556,6 +1568,7 @@ func (s *Store) runAutoCleanupSweep(ctx context.Context) {
 
 	cleanedUnauthorized := 0
 	cleanedRateLimited := 0
+	cleanedError := 0
 
 	if s.GetAutoCleanUnauthorized() {
 		cleanedUnauthorized = s.CleanByRuntimeStatus(cleanupCtx, "unauthorized")
@@ -1563,9 +1576,12 @@ func (s *Store) runAutoCleanupSweep(ctx context.Context) {
 	if s.GetAutoCleanRateLimited() {
 		cleanedRateLimited = s.CleanByRuntimeStatus(cleanupCtx, "rate_limited")
 	}
+	if s.GetAutoCleanError() {
+		cleanedError = s.CleanByRuntimeStatus(cleanupCtx, "error")
+	}
 
-	if cleanedUnauthorized > 0 || cleanedRateLimited > 0 {
-		log.Printf("自动清理完成: unauthorized=%d, rate_limited=%d", cleanedUnauthorized, cleanedRateLimited)
+	if cleanedUnauthorized > 0 || cleanedRateLimited > 0 || cleanedError > 0 {
+		log.Printf("自动清理完成: unauthorized=%d, rate_limited=%d, error=%d", cleanedUnauthorized, cleanedRateLimited, cleanedError)
 	}
 }
 

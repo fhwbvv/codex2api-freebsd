@@ -48,6 +48,7 @@ export default function Settings() {
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
     auto_clean_rate_limited: false,
+    auto_clean_error: false,
     admin_secret: '',
     admin_auth_source: 'disabled',
     auto_clean_full_usage: false,
@@ -438,6 +439,15 @@ export default function Settings() {
                   options={booleanOptions}
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanFullUsageDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.autoCleanError')}</label>
+                <Select
+                  value={settingsForm.auto_clean_error ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_error: value === 'true' }))}
+                  options={booleanOptions}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanErrorDesc')}</p>
               </div>
             </div>
             <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.scheduler')}</h3>

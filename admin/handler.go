@@ -92,6 +92,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/batch-test", h.BatchTest)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
+	api.POST("/accounts/clean-error", h.CleanError)
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/usage/stats", h.GetUsageStats)
@@ -1065,6 +1066,7 @@ type settingsResponse struct {
 	AdminSecret           string `json:"admin_secret"`
 	AdminAuthSource       string `json:"admin_auth_source"`
 	AutoCleanFullUsage    bool   `json:"auto_clean_full_usage"`
+	AutoCleanError        bool   `json:"auto_clean_error"`
 	ProxyPoolEnabled      bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled  bool   `json:"fast_scheduler_enabled"`
 	MaxRetries            int    `json:"max_retries"`
@@ -1087,6 +1089,7 @@ type updateSettingsReq struct {
 	AutoCleanRateLimited  *bool   `json:"auto_clean_rate_limited"`
 	AdminSecret           *string `json:"admin_secret"`
 	AutoCleanFullUsage    *bool   `json:"auto_clean_full_usage"`
+	AutoCleanError        *bool   `json:"auto_clean_error"`
 	ProxyPoolEnabled      *bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled  *bool   `json:"fast_scheduler_enabled"`
 	MaxRetries            *int    `json:"max_retries"`
@@ -1116,6 +1119,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AdminSecret:           adminSecret,
 		AdminAuthSource:       adminAuthSource,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:        h.store.GetAutoCleanError(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
 		MaxRetries:            h.store.GetMaxRetries(),
@@ -1233,6 +1237,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: auto_clean_full_usage = %t", *req.AutoCleanFullUsage)
 	}
 
+	if req.AutoCleanError != nil {
+		h.store.SetAutoCleanError(*req.AutoCleanError)
+		log.Printf("设置已更新: auto_clean_error = %t", *req.AutoCleanError)
+	}
+
 	if req.ProxyPoolEnabled != nil {
 		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
 		if *req.ProxyPoolEnabled {
@@ -1282,6 +1291,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanRateLimited:  h.store.GetAutoCleanRateLimited(),
 		AdminSecret:           currentAdminSecret,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:        h.store.GetAutoCleanError(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
 		MaxRetries:            h.store.GetMaxRetries(),
@@ -1291,7 +1301,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("无法持久化保存设置: %v", err)
 	}
 
-	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() {
+	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
 		h.store.TriggerAutoCleanupAsync()
 	}
 
@@ -1317,6 +1327,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AdminSecret:           adminSecretForDisplay,
 		AdminAuthSource:       adminAuthSource,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
+		AutoCleanError:        h.store.GetAutoCleanError(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
 		MaxRetries:            h.store.GetMaxRetries(),
@@ -1514,6 +1525,11 @@ func (h *Handler) CleanBanned(c *gin.Context) {
 // CleanRateLimited 清理限流（rate_limited）账号
 func (h *Handler) CleanRateLimited(c *gin.Context) {
 	h.cleanByStatus(c, "rate_limited")
+}
+
+// CleanError 清理错误（error）账号
+func (h *Handler) CleanError(c *gin.Context) {
+	h.cleanByStatus(c, "error")
 }
 
 // cleanByStatus 按运行时状态清理账号

@@ -1,0 +1,17 @@
+name: codex2api-sqlite-local
+
+services:
+  codex2api:
+    build: .
+    container_name: codex2api-sqlite-local
+    ports:
+      - "${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
+    env_file:
+      - .env
+    volumes:
+      - sqlite-data-local:/data
+    restart: unless-stopped
+
+volumes:
+  sqlite-data-local:
+    name: codex2api-sqlite-local_sqlite-data-local

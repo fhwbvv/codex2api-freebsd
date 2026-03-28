@@ -1,0 +1,170 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: 'Inter', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', ui-monospace, monospace;
+  --font-geist-mono: 'Geist Mono', 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', ui-monospace, monospace;
+
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+
+  /* Light theme (default) */
+  --color-background: hsl(250 5% 96%);
+  --color-foreground: hsl(262 30% 12%);
+  --color-card: hsl(260 20% 98%);
+  --color-card-foreground: hsl(262 30% 12%);
+  --color-popover: hsl(260 20% 98%);
+  --color-popover-foreground: hsl(262 30% 12%);
+  --color-primary: hsl(258 60% 63%);
+  --color-primary-foreground: hsl(0 0% 100%);
+  --color-secondary: hsl(258 12% 90%);
+  --color-secondary-foreground: hsl(262 20% 32%);
+  --color-muted: hsl(258 12% 90%);
+  --color-muted-foreground: hsl(262 14% 50%);
+  --color-accent: hsl(258 12% 90%);
+  --color-accent-foreground: hsl(262 30% 12%);
+  --color-destructive: hsl(0 60% 48%);
+  --color-destructive-foreground: hsl(0 0% 100%);
+  --color-border: hsl(258 15% 86%);
+  --color-input: hsl(258 15% 86%);
+  --color-ring: hsl(258 60% 63%);
+}
+
+@layer base {
+  :root {
+    --success: 152 50% 34%;
+    --success-bg: 152 50% 34% / 0.12;
+    --warning: 36 72% 40%;
+    --warning-bg: 36 72% 40% / 0.12;
+    --info: 220 44% 57%;
+    --info-bg: 220 44% 57% / 0.12;
+    --sidebar-background: 260 20% 98%;
+  }
+
+  /* ===== One Dark Pro Darker ===== */
+  .dark {
+    --color-background: hsl(220 13% 12%);
+    --color-foreground: hsl(220 14% 86%);
+    --color-card: hsl(220 13% 15%);
+    --color-card-foreground: hsl(220 14% 86%);
+    --color-popover: hsl(220 13% 15%);
+    --color-popover-foreground: hsl(220 14% 86%);
+    --color-primary: hsl(258 60% 68%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(220 12% 22%);
+    --color-secondary-foreground: hsl(220 14% 78%);
+    --color-muted: hsl(220 12% 22%);
+    --color-muted-foreground: hsl(220 10% 62%);
+    --color-accent: hsl(220 12% 22%);
+    --color-accent-foreground: hsl(220 14% 86%);
+    --color-destructive: hsl(0 65% 54%);
+    --color-destructive-foreground: hsl(0 0% 100%);
+    --color-border: hsl(220 12% 20%);
+    --color-input: hsl(220 12% 20%);
+    --color-ring: hsl(258 60% 68%);
+
+    --success: 152 55% 46%;
+    --success-bg: 152 55% 46% / 0.14;
+    --warning: 36 80% 50%;
+    --warning-bg: 36 80% 50% / 0.14;
+    --info: 220 55% 70%;
+    --info-bg: 220 55% 70% / 0.14;
+    --sidebar-background: 220 13% 10%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans);
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at top left, hsl(258 60% 63% / 0.08), transparent 32%),
+      radial-gradient(circle at 85% 15%, hsl(258 50% 55% / 0.1), transparent 24%),
+      linear-gradient(180deg, hsl(250 15% 96%) 0%, hsl(250 12% 92%) 100%);
+  }
+
+  .dark body,
+  body.dark {
+    background:
+      radial-gradient(circle at top left, hsl(258 60% 63% / 0.06), transparent 32%),
+      radial-gradient(circle at 85% 15%, hsl(258 50% 55% / 0.05), transparent 24%),
+      linear-gradient(180deg, hsl(220 13% 12%) 0%, hsl(220 14% 10%) 100%);
+  }
+}
+
+/* 主题切换过渡：仅在切换时临时启用，避免影响正常交互 */
+.theme-transition,
+.theme-transition *,
+.theme-transition *::before,
+.theme-transition *::after {
+  transition: background-color 0.4s ease, color 0.3s ease, border-color 0.35s ease,
+              box-shadow 0.35s ease, background 0.4s ease, fill 0.3s ease, stroke 0.3s ease !important;
+}
+
+/* Toast animation */
+@keyframes toast-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  width: 2rem;
+  height: 2rem;
+  border: 3px solid var(--color-border);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* ===== Dark mode overrides for hardcoded bg-white ===== */
+.dark .bg-white\/40,
+.dark .bg-white\/50,
+.dark .bg-white\/55,
+.dark .bg-white\/60,
+.dark .bg-white\/65,
+.dark .bg-white\/70,
+.dark .bg-white\/80,
+.dark .bg-white\/90 {
+  background-color: hsl(220 13% 17% / 0.6) !important;
+}
+
+.dark .bg-white {
+  background-color: hsl(220 13% 17%) !important;
+}
+
+/* Dark mode table styling */
+.dark tr:hover {
+  background-color: hsl(220 13% 17% / 0.5);
+}
+
+/* Dark mode input styling */
+.dark input,
+.dark textarea,
+.dark select {
+  background-color: hsl(220 13% 14%);
+  color: hsl(220 14% 86%);
+  border-color: hsl(220 12% 22%);
+}
+
+/* Dark mode shadow softening */
+.dark [class*="shadow-"] {
+  --tw-shadow-color: hsl(0 0% 0% / 0.3);
+}

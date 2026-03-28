@@ -1,0 +1,69 @@
+name: codex2api
+
+services:
+  codex2api:
+    image: ghcr.io/james-6-23/codex2api:latest
+    container_name: codex2api
+    ports:
+      - "${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - codex2api-net
+
+  postgres:
+    image: postgres:18-alpine
+    container_name: codex2api-postgres
+    environment:
+      POSTGRES_USER: ${DATABASE_USER:-codex2api}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-codex2api}
+      POSTGRES_DB: ${DATABASE_NAME:-codex2api}
+      PGDATA: /var/lib/postgresql/data
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # ports:
+    #   - "5432:5432"   # 取消注释以便本地调试
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-codex2api}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - codex2api-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: codex2api-redis
+    command: redis-server --appendonly yes
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - redisdata:/data
+    # ports:
+    #   - "6379:6379"   # 取消注释以便本地调试
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - codex2api-net
+
+networks:
+  codex2api-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: codex2api_pgdata
+  redisdata:
+    name: codex2api_redisdata

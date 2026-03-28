@@ -1,0 +1,17 @@
+name: codex2api-sqlite
+
+services:
+  codex2api:
+    image: ghcr.io/james-6-23/codex2api:latest
+    container_name: codex2api-sqlite
+    ports:
+      - "${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
+    env_file:
+      - .env
+    volumes:
+      - sqlite-data:/data
+    restart: unless-stopped
+
+volumes:
+  sqlite-data:
+    name: codex2api-sqlite_sqlite-data

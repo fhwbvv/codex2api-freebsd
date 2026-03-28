@@ -1,0 +1,32 @@
+# Git
+.git/
+.gitignore
+
+# Frontend build artifacts & deps (rebuilt in Docker)
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+
+# Docker
+docker-compose.yml
+.dockerignore
+
+# Go binaries
+*.exe
+*.dll
+*.so
+*.dylib
+codex2api

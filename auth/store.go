@@ -87,6 +87,8 @@ type Account struct {
 	ActiveRequests int64 // 当前并发请求数
 	TotalRequests  int64 // 累计总请求数
 	LastUsedAt     int64 // 最后使用时间（UnixNano）
+	Disabled       int32 // 原子标志，1 = 立即不可调度（401 时瞬间置位，无需等锁）
+	AddedAt        int64 // 加入号池的时间（UnixNano），用于过期清理
 
 }
 
@@ -356,6 +358,11 @@ func (a *Account) schedulerSnapshot(baseLimit int64) (AccountHealthTier, float64
 
 // IsAvailable 检查账号是否可用
 func (a *Account) IsAvailable() bool {
+	// 原子标志优先：401 时瞬间置位，无需等锁即可拦截并发请求
+	if atomic.LoadInt32(&a.Disabled) != 0 {
+		return false
+	}
+
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
@@ -1004,6 +1011,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			RefreshToken: rt,
 			ProxyURL:     proxy,
 			HealthTier:   HealthTierWarm,
+			AddedAt:      row.CreatedAt.UnixNano(),
 		}
 
 		// 尝试从 credentials 恢复已有的 AT
@@ -1082,11 +1090,13 @@ func (s *Store) StartBackgroundRefresh() {
 		refreshTicker := time.NewTicker(2 * time.Minute)
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
+		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
 		defer refreshTicker.Stop()
 		defer autoCleanupTicker.Stop()
 		defer fullUsageCleanupTicker.Stop()
+		defer expiredCleanupTicker.Stop()
 		defer rebuildSchedulerTicker.Stop()
 
 		for {
@@ -1101,6 +1111,9 @@ func (s *Store) StartBackgroundRefresh() {
 				if s.GetAutoCleanFullUsage() {
 					go s.CleanFullUsageAccounts(context.Background())
 				}
+			case <-expiredCleanupTicker.C:
+				// 每 15 分钟清理加入超过 30 分钟的账号
+				go s.CleanExpiredAccounts(context.Background(), 30*time.Minute)
 			case <-rebuildSchedulerTicker.C:
 				// 定期重建调度器以优化内存和性能
 				if s.FastSchedulerEnabled() {
@@ -1150,8 +1163,14 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 
 // Next 获取下一个可用账号（健康优先 + 低负载择优 + warm 公平调度）
 func (s *Store) Next() *Account {
+	return s.NextExcluding(nil)
+}
+
+// NextExcluding 获取下一个可用账号，排除指定的账号 ID 集合
+// 用于重试时避免再次选到已失败（如 401）的账号
+func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
 	if scheduler := s.getFastScheduler(); scheduler != nil {
-		return scheduler.Acquire()
+		return scheduler.AcquireExcluding(exclude)
 	}
 
 	s.mu.RLock()
@@ -1167,6 +1186,9 @@ func (s *Store) Next() *Account {
 	var candidates []*Account
 
 	for _, acc := range s.accounts {
+		if exclude != nil && exclude[acc.DBID] {
+			continue
+		}
 		if !acc.IsAvailable() {
 			continue
 		}
@@ -1320,6 +1342,10 @@ func (s *Store) AddAccount(acc *Account) {
 	if acc == nil {
 		return
 	}
+	// 记录加入时间（用于过期清理）
+	if atomic.LoadInt64(&acc.AddedAt) == 0 {
+		atomic.StoreInt64(&acc.AddedAt, time.Now().UnixNano())
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	acc.mu.Lock()
@@ -1414,6 +1440,7 @@ func (s *Store) ClearCooldown(acc *Account) {
 		return
 	}
 
+	atomic.StoreInt32(&acc.Disabled, 0) // 清除原子禁用标志
 	acc.mu.Lock()
 	wasCooling := acc.Status == StatusCooldown
 	if acc.Status == StatusCooldown {
@@ -1652,6 +1679,48 @@ func (s *Store) CleanFullUsageAccounts(ctx context.Context) int {
 	return cleaned
 }
 
+// CleanExpiredAccounts 清理加入号池超过指定时长的账号（不管是否被调用过）
+func (s *Store) CleanExpiredAccounts(ctx context.Context, maxAge time.Duration) int {
+	accounts := s.Accounts()
+	cleaned := 0
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+
+		addedAt := atomic.LoadInt64(&acc.AddedAt)
+		if addedAt == 0 || addedAt > cutoff {
+			continue // 未记录添加时间或未过期
+		}
+
+		// 跳过正在处理请求的账号
+		if atomic.LoadInt64(&acc.ActiveRequests) > 0 {
+			continue
+		}
+
+		if s.db != nil {
+			if err := s.db.SetError(ctx, acc.DBID, "deleted"); err != nil {
+				log.Printf("[账号 %d] 过期清理失败: %v", acc.DBID, err)
+				continue
+			}
+		}
+
+		s.RemoveAccount(acc.DBID)
+		log.Printf("[账号 %d] 加入超过 %v，已过期清理 (email=%s)", acc.DBID, maxAge, acc.Email)
+		if s.db != nil {
+			s.db.InsertAccountEventAsync(acc.DBID, "deleted", "clean_expired")
+		}
+		cleaned++
+	}
+
+	if cleaned > 0 {
+		log.Printf("过期清理完成: 共清理 %d 个超时账号", cleaned)
+	}
+	return cleaned
+}
+
 func (s *Store) parallelProbeUsage(ctx context.Context) {
 	s.usageProbeMu.RLock()
 	probeFn := s.usageProbe
@@ -1738,6 +1807,7 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 				log.Printf("[账号 %d] 恢复探测失败: %v", account.DBID, err)
 			} else {
 				// 探测成功：将账号从 banned 升级到 warm，给予重新调度的机会
+				atomic.StoreInt32(&account.Disabled, 0) // 清除原子禁用标志
 				account.mu.Lock()
 				if account.HealthTier == HealthTierBanned {
 					account.HealthTier = HealthTierWarm

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/api"
@@ -408,9 +409,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastErr error
 	var lastStatusCode int
 	var lastBody []byte
+	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account := h.store.Next()
+		account := h.store.NextExcluding(excludeAccounts)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
 			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
@@ -453,6 +455,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
 
 			// 不可重试的结构化错误直接返回
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
@@ -475,6 +478,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
@@ -767,9 +771,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastErr error
 	var lastStatusCode int
 	var lastBody []byte
+	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account := h.store.Next()
+		account := h.store.NextExcluding(excludeAccounts)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
 			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
@@ -812,6 +817,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
 
 			// 不可重试的结构化错误直接返回
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
@@ -834,6 +840,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
+			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
@@ -1216,7 +1223,22 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 		log.Printf("账号 %d 被限速 (plan=%s)，冷却 %v", account.ID(), account.GetPlanType(), cooldown)
 		h.store.MarkCooldown(account, cooldown, "rate_limited")
 	case http.StatusUnauthorized:
-		h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
+		// 原子标志瞬间置位，阻止其他并发请求再选到该账号
+		atomic.StoreInt32(&account.Disabled, 1)
+
+		if h.store.GetAutoCleanUnauthorized() {
+			// 开启自动清理时，401 立即从号池删除
+			log.Printf("账号 %d 收到 401，立即清理", account.ID())
+			if h.db != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = h.db.SetError(ctx, account.ID(), "deleted")
+				cancel()
+				h.db.InsertAccountEventAsync(account.ID(), "deleted", "auto_clean_401")
+			}
+			h.store.RemoveAccount(account.ID())
+		} else {
+			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
+		}
 	}
 }
 

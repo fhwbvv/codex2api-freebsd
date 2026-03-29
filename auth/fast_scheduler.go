@@ -125,6 +125,11 @@ func (s *FastScheduler) SetBaseLimit(baseLimit int64) {
 }
 
 func (s *FastScheduler) Acquire() *Account {
+	return s.AcquireExcluding(nil)
+}
+
+// AcquireExcluding 获取下一个可用账号，排除指定的账号 ID 集合
+func (s *FastScheduler) AcquireExcluding(exclude map[int64]bool) *Account {
 	if s == nil {
 		return nil
 	}
@@ -143,6 +148,9 @@ func (s *FastScheduler) Acquire() *Account {
 		for offset := 0; offset < len(bucket); offset++ {
 			entry := bucket[(start+offset)%len(bucket)]
 			if entry.acc == nil {
+				continue
+			}
+			if exclude != nil && exclude[entry.dbID] {
 				continue
 			}
 

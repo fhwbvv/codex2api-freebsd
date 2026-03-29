@@ -50,10 +50,8 @@ func (s *Store) EnableRefreshScheduler(config RefreshConfig) {
 	}
 	integration.enabled.Store(true)
 
-	// 启动调度器
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	integration.scheduler.Start(ctx)
+	// 启动调度器（生命周期由 scheduler.Stop() 管理，不能在此 defer cancel）
+	integration.scheduler.Start(context.Background())
 
 	// 存储到 store
 	s.refreshScheduler.Store(integration)

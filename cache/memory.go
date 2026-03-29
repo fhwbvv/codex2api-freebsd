@@ -145,6 +145,9 @@ func (tc *MemoryTokenCache) WaitForRefreshComplete(ctx context.Context, accountI
 	}
 
 	deadline := time.Now().Add(timeout)
+	pollTimer := time.NewTimer(200 * time.Millisecond)
+	defer pollTimer.Stop()
+
 	for time.Now().Before(deadline) {
 		tc.mu.Lock()
 		lockUntil, locked := tc.locks[accountID]
@@ -164,10 +167,11 @@ func (tc *MemoryTokenCache) WaitForRefreshComplete(ctx context.Context, accountI
 			return entry.token, nil
 		}
 
+		pollTimer.Reset(200 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+		case <-pollTimer.C:
 		}
 	}
 

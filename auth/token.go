@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -187,13 +188,59 @@ func parseIDToken(idToken string) *AccountInfo {
 	return info
 }
 
-// authClientPool 认证请求的连接池（按 proxyURL 分组）
-var authClientPool sync.Map
+// authClientPool 认证请求的连接池（按 proxyURL 分组，带 TTL 清理）
+var authClientPool sync.Map // map[string]*authPoolEntry
 
-// buildHTTPClient 构建支持代理的 HTTP 客户端（连接池复用）
+type authPoolEntry struct {
+	client   *http.Client
+	lastUsed atomic.Int64
+}
+
+func (e *authPoolEntry) touch() {
+	e.lastUsed.Store(time.Now().UnixNano())
+}
+
+const (
+	authClientPoolTTL         = 5 * time.Minute
+	authClientPoolCleanupInterval = 60 * time.Second
+)
+
+// authClientPoolStop 用于停止清理协程（测试中可调用以避免 goroutine 泄漏）
+var authClientPoolStop = make(chan struct{})
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(authClientPoolCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				evictExpiredAuthClients()
+			case <-authClientPoolStop:
+				return
+			}
+		}
+	}()
+}
+
+func evictExpiredAuthClients() {
+	cutoff := time.Now().Add(-authClientPoolTTL).UnixNano()
+	authClientPool.Range(func(key, value any) bool {
+		entry := value.(*authPoolEntry)
+		if entry.lastUsed.Load() < cutoff {
+			authClientPool.Delete(key)
+			entry.client.CloseIdleConnections()
+		}
+		return true
+	})
+}
+
+// buildHTTPClient 构建支持代理的 HTTP 客户端（连接池复用，带 TTL 清理）
 func buildHTTPClient(proxyURL string) *http.Client {
 	if v, ok := authClientPool.Load(proxyURL); ok {
-		return v.(*http.Client)
+		entry := v.(*authPoolEntry)
+		entry.touch()
+		return entry.client
 	}
 
 	transport := &http.Transport{
@@ -217,8 +264,13 @@ func buildHTTPClient(proxyURL string) *http.Client {
 		Timeout:   30 * time.Second,
 	}
 
-	if v, loaded := authClientPool.LoadOrStore(proxyURL, client); loaded {
-		return v.(*http.Client)
+	entry := &authPoolEntry{client: client}
+	entry.touch()
+
+	if v, loaded := authClientPool.LoadOrStore(proxyURL, entry); loaded {
+		e := v.(*authPoolEntry)
+		e.touch()
+		return e.client
 	}
 	return client
 }

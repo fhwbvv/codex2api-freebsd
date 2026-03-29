@@ -72,10 +72,9 @@ func getResponseCache(responseID string) []json.RawMessage {
 	if !ok {
 		return nil
 	}
+	// entry.createdAt 在创建后不可变，无锁访问安全
 	if time.Since(entry.createdAt) > responseCacheTTL {
 		// 同步删除过期条目，避免goroutine爆炸
-		// 先释放读锁，再获取写锁进行删除
-		respCache.mu.RUnlock()
 		respCache.mu.Lock()
 		// 双重检查：确认条目仍然存在且已过期
 		if e, exists := respCache.store[responseID]; exists && time.Since(e.createdAt) > responseCacheTTL {

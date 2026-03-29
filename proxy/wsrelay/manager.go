@@ -330,14 +330,19 @@ func (m *Manager) createConnection(
 		}
 	}
 
-	// 创建会话
+	// 创建会话（先关闭旧 session 避免泄漏）
+	sessionKey := m.poolKey(account.ID(), wsURL)
+	if oldSessionVal, ok := m.sessions.Load(sessionKey); ok {
+		oldSession := oldSessionVal.(*Session)
+		oldSession.Close()
+	}
 	session := NewSession(account.ID(), m)
-	m.sessions.Store(m.poolKey(account.ID(), wsURL), session)
+	m.sessions.Store(sessionKey, session)
 
 	// 拨号连接
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
 	if err != nil {
-		m.sessions.Delete(m.poolKey(account.ID(), wsURL))
+		m.sessions.Delete(sessionKey)
 		session.Close()
 		return nil, fmt.Errorf("websocket handshake failed: %w", err)
 	}

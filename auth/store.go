@@ -1210,14 +1210,18 @@ func (s *Store) Next() *Account {
 
 // WaitForAvailable 等待可用账号（带超时的请求排队）
 func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Account {
-	deadline := time.After(timeout)
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
 	backoff := 50 * time.Millisecond
+	backoffTimer := time.NewTimer(backoff)
+	defer backoffTimer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-deadline:
+		case <-deadline.C:
 			return nil
 		default:
 			acc := s.Next()
@@ -1225,14 +1229,15 @@ func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Ac
 				return acc
 			}
 			// 等待一下再重试（指数退避，最大 500ms）
+			backoffTimer.Reset(backoff)
 			select {
-			case <-time.After(backoff):
+			case <-backoffTimer.C:
 				if backoff < 500*time.Millisecond {
 					backoff *= 2
 				}
 			case <-ctx.Done():
 				return nil
-			case <-deadline:
+			case <-deadline.C:
 				return nil
 			}
 		}
@@ -1332,6 +1337,10 @@ func (s *Store) RemoveAccount(dbID int64) {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
 			s.fastSchedulerRemove(dbID)
+			// 清理 RefreshScheduler 中可能残留的任务
+			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
+				scheduler.CancelTask(dbID)
+			}
 			return
 		}
 	}

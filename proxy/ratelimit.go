@@ -277,6 +277,7 @@ type LevelLimiter struct {
 	cooldown *cooldownManager // 冷却管理器
 	metrics  LimitMetrics    // 指标
 	enabled  bool            // 是否启用
+	lastAccess atomic.Int64  // 最后访问时间（用于 TTL 清理）
 }
 
 // newLevelLimiter 创建单级别限流器
@@ -287,6 +288,7 @@ func newLevelLimiter(key string, level RateLimitLevel, rpm int) *LevelLimiter {
 		enabled:  rpm > 0,
 		cooldown: newCooldownManager(),
 	}
+	ll.lastAccess.Store(time.Now().UnixNano())
 	if ll.enabled {
 		ll.bucket = newTokenBucket(rpm)
 		ll.metrics.LimitRPM = int64(rpm)
@@ -296,6 +298,7 @@ func newLevelLimiter(key string, level RateLimitLevel, rpm int) *LevelLimiter {
 
 // allow 尝试获取令牌
 func (ll *LevelLimiter) allow() bool {
+	ll.lastAccess.Store(time.Now().UnixNano())
 	ll.mu.Lock()
 	defer ll.mu.Unlock()
 
@@ -328,6 +331,7 @@ func (ll *LevelLimiter) allow() bool {
 
 // allowN 尝试获取N个令牌
 func (ll *LevelLimiter) allowN(n int) bool {
+	ll.lastAccess.Store(time.Now().UnixNano())
 	ll.mu.Lock()
 	defer ll.mu.Unlock()
 
@@ -476,6 +480,9 @@ func NewEnhancedRateLimiter(db *database.DB, globalRPM, accountRPM, modelRPM int
 	if db != nil {
 		go erl.persistenceLoop()
 	}
+
+	// 启动 limiter 清理协程（无论是否有 db 都需要）
+	go erl.limiterEvictionLoop()
 
 	return erl
 }
@@ -686,6 +693,46 @@ func (erl *EnhancedRateLimiter) persistenceLoop() {
 			erl.persistSnapshots()
 		case <-erl.stopCh:
 			return
+		}
+	}
+}
+
+// limiterEvictionLoop 清理长时间未使用的限流器（30 分钟 TTL）
+func (erl *EnhancedRateLimiter) limiterEvictionLoop() {
+	const (
+		evictionTTL      = 30 * time.Minute
+		evictionInterval = 5 * time.Minute
+	)
+
+	ticker := time.NewTicker(evictionInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			erl.evictStaleLimiters(evictionTTL)
+		case <-erl.stopCh:
+			return
+		}
+	}
+}
+
+// evictStaleLimiters 清理超过 TTL 未访问的限流器
+func (erl *EnhancedRateLimiter) evictStaleLimiters(ttl time.Duration) {
+	cutoff := time.Now().Add(-ttl).UnixNano()
+
+	erl.mu.Lock()
+	defer erl.mu.Unlock()
+
+	for key, limiter := range erl.accountLimiters {
+		if limiter.lastAccess.Load() < cutoff {
+			delete(erl.accountLimiters, key)
+		}
+	}
+
+	for key, limiter := range erl.modelLimiters {
+		if limiter.lastAccess.Load() < cutoff {
+			delete(erl.modelLimiters, key)
 		}
 	}
 }

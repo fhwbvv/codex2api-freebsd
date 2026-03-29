@@ -33,8 +33,7 @@ function formatTokens(value?: number | null): string {
 
 function formatTime(iso: string): string {
   try {
-    const normalizedIso = iso.replace(/(Z|[+-]\d{2}(:\d{2})?)$/, '')
-    const d = new Date(normalizedIso)
+    const d = new Date(iso)
     if (isNaN(d.getTime())) return '-'
     const pad = (n: number) => String(n).padStart(2, '0')
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`

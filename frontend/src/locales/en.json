@@ -476,6 +476,8 @@
     "autoCleanFullUsageDesc": "Checks every 5 minutes and removes accounts with ≥ 100% usage. Accounts with active requests are skipped.",
     "autoCleanError": "Auto clean error accounts",
     "autoCleanErrorDesc": "Checks every 30 seconds and removes accounts in error state (e.g. expired refresh tokens).",
+    "autoCleanExpired": "Auto clean expired accounts",
+    "autoCleanExpiredDesc": "Every 15 minutes, removes accounts older than 30 minutes regardless of usage. Runs immediately when toggled on.",
     "scheduler": "Scheduling",
     "fastSchedulerEnabled": "Fast Scheduler",
     "fastSchedulerEnabledDesc": "Uses an in-memory fast scheduling algorithm, significantly reducing dispatch latency under high concurrency. Recommended for large account pools (100+).",

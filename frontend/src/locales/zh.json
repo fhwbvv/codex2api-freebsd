@@ -481,6 +481,8 @@
     "autoCleanFullUsageDesc": "开启后，后台每 5 分钟巡检一次，用量 ≥ 100% 的账号会自动清理。正在处理请求的账号不会被清理。",
     "autoCleanError": "自动清理错误账号",
     "autoCleanErrorDesc": "开启后，每 30 秒巡检一次，自动移除 error 状态的账号（如 refresh token 失效）。",
+    "autoCleanExpired": "自动清理过期账号",
+    "autoCleanExpiredDesc": "开启后，每 15 分钟清理加入超过 30 分钟的账号，不管是否被调用过。开启时立即执行一次。",
     "scheduler": "调度优化",
     "fastSchedulerEnabled": "快速调度器",
     "fastSchedulerEnabledDesc": "启用后，账号选择将使用内存快速调度算法，大幅降低高并发场景下的调度延迟。适合大号池（100+ 账号）场景。",

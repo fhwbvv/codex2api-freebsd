@@ -1452,6 +1452,7 @@ type settingsResponse struct {
 	AdminAuthSource       string `json:"admin_auth_source"`
 	AutoCleanFullUsage    bool   `json:"auto_clean_full_usage"`
 	AutoCleanError        bool   `json:"auto_clean_error"`
+	AutoCleanExpired      bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled      bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled  bool   `json:"fast_scheduler_enabled"`
 	MaxRetries            int    `json:"max_retries"`
@@ -1475,6 +1476,7 @@ type updateSettingsReq struct {
 	AdminSecret           *string `json:"admin_secret"`
 	AutoCleanFullUsage    *bool   `json:"auto_clean_full_usage"`
 	AutoCleanError        *bool   `json:"auto_clean_error"`
+	AutoCleanExpired      *bool   `json:"auto_clean_expired"`
 	ProxyPoolEnabled      *bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled  *bool   `json:"fast_scheduler_enabled"`
 	MaxRetries            *int    `json:"max_retries"`
@@ -1505,6 +1507,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AdminAuthSource:       adminAuthSource,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:        h.store.GetAutoCleanError(),
+		AutoCleanExpired:      h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
 		MaxRetries:            h.store.GetMaxRetries(),
@@ -1627,6 +1630,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: auto_clean_error = %t", *req.AutoCleanError)
 	}
 
+	if req.AutoCleanExpired != nil {
+		h.store.SetAutoCleanExpired(*req.AutoCleanExpired)
+		log.Printf("设置已更新: auto_clean_expired = %t", *req.AutoCleanExpired)
+	}
+
 	if req.ProxyPoolEnabled != nil {
 		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
 		if *req.ProxyPoolEnabled {
@@ -1677,6 +1685,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AdminSecret:           currentAdminSecret,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:        h.store.GetAutoCleanError(),
+		AutoCleanExpired:      h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
 		MaxRetries:            h.store.GetMaxRetries(),
@@ -1713,6 +1722,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AdminAuthSource:       adminAuthSource,
 		AutoCleanFullUsage:    h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:        h.store.GetAutoCleanError(),
+		AutoCleanExpired:      h.store.GetAutoCleanExpired(),
 		ProxyPoolEnabled:      h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
 		MaxRetries:            h.store.GetMaxRetries(),

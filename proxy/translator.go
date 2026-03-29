@@ -67,18 +67,18 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	return result, nil
 }
 
-// clampReasoningEffort 将 reasoning.effort 钳位到上游支持的值（low/medium/high）
-// 不支持的值（如 xhigh）映射到最接近的合法值
+// clampReasoningEffort 将 reasoning.effort 钳位到上游支持的值（low/medium/high/xhigh）
+// 不支持的值映射到最接近的合法值
 func clampReasoningEffort(body []byte) []byte {
 	effort := gjson.GetBytes(body, "reasoning.effort").String()
 	if effort == "" {
 		return body
 	}
 	switch strings.ToLower(effort) {
-	case "low", "medium", "high":
+	case "low", "medium", "high", "xhigh":
 		return body // 合法值，不修改
 	default:
-		// xhigh / very_high 等超出范围的值 → 钳位到 high
+		// very_high 等超出范围的值 → 钳位到 high
 		body, _ = sjson.SetBytes(body, "reasoning.effort", "high")
 		return body
 	}

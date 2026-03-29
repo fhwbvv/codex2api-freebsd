@@ -28,13 +28,17 @@ type fastSchedulerPosition struct {
 // 它不在请求热路径内重算全量 score，而是直接复用 Account 上已缓存的
 // HealthTier / SchedulerScore / DynamicConcurrencyLimit。
 //
-// 这让我们可以先验证“增量维护 + 热路径轻量化”是否值得正式接管 Store.Next。
+// 调度策略：两阶段扫描
+// 1. 优先在验证过的账号（score > 100，排在桶前部）中 round-robin
+// 2. 验证账号全忙时，回退到全量 round-robin
 type FastScheduler struct {
-	mu        sync.RWMutex
-	baseLimit int64
-	buckets   map[AccountHealthTier][]fastSchedulerEntry
-	positions map[int64]fastSchedulerPosition
-	cursors   [3]atomic.Uint64
+	mu           sync.RWMutex
+	baseLimit    int64
+	buckets      map[AccountHealthTier][]fastSchedulerEntry
+	positions    map[int64]fastSchedulerPosition
+	cursors      [3]atomic.Uint64
+	provenBounds [3]int          // 每个 tier 桶中验证过的账号数量（排在前面）
+	provenCurs   [3]atomic.Uint64 // 验证账号专用 round-robin 游标
 }
 
 func NewFastScheduler(baseLimit int64) *FastScheduler {
@@ -84,9 +88,42 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 	}
 	s.positions = make(map[int64]fastSchedulerPosition, len(accounts))
 
+	// 批量插入：先全部放入桶中，不逐条排序
 	now := time.Now()
 	for _, acc := range accounts {
-		s.insertLocked(acc, now)
+		if acc == nil || acc.DBID == 0 {
+			continue
+		}
+		tier, score, limit, available := acc.fastSchedulerSnapshot(s.baseLimit, now)
+		if !available || limit <= 0 {
+			continue
+		}
+		if tier != HealthTierHealthy && tier != HealthTierWarm && tier != HealthTierRisky {
+			continue
+		}
+		s.buckets[tier] = append(s.buckets[tier], fastSchedulerEntry{
+			acc:   acc,
+			dbID:  acc.DBID,
+			score: score,
+		})
+	}
+
+	// 每个桶只排序一次 + 重建位置索引 + 计算验证账号边界
+	for tierIdx, tier := range fastSchedulerTierOrder {
+		entries := s.buckets[tier]
+		if len(entries) == 0 {
+			s.provenBounds[tierIdx] = 0
+			continue
+		}
+		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].score == entries[j].score {
+				return entries[i].dbID < entries[j].dbID
+			}
+			return entries[i].score > entries[j].score
+		})
+		s.buckets[tier] = entries
+		s.rebuildPositionsLocked(tier)
+		s.provenBounds[tierIdx] = countProvenEntries(entries)
 	}
 }
 
@@ -129,6 +166,7 @@ func (s *FastScheduler) Acquire() *Account {
 }
 
 // AcquireExcluding 获取下一个可用账号，排除指定的账号 ID 集合
+// 两阶段调度：优先在验证过的账号中选取，全忙时回退到全量扫描
 func (s *FastScheduler) AcquireExcluding(exclude map[int64]bool) *Account {
 	if s == nil {
 		return nil
@@ -144,28 +182,49 @@ func (s *FastScheduler) AcquireExcluding(exclude map[int64]bool) *Account {
 			continue
 		}
 
-		start := int(s.cursors[tierIdx].Add(1)-1) % len(bucket)
-		for offset := 0; offset < len(bucket); offset++ {
-			entry := bucket[(start+offset)%len(bucket)]
-			if entry.acc == nil {
-				continue
+		// 阶段 1：优先在验证过的账号（桶前部 provenBound 个）中 round-robin
+		provenBound := s.provenBounds[tierIdx]
+		if provenBound > 0 {
+			if acc := s.scanRange(bucket, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, now, exclude); acc != nil {
+				s.mu.RUnlock()
+				return acc
 			}
-			if exclude != nil && exclude[entry.dbID] {
-				continue
-			}
+		}
 
-			_, _, limit, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
-			if !available || limit <= 0 {
-				continue
-			}
-			if !tryAcquireAccount(entry.acc, limit) {
-				continue
-			}
+		// 阶段 2：回退到全量 round-robin
+		if acc := s.scanRange(bucket, 0, len(bucket), &s.cursors[tierIdx], baseLimit, now, exclude); acc != nil {
 			s.mu.RUnlock()
-			return entry.acc
+			return acc
 		}
 	}
 	s.mu.RUnlock()
+	return nil
+}
+
+// scanRange 在 bucket[start:end) 范围内 round-robin 扫描可用账号
+func (s *FastScheduler) scanRange(bucket []fastSchedulerEntry, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, exclude map[int64]bool) *Account {
+	rangeLen := rangeEnd - rangeStart
+	if rangeLen <= 0 {
+		return nil
+	}
+	start := int(cursor.Add(1)-1) % rangeLen
+	for offset := 0; offset < rangeLen; offset++ {
+		entry := bucket[rangeStart+(start+offset)%rangeLen]
+		if entry.acc == nil {
+			continue
+		}
+		if exclude != nil && exclude[entry.dbID] {
+			continue
+		}
+		_, _, limit, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+		if !available || limit <= 0 {
+			continue
+		}
+		if !tryAcquireAccount(entry.acc, limit) {
+			continue
+		}
+		return entry.acc
+	}
 	return nil
 }
 
@@ -216,6 +275,13 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 	})
 	s.buckets[tier] = entries
 	s.rebuildPositionsLocked(tier)
+	// 更新该 tier 的验证账号边界
+	for tierIdx, t := range fastSchedulerTierOrder {
+		if t == tier {
+			s.provenBounds[tierIdx] = countProvenEntries(entries)
+			break
+		}
+	}
 }
 
 func (s *FastScheduler) removeLocked(dbID int64) {
@@ -235,6 +301,24 @@ func (s *FastScheduler) removeLocked(dbID int64) {
 	s.buckets[pos.tier] = entries
 	delete(s.positions, dbID)
 	s.rebuildPositionsLocked(pos.tier)
+	// 更新该 tier 的验证账号边界
+	for tierIdx, t := range fastSchedulerTierOrder {
+		if t == pos.tier {
+			s.provenBounds[tierIdx] = countProvenEntries(entries)
+			break
+		}
+	}
+}
+
+// countProvenEntries 统计桶中验证过的账号数量（score > 100，排在前面）
+// 桶已按 score 降序排列，找到第一个 score <= 100 的位置即为边界
+func countProvenEntries(entries []fastSchedulerEntry) int {
+	for i, e := range entries {
+		if e.score <= 100 {
+			return i
+		}
+	}
+	return len(entries) // 全部都是验证过的
 }
 
 func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {

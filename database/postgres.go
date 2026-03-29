@@ -262,6 +262,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_error BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_expired BOOLEAN DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
@@ -347,6 +348,7 @@ type SystemSettings struct {
 	AdminSecret           string
 	AutoCleanFullUsage    bool
 	AutoCleanError        bool
+	AutoCleanExpired      bool
 	ProxyPoolEnabled      bool
 	FastSchedulerEnabled  bool
 	MaxRetries            int
@@ -363,13 +365,14 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(fast_scheduler_enabled, false),
 		       COALESCE(max_retries, 2),
 		       COALESCE(allow_remote_migration, false),
-		       COALESCE(auto_clean_error, false)
+		       COALESCE(auto_clean_error, false),
+		       COALESCE(auto_clean_expired, false)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
-		&s.AutoCleanError,
+		&s.AutoCleanError, &s.AutoCleanExpired,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -383,9 +386,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		INSERT INTO system_settings (
 			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
-			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error
+			fast_scheduler_enabled, max_retries, allow_remote_migration, auto_clean_error, auto_clean_expired
 		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (id) DO UPDATE SET
 			max_concurrency         = EXCLUDED.max_concurrency,
 			global_rpm              = EXCLUDED.global_rpm,
@@ -402,10 +405,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			fast_scheduler_enabled  = EXCLUDED.fast_scheduler_enabled,
 			max_retries             = EXCLUDED.max_retries,
 			allow_remote_migration  = EXCLUDED.allow_remote_migration,
-			auto_clean_error        = EXCLUDED.auto_clean_error
+			auto_clean_error        = EXCLUDED.auto_clean_error,
+			auto_clean_expired      = EXCLUDED.auto_clean_expired
 	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
-		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError)
+		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired)
 	return err
 }
 
@@ -1478,6 +1482,71 @@ func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
 	query := `UPDATE accounts SET status = 'error', error_message = $1, cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	_, err := db.conn.ExecContext(ctx, query, errorMsg, id)
 	return err
+}
+
+// BatchSetError 批量标记账号错误状态，分批执行避免 SQL 参数过多
+func (db *DB) BatchSetError(ctx context.Context, ids []int64, errorMsg string) error {
+	const batchSize = 500
+	for i := 0; i < len(ids); i += batchSize {
+		end := i + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		batch := ids[i:end]
+
+		// 构建 $2, $3, ... 占位符（$1 留给 errorMsg）
+		placeholders := make([]string, len(batch))
+		args := make([]interface{}, 0, len(batch)+1)
+		args = append(args, errorMsg)
+		for j, id := range batch {
+			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, id)
+		}
+
+		query := fmt.Sprintf(
+			`UPDATE accounts SET status = 'error', error_message = $1, cooldown_reason = '', cooldown_until = NULL, updated_at = CURRENT_TIMESTAMP WHERE id IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		if _, err := db.conn.ExecContext(ctx, query, args...); err != nil {
+			return fmt.Errorf("batch %d-%d failed: %w", i, end, err)
+		}
+	}
+	return nil
+}
+
+// BatchInsertAccountEventsAsync 批量异步插入账号事件
+func (db *DB) BatchInsertAccountEventsAsync(ids []int64, eventType string, source string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		const batchSize = 500
+		for i := 0; i < len(ids); i += batchSize {
+			end := i + batchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			batch := ids[i:end]
+
+			// 构建 VALUES ($1,$2,$3), ($4,$2,$3), ...
+			placeholders := make([]string, len(batch))
+			args := make([]interface{}, 0, len(batch)+2)
+			args = append(args, eventType, source) // $1=eventType, $2=source
+			for j, id := range batch {
+				paramIdx := j + 3 // $3, $4, ...
+				placeholders[j] = fmt.Sprintf("($%d, $1, $2)", paramIdx)
+				args = append(args, id)
+			}
+
+			query := fmt.Sprintf(
+				`INSERT INTO account_events (account_id, event_type, source) VALUES %s`,
+				strings.Join(placeholders, ","),
+			)
+			if _, err := db.conn.ExecContext(ctx, query, args...); err != nil {
+				log.Printf("[账号事件] 批量插入失败 (%d 条): %v", len(batch), err)
+			}
+		}
+	}()
 }
 
 // ClearError 清除账号错误状态

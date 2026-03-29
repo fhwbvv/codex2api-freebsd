@@ -392,7 +392,7 @@ func ChatCompletionValidationRules() map[string][]ValidationRule {
 		"presence_penalty":  {TypeNumber(), Range(-2, 2)},
 		"frequency_penalty": {TypeNumber(), Range(-2, 2)},
 		"user":         {TypeString(), MaxLength(256)},
-		"reasoning_effort":  {TypeString(), Enum("low", "medium", "high")},
+		"reasoning_effort":  {TypeString(), Enum("low", "medium", "high", "xhigh")},
 		"service_tier":      {TypeString(), Enum("auto", "default", "fast")},
 		"tools":             {TypeArray(), MaxItems(128)},
 		// tool_choice removed from strict validation to maintain backward compatibility
@@ -411,7 +411,7 @@ func ResponsesAPIValidationRules() map[string][]ValidationRule {
 		"stream":            {TypeBoolean()},
 		"stop":              {TypeString(), MaxLength(256)},
 		"user":              {TypeString(), MaxLength(256)},
-		"reasoning.effort":  {TypeString(), Enum("low", "medium", "high")},
+		"reasoning.effort":  {TypeString(), Enum("low", "medium", "high", "xhigh")},
 		"service_tier":      {TypeString(), Enum("auto", "default", "fast")},
 		"store":             {TypeBoolean()},
 		"truncation":        {TypeString(), Enum("auto", "disabled")},

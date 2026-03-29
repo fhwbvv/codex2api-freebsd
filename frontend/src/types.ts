@@ -186,6 +186,7 @@ export interface SystemSettings {
   database_label: string
   cache_driver: string
   cache_label: string
+  expired_cleaned?: number
 }
 
 export interface CPAExportEntry {

@@ -11,6 +11,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import type { UsageLog, UsageStats } from '../types'
+import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -29,17 +30,6 @@ import { Select } from '@/components/ui/select'
 function formatTokens(value?: number | null): string {
   if (value === undefined || value === null) return '0'
   return value.toLocaleString()
-}
-
-function formatTime(iso: string): string {
-  try {
-    const d = new Date(iso)
-    if (isNaN(d.getTime())) return '-'
-    const pad = (n: number) => String(n).padStart(2, '0')
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-  } catch {
-    return '-'
-  }
 }
 
 function getStatusBadgeClassName(statusCode: number): string {
@@ -531,7 +521,7 @@ export default function Usage() {
                           </span>
                         </TableCell>
                         <TableCell className="text-[12px] text-muted-foreground whitespace-nowrap" style={{ fontFamily: "'Geist Mono', monospace" }}>
-                          {formatTime(log.created_at)}
+                          {formatBeijingTime(log.created_at)}
                         </TableCell>
                       </TableRow>
                       )

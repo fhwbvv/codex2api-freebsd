@@ -968,12 +968,14 @@ func (s *Store) GetAutoCleanExpired() bool {
 	return s.autoCleanExpired.Load()
 }
 
-// SetAutoCleanExpired 设置是否自动清理过期账号（开启时立即执行一次）
+// SetAutoCleanExpired 设置是否自动清理过期账号
 func (s *Store) SetAutoCleanExpired(enabled bool) {
 	s.autoCleanExpired.Store(enabled)
-	if enabled {
-		go s.CleanExpiredAccounts(context.Background(), 30*time.Minute)
-	}
+}
+
+// CleanExpiredNow 立即执行一次过期清理，返回清理数量
+func (s *Store) CleanExpiredNow() int {
+	return s.CleanExpiredAccounts(context.Background(), 30*time.Minute)
 }
 
 // Init 初始化：从数据库加载账号
@@ -1700,27 +1702,39 @@ func (s *Store) CleanFullUsageAccounts(ctx context.Context) int {
 // 批量操作优化：先收集所有过期 ID，再一次性完成数据库更新和内存移除
 func (s *Store) CleanExpiredAccounts(ctx context.Context, maxAge time.Duration) int {
 	accounts := s.Accounts()
-	cutoff := time.Now().Add(-maxAge).UnixNano()
+	now := time.Now()
+	cutoff := now.Add(-maxAge).UnixNano()
 
 	// 1. 收集所有需要清理的账号 ID
 	var expiredIDs []int64
+	var skipNoAddedAt, skipNotExpired, skipActive, skipProven int
 	for _, acc := range accounts {
 		if acc == nil {
 			continue
 		}
 		addedAt := atomic.LoadInt64(&acc.AddedAt)
-		if addedAt == 0 || addedAt > cutoff {
+		if addedAt == 0 {
+			skipNoAddedAt++
+			continue
+		}
+		if addedAt > cutoff {
+			skipNotExpired++
 			continue
 		}
 		if atomic.LoadInt64(&acc.ActiveRequests) > 0 {
+			skipActive++
 			continue
 		}
 		// 成功请求超过 10 次的账号保留，不做过期清理
 		if atomic.LoadInt64(&acc.TotalRequests) > 10 {
+			skipProven++
 			continue
 		}
 		expiredIDs = append(expiredIDs, acc.DBID)
 	}
+
+	log.Printf("过期清理扫描: 总数=%d, 待清理=%d, 跳过(无时间=%d, 未过期=%d, 处理中=%d, 已验证=%d)",
+		len(accounts), len(expiredIDs), skipNoAddedAt, skipNotExpired, skipActive, skipProven)
 
 	if len(expiredIDs) == 0 {
 		return 0

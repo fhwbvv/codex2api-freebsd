@@ -168,7 +168,11 @@ export default function Settings() {
         resetAdminAuthState()
         return
       }
-      showToast(t('settings.saveSuccess'))
+      if (updated.expired_cleaned && updated.expired_cleaned > 0) {
+        showToast(t('settings.expiredCleanedResult', { count: updated.expired_cleaned }))
+      } else {
+        showToast(t('settings.saveSuccess'))
+      }
     } catch (error) {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {

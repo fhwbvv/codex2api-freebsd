@@ -1461,6 +1461,7 @@ type settingsResponse struct {
 	DatabaseLabel         string `json:"database_label"`
 	CacheDriver           string `json:"cache_driver"`
 	CacheLabel            string `json:"cache_label"`
+	ExpiredCleaned        int    `json:"expired_cleaned,omitempty"`
 }
 
 type updateSettingsReq struct {
@@ -1630,9 +1631,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: auto_clean_error = %t", *req.AutoCleanError)
 	}
 
+	var expiredCleaned int
 	if req.AutoCleanExpired != nil {
 		h.store.SetAutoCleanExpired(*req.AutoCleanExpired)
 		log.Printf("设置已更新: auto_clean_expired = %t", *req.AutoCleanExpired)
+		// 开启时立即同步执行一次清理
+		if *req.AutoCleanExpired {
+			expiredCleaned = h.store.CleanExpiredNow()
+		}
 	}
 
 	if req.ProxyPoolEnabled != nil {
@@ -1731,6 +1737,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		DatabaseLabel:         h.databaseLabel,
 		CacheDriver:           h.cacheDriver,
 		CacheLabel:            h.cacheLabel,
+		ExpiredCleaned:        expiredCleaned,
 	})
 }
 

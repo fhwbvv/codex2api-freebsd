@@ -497,6 +497,7 @@
     "models": "模型配置",
     "modelsDesc": "以下模型当前可用：",
     "saveSuccess": "设置已保存，实时生效",
+    "expiredCleanedResult": "已清理 {{count}} 个过期账号",
     "saveFailed": "保存失败",
     "apiKeys": "API 密钥",
     "keyNamePlaceholder": "密钥名称（可选）",

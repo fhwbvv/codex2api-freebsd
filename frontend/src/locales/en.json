@@ -492,6 +492,7 @@
     "models": "Model Configuration",
     "modelsDesc": "The following models are currently available:",
     "saveSuccess": "Settings saved",
+    "expiredCleanedResult": "Cleaned {{count}} expired accounts",
     "saveFailed": "Failed to save",
     "apiKeys": "API Keys",
     "keyNamePlaceholder": "Key name (optional)",

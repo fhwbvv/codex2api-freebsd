@@ -58,25 +58,28 @@ export function formatRelativeTime(dateStr?: string | null, options: RelativeTim
 /**
  * Format a date string as Beijing time (UTC+8)
  * Output format: YYYY-MM-DD HH:mm:ss
+ *
+ * 使用 Intl.DateTimeFormat 以 Asia/Shanghai 时区格式化，
+ * 无论后端返回的是 UTC（带 Z）还是带时区偏移（+08:00），都能正确显示北京时间，
+ * 避免手动加减偏移导致的重复转换问题。
  */
 export function formatBeijingTime(dateStr?: string | null, fallback = '-'): string {
   if (!dateStr) return fallback
 
-  const timestamp = new Date(dateStr).getTime()
-  if (Number.isNaN(timestamp)) return fallback
+  const date = new Date(dateStr)
+  if (Number.isNaN(date.getTime())) return fallback
 
-  // Convert to Beijing time (UTC+8)
-  const date = new Date(timestamp)
-  const beijingOffset = 8 * 60 // UTC+8 in minutes
-  const localOffset = date.getTimezoneOffset() // local offset in minutes (negative for east)
-  const beijingTime = new Date(timestamp + (beijingOffset + localOffset) * 60 * 1000)
+  const fmt = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
 
-  const year = beijingTime.getFullYear()
-  const month = String(beijingTime.getMonth() + 1).padStart(2, '0')
-  const day = String(beijingTime.getDate()).padStart(2, '0')
-  const hours = String(beijingTime.getHours()).padStart(2, '0')
-  const minutes = String(beijingTime.getMinutes()).padStart(2, '0')
-  const seconds = String(beijingTime.getSeconds()).padStart(2, '0')
-
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`
+  // sv-SE locale 输出格式为 "YYYY-MM-DD HH:mm:ss"，正好是目标格式
+  return fmt.format(date)
 }

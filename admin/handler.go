@@ -593,21 +593,6 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			}
 		}
 		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
-
-		// 异步验证 AT 有效性并采集用量信息
-		go func(accountID int64) {
-			probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			acc := h.store.FindByID(accountID)
-			if acc == nil {
-				return
-			}
-			if err := h.ProbeUsageSnapshot(probeCtx, acc); err != nil {
-				log.Printf("AT 账号 %d 探针验证失败: %v", accountID, err)
-			} else {
-				log.Printf("AT 账号 %d 探针验证成功", accountID)
-			}
-		}(id)
 	}
 
 	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
@@ -1073,19 +1058,6 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 				}
 			}
 			h.store.AddAccount(newAcc)
-
-			// 异步验证 AT 有效性并采集用量信息
-			go func(accountID int64) {
-				probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				acc := h.store.FindByID(accountID)
-				if acc == nil {
-					return
-				}
-				if err := h.ProbeUsageSnapshot(probeCtx, acc); err != nil {
-					log.Printf("AT 导入账号 %d 探针验证失败: %v", accountID, err)
-				}
-			}(id)
 		}(i, at)
 	}
 

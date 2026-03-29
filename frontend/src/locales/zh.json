@@ -280,6 +280,7 @@
     "refreshAccessToken": "刷新 AT",
     "addMethodTab": "添加方式",
     "addMethodRT": "Refresh Token",
+    "addMethodAT": "Access Token",
     "addMethodOAuth": "OAuth 授权",
     "oauthStep1Title": "第一步：生成授权链接",
     "oauthStep1Desc": "点击下方按钮生成专属授权链接，在浏览器中完成 OpenAI 账号登录。",
@@ -301,7 +302,13 @@
     "oauthNamePlaceholder": "留空则使用邮箱作为名称",
     "oauthProxyUrl": "代理地址（可选）",
     "oauthProxyUrlPlaceholder": "例如 http://127.0.0.1:7890",
-    "oauthRestart": "重新发起授权"
+    "oauthRestart": "重新发起授权",
+    "accessTokenLabel": "Access Token",
+    "accessTokenPlaceholder": "每行一个 Access Token，支持批量粘贴",
+    "importAtTxt": "AT TXT 文件",
+    "importAtTxtDesc": "每行一个 Access Token",
+    "atWarning": "AT 模式账号无法自动刷新，过期后需手动更新",
+    "atRefreshDisabled": "AT 账号无法刷新"
   },
   "status": {
     "active": "可用",

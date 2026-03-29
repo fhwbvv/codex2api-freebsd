@@ -1547,6 +1547,45 @@ func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) 
 	return result, rows.Err()
 }
 
+// InsertATAccount 插入 AT-only 账号（无 refresh_token）
+func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken string, proxyURL string) (int64, error) {
+	credentials := map[string]interface{}{
+		"access_token": accessToken,
+	}
+	credJSON, err := json.Marshal(credentials)
+	if err != nil {
+		return 0, err
+	}
+
+	return db.insertRowID(ctx,
+		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`,
+		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
+		name, credJSON, proxyURL,
+	)
+}
+
+// GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重）
+func (db *DB) GetAllAccessTokens(ctx context.Context) (map[string]bool, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]bool)
+	for rows.Next() {
+		var raw interface{}
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		at := credentialString(raw, "access_token")
+		if at != "" {
+			result[at] = true
+		}
+	}
+	return result, rows.Err()
+}
+
 // ==================== 账号事件 ====================
 
 // InsertAccountEvent 插入一条账号事件记录

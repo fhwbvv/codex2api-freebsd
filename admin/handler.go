@@ -86,6 +86,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/stats", h.GetStats)
 	api.GET("/accounts", h.ListAccounts)
 	api.POST("/accounts", h.AddAccount)
+	api.POST("/accounts/at", h.AddATAccount)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
@@ -227,6 +228,7 @@ type accountResponse struct {
 	Email              string                     `json:"email"`
 	PlanType           string                     `json:"plan_type"`
 	Status             string                     `json:"status"`
+	ATOnly             bool                       `json:"at_only"`
 	HealthTier         string                     `json:"health_tier"`
 	SchedulerScore     float64                    `json:"scheduler_score"`
 	ConcurrencyCap     int64                      `json:"dynamic_concurrency_limit"`
@@ -292,6 +294,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Email:     row.GetCredential("email"),
 			PlanType:  row.GetCredential("plan_type"),
 			Status:    row.Status,
+			ATOnly:    row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			ProxyURL:  row.ProxyURL,
 			CreatedAt: row.CreatedAt.Format(time.RFC3339),
 			UpdatedAt: row.UpdatedAt.Format(time.RFC3339),
@@ -475,6 +478,152 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	})
 }
 
+// addATAccountReq AT 模式添加账号请求
+type addATAccountReq struct {
+	Name        string `json:"name"`
+	AccessToken string `json:"access_token"`
+	ProxyURL    string `json:"proxy_url"`
+}
+
+// AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
+func (h *Handler) AddATAccount(c *gin.Context) {
+	var req addATAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+
+	if req.AccessToken == "" {
+		writeError(c, http.StatusBadRequest, "access_token 是必填字段")
+		return
+	}
+
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+
+	// 按行分割，支持批量添加
+	lines := strings.Split(req.AccessToken, "\n")
+	var tokens []string
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if t != "" {
+			tokens = append(tokens, t)
+		}
+	}
+
+	if len(tokens) == 0 {
+		writeError(c, http.StatusBadRequest, "未找到有效的 Access Token")
+		return
+	}
+
+	if len(tokens) > 100 {
+		writeError(c, http.StatusBadRequest, "单次最多添加100个账号")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	successCount := 0
+	failCount := 0
+
+	for i, at := range tokens {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("at-account-%d", i+1)
+		} else if len(tokens) > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
+		if err != nil {
+			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+			failCount++
+			continue
+		}
+
+		successCount++
+		h.db.InsertAccountEventAsync(id, "added", "manual_at")
+
+		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
+		atInfo := auth.ParseAccessToken(at)
+
+		// 热加载到内存池（AT-only，无 RT）
+		newAcc := &auth.Account{
+			DBID:        id,
+			AccessToken: at,
+			ExpiresAt:   time.Now().Add(1 * time.Hour),
+			ProxyURL:    req.ProxyURL,
+		}
+		if atInfo != nil {
+			newAcc.Email = atInfo.Email
+			newAcc.AccountID = atInfo.ChatGPTAccountID
+			newAcc.PlanType = atInfo.PlanType
+			if !atInfo.ExpiresAt.IsZero() {
+				newAcc.ExpiresAt = atInfo.ExpiresAt
+			}
+		}
+		h.store.AddAccount(newAcc)
+
+		// 将解析到的信息持久化到数据库
+		if atInfo != nil {
+			creds := map[string]interface{}{
+				"email":      atInfo.Email,
+				"account_id": atInfo.ChatGPTAccountID,
+				"plan_type":  atInfo.PlanType,
+				"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
+			}
+			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
+				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
+			}
+		}
+		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
+
+		// 异步验证 AT 有效性并采集用量信息
+		go func(accountID int64) {
+			probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			acc := h.store.FindByID(accountID)
+			if acc == nil {
+				return
+			}
+			if err := h.ProbeUsageSnapshot(probeCtx, acc); err != nil {
+				log.Printf("AT 账号 %d 探针验证失败: %v", accountID, err)
+			} else {
+				log.Printf("AT 账号 %d 探针验证成功", accountID)
+			}
+		}(id)
+	}
+
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+
+	msg := fmt.Sprintf("成功添加 %d 个 AT 账号", successCount)
+	if failCount > 0 {
+		msg += fmt.Sprintf("，%d 个失败", failCount)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": msg,
+		"success": successCount,
+		"failed":  failCount,
+	})
+}
+
 // importToken 导入时的统一 token 载体
 type importToken struct {
 	refreshToken string
@@ -495,6 +644,8 @@ func (h *Handler) ImportAccounts(c *gin.Context) {
 	switch format {
 	case "json":
 		h.importAccountsJSON(c, proxyURL)
+	case "at_txt":
+		h.importAccountsATTXT(c, proxyURL)
 	default:
 		h.importAccountsTXT(c, proxyURL)
 	}
@@ -765,6 +916,190 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	})
 
 	log.Printf("导入完成: success=%d, duplicate=%d, failed=%d, total=%d", suc, duplicateCount, fai, total)
+}
+
+// importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
+func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
+	file, header, err := c.Request.FormFile("file")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "请上传文件（字段名: file）")
+		return
+	}
+	defer file.Close()
+
+	if header.Size > 2*1024*1024 {
+		writeError(c, http.StatusBadRequest, "文件大小不能超过 2MB")
+		return
+	}
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "读取文件失败")
+		return
+	}
+
+	// 按行分割，文件内去重
+	lines := strings.Split(string(data), "\n")
+	seen := make(map[string]bool)
+	var atTokens []string
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		t = strings.TrimPrefix(t, "\xef\xbb\xbf")
+		if t != "" && !seen[t] {
+			seen[t] = true
+			atTokens = append(atTokens, t)
+		}
+	}
+
+	if len(atTokens) == 0 {
+		writeError(c, http.StatusBadRequest, "文件中未找到有效的 Access Token")
+		return
+	}
+
+	// 数据库去重
+	dedupeCtx, dedupeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dedupeCancel()
+	existingATs, err := h.db.GetAllAccessTokens(dedupeCtx)
+	if err != nil {
+		log.Printf("查询已有 AT 失败: %v", err)
+		existingATs = make(map[string]bool)
+	}
+
+	var newTokens []string
+	duplicateCount := 0
+	for _, at := range atTokens {
+		if existingATs[at] {
+			duplicateCount++
+		} else {
+			newTokens = append(newTokens, at)
+		}
+	}
+
+	total := len(atTokens)
+
+	if len(newTokens) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message":   fmt.Sprintf("所有 %d 个 AT 已存在，无需导入", total),
+			"success":   0,
+			"duplicate": duplicateCount,
+			"failed":    0,
+			"total":     total,
+		})
+		return
+	}
+
+	// SSE 流式响应
+	setupSSE(c)
+
+	var successCount int64
+	var failCount int64
+	var current int64
+	sem := make(chan struct{}, 20)
+	var wg sync.WaitGroup
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				cur := int(atomic.LoadInt64(&current))
+				suc := int(atomic.LoadInt64(&successCount))
+				fai := int(atomic.LoadInt64(&failCount))
+				sendImportEvent(c, importEvent{
+					Type: "progress", Current: cur + duplicateCount, Total: total,
+					Success: suc, Duplicate: duplicateCount, Failed: fai,
+				})
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	for i, at := range newTokens {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(idx int, accessToken string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			name := fmt.Sprintf("at-import-%d", idx+1)
+
+			insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			id, err := h.db.InsertATAccount(insertCtx, name, accessToken, proxyURL)
+			insertCancel()
+
+			if err != nil {
+				log.Printf("导入 AT 账号 %d/%d 失败: %v", idx+1, len(newTokens), err)
+				atomic.AddInt64(&failCount, 1)
+				atomic.AddInt64(&current, 1)
+				return
+			}
+
+			atomic.AddInt64(&successCount, 1)
+			atomic.AddInt64(&current, 1)
+			h.db.InsertAccountEventAsync(id, "added", "import_at")
+
+			// 解析 AT JWT 提取账号信息
+			atInfo := auth.ParseAccessToken(accessToken)
+
+			newAcc := &auth.Account{
+				DBID:        id,
+				AccessToken: accessToken,
+				ExpiresAt:   time.Now().Add(1 * time.Hour),
+				ProxyURL:    proxyURL,
+			}
+			if atInfo != nil {
+				newAcc.Email = atInfo.Email
+				newAcc.AccountID = atInfo.ChatGPTAccountID
+				newAcc.PlanType = atInfo.PlanType
+				if !atInfo.ExpiresAt.IsZero() {
+					newAcc.ExpiresAt = atInfo.ExpiresAt
+				}
+				// 持久化解析到的账号信息
+				credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_ = h.db.UpdateCredentials(credCtx, id, map[string]interface{}{
+					"email":      atInfo.Email,
+					"account_id": atInfo.ChatGPTAccountID,
+					"plan_type":  atInfo.PlanType,
+					"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
+				})
+				credCancel()
+
+				// 如果解析到邮箱，用邮箱替换默认名称
+				if atInfo.Email != "" {
+					name = atInfo.Email
+				}
+			}
+			h.store.AddAccount(newAcc)
+
+			// 异步验证 AT 有效性并采集用量信息
+			go func(accountID int64) {
+				probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				acc := h.store.FindByID(accountID)
+				if acc == nil {
+					return
+				}
+				if err := h.ProbeUsageSnapshot(probeCtx, acc); err != nil {
+					log.Printf("AT 导入账号 %d 探针验证失败: %v", accountID, err)
+				}
+			}(id)
+		}(i, at)
+	}
+
+	wg.Wait()
+	close(done)
+
+	suc := int(atomic.LoadInt64(&successCount))
+	fai := int(atomic.LoadInt64(&failCount))
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: suc, Duplicate: duplicateCount, Failed: fai,
+	})
+
+	log.Printf("AT 导入完成: success=%d, duplicate=%d, failed=%d, total=%d", suc, duplicateCount, fai, total)
 }
 
 // GetAccountUsage 查询单个账号的用量统计

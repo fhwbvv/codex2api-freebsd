@@ -988,8 +988,9 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 
 	for _, row := range rows {
 		rt := row.GetCredential("refresh_token")
-		if rt == "" {
-			log.Printf("[账号 %d] 缺少 refresh_token，跳过", row.ID)
+		at := row.GetCredential("access_token")
+		if rt == "" && at == "" {
+			log.Printf("[账号 %d] 缺少 refresh_token 和 access_token，跳过", row.ID)
 			continue
 		}
 
@@ -1006,7 +1007,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		}
 
 		// 尝试从 credentials 恢复已有的 AT
-		if at := row.GetCredential("access_token"); at != "" {
+		if at != "" {
 			account.AccessToken = at
 			account.AccountID = row.GetCredential("account_id")
 			account.Email = row.GetCredential("email")
@@ -1831,6 +1832,13 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 			continue
 		}
 		if acc.HasActiveCooldown() {
+			continue
+		}
+		// AT-only 账号无 RT，无法刷新
+		acc.mu.RLock()
+		hasRT := acc.RefreshToken != ""
+		acc.mu.RUnlock()
+		if !hasRT {
 			continue
 		}
 		if !acc.NeedsRefresh() {

@@ -280,6 +280,7 @@
     "refreshAccessToken": "Refresh Access Token",
     "addMethodTab": "Add Method",
     "addMethodRT": "Refresh Token",
+    "addMethodAT": "Access Token",
     "addMethodOAuth": "OAuth",
     "oauthStep1Title": "Step 1: Generate Authorization Link",
     "oauthStep1Desc": "Click the button below to generate a unique authorization link, then sign in with your OpenAI account.",
@@ -301,7 +302,13 @@
     "oauthNamePlaceholder": "Leave blank to use email as name",
     "oauthProxyUrl": "Proxy URL (optional)",
     "oauthProxyUrlPlaceholder": "e.g. http://127.0.0.1:7890",
-    "oauthRestart": "Restart Authorization"
+    "oauthRestart": "Restart Authorization",
+    "accessTokenLabel": "Access Token",
+    "accessTokenPlaceholder": "One access token per line. Bulk paste is supported.",
+    "importAtTxt": "AT TXT File",
+    "importAtTxtDesc": "One access token per line",
+    "atWarning": "AT-only accounts cannot auto-refresh. You will need to manually update the token after it expires.",
+    "atRefreshDisabled": "AT accounts cannot be refreshed"
   },
   "status": {
     "active": "Available",

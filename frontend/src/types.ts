@@ -21,6 +21,7 @@ export interface AccountRow {
   email: string
   plan_type: string
   status: AccountStatus
+  at_only?: boolean
   health_tier?: string
   scheduler_score?: number
   dynamic_concurrency_limit?: number
@@ -57,6 +58,12 @@ export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
 export interface AddAccountRequest {
   name?: string
   refresh_token: string
+  proxy_url: string
+}
+
+export interface AddATAccountRequest {
+  name?: string
+  access_token: string
   proxy_url: string
 }
 

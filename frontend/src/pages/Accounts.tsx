@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest } from '../types'
+import type { AccountRow, AddAccountRequest, AddATAccountRequest } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -24,7 +24,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -62,7 +62,11 @@ export default function Accounts() {
   const [migrateKey, setMigrateKey] = useState('')
   const [migrating, setMigrating] = useState(false)
   const [importProgress, setImportProgress] = useState<{ show: boolean; current: number; total: number; success: number; duplicate: number; failed: number; done: boolean }>({ show: false, current: 0, total: 0, success: 0, duplicate: 0, failed: 0, done: false })
-  const [addMethod, setAddMethod] = useState<'rt' | 'oauth'>('rt')
+  const [addMethod, setAddMethod] = useState<'rt' | 'at' | 'oauth'>('rt')
+  const [atForm, setAtForm] = useState<AddATAccountRequest>({
+    access_token: '',
+    proxy_url: '',
+  })
   const [oauthStep, setOauthStep] = useState<'generate' | 'exchange'>('generate')
   const [oauthSession, setOauthSession] = useState<{ session_id: string; auth_url: string } | null>(null)
   const [oauthProxyUrl, setOauthProxyUrl] = useState('')
@@ -72,6 +76,7 @@ export default function Accounts() {
   const [oauthCompleting, setOauthCompleting] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const jsonInputRef = useRef<HTMLInputElement>(null)
+  const atFileInputRef = useRef<HTMLInputElement>(null)
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
 
@@ -188,6 +193,22 @@ export default function Accounts() {
       showToast(t('accounts.addSuccess'))
       setShowAdd(false)
       setAddForm({ refresh_token: '', proxy_url: '' })
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.addFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleAddAT = async () => {
+    if (!atForm.access_token.trim()) return
+    setSubmitting(true)
+    try {
+      await api.addATAccount(atForm)
+      showToast(t('accounts.addSuccess'))
+      setShowAdd(false)
+      setAtForm({ access_token: '', proxy_url: '' })
       void reload()
     } catch (error) {
       showToast(t('accounts.addFailed', { error: getErrorMessage(error) }), 'error')
@@ -335,6 +356,39 @@ export default function Accounts() {
     } finally {
       setImporting(false)
       if (jsonInputRef.current) jsonInputRef.current.value = ''
+    }
+  }
+
+  const handleAtFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+    if (!file.name.endsWith('.txt')) {
+      showToast(t('accounts.selectTxtFile'), 'error')
+      return
+    }
+    setImporting(true)
+    setShowImportPicker(false)
+    try {
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('format', 'at_txt')
+      const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData, headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {} })
+      if (res.headers.get('content-type')?.includes('text/event-stream')) {
+        await readImportSSE(res)
+      } else {
+        const data = await res.json()
+        if (!res.ok) {
+          showToast(data.error ? t('accounts.importFailedWithReason', { error: data.error }) : t('accounts.importFailed'), 'error')
+        } else {
+          showToast(t('accounts.importCompleted'))
+          void reload()
+        }
+      }
+    } catch (error) {
+      showToast(t('accounts.importFailedWithReason', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setImporting(false)
+      if (atFileInputRef.current) atFileInputRef.current.value = ''
     }
   }
 
@@ -622,6 +676,13 @@ export default function Accounts() {
                 className="hidden"
                 onChange={(e) => void handleJsonImport(e)}
               />
+              <input
+                ref={atFileInputRef}
+                type="file"
+                accept=".txt"
+                className="hidden"
+                onChange={(e) => void handleAtFileImport(e)}
+              />
             </div>
           )}
         />
@@ -761,7 +822,14 @@ export default function Accounts() {
                           />
                         </TableCell>
                         <TableCell className="text-[14px] font-mono text-muted-foreground">{account.id}</TableCell>
-                        <TableCell className="text-[14px] text-muted-foreground">{account.email || '-'}</TableCell>
+                        <TableCell className="text-[14px] text-muted-foreground">
+                          {account.email || '-'}
+                          {account.at_only && (
+                            <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
+                              AT
+                            </span>
+                          )}
+                        </TableCell>
                         <TableCell
                           className="text-[13px] font-medium"
                         >
@@ -815,9 +883,9 @@ export default function Accounts() {
                               variant="outline"
                               size="icon"
                               className="h-7 w-8 px-0"
-                              disabled={refreshingIds.has(account.id)}
+                              disabled={refreshingIds.has(account.id) || account.at_only}
                               onClick={() => void handleRefresh(account)}
-                              title={t('accounts.refreshAccessToken')}
+                              title={account.at_only ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
                             >
                               <RefreshCw className={`size-3.5 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
                             </Button>
@@ -879,6 +947,10 @@ export default function Accounts() {
                 <Button onClick={() => void handleAdd()} disabled={submitting || !addForm.refresh_token.trim()}>
                   {submitting ? t('accounts.adding') : t('accounts.submit')}
                 </Button>
+              ) : addMethod === 'at' ? (
+                <Button onClick={() => void handleAddAT()} disabled={submitting || !atForm.access_token.trim()}>
+                  {submitting ? t('accounts.adding') : t('accounts.submit')}
+                </Button>
               ) : oauthStep === 'generate' ? (
                 <Button onClick={() => void handleOAuthGenerate()} disabled={oauthGenerating}>
                   {oauthGenerating ? t('accounts.oauthGenerating') : t('accounts.oauthGenerateBtn')}
@@ -906,6 +978,17 @@ export default function Accounts() {
             >
               <RefreshCw className="size-3.5" />
               {t('accounts.addMethodRT')}
+            </button>
+            <button
+              onClick={() => setAddMethod('at')}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                addMethod === 'at'
+                  ? 'bg-background shadow-sm text-foreground'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <Fingerprint className="size-3.5" />
+              {t('accounts.addMethodAT')}
             </button>
             <button
               onClick={() => { setAddMethod('oauth'); setOauthStep('generate'); setOauthSession(null); setOauthCallbackUrl('') }}
@@ -941,6 +1024,34 @@ export default function Accounts() {
                   value={addForm.proxy_url}
                   onChange={(event: ChangeEvent<HTMLInputElement>) =>
                     setAddForm((form) => ({ ...form, proxy_url: event.target.value }))
+                  }
+                />
+              </div>
+            </div>
+          ) : addMethod === 'at' ? (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-300">
+                {t('accounts.atWarning')}
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.accessTokenLabel')} *</label>
+                <textarea
+                  className="w-full min-h-[160px] p-3 border border-input rounded-xl bg-background text-sm resize-y focus:outline-none focus:ring-2 focus:ring-ring"
+                  placeholder={t('accounts.accessTokenPlaceholder')}
+                  value={atForm.access_token}
+                  onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                    setAtForm((form) => ({ ...form, access_token: event.target.value }))
+                  }
+                  rows={6}
+                />
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyUrl')}</label>
+                <Input
+                  placeholder={t('accounts.proxyUrlPlaceholder')}
+                  value={atForm.proxy_url}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setAtForm((form) => ({ ...form, proxy_url: event.target.value }))
                   }
                 />
               </div>
@@ -1014,10 +1125,10 @@ export default function Accounts() {
         <Modal
           show={showImportPicker}
           title={t('accounts.importTitle')}
-          contentClassName="sm:max-w-[520px]"
+          contentClassName="sm:max-w-[640px]"
           onClose={() => setShowImportPicker(false)}
         >
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-3 gap-3">
             <button
               className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
               onClick={() => {
@@ -1042,6 +1153,19 @@ export default function Accounts() {
               <div>
                 <div className="text-sm font-medium">{t('accounts.importJson')}</div>
                 <div className="text-[11px] text-muted-foreground">{t('accounts.importJsonDesc')}</div>
+              </div>
+            </button>
+            <button
+              className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
+              onClick={() => {
+                setShowImportPicker(false)
+                atFileInputRef.current?.click()
+              }}
+            >
+              <Fingerprint className="size-5 shrink-0 text-muted-foreground" />
+              <div>
+                <div className="text-sm font-medium">{t('accounts.importAtTxt')}</div>
+                <div className="text-[11px] text-muted-foreground">{t('accounts.importAtTxtDesc')}</div>
               </div>
             </button>
           </div>

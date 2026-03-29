@@ -188,6 +188,70 @@ func parseIDToken(idToken string) *AccountInfo {
 	return info
 }
 
+// AccessTokenInfo AT JWT 解析结果
+type AccessTokenInfo struct {
+	Email            string
+	ChatGPTAccountID string
+	PlanType         string
+	ExpiresAt        time.Time
+}
+
+// ParseAccessToken 解析 Access Token 的 JWT payload（不验签）
+// AT 的 email 在 https://api.openai.com/profile 下，与 id_token 不同
+func ParseAccessToken(accessToken string) *AccessTokenInfo {
+	if accessToken == "" {
+		return nil
+	}
+
+	parts := strings.Split(accessToken, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+
+	payload := parts[1]
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		decoded, err = base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			return nil
+		}
+	}
+
+	var claims struct {
+		Exp            int64 `json:"exp"`
+		OpenAIAuth    *struct {
+			ChatGPTAccountID string `json:"chatgpt_account_id"`
+			PlanType         string `json:"chatgpt_plan_type"`
+		} `json:"https://api.openai.com/auth"`
+		OpenAIProfile *struct {
+			Email string `json:"email"`
+		} `json:"https://api.openai.com/profile"`
+	}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return nil
+	}
+
+	info := &AccessTokenInfo{}
+	if claims.OpenAIProfile != nil {
+		info.Email = claims.OpenAIProfile.Email
+	}
+	if claims.OpenAIAuth != nil {
+		info.ChatGPTAccountID = claims.OpenAIAuth.ChatGPTAccountID
+		info.PlanType = claims.OpenAIAuth.PlanType
+	}
+	if claims.Exp > 0 {
+		info.ExpiresAt = time.Unix(claims.Exp, 0)
+	}
+	return info
+}
+
 // authClientPool 认证请求的连接池（按 proxyURL 分组，带 TTL 清理）
 var authClientPool sync.Map // map[string]*authPoolEntry
 

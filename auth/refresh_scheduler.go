@@ -189,6 +189,7 @@ func (s *RefreshScheduler) Schedule(account *Account) {
 		Priority:    s.calculatePriority(account),
 		State:       RefreshStatePending,
 		Attempts:    0,
+		heapIndex:   -1, // 未入堆，-1 避免与有效索引 0 冲突
 	}
 
 	s.tasks[account.DBID] = task
@@ -213,6 +214,7 @@ func (s *RefreshScheduler) ScheduleImmediate(account *Account) {
 		Priority:    1000, // 最高优先级
 		State:       RefreshStatePending,
 		Attempts:    0,
+		heapIndex:   -1,
 	}
 
 	// 如果已有任务，从堆中移除旧任务

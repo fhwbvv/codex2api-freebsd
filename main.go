@@ -20,6 +20,7 @@ import (
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
@@ -154,6 +155,9 @@ func main() {
 	}
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 
+	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
+	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
+
 	r.Use(rateLimiter.Middleware())
 	if settings.GlobalRPM > 0 {
 		log.Printf("全局限流已生效: %d RPM", settings.GlobalRPM)
@@ -232,7 +236,7 @@ func main() {
 
 	log.Println("正在关闭...")
 	store.Stop()
-	proxy.ShutdownWebsocketPool()
+	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()
 	log.Println("已关闭")
 }

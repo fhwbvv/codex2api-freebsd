@@ -453,6 +453,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+
+			// 不可重试的结构化错误直接返回
+			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			lastErr = reqErr
 			continue
@@ -805,6 +812,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+
+			// 不可重试的结构化错误直接返回
+			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				ErrorToGinResponse(c, reqErr)
+				return
+			}
+
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			lastErr = reqErr
 			continue

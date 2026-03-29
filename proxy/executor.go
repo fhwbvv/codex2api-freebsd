@@ -37,12 +37,15 @@ func (e *poolEntry) touch() {
 var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL
 
 // clientPoolTTL 未使用超过此时间的 Client 将被淘汰
-const clientPoolTTL = 2 * time.Minute
+const clientPoolTTL = 5 * time.Minute
+
+// clientPoolCleanupInterval 清理协程执行间隔
+const clientPoolCleanupInterval = 60 * time.Second
 
 func init() {
-	// 后台清理：每 30 秒扫描一次，淘汰过期的 Client
+	// 后台清理：每 60 秒扫描一次，淘汰过期的 Client
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(clientPoolCleanupInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			evictExpiredClients()
@@ -130,7 +133,14 @@ const (
 
 // ExecuteRequest 向 Codex 上游发送请求
 // sessionID 可选，用于 prompt cache 会话绑定
-func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string) (*http.Response, error) {
+// useWebsocket 可选，如果为 true 则使用 WebSocket 连接
+// headers 下游请求头，用于设备指纹学习
+func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
+	// 检查是否使用 WebSocket
+	if len(useWebsocket) > 0 && useWebsocket[0] {
+		return ExecuteRequestWebsocket(ctx, account, requestBody, sessionID, proxyOverride)
+	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -180,14 +190,24 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 
 	// ==================== 请求头（伪装 Codex CLI） ====================
-	// 每个账号使用确定性的 ClientProfile（UA + Version），模拟真实用户多样性
-	profile := ProfileForAccount(account.ID())
+	// 应用设备指纹稳定化
+	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
+		profile := ResolveDeviceProfile(account, apiKey, headers, deviceCfg)
+		ApplyDeviceProfileHeaders(req, profile)
+		// 稳定化时也需要设置 Version 头，保持行为一致
+		if profile.HasVersion {
+			req.Header.Set("Version", fmt.Sprintf("%d.%d.%d", profile.Version.major, profile.Version.minor, profile.Version.patch))
+		}
+	} else {
+		// 每个账号使用确定性的 ClientProfile（UA + Version），模拟真实用户多样性
+		profile := ProfileForAccount(account.ID())
+		req.Header.Set("User-Agent", profile.UserAgent)
+		req.Header.Set("Version", profile.Version)
+	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("User-Agent", profile.UserAgent)
-	req.Header.Set("Version", profile.Version)
 	req.Header.Set("Originator", Originator)
 	req.Header.Set("Connection", "Keep-Alive")
 	if accountID != "" {
@@ -244,7 +264,10 @@ func ResolveSessionID(authHeader string, body []byte) string {
 // ReadSSEStream 从上游 SSE 响应读取事件流
 // callback 返回 true 表示继续读取，false 表示停止
 func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
-	buf := make([]byte, 4096)
+	// 使用 sync.Pool 复用缓冲区，减少 GC 压力
+	buf := sseBufferPool.Get().([]byte)
+	defer sseBufferPool.Put(buf)
+
 	var lineBuf []byte
 	var dataLines [][]byte
 
@@ -291,7 +314,10 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 				if bytes.HasPrefix(line, []byte("data:")) {
 					data := bytes.TrimPrefix(line, []byte("data:"))
 					data = bytes.TrimPrefix(data, []byte(" "))
-					dataLines = append(dataLines, append([]byte(nil), data...))
+					// 使用 copy 避免底层数组共享导致的内存泄漏
+					dataCopy := make([]byte, len(data))
+					copy(dataCopy, data)
+					dataLines = append(dataLines, dataCopy)
 				}
 			}
 		}
@@ -303,7 +329,9 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 					if bytes.HasPrefix(line, []byte("data:")) {
 						data := bytes.TrimPrefix(line, []byte("data:"))
 						data = bytes.TrimPrefix(data, []byte(" "))
-						dataLines = append(dataLines, append([]byte(nil), data...))
+						dataCopy := make([]byte, len(data))
+						copy(dataCopy, data)
+						dataLines = append(dataLines, dataCopy)
 					}
 				}
 				if !emitEvent() {
@@ -314,4 +342,79 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 			return err
 		}
 	}
+}
+
+// sseBufferPool 用于复用 SSE 读取缓冲区
+var sseBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 8192) // 增加到 8KB 提高读取效率
+	},
+}
+
+// ExecuteRequestWebsocket 通过 WebSocket 向 Codex 上游发送请求
+// 返回一个模拟的 http.Response 用于兼容现有代码
+func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string) (*http.Response, error) {
+	wsExec := InitWebsocketExecutor()
+	wsResp, err := wsExec.ExecuteRequestViaWebsocket(ctx, account, requestBody, sessionID, proxyOverride)
+	if err != nil {
+		return nil, err
+	}
+
+	// 检查 HTTP 握手响应状态
+	statusCode := http.StatusOK
+	if wsResp.HTTPResponse() != nil {
+		statusCode = wsResp.HTTPResponse().StatusCode
+		// 如果握手失败（非 2xx），返回错误响应
+		if statusCode < 200 || statusCode >= 300 {
+			wsResp.Close()
+			return &http.Response{
+				StatusCode: statusCode,
+				Header:     wsResp.HTTPResponse().Header.Clone(),
+				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
+			}, nil
+		}
+	}
+
+	// 将 WebSocket 响应包装为 http.Response
+	pr, pw := io.Pipe()
+	resp := &http.Response{
+		StatusCode: statusCode,
+		Header:     make(http.Header),
+		Body:       pr,
+	}
+
+	// 从 HTTP 握手响应中复制头信息
+	if wsResp.HTTPResponse() != nil {
+		for key, values := range wsResp.HTTPResponse().Header {
+			for _, v := range values {
+				resp.Header.Add(key, v)
+			}
+		}
+	}
+
+	// 设置 SSE 响应头
+	resp.Header.Set("Content-Type", "text/event-stream")
+	resp.Header.Set("Cache-Control", "no-cache")
+	resp.Header.Set("Connection", "keep-alive")
+
+	// 在后台读取 WebSocket 流并写入 pipe
+	go func() {
+		defer pw.Close()
+		defer wsResp.Close()
+
+		err := wsResp.ReadStream(func(data []byte) bool {
+			// 将数据编码为 SSE 格式
+			line := fmt.Sprintf("data: %s\n\n", string(data))
+			if _, err := pw.Write([]byte(line)); err != nil {
+				return false
+			}
+			return true
+		})
+
+		if err != nil && err != io.EOF {
+			pw.CloseWithError(err)
+		}
+	}()
+
+	return resp, nil
 }

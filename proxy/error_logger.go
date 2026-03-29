@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/codex2api/security"
 )
 
 // fileLogger 单个日志文件实例
@@ -49,15 +51,25 @@ func (fl *fileLogger) close() {
 	}
 }
 
-// writeEntry 写一条错误日志
+// writeEntry 写一条错误日志（自动脱敏敏感信息）
 func (fl *fileLogger) writeEntry(endpoint string, statusCode int, model string, accountID int64, body []byte) {
 	l := fl.init()
 	if l == nil {
 		return
 	}
+
+	// 脱敏日志内容
+	safeEndpoint := security.SanitizeLog(endpoint)
+	safeModel := security.SanitizeLog(model)
+	bodyStr := string(body)
+
+	// 检查并脱敏响应体中的敏感信息
+	bodyStr = security.MaskSensitiveData(bodyStr)
+	bodyStr = security.SafeTruncate(bodyStr, 5000) // 限制日志大小
+
 	ts := time.Now().Format("2006/01/02 15:04:05")
 	l.Printf("========== %s ==========\nEndpoint: %s\nStatus: %d\nModel: %s\nAccount: %d\nResponse:\n%s\n",
-		ts, endpoint, statusCode, model, accountID, string(body))
+		ts, safeEndpoint, statusCode, safeModel, accountID, bodyStr)
 }
 
 // logUpstreamError 根据状态码分发到对应日志文件

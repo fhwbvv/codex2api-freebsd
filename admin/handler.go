@@ -15,11 +15,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -120,10 +122,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/oauth/exchange-code", h.ExchangeOAuthCode)
 }
 
-// adminAuthMiddleware 管理接口鉴权中间件
+// adminAuthMiddleware 管理接口鉴权中间件（增强版，增加安全审计日志）
 func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		adminSecret, _ := h.resolveAdminSecret(c.Request.Context())
+		adminSecret, source := h.resolveAdminSecret(c.Request.Context())
 		if adminSecret == "" {
 			// 未配置管理密钥，跳过鉴权
 			c.Next()
@@ -139,13 +141,25 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 			}
 		}
 
-		if adminKey != adminSecret {
+		// 清理输入
+		adminKey = security.SanitizeInput(adminKey)
+
+		// 使用安全比较防止时序攻击
+		if !security.SecureCompare(adminKey, adminSecret) {
+			// 记录安全审计日志
+			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "管理密钥无效或缺失",
 			})
 			c.Abort()
 			return
 		}
+
+		// 成功认证，记录审计日志
+		if security.IsSensitiveEndpoint(c.Request.URL.Path) {
+			security.SecurityAuditLog("ADMIN_ACCESS", fmt.Sprintf("path=%s ip=%s method=%s", c.Request.URL.Path, c.ClientIP(), c.Request.Method))
+		}
+
 		c.Next()
 	}
 }
@@ -354,8 +368,30 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		return
 	}
 
+	// 输入验证和清理
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+
 	if req.RefreshToken == "" {
 		writeError(c, http.StatusBadRequest, "refresh_token 是必填字段")
+		return
+	}
+
+	// 检查XSS和SQL注入
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+
+	// 验证名称长度
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	// 验证代理URL
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
 		return
 	}
 
@@ -363,7 +399,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	lines := strings.Split(req.RefreshToken, "\n")
 	var tokens []string
 	for _, line := range lines {
-		t := strings.TrimSpace(line)
+		t := strings.TrimSpace(security.SanitizeInput(line))
 		if t != "" {
 			tokens = append(tokens, t)
 		}
@@ -371,6 +407,12 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 	if len(tokens) == 0 {
 		writeError(c, http.StatusBadRequest, "未找到有效的 Refresh Token")
+		return
+	}
+
+	// 限制批量添加数量
+	if len(tokens) > 100 {
+		writeError(c, http.StatusBadRequest, "单次最多添加100个账号")
 		return
 	}
 
@@ -417,6 +459,9 @@ func (h *Handler) AddAccount(c *gin.Context) {
 			}
 		}(id)
 	}
+
+	// 记录安全审计日志
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
 
 	msg := fmt.Sprintf("成功添加 %d 个账号", successCount)
 	if failCount > 0 {
@@ -978,7 +1023,7 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 
 // ==================== API Keys ====================
 
-// ListAPIKeys 获取所有 API 密钥
+// ListAPIKeys 获取所有 API 密钥（脱敏版本）
 func (h *Handler) ListAPIKeys(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -988,10 +1033,14 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
-	if keys == nil {
-		keys = []*database.APIKeyRow{}
+
+	// 转换为脱敏响应
+	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
+	for _, k := range keys {
+		maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
 	}
-	c.JSON(http.StatusOK, apiKeysResponse{Keys: keys})
+
+	c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
 }
 
 type createKeyReq struct {
@@ -1006,19 +1055,41 @@ func generateKey() string {
 	return "sk-" + hex.EncodeToString(b)
 }
 
-// CreateAPIKey 创建新 API 密钥
+// CreateAPIKey 创建新 API 密钥（增强版，带输入验证）
 func (h *Handler) CreateAPIKey(c *gin.Context) {
 	var req createKeyReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		req.Name = ""
 	}
+
+	// 输入验证和清理
+	req.Name = security.SanitizeInput(req.Name)
 	if req.Name == "" {
 		req.Name = "default"
+	}
+
+	// 验证名称长度
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	// 检查XSS
+	if security.ContainsXSS(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
 	}
 
 	key := req.Key
 	if key == "" {
 		key = generateKey()
+	} else {
+		// 验证用户提供的key格式
+		key = security.SanitizeInput(key)
+		if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
+			writeError(c, http.StatusBadRequest, "API Key格式无效")
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -1029,6 +1100,9 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "创建失败: "+err.Error())
 		return
 	}
+
+	// 记录安全审计日志
+	security.SecurityAuditLog("API_KEY_CREATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(req.Name), c.ClientIP()))
 
 	c.JSON(http.StatusOK, createAPIKeyResponse{
 		ID:   id,

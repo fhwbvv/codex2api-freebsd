@@ -18,7 +18,8 @@ import (
 
 const (
 	responseCacheTTL      = 10 * time.Minute
-	responseCacheMaxItems = 5000 // 最大缓存条目数，防止内存无限增长
+	responseCacheMaxItems = 10000 // 增加缓存条目数以提高命中率
+	responseCleanupInterval = 2 * time.Minute // 增加清理间隔以减少锁竞争
 )
 
 type responseCacheEntry struct {
@@ -39,13 +40,25 @@ func init() {
 // setResponseCache 存储响应上下文
 func setResponseCache(responseID string, items []json.RawMessage) {
 	respCache.mu.Lock()
-	// 超过上限时跳过写入，等待清理腾出空间
+	// 超过上限时随机清理10%的条目
+	// 注意：Go map 遍历顺序是随机的，这不是真正的 LRU，但简单高效
 	if len(respCache.store) >= responseCacheMaxItems {
-		respCache.mu.Unlock()
-		return
+		deleteCount := responseCacheMaxItems / 10
+		for k := range respCache.store {
+			delete(respCache.store, k)
+			deleteCount--
+			if deleteCount <= 0 {
+				break
+			}
+		}
 	}
+
+	// 复制 items 避免外部修改
+	itemsCopy := make([]json.RawMessage, len(items))
+	copy(itemsCopy, items)
+
 	respCache.store[responseID] = &responseCacheEntry{
-		items:     items,
+		items:     itemsCopy,
 		createdAt: time.Now(),
 	}
 	respCache.mu.Unlock()
@@ -56,7 +69,19 @@ func getResponseCache(responseID string) []json.RawMessage {
 	respCache.mu.RLock()
 	entry, ok := respCache.store[responseID]
 	respCache.mu.RUnlock()
-	if !ok || time.Since(entry.createdAt) > responseCacheTTL {
+	if !ok {
+		return nil
+	}
+	if time.Since(entry.createdAt) > responseCacheTTL {
+		// 同步删除过期条目，避免goroutine爆炸
+		// 先释放读锁，再获取写锁进行删除
+		respCache.mu.RUnlock()
+		respCache.mu.Lock()
+		// 双重检查：确认条目仍然存在且已过期
+		if e, exists := respCache.store[responseID]; exists && time.Since(e.createdAt) > responseCacheTTL {
+			delete(respCache.store, responseID)
+		}
+		respCache.mu.Unlock()
 		return nil
 	}
 	return entry.items
@@ -64,15 +89,20 @@ func getResponseCache(responseID string) []json.RawMessage {
 
 // respCacheCleanupLoop 后台清理过期条目
 func respCacheCleanupLoop() {
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(responseCleanupInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
 		respCache.mu.Lock()
+		// 批量删除，减少锁持有时间
+		var toDelete []string
 		for k, v := range respCache.store {
 			if now.Sub(v.createdAt) > responseCacheTTL {
-				delete(respCache.store, k)
+				toDelete = append(toDelete, k)
 			}
+		}
+		for _, k := range toDelete {
+			delete(respCache.store, k)
 		}
 		respCache.mu.Unlock()
 	}

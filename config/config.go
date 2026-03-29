@@ -66,10 +66,11 @@ func (c *CacheConfig) Label() string {
 // Config 全局核心环境配置（物理隔离的服务器参数）
 // 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
-	Port        int
-	AdminSecret string
-	Database    DatabaseConfig
-	Cache       CacheConfig
+	Port           int
+	AdminSecret    string
+	Database       DatabaseConfig
+	Cache          CacheConfig
+	UseWebsocket   bool   // 是否启用 WebSocket 传输
 }
 
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
@@ -89,6 +90,11 @@ func Load(envPath string) (*Config, error) {
 		fmt.Sscanf(port, "%d", &cfg.Port)
 	}
 	cfg.AdminSecret = strings.TrimSpace(os.Getenv("ADMIN_SECRET"))
+
+	// WebSocket 配置
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("USE_WEBSOCKET"))); v == "true" || v == "1" {
+		cfg.UseWebsocket = true
+	}
 
 	// 数据库配置
 	cfg.Database.Driver = normalizeDriver(os.Getenv("DATABASE_DRIVER"), "postgres")

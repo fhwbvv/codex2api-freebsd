@@ -2,8 +2,10 @@ package admin
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
@@ -42,7 +44,25 @@ type usageLogsResponse struct {
 }
 
 type apiKeysResponse struct {
-	Keys []*database.APIKeyRow `json:"keys"`
+	Keys []*MaskedAPIKeyRow `json:"keys"`
+}
+
+// MaskedAPIKeyRow 脱敏的 API Key 响应
+type MaskedAPIKeyRow struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Key       string `json:"key"`
+	CreatedAt string `json:"created_at"`
+}
+
+// NewMaskedAPIKeyRow 创建脱敏的 API Key 响应
+func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
+	return &MaskedAPIKeyRow{
+		ID:        row.ID,
+		Name:      row.Name,
+		Key:       security.MaskAPIKey(row.Key),
+		CreatedAt: row.CreatedAt.Format(time.RFC3339),
+	}
 }
 
 type createAPIKeyResponse struct {

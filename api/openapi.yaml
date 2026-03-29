@@ -1,0 +1,580 @@
+# OpenAPI Specification for Codex2API
+
+openapi: 3.0.3
+info:
+  title: Codex2API
+  description: |
+    OpenAI-compatible API proxy for Codex with enhanced features including:
+    - Multi-account pooling with automatic rotation
+    - Intelligent request routing and load balancing
+    - Real-time usage tracking and monitoring
+    - Administrative management interface
+    - Request/response translation between OpenAI and Codex formats
+    - Streaming and non-streaming chat completions
+    - Function calling support
+    - Tool calling support
+  version: 1.0.0
+  contact:
+    name: API Support
+    url: https://github.com/codex2api
+    email: support@codex2api.local
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080/v1
+    description: Local development server
+  - url: https://api.codex2api.local/v1
+    description: Production server
+
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Enter your API key with Bearer prefix.
+        Example: "Bearer sk-..."
+
+  schemas:
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+            - type
+          properties:
+            code:
+              type: string
+              description: Machine-readable error code
+              enum:
+                - invalid_request
+                - invalid_api_key
+                - missing_api_key
+                - insufficient_scope
+                - invalid_parameter
+                - missing_field
+                - invalid_field_type
+                - invalid_field_format
+                - context_length_exceeded
+                - unsupported_model
+                - rate_limit_reached
+                - server_error
+                - service_unavailable
+                - upstream_error
+                - upstream_timeout
+                - resource_not_found
+                - resource_conflict
+            message:
+              type: string
+              description: Human-readable error message
+            type:
+              type: string
+              description: Error category
+              enum:
+                - invalid_request_error
+                - authentication_error
+                - permission_error
+                - not_found_error
+                - rate_limit_error
+                - server_error
+                - upstream_error
+            details:
+              description: Additional error context
+              oneOf:
+                - type: object
+                  additionalProperties: true
+                - type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+
+    Model:
+      type: object
+      required:
+        - id
+        - object
+        - created
+        - owned_by
+      properties:
+        id:
+          type: string
+          description: Model identifier
+          example: "gpt-5.4"
+        object:
+          type: string
+          enum: [model]
+        created:
+          type: integer
+          description: Unix timestamp
+        owned_by:
+          type: string
+          example: "openai"
+
+    ModelList:
+      type: object
+      required:
+        - object
+        - data
+      properties:
+        object:
+          type: string
+          enum: [list]
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Model'
+
+    ChatCompletionRequest:
+      type: object
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+          description: ID of the model to use
+          example: "gpt-5.4"
+        messages:
+          type: array
+          description: Messages comprising the conversation
+          items:
+            type: object
+            required:
+              - role
+              - content
+            properties:
+              role:
+                type: string
+                enum: [system, user, assistant, tool]
+              content:
+                type: string
+              name:
+                type: string
+              tool_calls:
+                type: array
+              tool_call_id:
+                type: string
+          minItems: 1
+          maxItems: 4096
+        max_tokens:
+          type: integer
+          description: Maximum number of tokens to generate
+          minimum: 1
+          maximum: 65536
+        temperature:
+          type: number
+          description: Sampling temperature
+          minimum: 0
+          maximum: 2
+          default: 1
+        top_p:
+          type: number
+          description: Nucleus sampling parameter
+          minimum: 0
+          maximum: 1
+          default: 1
+        n:
+          type: integer
+          description: Number of completions to generate
+          minimum: 1
+          maximum: 1
+          default: 1
+        stream:
+          type: boolean
+          description: Whether to stream back partial progress
+          default: false
+        stop:
+          type: string
+          description: Stop sequence
+          maxLength: 256
+        presence_penalty:
+          type: number
+          minimum: -2
+          maximum: 2
+          default: 0
+        frequency_penalty:
+          type: number
+          minimum: -2
+          maximum: 2
+          default: 0
+        user:
+          type: string
+          description: Unique identifier for the end-user
+          maxLength: 256
+        reasoning_effort:
+          type: string
+          enum: [low, medium, high]
+          description: Level of reasoning effort
+        service_tier:
+          type: string
+          enum: [auto, default, fast]
+          default: auto
+
+    ChatCompletionResponse:
+      type: object
+      required:
+        - id
+        - object
+        - created
+        - model
+        - choices
+      properties:
+        id:
+          type: string
+          example: "chatcmpl-abc123"
+        object:
+          type: string
+          enum: [chat.completion]
+        created:
+          type: integer
+          description: Unix timestamp
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                type: object
+                properties:
+                  role:
+                    type: string
+                    enum: [assistant]
+                  content:
+                    type: string
+                  reasoning_content:
+                    type: string
+                  tool_calls:
+                    type: array
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter, null]
+              logprobs:
+                type: object
+        usage:
+          type: object
+          properties:
+            prompt_tokens:
+              type: integer
+            completion_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+            prompt_tokens_details:
+              type: object
+              properties:
+                cached_tokens:
+                  type: integer
+            completion_tokens_details:
+              type: object
+              properties:
+                reasoning_tokens:
+                  type: integer
+        system_fingerprint:
+          type: string
+
+    ChatCompletionStreamResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [chat.completion.chunk]
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              delta:
+                type: object
+                properties:
+                  role:
+                    type: string
+                  content:
+                    type: string
+                  reasoning_content:
+                    type: string
+                  tool_calls:
+                    type: array
+              finish_reason:
+                type: string
+                enum: [stop, length, tool_calls, content_filter, null]
+
+    ResponsesRequest:
+      type: object
+      required:
+        - model
+        - input
+      properties:
+        model:
+          type: string
+          description: ID of the model to use
+        input:
+          type: array
+          description: Input items for the response
+          items:
+            type: object
+        instructions:
+          type: string
+        max_output_tokens:
+          type: integer
+          minimum: 1
+          maximum: 65536
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+        stream:
+          type: boolean
+        stop:
+          type: string
+        user:
+          type: string
+        reasoning:
+          type: object
+          properties:
+            effort:
+              type: string
+              enum: [low, medium, high]
+        service_tier:
+          type: string
+          enum: [auto, default, fast]
+        store:
+          type: boolean
+        truncation:
+          type: string
+          enum: [auto, disabled]
+        previous_response_id:
+          type: string
+        tools:
+          type: array
+        tool_choice:
+          type: object
+
+    ResponsesResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          enum: [response]
+        created_at:
+          type: integer
+        status:
+          type: string
+          enum: [in_progress, completed, failed, cancelled, incomplete]
+        error:
+          $ref: '#/components/schemas/Error'
+        model:
+          type: string
+        output:
+          type: array
+        usage:
+          type: object
+          properties:
+            input_tokens:
+              type: integer
+            output_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+        incomplete_details:
+          type: object
+
+paths:
+  /models:
+    get:
+      summary: List available models
+      description: Returns a list of available models that can be used with the API
+      operationId: listModels
+      tags:
+        - Models
+      responses:
+        '200':
+          description: List of models
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /chat/completions:
+    post:
+      summary: Create chat completion
+      description: |
+        Creates a chat completion for the provided messages.
+        Compatible with OpenAI Chat Completions API.
+      operationId: createChatCompletion
+      tags:
+        - Chat
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: Chat completion response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionStreamResponse'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying
+              schema:
+                type: integer
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /responses:
+    post:
+      summary: Create response
+      description: |
+        Creates a response using the native Codex Responses API.
+        Provides direct access to Codex functionality.
+      operationId: createResponse
+      tags:
+        - Responses
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResponsesRequest'
+      responses:
+        '200':
+          description: Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResponsesResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /health:
+    servers:
+      - url: http://localhost:8080
+        description: Local development server
+      - url: https://api.codex2api.local
+        description: Production server
+    get:
+      summary: Health check
+      description: Returns the health status of the API
+      operationId: healthCheck
+      tags:
+        - Health
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                  available:
+                    type: integer
+                  total:
+                    type: integer

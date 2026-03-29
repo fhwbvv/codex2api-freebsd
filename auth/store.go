@@ -87,6 +87,7 @@ type Account struct {
 	ActiveRequests int64 // 当前并发请求数
 	TotalRequests  int64 // 累计总请求数
 	LastUsedAt     int64 // 最后使用时间（UnixNano）
+
 }
 
 // SchedulerBreakdown 调度评分拆解
@@ -693,6 +694,9 @@ type Store struct {
 	fastScheduler        atomic.Pointer[FastScheduler]
 	fastSchedulerEnabled atomic.Bool
 
+	// 智能刷新调度器
+	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
+
 	allowRemoteMigration atomic.Bool // 是否允许远程迁移拉取账号
 }
 
@@ -1077,9 +1081,12 @@ func (s *Store) StartBackgroundRefresh() {
 		refreshTicker := time.NewTicker(2 * time.Minute)
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
+		// 添加定时重建 FastScheduler 以优化性能
+		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
 		defer refreshTicker.Stop()
 		defer autoCleanupTicker.Stop()
 		defer fullUsageCleanupTicker.Stop()
+		defer rebuildSchedulerTicker.Stop()
 
 		for {
 			select {
@@ -1092,6 +1099,11 @@ func (s *Store) StartBackgroundRefresh() {
 			case <-fullUsageCleanupTicker.C:
 				if s.GetAutoCleanFullUsage() {
 					go s.CleanFullUsageAccounts(context.Background())
+				}
+			case <-rebuildSchedulerTicker.C:
+				// 定期重建调度器以优化内存和性能
+				if s.FastSchedulerEnabled() {
+					s.rebuildFastScheduler()
 				}
 			case <-s.stopCh:
 				return

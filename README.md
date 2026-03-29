@@ -7,11 +7,25 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 
 它对外提供兼容 OpenAI 风格的接口，并在内部维护一套基于 **Refresh Token 账号池** 的调度、刷新、测试、限流恢复、用量观测与后台管理能力。
 
-本项目在设计与实现思路上参考并鸣谢 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 与 [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)。
+---
+
+## 目录
+
+- [快速部署](#快速部署)
+- [完整文档](#完整文档)
+- [环境配置](#环境配置)
+- [对外接口](#对外接口)
+- [管理后台](#管理后台)
+- [核心能力](#核心能力)
+- [目录结构](#目录结构)
+- [常见注意事项](#常见注意事项)
+- [免责声明](#免责声明与开源协议)
 
 ---
 
 ## 快速部署
+
+> 详细部署指南请参考：[DEPLOYMENT.md](docs/DEPLOYMENT.md)
 
 ### 部署模式总览
 
@@ -81,7 +95,24 @@ docker compose -f docker-compose.sqlite.local.yml logs -f codex2api
 - 管理台：`http://localhost:8080/admin/`
 - 健康检查：`http://localhost:8080/health`
 
-标准镜像版升级命令：
+> 更多部署详情请参考：[DEPLOYMENT.md](docs/DEPLOYMENT.md)
+
+---
+
+## 完整文档
+
+| 文档 | 说明 | 路径 |
+|------|------|------|
+| [API 文档](docs/API.md) | 所有 API 端点、请求/响应示例、错误码说明 | `docs/API.md` |
+| [部署文档](docs/DEPLOYMENT.md) | 各种部署模式、升级指南、备份恢复 | `docs/DEPLOYMENT.md` |
+| [配置文档](docs/CONFIGURATION.md) | 环境变量、系统设置、配置优先级 | `docs/CONFIGURATION.md` |
+| [架构文档](docs/ARCHITECTURE.md) | 系统架构、调度算法、存储设计 | `docs/ARCHITECTURE.md` |
+| [故障排查](docs/TROUBLESHOOTING.md) | 常见问题排查、诊断脚本、解决方案 | `docs/TROUBLESHOOTING.md` |
+| [贡献指南](docs/CONTRIBUTING.md) | 开发规范、PR 流程、代码标准 | `docs/CONTRIBUTING.md` |
+
+---
+
+## 环境配置
 
 ```bash
 git pull && docker compose pull && docker compose up -d && docker compose logs -f codex2api
@@ -126,6 +157,8 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 ## 环境配置
 
 ### `.env` 环境变量
+
+> 完整配置说明请参考：[CONFIGURATION.md](docs/CONFIGURATION.md)
 
 | 变量 | 说明 |
 | --- | --- |

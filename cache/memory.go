@@ -73,15 +73,20 @@ func (tc *MemoryTokenCache) SetPoolSize(n int) {
 }
 
 func (tc *MemoryTokenCache) GetAccessToken(ctx context.Context, accountID int64) (string, error) {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-
+	tc.mu.RLock()
 	entry, ok := tc.tokens[accountID]
+	tc.mu.RUnlock()
 	if !ok {
 		return "", nil
 	}
 	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
-		delete(tc.tokens, accountID)
+		// 同步删除过期条目，避免删除刚刷新的 token
+		tc.mu.Lock()
+		current, ok := tc.tokens[accountID]
+		if ok && current == entry && !current.expiresAt.IsZero() && time.Now().After(current.expiresAt) {
+			delete(tc.tokens, accountID)
+		}
+		tc.mu.Unlock()
 		return "", nil
 	}
 	return entry.token, nil
@@ -91,8 +96,11 @@ func (tc *MemoryTokenCache) SetAccessToken(ctx context.Context, accountID int64,
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 
-	expiresAt := time.Time{}
+	var expiresAt time.Time
 	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl)
+	} else if ttl < 0 {
+		// 负数 TTL 表示已经过期，直接设置为过去的时间
 		expiresAt = time.Now().Add(ttl)
 	}
 	tc.tokens[accountID] = memoryTokenEntry{

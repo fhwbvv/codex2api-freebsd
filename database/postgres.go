@@ -59,6 +59,8 @@ type DB struct {
 	logMu   sync.Mutex
 	logStop chan struct{}
 	logWg   sync.WaitGroup
+	// 预分配日志缓冲以减少内存分配
+	logBufCap int
 }
 
 // usageLogEntry 日志缓冲条目
@@ -102,10 +104,10 @@ func New(driver string, dsn string) (*DB, error) {
 		conn.SetMaxIdleConns(1)
 	} else {
 		// 高并发场景：大量 RT 刷新 + 前端查询 + 使用日志写入 并行
-		conn.SetMaxOpenConns(50)                  // 最大打开连接数（默认无限制，限制避免 PG too many connections）
-		conn.SetMaxIdleConns(25)                  // 空闲连接数（保持足够的热连接避免频繁建连）
-		conn.SetConnMaxLifetime(30 * time.Minute) // 连接最大生存时间（避免长连接僵死）
-		conn.SetConnMaxIdleTime(10 * time.Minute) // 空闲连接最大闲置时间
+		conn.SetMaxOpenConns(100)                  // 增加最大打开连接数以处理更高并发
+		conn.SetMaxIdleConns(50)                   // 增加空闲连接数以保持热连接
+		conn.SetConnMaxLifetime(60 * time.Minute)  // 增加连接最大生存时间
+		conn.SetConnMaxIdleTime(30 * time.Minute)  // 增加空闲连接最大闲置时间
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -116,9 +118,10 @@ func New(driver string, dsn string) (*DB, error) {
 	}
 
 	db := &DB{
-		conn:    conn,
-		driver:  driver,
-		logStop: make(chan struct{}),
+		conn:      conn,
+		driver:    driver,
+		logStop:   make(chan struct{}),
+		logBufCap: 128,
 	}
 	if db.isSQLite() {
 		if err := db.configureSQLite(ctx); err != nil {
@@ -634,7 +637,8 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 	bufLen := len(db.logBuf)
 	db.logMu.Unlock()
 
-	if bufLen >= 100 {
+	// 增加触发 flush 的阈值，减少 flush 频率
+	if bufLen >= 200 {
 		go db.flushLogs()
 	}
 	return nil
@@ -662,12 +666,12 @@ type UsageLogInput struct {
 	ServiceTier      string
 }
 
-// startLogFlusher 启动后台定时 flush 协程（每 3 秒一次）
+// startLogFlusher 启动后台定时 flush 协程（每 5 秒一次）
 func (db *DB) startLogFlusher() {
 	db.logWg.Add(1)
 	go func() {
 		defer db.logWg.Done()
-		ticker := time.NewTicker(3 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -688,12 +692,22 @@ func (db *DB) flushLogs() {
 		return
 	}
 	batch := db.logBuf
-	db.logBuf = make([]usageLogEntry, 0, 64)
+	db.logBuf = make([]usageLogEntry, 0, db.logBufCap)
 	db.logMu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
+	// 使用批处理插入优化性能
+	if db.driver == "postgres" {
+		err := db.batchInsertLogs(ctx, batch)
+		if err != nil {
+			log.Printf("批量写入日志失败: %v", err)
+		}
+		return
+	}
+
+	// SQLite 使用事务插入
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		log.Printf("批量写入日志失败（开始事务）: %v", err)
@@ -728,6 +742,58 @@ func (db *DB) flushLogs() {
 	if len(batch) > 10 {
 		log.Printf("批量写入 %d 条使用日志", len(batch))
 	}
+}
+
+// batchInsertLogs 使用 PostgreSQL 的批量插入优化
+// 分批处理以避免 PostgreSQL 65535 参数限制（每行18个参数，每批最多3640行）
+func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	const maxRowsPerBatch = 3000 // 安全阈值，低于3640行的理论上限
+
+	// 分批处理
+	for start := 0; start < len(batch); start += maxRowsPerBatch {
+		end := start + maxRowsPerBatch
+		if end > len(batch) {
+			end = len(batch)
+		}
+		subBatch := batch[start:end]
+
+		if err := db.batchInsertLogsChunk(ctx, subBatch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// batchInsertLogsChunk 插入单批日志（内部辅助函数）
+func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	// 使用 COPY 或批量 VALUES 优化插入性能
+	valueStrings := make([]string, 0, len(batch))
+	valueArgs := make([]interface{}, 0, len(batch)*18)
+	argIdx := 1
+
+	for _, e := range batch {
+		valueStrings = append(valueStrings, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			argIdx, argIdx+1, argIdx+2, argIdx+3, argIdx+4, argIdx+5, argIdx+6, argIdx+7, argIdx+8, argIdx+9,
+			argIdx+10, argIdx+11, argIdx+12, argIdx+13, argIdx+14, argIdx+15, argIdx+16, argIdx+17))
+		valueArgs = append(valueArgs, e.AccountID, e.Endpoint, e.Model, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
+			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.CachedTokens, e.ServiceTier)
+		argIdx += 18
+	}
+
+	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
+		input_tokens, output_tokens, reasoning_tokens, first_token_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, cached_tokens, service_tier)
+		VALUES %s`, strings.Join(valueStrings, ","))
+
+	_, err := db.conn.ExecContext(ctx, query, valueArgs...)
+	return err
 }
 
 // UsageStats 使用统计

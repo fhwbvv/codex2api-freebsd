@@ -190,14 +190,19 @@ func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.Clie
 
 	// 检查是否有其他 goroutine 正在创建连接
 	if cond, ok := t.pending[host]; ok {
-		// 等待其他 goroutine 完成
-		cond.Wait()
-		// 再次检查连接是否可用
-		if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
-			t.mu.Unlock()
-			return h2Conn, nil
+		// 等待其他 goroutine 完成（循环重试，避免虚假唤醒）
+		for {
+			cond.Wait()
+			// 再次检查连接是否可用
+			if h2Conn, ok := t.connections[host]; ok && h2Conn.CanTakeNewRequest() {
+				t.mu.Unlock()
+				return h2Conn, nil
+			}
+			// 如果 pending 已移除，说明创建完成（可能失败），跳出循环自己创建
+			if _, still := t.pending[host]; !still {
+				break
+			}
 		}
-		// 连接仍不可用，继续创建
 	}
 
 	// 标记此 host 正在创建连接
@@ -211,7 +216,7 @@ func (t *utlsRoundTripper) getOrCreateConnection(host, addr string) (*http2.Clie
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// 移除 pending 标记并唤醒等待的 goroutine
+	// 移除 pending 标记并唤醒一个等待者（Signal 而非 Broadcast，避免惊群）
 	delete(t.pending, host)
 	cond.Broadcast()
 

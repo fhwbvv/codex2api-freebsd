@@ -173,7 +173,7 @@ func TestConvertMessagesToInput_FullMultiTurn(t *testing.T) {
 }
 
 func TestStreamTranslator_FunctionCall(t *testing.T) {
-	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4")
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 
 	// 1. output_item.added: function_call
 	addedEvent := []byte(`{
@@ -257,7 +257,7 @@ func TestStreamTranslator_FunctionCall(t *testing.T) {
 }
 
 func TestStreamTranslator_TextOnly(t *testing.T) {
-	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4")
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 
 	// 文本 delta
 	textEvent := []byte(`{"type":"response.output_text.delta","delta":"Hello"}`)
@@ -289,7 +289,7 @@ func TestStreamTranslator_TextOnly(t *testing.T) {
 }
 
 func TestStreamTranslator_MultipleFunctionCalls(t *testing.T) {
-	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4")
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 
 	// 第一个 function call
 	event1 := []byte(`{

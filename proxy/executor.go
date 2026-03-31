@@ -271,7 +271,16 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 	buf := sseBufferPool.Get().([]byte)
 	defer sseBufferPool.Put(buf)
 
-	var lineBuf []byte
+	lineBufPtr := sseLineBufPool.Get().(*[]byte)
+	lineBuf := (*lineBufPtr)[:0]
+	defer func() {
+		// 归还时限制容量，避免异常大的缓冲区长期驻留池中
+		if cap(lineBuf) <= 256*1024 {
+			*lineBufPtr = lineBuf[:0]
+			sseLineBufPool.Put(lineBufPtr)
+		}
+	}()
+
 	var dataLines [][]byte
 
 	emitEvent := func() bool {
@@ -323,6 +332,13 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 					dataLines = append(dataLines, dataCopy)
 				}
 			}
+
+			// 缩容：已消费数据超过一半时，将剩余数据移到头部释放前端内存
+			if len(lineBuf) > 0 && cap(lineBuf) > 4096 && len(lineBuf) < cap(lineBuf)/4 {
+				compact := make([]byte, len(lineBuf), cap(lineBuf)/2)
+				copy(compact, lineBuf)
+				lineBuf = compact
+			}
 		}
 
 		if err != nil {
@@ -347,9 +363,17 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 	}
 }
 
-// sseBufferPool 用于复用 SSE 读取缓冲区
+// sseBufferPool 用于复用 SSE 读取缓冲区（64KB 以适应 reasoning 模型的大 thinking block）
 var sseBufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 8192) // 增加到 8KB 提高读取效率
+		return make([]byte, 64*1024)
+	},
+}
+
+// sseLineBufPool 用于复用行缓冲区，减少频繁分配
+var sseLineBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 0, 64*1024)
+		return &b
 	},
 }

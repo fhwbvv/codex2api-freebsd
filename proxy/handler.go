@@ -20,7 +20,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // Handler API 路由处理器
@@ -358,51 +357,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		c.Set("x-service-tier", serviceTier)
 	}
 
-	// 2. 注入/修正 Codex 必需字段
-	codexBody := rawBody
-	codexBody, _ = sjson.SetBytes(codexBody, "stream", true)
-	codexBody, _ = sjson.SetBytes(codexBody, "store", false)
-	if !gjson.GetBytes(codexBody, "include").Exists() {
-		codexBody, _ = sjson.SetBytes(codexBody, "include", []string{"reasoning.encrypted_content"})
-	}
-
-	// 自动将字符串 input 包装为数组格式（Codex 要求 input 为 list）
-	inputResult := gjson.GetBytes(codexBody, "input")
-	if inputResult.Exists() && inputResult.Type == gjson.String {
-		codexBody, _ = sjson.SetBytes(codexBody, "input", []map[string]string{
-			{"role": "user", "content": inputResult.String()},
-		})
-	}
-
-	// 将 Chat Completions 风格的 reasoning_effort 自动转换为 Responses API 的 reasoning.effort
-	if re := gjson.GetBytes(codexBody, "reasoning_effort"); re.Exists() && !gjson.GetBytes(codexBody, "reasoning.effort").Exists() {
-		codexBody, _ = sjson.SetBytes(codexBody, "reasoning.effort", re.String())
-	}
-	codexBody = clampReasoningEffort(codexBody)
-	codexBody = sanitizeServiceTierForUpstream(codexBody)
-
-	// 为缺少 description 的客户端执行工具补充默认描述（如 tool_search）
-	codexBody = ensureToolDescriptions(codexBody)
-	// 清理 function tool parameters 中上游不支持的 JSON Schema 关键字
-	codexBody = sanitizeToolSchemas(codexBody)
-
-	// 展开 previous_response_id（将缓存的历史对话上下文注入 input）
-	codexBody, _ = expandPreviousResponse(codexBody)
-	// 保存展开后的 input，用于在 response.completed 时缓存完整上下文
-	expandedInputRaw := gjson.GetBytes(codexBody, "input").Raw
-
-	// 删除 Codex 不支持的参数
-	unsupportedFields := []string{
-		"max_output_tokens", "max_tokens", "max_completion_tokens",
-		"temperature", "top_p", "frequency_penalty", "presence_penalty",
-		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
-		"logit_bias", "response_format", "serviceTier",
-		"stream_options", "reasoning_effort", "truncation", "context_management",
-		"disable_response_storage", "verbosity",
-	}
-	for _, field := range unsupportedFields {
-		codexBody, _ = sjson.DeleteBytes(codexBody, field)
-	}
+	// 2. 准备上游请求体（Unmarshal→map→Marshal，一次序列化）
+	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -542,7 +498,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-				eventType := gjson.GetBytes(data, "type").String()
+				parsed := gjson.ParseBytes(data)
+				eventType := parsed.Get("type").String()
 
 				// TTFT: 记录第一个 output_text.delta 事件的时间
 				if !ttftRecorded && eventType == "response.output_text.delta" {
@@ -552,13 +509,13 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				// 累计 delta 字符数
 				if eventType == "response.output_text.delta" {
-					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
+					deltaCharCount += len(parsed.Get("delta").String())
 				}
 
 				// 提取 usage + service_tier
 				if eventType == "response.completed" {
-					usage = extractUsage(data)
-					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
+					usage = extractUsageFromResult(parsed.Get("response.usage"))
+					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
@@ -581,18 +538,19 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 非流式收集
 			var lastResponseData []byte
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-				eventType := gjson.GetBytes(data, "type").String()
+				parsed := gjson.ParseBytes(data)
+				eventType := parsed.Get("type").String()
 				if !ttftRecorded && eventType == "response.output_text.delta" {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
 				// 累计 delta 字符数
 				if eventType == "response.output_text.delta" {
-					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
+					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {
-					usage = extractUsage(data)
-					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
+					usage = extractUsageFromResult(parsed.Get("response.usage"))
+					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
@@ -890,7 +848,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		created := time.Now().Unix()
 
 		if isStream {
-			streamTranslator := NewStreamTranslator(chunkID, model)
+			streamTranslator := NewStreamTranslator(chunkID, model, created)
 			c.Header("Content-Type", "text/event-stream")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
@@ -909,18 +867,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				chunk, done := streamTranslator.Translate(data)
 
-				eventType := gjson.GetBytes(data, "type").String()
+				parsed := gjson.ParseBytes(data)
+				eventType := parsed.Get("type").String()
 				if !ttftRecorded && strings.Contains(eventType, ".delta") {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
 				// 累计 delta 字符数（文本 + function call 参数）
 				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
-					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
+					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {
-					usage = extractUsage(data)
-					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
+					usage = extractUsageFromResult(parsed.Get("response.usage"))
+					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
 					gotTerminal = true
@@ -930,7 +889,6 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 
 				if chunk != nil {
-					chunk, _ = sjson.SetBytes(chunk, "created", created)
 					if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", chunk); err != nil {
 						writeErr = err
 						return false
@@ -954,20 +912,22 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			var toolCalls []ToolCallResult
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-				eventType := gjson.GetBytes(data, "type").String()
+				parsed := gjson.ParseBytes(data)
+				eventType := parsed.Get("type").String()
 				if !ttftRecorded && strings.Contains(eventType, ".delta") {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
 				switch eventType {
 				case "response.output_text.delta":
-					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
-					fullContent.WriteString(gjson.GetBytes(data, "delta").String())
+					delta := parsed.Get("delta").String()
+					deltaCharCount += len(delta)
+					fullContent.WriteString(delta)
 				case "response.function_call_arguments.delta":
-					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
+					deltaCharCount += len(parsed.Get("delta").String())
 				case "response.completed":
-					usage = extractUsage(data)
-					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
+					usage = extractUsageFromResult(parsed.Get("response.usage"))
+					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
 					// 从 response.output 提取 function_call 项
@@ -981,42 +941,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				return true
 			})
 
-			result := []byte(`{}`)
-			result, _ = sjson.SetBytes(result, "id", chunkID)
-			result, _ = sjson.SetBytes(result, "object", "chat.completion")
-			result, _ = sjson.SetBytes(result, "created", created)
-			result, _ = sjson.SetBytes(result, "model", model)
-			result, _ = sjson.SetBytes(result, "choices.0.index", 0)
-			result, _ = sjson.SetBytes(result, "choices.0.message.role", "assistant")
-
-			if len(toolCalls) > 0 {
-				// 有工具调用: 设置 tool_calls 和对应的 finish_reason
-				contentStr := fullContent.String()
-				if contentStr != "" {
-					result, _ = sjson.SetBytes(result, "choices.0.message.content", contentStr)
-				} else {
-					result, _ = sjson.SetRawBytes(result, "choices.0.message.content", []byte("null"))
-				}
-				for i, tc := range toolCalls {
-					prefix := fmt.Sprintf("choices.0.message.tool_calls.%d", i)
-					result, _ = sjson.SetBytes(result, prefix+".id", tc.ID)
-					result, _ = sjson.SetBytes(result, prefix+".type", "function")
-					result, _ = sjson.SetBytes(result, prefix+".function.name", tc.Name)
-					result, _ = sjson.SetBytes(result, prefix+".function.arguments", tc.Arguments)
-				}
-				result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "tool_calls")
-			} else {
-				result, _ = sjson.SetBytes(result, "choices.0.message.content", fullContent.String())
-				result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "stop")
-			}
-
-			if usage != nil {
-				result, _ = sjson.SetBytes(result, "usage.prompt_tokens", usage.PromptTokens)
-				result, _ = sjson.SetBytes(result, "usage.completion_tokens", usage.CompletionTokens)
-				result, _ = sjson.SetBytes(result, "usage.total_tokens", usage.TotalTokens)
-			}
-
-			compactResult = result
+			compactResult = BuildCompactResponse(chunkID, model, created, fullContent.String(), toolCalls, usage)
 		}
 
 		// 断流检测 + token 估算
@@ -1129,9 +1054,8 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 	}
 
 	err := ReadSSEStream(body, func(data []byte) bool {
-		chunk, done := TranslateStreamChunk(data, model, chunkID)
+		chunk, done := TranslateStreamChunk(data, model, chunkID, created)
 		if chunk != nil {
-			chunk, _ = sjson.SetBytes(chunk, "created", created)
 			fmt.Fprintf(c.Writer, "data: %s\n\n", chunk)
 			flusher.Flush()
 		}
@@ -1168,21 +1092,7 @@ func (h *Handler) handleCompactResponse(c *gin.Context, body io.Reader, model, c
 		return true
 	})
 
-	result := []byte(`{}`)
-	result, _ = sjson.SetBytes(result, "id", chunkID)
-	result, _ = sjson.SetBytes(result, "object", "chat.completion")
-	result, _ = sjson.SetBytes(result, "created", created)
-	result, _ = sjson.SetBytes(result, "model", model)
-	result, _ = sjson.SetBytes(result, "choices.0.index", 0)
-	result, _ = sjson.SetBytes(result, "choices.0.message.role", "assistant")
-	result, _ = sjson.SetBytes(result, "choices.0.message.content", fullContent.String())
-	result, _ = sjson.SetBytes(result, "choices.0.finish_reason", "stop")
-
-	if usage != nil {
-		result, _ = sjson.SetBytes(result, "usage.prompt_tokens", usage.PromptTokens)
-		result, _ = sjson.SetBytes(result, "usage.completion_tokens", usage.CompletionTokens)
-		result, _ = sjson.SetBytes(result, "usage.total_tokens", usage.TotalTokens)
-	}
+	result := BuildCompactResponse(chunkID, model, created, fullContent.String(), nil, usage)
 
 	c.Data(http.StatusOK, "application/json", result)
 }

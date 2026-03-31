@@ -7,7 +7,21 @@
 - [概述](#概述)
 - [认证](#认证)
 - [公共 API](#公共-api)
+  - [Chat Completions](#1-chat-completions)
+  - [Responses](#2-responses)
+  - [List Models](#3-list-models)
+  - [Health Check](#4-health-check)
 - [管理 API](#管理-api)
+  - [统计接口](#统计接口)
+  - [账号管理](#账号管理) — 添加 RT / AT 账号、批量导入、导出、迁移
+  - [用量统计](#用量统计)
+  - [API Key 管理](#api-key-管理)
+  - [系统设置](#系统设置)
+  - [代理池管理](#代理池管理)
+  - [运维监控](#运维监控)
+  - [模型管理](#模型管理)
+  - [OAuth 授权](#oauth-授权) — PKCE 流程获取 Token
+- [支持模型](#支持模型)
 - [错误码](#错误码)
 - [限流说明](#限流说明)
 
@@ -312,7 +326,7 @@ data: [DONE]
 
 #### POST /api/admin/accounts
 
-添加新账号（支持批量）。
+添加 Refresh Token 账号（支持批量）。
 
 **请求:**
 ```json
@@ -322,6 +336,14 @@ data: [DONE]
   "proxy_url": "http://proxy.example.com:8080"
 }
 ```
+
+**参数说明:**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| name | string | 否 | 账号名称，批量时自动追加序号，默认 `account-{n}` |
+| refresh_token | string | 是 | Refresh Token，多个用 `\n` 换行分隔（单次最多 100 个） |
+| proxy_url | string | 否 | 代理 URL |
 
 批量添加（使用换行分隔）:
 ```json
@@ -340,6 +362,76 @@ data: [DONE]
   "failed": 0
 }
 ```
+
+**curl 示例:**
+
+单个添加:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-account", "refresh_token": "rt_xxxxxxxxxxxx", "proxy_url": ""}'
+```
+
+批量添加（换行分隔）:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "batch", "refresh_token": "rt_xxx1\nrt_xxx2\nrt_xxx3"}'
+```
+
+> 添加后系统自动在后台刷新 Access Token，无需手动触发。
+
+#### POST /api/admin/accounts/at
+
+添加 Access Token（AT-only）账号（支持批量）。适用于只有 AT 没有 RT 的场景。
+
+**请求:**
+```json
+{
+  "name": "my-at-account",
+  "access_token": "eyJhbGciOiJSUzI1NiIs...",
+  "proxy_url": "http://proxy.example.com:8080"
+}
+```
+
+**参数说明:**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| name | string | 否 | 账号名称，批量时自动追加序号，默认 `at-account-{n}` |
+| access_token | string | 是 | Access Token，多个用 `\n` 换行分隔（单次最多 100 个） |
+| proxy_url | string | 否 | 代理 URL |
+
+批量添加:
+```json
+{
+  "name": "batch-at",
+  "access_token": "eyJtoken1...\neyJtoken2...\neyJtoken3...",
+  "proxy_url": ""
+}
+```
+
+**响应:**
+```json
+{
+  "message": "成功添加 3 个 AT 账号",
+  "success": 3,
+  "failed": 0
+}
+```
+
+**curl 示例:**
+
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts/at \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-at", "access_token": "eyJhbGciOiJSUzI1NiIs..."}'
+```
+
+> AT-only 账号无法自动刷新，过期后需重新添加。系统会自动解析 JWT 提取 email、plan_type 等信息。
 
 #### DELETE /api/admin/accounts/:id
 
@@ -394,18 +486,88 @@ data: [DONE]
 
 #### POST /api/admin/accounts/import
 
-批量导入账号（支持 TXT/JSON 格式）。
+批量导入账号（支持 TXT/JSON/AT-TXT 三种格式）。
 
 **请求:**
 - Method: POST
 - Content-Type: multipart/form-data
-- Form 字段: `file`, `format` (txt|json), `proxy_url`
+
+**Form 字段:**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| file | file | 是 | 上传文件（最大 2MB，JSON 格式支持多文件） |
+| format | string | 否 | 文件格式：`txt`（默认）、`json`、`at_txt` |
+| proxy_url | string | 否 | 代理 URL |
+
+**format 格式说明:**
+
+- **`txt`** — 每行一个 Refresh Token:
+  ```
+  rt_xxxxxx1
+  rt_xxxxxx2
+  rt_xxxxxx3
+  ```
+
+- **`json`** — CLIProxyAPI 凭证 JSON 格式（支持数组或单对象）:
+  ```json
+  [
+    {"refresh_token": "rt_xxx1", "email": "user1@example.com"},
+    {"refresh_token": "rt_xxx2", "email": "user2@example.com"}
+  ]
+  ```
+
+- **`at_txt`** — 每行一个 Access Token（AT-only 模式）:
+  ```
+  eyJhbGciOiJSUzI1NiIs...token1
+  eyJhbGciOiJSUzI1NiIs...token2
+  ```
+
+> 所有格式均自动文件内去重 + 数据库去重，已存在的 Token 计入 `duplicate` 不重复导入。
+
+**curl 示例:**
+
+导入 RT（TXT 格式）:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@tokens.txt" \
+  -F "format=txt" \
+  -F "proxy_url=http://proxy.example.com:8080"
+```
+
+导入 RT（JSON 格式）:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@credentials.json" \
+  -F "format=json"
+```
+
+导入 AT（AT-TXT 格式）:
+```bash
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@access_tokens.txt" \
+  -F "format=at_txt"
+```
 
 **响应:** SSE 流式进度
 ```
 data: {"type":"progress","current":5,"total":10,"success":3,"duplicate":1,"failed":1}
 
 data: {"type":"complete","current":10,"total":10,"success":8,"duplicate":1,"failed":1}
+```
+
+若所有 Token 均已存在，返回普通 JSON（非 SSE）:
+```json
+{
+  "message": "所有 10 个 RT 已存在，无需导入",
+  "success": 0,
+  "duplicate": 10,
+  "failed": 0,
+  "total": 10
+}
 ```
 
 #### POST /api/admin/accounts/batch-test
@@ -885,28 +1047,71 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 ### OAuth 授权
 
+通过 OAuth PKCE 流程授权获取 Codex 账号的 Refresh Token，适用于无法手动获取 RT 的场景。
+
+**流程:** 生成授权 URL → 用户在浏览器中完成授权 → 用授权码兑换 Token 并写入系统
+
 #### POST /api/admin/oauth/generate-auth-url
 
-生成 OAuth 授权 URL。
+生成 OAuth 授权 URL（PKCE 模式）。
 
 **请求:**
 ```json
 {
-  "provider": "google",
-  "redirect_uri": "http://localhost:8080/admin/oauth/callback"
+  "proxy_url": "http://proxy.example.com:8080",
+  "redirect_uri": "https://example.com/callback"
 }
 ```
 
+**参数说明:**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| proxy_url | string | 否 | 账号使用的代理 URL |
+| redirect_uri | string | 否 | 回调地址，默认为系统内置地址 |
+
+**响应:**
+```json
+{
+  "auth_url": "https://auth.openai.com/authorize?response_type=code&client_id=...&state=...",
+  "session_id": "a1b2c3d4e5f6..."
+}
+```
+
+> 将 `auth_url` 在浏览器中打开，完成授权后获取回调 URL 中的 `code` 和 `state` 参数。`session_id` 有效期 30 分钟。
+
 #### POST /api/admin/oauth/exchange-code
 
-交换授权码获取 Token。
+用授权码兑换 Token，自动创建新账号并加入号池。
 
 **请求:**
 ```json
 {
-  "provider": "google",
+  "session_id": "a1b2c3d4e5f6...",
   "code": "auth_code_from_callback",
-  "redirect_uri": "http://localhost:8080/admin/oauth/callback"
+  "state": "state_from_callback",
+  "name": "my-oauth-account",
+  "proxy_url": "http://proxy.example.com:8080"
+}
+```
+
+**参数说明:**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| session_id | string | 是 | `generate-auth-url` 返回的 session_id |
+| code | string | 是 | 授权回调 URL 中的 `code` 参数 |
+| state | string | 是 | 授权回调 URL 中的 `state` 参数 |
+| name | string | 否 | 账号名称，默认使用邮箱或 `oauth-account` |
+| proxy_url | string | 否 | 代理 URL，覆盖生成 URL 时的设置 |
+
+**响应:**
+```json
+{
+  "message": "OAuth 账号 user@example.com 添加成功",
+  "id": 42,
+  "email": "user@example.com",
+  "plan_type": "pro"
 }
 ```
 

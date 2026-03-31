@@ -283,8 +283,14 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		accountMap[acc.DBID] = acc
 	}
 
-	// 获取每账号的请求统计
-	reqCounts, _ := h.db.GetAccountRequestCounts(ctx)
+	// 获取每账号的请求统计（单独超时，避免被前面的查询挤占时间）
+	reqCountCtx, reqCountCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer reqCountCancel()
+	reqCounts, err := h.db.GetAccountRequestCounts(reqCountCtx)
+	if err != nil {
+		log.Printf("获取账号请求统计失败: %v", err)
+		reqCounts = make(map[int64]*database.AccountRequestCount)
+	}
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
@@ -612,12 +618,14 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 // importToken 导入时的统一 token 载体
 type importToken struct {
 	refreshToken string
+	accessToken  string // AT-only 兼容路径
 	name         string
 }
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
 	RefreshToken string `json:"refresh_token"`
+	AccessToken  string `json:"access_token"`
 	Email        string `json:"email"`
 }
 
@@ -726,18 +734,20 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 
 		for _, entry := range entries {
 			rt := strings.TrimSpace(entry.RefreshToken)
-			if rt == "" {
-				continue
+			at := strings.TrimSpace(entry.AccessToken)
+			email := strings.TrimSpace(entry.Email)
+
+			if rt != "" {
+				allTokens = append(allTokens, importToken{refreshToken: rt, name: email})
+			} else if at != "" {
+				// 没有 RT 则走 AT 兼容路径
+				allTokens = append(allTokens, importToken{accessToken: at, name: email})
 			}
-			allTokens = append(allTokens, importToken{
-				refreshToken: rt,
-				name:         strings.TrimSpace(entry.Email),
-			})
 		}
 	}
 
 	if len(allTokens) == 0 {
-		writeError(c, http.StatusBadRequest, "JSON 文件中未找到有效的 refresh_token")
+		writeError(c, http.StatusBadRequest, "JSON 文件中未找到有效的 refresh_token 或 access_token")
 		return
 	}
 
@@ -768,34 +778,62 @@ func setupSSE(c *gin.Context) {
 	c.Writer.Flush()
 }
 
-// importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑
+// importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
 func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
-	// 文件内去重
-	seen := make(map[string]bool)
+	// 文件内去重（RT 和 AT 分别去重）
+	seenRT := make(map[string]bool)
+	seenAT := make(map[string]bool)
 	var unique []importToken
 	for _, t := range tokens {
-		if !seen[t.refreshToken] {
-			seen[t.refreshToken] = true
-			unique = append(unique, t)
+		if t.accessToken != "" {
+			if !seenAT[t.accessToken] {
+				seenAT[t.accessToken] = true
+				unique = append(unique, t)
+			}
+		} else {
+			if !seenRT[t.refreshToken] {
+				seenRT[t.refreshToken] = true
+				unique = append(unique, t)
+			}
 		}
 	}
 
 	// 数据库去重（独立短超时）
 	dedupeCtx, dedupeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dedupeCancel()
+
 	existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
 	if err != nil {
 		log.Printf("查询已有 RT 失败: %v", err)
 		existingRTs = make(map[string]bool)
 	}
 
+	// 存在 AT-only token 时额外查询已有 AT
+	hasAT := len(seenAT) > 0
+	var existingATs map[string]bool
+	if hasAT {
+		existingATs, err = h.db.GetAllAccessTokens(dedupeCtx)
+		if err != nil {
+			log.Printf("查询已有 AT 失败: %v", err)
+			existingATs = make(map[string]bool)
+		}
+	}
+
 	var newTokens []importToken
 	duplicateCount := 0
 	for _, t := range unique {
-		if existingRTs[t.refreshToken] {
-			duplicateCount++
+		if t.accessToken != "" {
+			if existingATs[t.accessToken] {
+				duplicateCount++
+			} else {
+				newTokens = append(newTokens, t)
+			}
 		} else {
-			newTokens = append(newTokens, t)
+			if existingRTs[t.refreshToken] {
+				duplicateCount++
+			} else {
+				newTokens = append(newTokens, t)
+			}
 		}
 	}
 
@@ -803,7 +841,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 	if len(newTokens) == 0 {
 		c.JSON(http.StatusOK, gin.H{
-			"message":   fmt.Sprintf("所有 %d 个 RT 已存在，无需导入", total),
+			"message":   fmt.Sprintf("所有 %d 个 Token 已存在，无需导入", total),
 			"success":   0,
 			"duplicate": duplicateCount,
 			"failed":    0,
@@ -850,42 +888,91 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			defer func() { <-sem }()
 
 			name := tok.name
-			if name == "" {
-				name = fmt.Sprintf("import-%d", idx+1)
-			}
 
-			insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			id, err := h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
-			insertCancel()
-
-			if err != nil {
-				log.Printf("导入账号 %d/%d 失败: %v", idx+1, len(newTokens), err)
-				atomic.AddInt64(&failCount, 1)
-				atomic.AddInt64(&current, 1)
-				return
-			}
-
-			atomic.AddInt64(&successCount, 1)
-			atomic.AddInt64(&current, 1)
-			h.db.InsertAccountEventAsync(id, "added", "import")
-
-			newAcc := &auth.Account{
-				DBID:         id,
-				RefreshToken: tok.refreshToken,
-				ProxyURL:     proxyURL,
-			}
-			h.store.AddAccount(newAcc)
-
-			// 后台异步刷新，不阻塞导入流程
-			go func(accountID int64) {
-				refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-					log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
-				} else {
-					log.Printf("导入账号 %d 刷新成功", accountID)
+			if tok.accessToken != "" {
+				// AT-only 导入路径
+				if name == "" {
+					name = fmt.Sprintf("at-import-%d", idx+1)
 				}
-			}(id)
+
+				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				id, err := h.db.InsertATAccount(insertCtx, name, tok.accessToken, proxyURL)
+				insertCancel()
+
+				if err != nil {
+					log.Printf("导入 AT 账号 %d/%d 失败: %v", idx+1, len(newTokens), err)
+					atomic.AddInt64(&failCount, 1)
+					atomic.AddInt64(&current, 1)
+					return
+				}
+
+				atomic.AddInt64(&successCount, 1)
+				atomic.AddInt64(&current, 1)
+				h.db.InsertAccountEventAsync(id, "added", "import_at")
+
+				atInfo := auth.ParseAccessToken(tok.accessToken)
+				newAcc := &auth.Account{
+					DBID:        id,
+					AccessToken: tok.accessToken,
+					ExpiresAt:   time.Now().Add(1 * time.Hour),
+					ProxyURL:    proxyURL,
+				}
+				if atInfo != nil {
+					newAcc.Email = atInfo.Email
+					newAcc.AccountID = atInfo.ChatGPTAccountID
+					newAcc.PlanType = atInfo.PlanType
+					if !atInfo.ExpiresAt.IsZero() {
+						newAcc.ExpiresAt = atInfo.ExpiresAt
+					}
+					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_ = h.db.UpdateCredentials(credCtx, id, map[string]interface{}{
+						"email":      atInfo.Email,
+						"account_id": atInfo.ChatGPTAccountID,
+						"plan_type":  atInfo.PlanType,
+						"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
+					})
+					credCancel()
+				}
+				h.store.AddAccount(newAcc)
+			} else {
+				// RT 导入路径
+				if name == "" {
+					name = fmt.Sprintf("import-%d", idx+1)
+				}
+
+				insertCtx, insertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				id, err := h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
+				insertCancel()
+
+				if err != nil {
+					log.Printf("导入账号 %d/%d 失败: %v", idx+1, len(newTokens), err)
+					atomic.AddInt64(&failCount, 1)
+					atomic.AddInt64(&current, 1)
+					return
+				}
+
+				atomic.AddInt64(&successCount, 1)
+				atomic.AddInt64(&current, 1)
+				h.db.InsertAccountEventAsync(id, "added", "import")
+
+				newAcc := &auth.Account{
+					DBID:         id,
+					RefreshToken: tok.refreshToken,
+					ProxyURL:     proxyURL,
+				}
+				h.store.AddAccount(newAcc)
+
+				// 后台异步刷新，不阻塞导入流程
+				go func(accountID int64) {
+					refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
+						log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+					} else {
+						log.Printf("导入账号 %d 刷新成功", accountID)
+					}
+				}(id)
+			}
 		}(i, t)
 	}
 

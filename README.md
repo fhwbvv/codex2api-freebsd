@@ -15,6 +15,7 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 - [完整文档](#完整文档)
 - [环境配置](#环境配置)
 - [对外接口](#对外接口)
+  - [Token 上传与账号管理](#token-上传与账号管理)
 - [管理后台](#管理后台)
 - [核心能力](#核心能力)
 - [目录结构](#目录结构)
@@ -206,6 +207,68 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | `POST /v1/responses` | Responses 风格入口 |
 | `GET /v1/models` | 返回可用模型列表 |
 | `GET /health` | 健康检查 |
+
+> 完整请求/响应格式、错误码参见 [API 文档](docs/API.md)。
+
+### Token 上传与账号管理
+
+以下接口需要 `X-Admin-Key` 认证头。
+
+#### 添加 Refresh Token 账号
+
+```bash
+# 单个添加
+curl -X POST http://localhost:8080/api/admin/accounts \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-account", "refresh_token": "rt_xxxxxxxxxxxx"}'
+
+# 批量添加（换行分隔，单次最多 100 个）
+curl -X POST http://localhost:8080/api/admin/accounts \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "batch", "refresh_token": "rt_xxx1\nrt_xxx2\nrt_xxx3"}'
+```
+
+#### 添加 Access Token 账号（AT-only）
+
+```bash
+# 单个添加
+curl -X POST http://localhost:8080/api/admin/accounts/at \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-at", "access_token": "eyJhbGciOiJSUzI1NiIs..."}'
+
+# 批量添加（换行分隔）
+curl -X POST http://localhost:8080/api/admin/accounts/at \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"access_token": "eyJtoken1...\neyJtoken2...\neyJtoken3..."}'
+```
+
+#### 文件批量导入
+
+```bash
+# 导入 Refresh Token（TXT，每行一个）
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@tokens.txt" \
+  -F "format=txt"
+
+# 导入 Refresh Token（JSON 格式）
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@credentials.json" \
+  -F "format=json"
+
+# 导入 Access Token（AT-TXT，每行一个）
+curl -X POST http://localhost:8080/api/admin/accounts/import \
+  -H "X-Admin-Key: your-admin-secret" \
+  -F "file=@access_tokens.txt" \
+  -F "format=at_txt"
+```
+
+> 所有导入接口自动去重，已存在的 Token 不会重复写入。更多管理接口（导出、迁移、OAuth 授权等）参见 [API 文档](docs/API.md)。
 
 ---
 

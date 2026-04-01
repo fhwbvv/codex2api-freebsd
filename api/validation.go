@@ -394,7 +394,7 @@ func ChatCompletionValidationRules() map[string][]ValidationRule {
 		"user":         {TypeString(), MaxLength(256)},
 		"reasoning_effort":  {TypeString(), MaxLength(64)},
 		"service_tier":      {TypeString(), MaxLength(64)},
-		"tools":             {TypeArray(), MaxItems(128)},
+		"tools":             {TypeArray()},
 		// tool_choice removed from strict validation to maintain backward compatibility
 	}
 }
@@ -415,7 +415,7 @@ func ResponsesAPIValidationRules() map[string][]ValidationRule {
 		"service_tier":      {TypeString(), MaxLength(64)},
 		"store":             {TypeBoolean()},
 		"truncation":        {TypeString(), Enum("auto", "disabled")},
-		"tools":             {TypeArray(), MaxItems(128)},
+		"tools":             {TypeArray()},
 		"tool_choice":       {TypeString(), MaxLength(64)},
 	}
 }

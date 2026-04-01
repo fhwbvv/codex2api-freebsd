@@ -315,6 +315,7 @@
     "ready": "Ready",
     "cooldown": "Cooling Down",
     "rate_limited": "Rate Limited",
+    "usage_exhausted": "Usage Exhausted",
     "unauthorized": "Banned",
     "error": "Error",
     "paused": "Paused",

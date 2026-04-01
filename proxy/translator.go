@@ -151,6 +151,9 @@ type openAIErrorResponse struct {
 
 const requestCacheSize = 256
 
+// maxTools 上游 Codex API 允许的最大工具数量
+const maxTools = 128
+
 type requestCacheEntry struct {
 	key [32]byte
 	req openAIRequest
@@ -311,8 +314,12 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		}
 	}
 
-	// 5. 工具描述补充 + schema 清理
+	// 5. 工具描述补充 + schema 清理 + 上游数量限制
 	if tools, ok := body["tools"].([]any); ok {
+		if len(tools) > maxTools {
+			tools = tools[:maxTools]
+			body["tools"] = tools
+		}
 		toolDescDefaults := map[string]string{
 			"tool_search": "Search through available tools to find the most relevant one for the task.",
 		}
@@ -527,8 +534,14 @@ func firstNonSpace(raw json.RawMessage) byte {
 // convertToolsToCodexFormat 将 OpenAI 工具格式转为 Codex 格式（纯内存操作）
 // OpenAI: {type:"function", function:{name, description, parameters}}
 // Codex:  {type:"function", name, description, parameters}
+// 上游限制最多 128 个工具，超出部分静默截断
 func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
-	tools := make([]any, 0, len(rawTools))
+	cap := len(rawTools)
+	if cap > maxTools {
+		cap = maxTools
+		rawTools = rawTools[:maxTools]
+	}
+	tools := make([]any, 0, cap)
 	for _, raw := range rawTools {
 		var parsed openAIToolParsed
 		if json.Unmarshal(raw, &parsed) != nil {

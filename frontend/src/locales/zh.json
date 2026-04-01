@@ -315,6 +315,7 @@
     "ready": "就绪",
     "cooldown": "冷却中",
     "rate_limited": "限流",
+    "usage_exhausted": "用量耗尽",
     "unauthorized": "封禁",
     "error": "错误",
     "paused": "已暂停",

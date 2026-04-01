@@ -349,6 +349,10 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
 		available = false
 	}
+	// Free 账号 7d 用量耗尽，不参与调度
+	if a.usageExhaustedLocked() {
+		available = false
+	}
 
 	return tier, score, limit, available
 }

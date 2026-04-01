@@ -379,6 +379,10 @@ func (a *Account) IsAvailable() bool {
 	if a.healthTierLocked() == HealthTierBanned {
 		return false
 	}
+	// Free 账号 7d 用量 >= 100%，视为不可用
+	if a.usageExhaustedLocked() {
+		return false
+	}
 	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
 		return false
 	}
@@ -387,6 +391,11 @@ func (a *Account) IsAvailable() bool {
 		return a.AccessToken != ""
 	}
 	return a.AccessToken != ""
+}
+
+// usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
+func (a *Account) usageExhaustedLocked() bool {
+	return a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") && a.UsagePercent7d >= 100
 }
 
 // NeedsRefresh 检查 AT 是否需要刷新（过期前 5 分钟刷新）
@@ -456,6 +465,10 @@ func (a *Account) RuntimeStatus() string {
 	defer a.mu.RUnlock()
 	if a.healthTierLocked() == HealthTierBanned {
 		return "unauthorized"
+	}
+	// Free 账号 7d 用量耗尽，优先于冷却状态展示
+	if a.usageExhaustedLocked() {
+		return "usage_exhausted"
 	}
 	switch a.Status {
 	case StatusError:
@@ -1892,27 +1905,35 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 			if err := probeFn(probeCtx, account); err != nil {
 				log.Printf("[账号 %d] 恢复探测失败: %v", account.DBID, err)
 			} else {
-				// 探测成功：将账号从 banned 升级到 warm，给予重新调度的机会
-				atomic.StoreInt32(&account.Disabled, 0) // 清除原子禁用标志
-				account.mu.Lock()
-				if account.HealthTier == HealthTierBanned {
-					account.HealthTier = HealthTierWarm
-					account.SchedulerScore = 80
-					account.FailureStreak = 0
-					account.SuccessStreak = 1
-					account.LastSuccessAt = time.Now()
-					if account.Status == StatusCooldown {
-						account.Status = StatusReady
-						account.CooldownUtil = time.Time{}
-						account.CooldownReason = ""
+				// 用量已耗尽的账号不重置状态
+				account.mu.RLock()
+				exhausted := account.usageExhaustedLocked()
+				account.mu.RUnlock()
+				if exhausted {
+					log.Printf("[账号 %d] 恢复探测成功但用量已耗尽，保持当前状态", account.DBID)
+				} else {
+					// 探测成功：将账号从 banned 升级到 warm，给予重新调度的机会
+					atomic.StoreInt32(&account.Disabled, 0) // 清除原子禁用标志
+					account.mu.Lock()
+					if account.HealthTier == HealthTierBanned {
+						account.HealthTier = HealthTierWarm
+						account.SchedulerScore = 80
+						account.FailureStreak = 0
+						account.SuccessStreak = 1
+						account.LastSuccessAt = time.Now()
+						if account.Status == StatusCooldown {
+							account.Status = StatusReady
+							account.CooldownUtil = time.Time{}
+							account.CooldownReason = ""
+						}
+						account.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+						log.Printf("[账号 %d] 恢复探测成功！已从 banned 升级到 warm", account.DBID)
 					}
-					account.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-					log.Printf("[账号 %d] 恢复探测成功！已从 banned 升级到 warm", account.DBID)
-				}
-				account.mu.Unlock()
-				// 清理数据库冷却状态
-				if s.db != nil {
-					_ = s.db.ClearCooldown(context.Background(), account.DBID)
+					account.mu.Unlock()
+					// 清理数据库冷却状态
+					if s.db != nil {
+						_ = s.db.ClearCooldown(context.Background(), account.DBID)
+					}
 				}
 			}
 		}(acc)

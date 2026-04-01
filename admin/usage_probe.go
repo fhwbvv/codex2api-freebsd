@@ -31,7 +31,8 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 	}
 	defer resp.Body.Close()
 
-	if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, account); ok {
+	usagePct, hasUsage := proxy.ParseCodexUsageHeaders(resp, account)
+	if hasUsage {
 		h.store.PersistUsageSnapshot(account, usagePct)
 	}
 
@@ -40,7 +41,10 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 	switch resp.StatusCode {
 	case http.StatusOK:
 		h.store.ReportRequestSuccess(account, 0)
-		h.store.ClearCooldown(account)
+		// 只有用量未耗尽时才重置状态
+		if !hasUsage || usagePct < 100 {
+			h.store.ClearCooldown(account)
+		}
 		return nil
 	case http.StatusUnauthorized:
 		h.store.ReportRequestFailure(account, "client", 0)

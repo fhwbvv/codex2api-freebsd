@@ -1,5 +1,5 @@
 import type { ChangeEvent } from 'react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
 import { api, getAdminKey } from '../api'
 import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
@@ -838,6 +838,9 @@ export default function Accounts() {
                         <TableCell>
                           <div className="space-y-1">
                             <StatusBadge status={account.status} />
+                            {account.cooldown_until && (account.status === 'rate_limited' || account.status === 'error') && (
+                              <CooldownTimer until={account.cooldown_until} />
+                            )}
                             <div className="text-[11px] text-muted-foreground">
                               {t('accounts.healthSummary', {
                                 health: formatHealthTier(account.health_tier, t),
@@ -1750,4 +1753,38 @@ function UsageCell({ account }: { account: AccountRow }) {
     )
   }
   return <span className="text-[13px] text-muted-foreground">-</span>
+}
+
+// 冷却倒计时组件
+function CooldownTimer({ until }: { until: string }) {
+  const [remaining, setRemaining] = useState('')
+
+  useEffect(() => {
+    const target = new Date(until).getTime()
+
+    const update = () => {
+      const diff = Math.max(0, target - Date.now())
+      if (diff <= 0) {
+        setRemaining('')
+        return
+      }
+      const h = Math.floor(diff / 3600000)
+      const m = Math.floor((diff % 3600000) / 60000)
+      const s = Math.floor((diff % 60000) / 1000)
+      if (h > 0) {
+        setRemaining(`${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`)
+      } else if (m > 0) {
+        setRemaining(`${m}m ${String(s).padStart(2, '0')}s`)
+      } else {
+        setRemaining(`${s}s`)
+      }
+    }
+
+    update()
+    const id = setInterval(update, 1000)
+    return () => clearInterval(id)
+  }, [until])
+
+  if (!remaining) return null
+  return <span className="text-[11px] font-mono text-amber-600">⏳ {remaining}</span>
 }

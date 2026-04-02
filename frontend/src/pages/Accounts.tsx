@@ -1735,7 +1735,7 @@ function UsageCell({ account }: { account: AccountRow }) {
     )
   }
 
-  if (plan === 'pro' || plan === 'team') {
+  if (plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus') {
     if (!has5h && !has7d) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
       <div className="w-48 space-y-1.5">

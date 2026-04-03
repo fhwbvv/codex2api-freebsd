@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { UsageLog, UsageStats } from '../types'
+import type { APIKeyRow, UsageLog, UsageStats } from '../types'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -53,6 +53,28 @@ function getStatusBadgeClassName(statusCode: number): string {
 
 const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
 
+function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
+  return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
+}
+
+function formatUsageAPIKeyLabel(name?: string, maskedKey?: string): string {
+  const trimmedName = name?.trim() ?? ''
+  if (trimmedName) {
+    return trimmedName
+  }
+
+  const trimmedKey = maskedKey?.trim() ?? ''
+  if (!trimmedKey) {
+    return ''
+  }
+
+  if (trimmedKey.length <= 8) {
+    return trimmedKey
+  }
+
+  return `${trimmedKey.slice(0, 4)}...${trimmedKey.slice(-4)}`
+}
+
 export default function Usage() {
   const { t } = useTranslation()
   const { toast, showToast } = useToast()
@@ -67,8 +89,11 @@ export default function Usage() {
   const [searchEmail, setSearchEmail] = useState('')
   const [filterModel, setFilterModel] = useState('')
   const [filterEndpoint, setFilterEndpoint] = useState('')
+  const [filterApiKeyId, setFilterApiKeyId] = useState('')
   const [filterFast, setFilterFast] = useState('')
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
+  const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
+  const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = false
   const PAGE_SIZE = 20
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
@@ -96,6 +121,17 @@ export default function Usage() {
     load: loadStats,
   })
 
+  const loadAPIKeys = useCallback(async () => {
+    try {
+      const response = await api.getAPIKeys()
+      setAPIKeys(response.keys ?? [])
+      setAPIKeyLoadFailed(false)
+    } catch {
+      setAPIKeys([])
+      setAPIKeyLoadFailed(true)
+    }
+  }, [])
+
   // 服务端分页加载日志（每页仅传输 20 行）
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
@@ -106,6 +142,7 @@ export default function Usage() {
         email: searchEmail || undefined,
         model: filterModel || undefined,
         endpoint: filterEndpoint || undefined,
+        apiKeyId: filterApiKeyId || undefined,
         fast: filterFast || undefined,
         stream: filterStream || undefined,
       })
@@ -116,12 +153,16 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, page, searchEmail, filterModel, filterEndpoint, filterFast, filterStream])
+  }, [timeRange, page, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
     void loadLogs()
   }, [loadLogs])
+
+  useEffect(() => {
+    void loadAPIKeys()
+  }, [loadAPIKeys])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -142,13 +183,19 @@ export default function Usage() {
   const errorRate = stats?.error_rate ?? 0
   const avgDurationMs = stats?.avg_duration_ms ?? 0
   const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
+  const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
+  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
+  const apiKeyOptions = [
+    { label: t('usage.allApiKeys'), value: '' },
+    ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
+  ]
 
   return (
     <StateShell
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => { void reload(); void loadLogs() }}
+      onRetry={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
       loadingTitle={t('usage.loadingTitle')}
       loadingDescription={t('usage.loadingDesc')}
       errorTitle={t('usage.errorTitle')}
@@ -157,7 +204,7 @@ export default function Usage() {
         <PageHeader
           title={t('usage.title')}
           description={t('usage.description')}
-          onRefresh={() => { void reload(); void loadLogs() }}
+          onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
         />
 
         {/* Top stats: 2 columns */}
@@ -344,12 +391,23 @@ export default function Usage() {
                 ]}
               />
 
+              {showAPIKeyFilter && (
+                <Select
+                  className="w-60"
+                  compact
+                  value={filterApiKeyId}
+                  onValueChange={(v) => { setFilterApiKeyId(v); setPage(1) }}
+                  placeholder={t('usage.allApiKeys')}
+                  options={apiKeyOptions}
+                />
+              )}
+
               {/* 类型下拉 */}
               <Select
                 className="w-32"
                 compact
                 value={filterStream}
-                onValueChange={(v) => { setFilterStream(v); setPage(1) }}
+                onValueChange={(v) => { setFilterStream(v as '' | 'true' | 'false'); setPage(1) }}
                 placeholder={t('usage.allTypes')}
                 options={[
                   { label: t('usage.allTypes'), value: '' },
@@ -374,12 +432,13 @@ export default function Usage() {
               )}
 
               {/* 清除筛选 */}
-              {(searchInput || filterModel || filterEndpoint || filterStream || filterFast) && (
+              {hasActiveFilters && (
                 <button
                   type="button"
                   onClick={() => {
                     setSearchInput(''); setSearchEmail('')
                     setFilterModel(''); setFilterEndpoint('')
+                    setFilterApiKeyId('')
                     setFilterStream(''); setFilterFast('')
                     setPage(1)
                   }}
@@ -395,7 +454,7 @@ export default function Usage() {
               variant="section"
               isEmpty={logs.length === 0}
               emptyTitle={t('usage.emptyTitle')}
-              emptyDescription={t('usage.emptyDesc')}
+              emptyDescription={hasActiveFilters ? t('usage.emptyFilteredDesc') : t('usage.emptyDesc')}
             >
               <div className="overflow-auto border border-border rounded-xl">
                 <Table>
@@ -404,6 +463,7 @@ export default function Usage() {
                       <TableHead className="text-[14px] font-semibold">{t('usage.tableStatus')}</TableHead>
                       <TableHead className="text-[14px] font-semibold">{t('usage.tableModel')}</TableHead>
                       <TableHead className="text-[14px] font-semibold">{t('usage.tableAccount')}</TableHead>
+                      <TableHead className="text-[14px] font-semibold">{t('usage.tableApiKey')}</TableHead>
                       <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableEndpoint')}</TableHead>
                       <TableHead className="text-[14px] font-semibold">{t('usage.tableType')}</TableHead>
                       <TableHead className="text-[14px] font-semibold">{t('usage.tableToken')}</TableHead>
@@ -457,6 +517,11 @@ export default function Usage() {
                         </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
                           {log.account_email || '-'}
+                        </TableCell>
+                        <TableCell className="text-[14px] text-muted-foreground">
+                          <span className="block max-w-[180px] truncate whitespace-nowrap" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>
+                            {formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}
+                          </span>
                         </TableCell>
                         <TableCell>
                           <div className="text-[16px] leading-relaxed" style={{ fontFamily: "'Geist Mono', monospace" }}>

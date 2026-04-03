@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -632,6 +633,106 @@ type jsonAccountEntry struct {
 	Email        string `json:"email"`
 }
 
+type sub2apiImportPayload struct {
+	Accounts []sub2apiAccountEntry `json:"accounts"`
+}
+
+type sub2apiAccountEntry struct {
+	Name        string                    `json:"name"`
+	Credentials sub2apiAccountCredentials `json:"credentials"`
+}
+
+type sub2apiAccountCredentials struct {
+	RefreshToken string `json:"refresh_token"`
+	AccessToken  string `json:"access_token"`
+	Email        string `json:"email"`
+}
+
+var utf8BOM = []byte{0xef, 0xbb, 0xbf}
+
+func trimUTF8BOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, utf8BOM)
+}
+
+// parseImportJSONTokens 同时兼容现有扁平 JSON 和 Sub2Api 顶层对象。
+func parseImportJSONTokens(data []byte) ([]importToken, error) {
+	data = trimUTF8BOM(data)
+	if !json.Valid(data) {
+		return nil, fmt.Errorf("invalid import json")
+	}
+
+	if tokens := parseFlatJSONImportTokens(data); len(tokens) > 0 {
+		return tokens, nil
+	}
+
+	if tokens := parseSub2APIJSONImportTokens(data); len(tokens) > 0 {
+		return tokens, nil
+	}
+
+	return nil, nil
+}
+
+func parseFlatJSONImportTokens(data []byte) []importToken {
+	var entries []jsonAccountEntry
+	if err := json.Unmarshal(data, &entries); err == nil {
+		return jsonAccountEntriesToTokens(entries)
+	}
+
+	var single jsonAccountEntry
+	if err := json.Unmarshal(data, &single); err == nil {
+		return jsonAccountEntriesToTokens([]jsonAccountEntry{single})
+	}
+
+	return nil
+}
+
+func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
+	tokens := make([]importToken, 0, len(entries))
+	for _, entry := range entries {
+		rt := strings.TrimSpace(entry.RefreshToken)
+		at := strings.TrimSpace(entry.AccessToken)
+		email := strings.TrimSpace(entry.Email)
+
+		if rt != "" {
+			tokens = append(tokens, importToken{refreshToken: rt, name: email})
+			continue
+		}
+		if at != "" {
+			tokens = append(tokens, importToken{accessToken: at, name: email})
+		}
+	}
+	return tokens
+}
+
+func parseSub2APIJSONImportTokens(data []byte) []importToken {
+	var payload sub2apiImportPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil
+	}
+
+	tokens := make([]importToken, 0, len(payload.Accounts))
+	for _, account := range payload.Accounts {
+		rt := strings.TrimSpace(account.Credentials.RefreshToken)
+		at := strings.TrimSpace(account.Credentials.AccessToken)
+		name := strings.TrimSpace(account.Name)
+		email := strings.TrimSpace(account.Credentials.Email)
+
+		if name == "" {
+			name = email
+		}
+
+		if rt != "" {
+			tokens = append(tokens, importToken{refreshToken: rt, name: name})
+			continue
+		}
+		if at != "" {
+			tokens = append(tokens, importToken{accessToken: at, name: name})
+		}
+	}
+
+	return tokens
+}
+
 // ImportAccounts 批量导入账号（支持 TXT / JSON）
 func (h *Handler) ImportAccounts(c *gin.Context) {
 	format := c.DefaultPostForm("format", "txt")
@@ -721,32 +822,13 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 			return
 		}
 
-		// 去除 UTF-8 BOM
-		data = []byte(strings.TrimPrefix(string(data), "\xef\xbb\xbf"))
-
-		// 尝试解析为数组，失败则尝试单对象
-		var entries []jsonAccountEntry
-		if err := json.Unmarshal(data, &entries); err != nil {
-			var single jsonAccountEntry
-			if err := json.Unmarshal(data, &single); err != nil {
-				writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
-				return
-			}
-			entries = []jsonAccountEntry{single}
+		tokens, err := parseImportJSONTokens(data)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
+			return
 		}
 
-		for _, entry := range entries {
-			rt := strings.TrimSpace(entry.RefreshToken)
-			at := strings.TrimSpace(entry.AccessToken)
-			email := strings.TrimSpace(entry.Email)
-
-			if rt != "" {
-				allTokens = append(allTokens, importToken{refreshToken: rt, name: email})
-			} else if at != "" {
-				// 没有 RT 则走 AT 兼容路径
-				allTokens = append(allTokens, importToken{accessToken: at, name: email})
-			}
-		}
+		allTokens = append(allTokens, tokens...)
 	}
 
 	if len(allTokens) == 0 {
@@ -759,7 +841,7 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 
 // importEvent SSE 导入进度事件
 type importEvent struct {
-	Type      string `json:"type"`                // progress | complete
+	Type      string `json:"type"` // progress | complete
 	Current   int    `json:"current"`
 	Total     int    `json:"total"`
 	Success   int    `json:"success"`
@@ -1388,6 +1470,15 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 					pageSize = n
 				}
 			}
+			var apiKeyID *int64
+			if apiKeyIDStr := c.Query("api_key_id"); apiKeyIDStr != "" {
+				parsed, err := strconv.ParseInt(apiKeyIDStr, 10, 64)
+				if err != nil || parsed <= 0 {
+					writeError(c, http.StatusBadRequest, "api_key_id 参数无效，需要正整数")
+					return
+				}
+				apiKeyID = &parsed
+			}
 
 			filter := database.UsageLogFilter{
 				Start:    startTime,
@@ -1397,6 +1488,7 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 				Email:    c.Query("email"),
 				Model:    c.Query("model"),
 				Endpoint: c.Query("endpoint"),
+				APIKeyID: apiKeyID,
 			}
 			if fastStr := c.Query("fast"); fastStr != "" {
 				v := fastStr == "true"
@@ -2325,4 +2417,3 @@ func (h *Handler) TestProxy(c *gin.Context) {
 		"location":   location,
 	})
 }
-

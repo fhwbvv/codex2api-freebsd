@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -130,5 +133,67 @@ func TestSendFinalUpstreamError_Non429StatusPassthrough(t *testing.T) {
 	// 非 429 直接透传原状态码
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestAuthMiddlewareSetsAPIKeyContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	key := "sk-test-auth-1234567890"
+	id, err := db.InsertAPIKey(context.Background(), "Team A", key)
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+
+	handler := NewHandler(nil, db, nil, nil)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/ok", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"id":     c.MustGet(contextAPIKeyID),
+			"name":   c.MustGet(contextAPIKeyName),
+			"masked": c.MustGet(contextAPIKeyMasked),
+			"raw":    c.MustGet("apiKey"),
+		})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var payload struct {
+		ID     int64  `json:"id"`
+		Name   string `json:"name"`
+		Masked string `json:"masked"`
+		Raw    string `json:"raw"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json.Unmarshal 返回错误: %v", err)
+	}
+
+	if payload.ID != id {
+		t.Fatalf("id = %d, want %d", payload.ID, id)
+	}
+	if payload.Name != "Team A" {
+		t.Fatalf("name = %q, want %q", payload.Name, "Team A")
+	}
+	if payload.Masked == "" || payload.Masked == key {
+		t.Fatalf("masked = %q, want masked value", payload.Masked)
+	}
+	if payload.Raw != key {
+		t.Fatalf("raw = %q, want %q", payload.Raw, key)
 	}
 }

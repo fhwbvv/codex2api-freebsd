@@ -27,12 +27,12 @@ type Handler struct {
 	store      *auth.Store
 	configKeys map[string]bool // 配置文件中的静态 key
 	db         *database.DB
-	cfg        *config.Config  // 全局配置
+	cfg        *config.Config       // 全局配置
 	deviceCfg  *DeviceProfileConfig // 设备指纹配置
 
 	// 动态 key 缓存
 	dbKeysMu    sync.RWMutex
-	dbKeys      map[string]bool
+	dbKeys      map[string]*database.APIKeyRow
 	dbKeysUntil time.Time
 }
 
@@ -42,6 +42,12 @@ type usageLimitDetails struct {
 	resetsAt        int64
 	resetsInSeconds int64
 }
+
+const (
+	contextAPIKeyID     = "apiKeyID"
+	contextAPIKeyName   = "apiKeyName"
+	contextAPIKeyMasked = "apiKeyMasked"
+)
 
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
@@ -60,7 +66,7 @@ func NewHandlerWithDeviceProfile(store *auth.Store, db *database.DB, deviceCfg *
 }
 
 // refreshDBKeys 从数据库刷新密钥缓存（5 分钟）
-func (h *Handler) refreshDBKeys() map[string]bool {
+func (h *Handler) refreshDBKeys() map[string]*database.APIKeyRow {
 	h.dbKeysMu.RLock()
 	if time.Now().Before(h.dbKeysUntil) {
 		keys := h.dbKeys
@@ -79,28 +85,41 @@ func (h *Handler) refreshDBKeys() map[string]bool {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	vals, err := h.db.GetAllAPIKeyValues(ctx)
+	rows, err := h.db.ListAPIKeys(ctx)
 	if err != nil {
 		log.Printf("刷新 API Keys 缓存失败: %v", err)
 		return h.dbKeys
 	}
 
-	newMap := make(map[string]bool, len(vals))
-	for _, v := range vals {
-		newMap[v] = true
+	newMap := make(map[string]*database.APIKeyRow, len(rows))
+	for _, row := range rows {
+		if row == nil || row.Key == "" {
+			continue
+		}
+		newMap[row.Key] = row
 	}
 	h.dbKeys = newMap
 	h.dbKeysUntil = time.Now().Add(5 * time.Minute)
 	return newMap
 }
 
-// isValidKey 检查 key 是否有效（配置文件 + DB）
-func (h *Handler) isValidKey(key string) bool {
+func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
 	if h.configKeys[key] {
-		return true
+		return &database.APIKeyRow{
+			ID:   0,
+			Name: "config",
+			Key:  key,
+		}, true
 	}
 	dbKeys := h.refreshDBKeys()
-	return dbKeys[key]
+	row, ok := dbKeys[key]
+	return row, ok
+}
+
+// isValidKey 检查 key 是否有效（配置文件 + DB）
+func (h *Handler) isValidKey(key string) bool {
+	_, ok := h.resolveAPIKey(key)
+	return ok
 }
 
 // hasAnyKeys 检查是否配置了任何密钥
@@ -118,6 +137,35 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 		return
 	}
 	_ = h.db.InsertUsageLog(context.Background(), input)
+}
+
+func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput) {
+	if c == nil || input == nil {
+		return
+	}
+	if v, exists := c.Get(contextAPIKeyID); exists && v != nil {
+		switch typed := v.(type) {
+		case int64:
+			input.APIKeyID = typed
+		case int:
+			input.APIKeyID = int64(typed)
+		}
+	}
+	if v, exists := c.Get(contextAPIKeyName); exists && v != nil {
+		if name, ok := v.(string); ok {
+			input.APIKeyName = name
+		}
+	}
+	if v, exists := c.Get(contextAPIKeyMasked); exists && v != nil {
+		if masked, ok := v.(string); ok {
+			input.APIKeyMasked = masked
+		}
+	}
+}
+
+func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
+	populateAPIKeyMetaFromContext(c, input)
+	h.logUsage(input)
 }
 
 // extractReasoningEffort 从请求体提取推理强度
@@ -260,8 +308,9 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		// 清理输入
 		authHeader = security.SanitizeInput(authHeader)
 
-		key := strings.TrimPrefix(authHeader, "Bearer ")
-		if !h.isValidKey(key) {
+		key := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		apiKeyRow, ok := h.resolveAPIKey(key)
+		if !ok {
 			// 记录安全审计日志（脱敏）
 			maskedKey := security.MaskAPIKey(key)
 			security.SecurityAuditLog("AUTH_FAILED", fmt.Sprintf("path=%s ip=%s key=%s", c.Request.URL.Path, c.ClientIP(), maskedKey))
@@ -270,6 +319,10 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		c.Set(contextAPIKeyID, apiKeyRow.ID)
+		c.Set(contextAPIKeyName, strings.TrimSpace(apiKeyRow.Name))
+		c.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKeyRow.Key))
+		c.Set("apiKey", key)
 		c.Next()
 	}
 }
@@ -438,7 +491,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-			h.logUsage(&database.UsageLogInput{
+			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses",
 				Model:            model,
@@ -643,7 +696,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
-		h.logUsage(logInput)
+		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
 		if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
@@ -802,7 +855,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
-			h.logUsage(&database.UsageLogInput{
+			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/chat/completions",
 				Model:            model,
@@ -1012,7 +1065,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
-		h.logUsage(logInput)
+		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
 		if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {

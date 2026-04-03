@@ -127,6 +127,11 @@ func New(driver string, dsn string) (*DB, error) {
 		if err := db.configureSQLite(ctx); err != nil {
 			return nil, fmt.Errorf("配置 SQLite 失败: %w", err)
 		}
+	} else {
+		// PostgreSQL: 统一会话时区为 UTC，确保 NOW() 和时间字面量一致
+		if _, err := conn.ExecContext(ctx, "SET timezone = 'UTC'"); err != nil {
+			return nil, fmt.Errorf("设置数据库时区失败: %w", err)
+		}
 	}
 	if err := db.migrate(ctx); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
@@ -190,12 +195,12 @@ func (db *DB) migrate(ctx context.Context) error {
 		proxy_url     VARCHAR(500) DEFAULT '',
 		status        VARCHAR(50) DEFAULT 'active',
 		error_message TEXT DEFAULT '',
-		created_at    TIMESTAMP DEFAULT NOW(),
-		updated_at    TIMESTAMP DEFAULT NOW()
+		created_at    TIMESTAMPTZ DEFAULT NOW(),
+		updated_at    TIMESTAMPTZ DEFAULT NOW()
 	);
 
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
-	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMP NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
 
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 	CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);
@@ -212,10 +217,8 @@ func (db *DB) migrate(ctx context.Context) error {
 		total_tokens   INT DEFAULT 0,
 		status_code    INT DEFAULT 0,
 		duration_ms    INT DEFAULT 0,
-		created_at     TIMESTAMP DEFAULT NOW()
+		created_at     TIMESTAMPTZ DEFAULT NOW()
 	);
-
-	-- 复合索引
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);
@@ -237,7 +240,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		id         SERIAL PRIMARY KEY,
 		name       VARCHAR(255) DEFAULT '',
 		key        VARCHAR(255) NOT NULL UNIQUE,
-		created_at TIMESTAMP DEFAULT NOW()
+		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 
 	CREATE TABLE IF NOT EXISTS system_settings (
@@ -270,7 +273,7 @@ func (db *DB) migrate(ctx context.Context) error {
 		url        VARCHAR(500) NOT NULL UNIQUE,
 		label      VARCHAR(255) DEFAULT '',
 		enabled    BOOLEAN DEFAULT TRUE,
-		created_at TIMESTAMP DEFAULT NOW()
+		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_ip VARCHAR(100) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_location VARCHAR(255) DEFAULT '';
@@ -281,12 +284,41 @@ func (db *DB) migrate(ctx context.Context) error {
 		account_id INT NOT NULL DEFAULT 0,
 		event_type VARCHAR(20) NOT NULL,
 		source     VARCHAR(30) DEFAULT '',
-		created_at TIMESTAMP DEFAULT NOW()
+		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
 	CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);
 	CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);
 	`
 	_, err := db.conn.ExecContext(ctx, query)
+	if err != nil {
+		return err
+	}
+
+	// 独立长超时：将已有 TIMESTAMP 列迁移为 TIMESTAMPTZ（大表 ALTER COLUMN TYPE 可能较慢）
+	migrateQuery := `
+	DO $$
+	DECLARE
+		_tbl  TEXT;
+		_col  TEXT;
+		_rec  RECORD;
+	BEGIN
+		FOR _rec IN
+			SELECT table_name, column_name
+			FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND data_type = 'timestamp without time zone'
+			  AND table_name IN ('accounts', 'usage_logs', 'api_keys', 'proxies', 'account_events')
+		LOOP
+			EXECUTE format(
+				'ALTER TABLE %I ALTER COLUMN %I TYPE TIMESTAMPTZ USING %I AT TIME ZONE current_setting(''TIMEZONE'')',
+				_rec.table_name, _rec.column_name, _rec.column_name
+			);
+		END LOOP;
+	END $$;
+	`
+	migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer migrateCancel()
+	_, err = db.conn.ExecContext(migrateCtx, migrateQuery)
 	return err
 }
 

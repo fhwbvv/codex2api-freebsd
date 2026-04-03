@@ -277,6 +277,7 @@ export interface APIKeyRow {
   id: number
   name: string
   key: string
+  raw_key: string
   created_at: ISODateString
 }
 

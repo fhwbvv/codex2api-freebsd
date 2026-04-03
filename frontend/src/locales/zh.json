@@ -694,6 +694,13 @@
     "listAccounts": {
       "title": "List Accounts",
       "desc": "列出所有账号及其状态、用量等信息。"
+    },
+    "tryIt": {
+      "button": "Try it",
+      "send": "发送请求",
+      "sending": "发送中…",
+      "placeholder": "点击 Send 发送请求",
+      "selectKey": "选择密钥："
     }
   }
 }

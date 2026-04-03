@@ -694,6 +694,13 @@
     "listAccounts": {
       "title": "List Accounts",
       "desc": "List all accounts with their status, usage and other details."
+    },
+    "tryIt": {
+      "button": "Try it",
+      "send": "Send",
+      "sending": "Sending…",
+      "placeholder": "Click Send to make a request",
+      "selectKey": "Select key:"
     }
   }
 }

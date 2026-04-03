@@ -106,7 +106,7 @@ model_auto_compact_token_limit = 900000
 
 [model_providers.OpenAI]
 name = "OpenAI"
-base_url = "${baseUrl}/v1"
+base_url = "${baseUrl}"
 wire_api = "responses"
 requires_openai_auth = true`
 

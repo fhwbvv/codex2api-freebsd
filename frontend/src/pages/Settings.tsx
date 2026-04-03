@@ -354,7 +354,7 @@ export default function Settings() {
                         <TableCell>
                           <div className="flex items-center gap-2">
                             <span className="font-mono text-[14px]">
-                              {visibleKeys.has(keyRow.id) ? keyRow.key : '••••••••••••••••'}
+                              {visibleKeys.has(keyRow.id) ? keyRow.raw_key : keyRow.key}
                             </span>
                             <button
                               onClick={() => setVisibleKeys(prev => {

@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Copy, Check } from 'lucide-react'
+import { Copy, Check, Play, Loader2 } from 'lucide-react'
+import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { Select } from '@/components/ui/select'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 
 // 带复制按钮的代码块
 function CodeBlock({ label, content, lang }: { label?: string; content: string; lang?: string }) {
@@ -102,8 +111,197 @@ function MethodBadge({ method, sm }: { method: string; sm?: boolean }) {
   )
 }
 
+// Try It 测试弹窗
+function TryItDialog({ open, onClose, method, path, defaultBody, apiKey, baseUrl, allKeys }: {
+  open: boolean
+  onClose: () => void
+  method: string
+  path: string
+  defaultBody: string
+  apiKey: string
+  baseUrl: string
+  allKeys: { name: string; key: string }[]
+}) {
+  const { t } = useTranslation()
+  const [body, setBody] = useState(defaultBody)
+  const [token, setToken] = useState(apiKey)
+  const [response, setResponse] = useState('')
+  const [status, setStatus] = useState<number | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [duration, setDuration] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (open) {
+      setBody(defaultBody)
+      setToken(apiKey)
+      setResponse('')
+      setStatus(null)
+      setDuration(null)
+    }
+  }, [open, defaultBody, apiKey])
+
+  const handleSend = async () => {
+    setLoading(true)
+    setResponse('')
+    setStatus(null)
+    setDuration(null)
+    const start = performance.now()
+    try {
+      const isAdmin = path.startsWith('/api/admin')
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (isAdmin) {
+        headers['X-Admin-Key'] = token
+      } else if (path === '/v1/messages') {
+        headers['x-api-key'] = token
+        headers['anthropic-version'] = '2023-06-01'
+      } else {
+        headers['Authorization'] = `Bearer ${token}`
+      }
+
+      const isGet = method === 'GET'
+      const url = baseUrl + path
+      const res = await fetch(url, {
+        method,
+        headers: isGet ? { 'Authorization': `Bearer ${token}`, 'X-Admin-Key': token } : headers,
+        body: isGet ? undefined : body.trim() || undefined,
+      })
+      setStatus(res.status)
+      setDuration(Math.round(performance.now() - start))
+      const text = await res.text()
+      try {
+        setResponse(JSON.stringify(JSON.parse(text), null, 2))
+      } catch {
+        setResponse(text)
+      }
+    } catch (e) {
+      setDuration(Math.round(performance.now() - start))
+      setResponse(`Error: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const statusColor = status === null ? '' : status < 300 ? 'text-emerald-600' : status < 400 ? 'text-amber-600' : 'text-red-500'
+  const statusBg = status === null ? '' : status < 300 ? 'bg-emerald-50 dark:bg-emerald-900/20' : status < 400 ? 'bg-amber-50 dark:bg-amber-900/20' : 'bg-red-50 dark:bg-red-900/20'
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => { if (!v) onClose() }}>
+      <DialogContent className="sm:max-w-3xl max-h-[90vh] overflow-visible flex flex-col gap-0 p-0" showCloseButton={false}>
+        {/* 顶部端点栏 + Send */}
+        <div className="flex items-center gap-3 px-5 py-3.5 border-b border-border bg-muted/30">
+          <div className="flex items-center gap-2.5 flex-1 px-3 py-2 rounded-xl border border-border bg-background">
+            <MethodBadge method={method} />
+            <code className="font-mono text-sm font-medium text-foreground">{path}</code>
+          </div>
+          <Button
+            onClick={() => void handleSend()}
+            disabled={loading}
+            className="gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-5 shrink-0"
+          >
+            {loading ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
+            {loading ? t('apiRef.tryIt.sending') : 'Send'}
+          </Button>
+        </div>
+
+        {/* 内容区：左右分栏 */}
+        <div className="flex flex-1 min-h-0 overflow-hidden">
+          {/* 左侧：参数 */}
+          <div className="flex-1 overflow-visible p-5 space-y-4 border-r border-border">
+            {/* Authorization */}
+            <div className="rounded-xl border border-border overflow-visible">
+              <div className="px-4 py-2.5 bg-muted/30 border-b border-border">
+                <span className="text-sm font-semibold text-foreground">Authorization</span>
+              </div>
+              <div className="p-4 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold text-foreground">
+                        {path === '/v1/messages' ? 'x-api-key' : path.startsWith('/api/admin') ? 'X-Admin-Key' : 'Authorization'}
+                      </span>
+                      <span className="text-[11px] text-muted-foreground font-mono">string</span>
+                    </div>
+                    <Badge variant="destructive" className="mt-1 text-[10px] px-1.5 py-0">required</Badge>
+                  </div>
+                  <input
+                    className="w-52 px-3 py-1.5 rounded-lg border border-border bg-background text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
+                    placeholder="enter token"
+                    value={token}
+                    onChange={e => setToken(e.target.value)}
+                  />
+                </div>
+                {allKeys.length > 0 && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground shrink-0">{t('apiRef.tryIt.selectKey')}</span>
+                    <Select
+                      value={token}
+                      onValueChange={v => setToken(v)}
+                      options={allKeys.map(k => ({
+                        label: `${k.name} — ${k.key.length > 20 ? k.key.slice(0, 8) + '...' + k.key.slice(-4) : k.key}`,
+                        value: k.key,
+                      }))}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Request Body */}
+            {method !== 'GET' && method !== 'DELETE' && (
+              <div className="rounded-xl border border-border overflow-hidden">
+                <div className="px-4 py-2.5 bg-muted/30 border-b border-border">
+                  <span className="text-sm font-semibold text-foreground">Request Body</span>
+                </div>
+                <textarea
+                  className="w-full h-56 p-4 bg-background font-mono text-[20px] leading-relaxed resize-none focus:outline-none border-0"
+                  value={body}
+                  onChange={e => setBody(e.target.value)}
+                  spellCheck={false}
+                />
+              </div>
+            )}
+          </div>
+
+          {/* 右侧：响应 */}
+          <div className="flex-1 overflow-auto p-5">
+            <div className="rounded-xl border border-border overflow-hidden h-full flex flex-col">
+              <div className="px-4 py-2.5 bg-muted/30 border-b border-border flex items-center justify-between">
+                <span className="text-sm font-semibold text-foreground">Response</span>
+                {status !== null && (
+                  <div className="flex items-center gap-2.5">
+                    <span className={`px-2 py-0.5 rounded-md text-xs font-bold ${statusColor} ${statusBg}`}>{status}</span>
+                    {duration !== null && <span className="text-xs text-muted-foreground">{duration}ms</span>}
+                  </div>
+                )}
+              </div>
+              <div className="flex-1 overflow-auto">
+                {response ? (
+                  <pre className="p-4 font-mono text-[20px] text-foreground leading-relaxed whitespace-pre-wrap">
+                    <code>{response}</code>
+                  </pre>
+                ) : (
+                  <div className="flex items-center justify-center h-full min-h-[200px] text-sm text-muted-foreground">
+                    {loading ? (
+                      <div className="flex items-center gap-2">
+                        <Loader2 className="size-4 animate-spin" />
+                        <span>{t('apiRef.tryIt.sending')}</span>
+                      </div>
+                    ) : (
+                      <span>{t('apiRef.tryIt.placeholder')}</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // 单个端点文档
-function EndpointDoc({ id, method, path, title, description, curlExample, responseExamples }: {
+function EndpointDoc({ id, method, path, title, description, curlExample, responseExamples, defaultBody, apiKey, baseUrl, allKeys }: {
   id?: string
   method: string
   path: string
@@ -111,9 +309,15 @@ function EndpointDoc({ id, method, path, title, description, curlExample, respon
   description: string
   curlExample: string
   responseExamples: { code: number; body: string }[]
+  defaultBody?: string
+  apiKey?: string
+  baseUrl?: string
+  allKeys?: { name: string; key: string }[]
 }) {
+  const { t } = useTranslation()
   const [activeStatus, setActiveStatus] = useState(responseExamples[0]?.code ?? 200)
   const activeBody = responseExamples.find(r => r.code === activeStatus)?.body ?? ''
+  const [tryOpen, setTryOpen] = useState(false)
 
   return (
     <Card id={id} className="mb-6 scroll-mt-20">
@@ -122,11 +326,30 @@ function EndpointDoc({ id, method, path, title, description, curlExample, respon
         <h3 className="text-xl font-bold text-foreground mb-1">{title}</h3>
         <p className="text-sm text-muted-foreground mb-4">{description}</p>
 
-        {/* 端点路径栏 */}
+        {/* 端点路径栏 + Try it */}
         <div className="flex items-center gap-3 p-3 rounded-xl border border-border bg-muted/30 mb-5">
           <MethodBadge method={method} />
-          <code className="font-mono text-sm font-semibold text-foreground">{path}</code>
+          <code className="font-mono text-sm font-semibold text-foreground flex-1">{path}</code>
+          <Button
+            size="sm"
+            onClick={() => setTryOpen(true)}
+            className="gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white shrink-0"
+          >
+            <Play className="size-3.5" />
+            {t('apiRef.tryIt.button')}
+          </Button>
         </div>
+
+        <TryItDialog
+          open={tryOpen}
+          onClose={() => setTryOpen(false)}
+          method={method}
+          path={path}
+          defaultBody={defaultBody || ''}
+          apiKey={apiKey || ''}
+          baseUrl={baseUrl || ''}
+          allKeys={allKeys || []}
+        />
 
         {/* cURL 示例 */}
         <div className="mb-5">
@@ -154,6 +377,17 @@ function EndpointDoc({ id, method, path, title, description, curlExample, respon
 export default function ApiReference() {
   const { t } = useTranslation()
   const baseUrl = useMemo(() => window.location.origin, [])
+  const [firstKey, setFirstKey] = useState('')
+  const [allKeys, setAllKeys] = useState<{ name: string; key: string }[]>([])
+
+  // 加载 API Key 列表
+  useEffect(() => {
+    api.getAPIKeys().then(res => {
+      const keys = (res.keys ?? []).map(k => ({ name: k.name, key: k.raw_key || k.key }))
+      setAllKeys(keys)
+      if (keys.length > 0) setFirstKey(keys[0].key)
+    }).catch(() => {})
+  }, [])
 
   const navItems = [
     { id: 'auth', label: t('apiRef.authSection'), method: '' },
@@ -272,6 +506,14 @@ export default function ApiReference() {
         path="/v1/responses"
         title={t('apiRef.responses.title')}
         description={t('apiRef.responses.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "model": "gpt-5.4",
+  "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+  "stream": false
+}`}
         curlExample={`curl --request POST \\
   --url ${baseUrl}/v1/responses \\
   --header 'Authorization: Bearer <token>' \\
@@ -345,6 +587,14 @@ export default function ApiReference() {
         path="/v1/chat/completions"
         title={t('apiRef.chat.title')}
         description={t('apiRef.chat.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "model": "gpt-5.4",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "stream": false
+}`}
         curlExample={`curl --request POST \\
   --url ${baseUrl}/v1/chat/completions \\
   --header 'Authorization: Bearer <token>' \\
@@ -403,6 +653,14 @@ export default function ApiReference() {
         path="/v1/messages"
         title={t('apiRef.messages.title')}
         description={t('apiRef.messages.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "model": "claude-sonnet-4-5-20250514",
+  "max_tokens": 1024,
+  "messages": [{"role": "user", "content": "Hello"}]
+}`}
         curlExample={`curl --request POST \\
   --url ${baseUrl}/v1/messages \\
   --header 'x-api-key: <token>' \\
@@ -467,6 +725,9 @@ export default function ApiReference() {
         path="/v1/models"
         title={t('apiRef.models.title')}
         description={t('apiRef.models.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
         curlExample={`curl --request GET \\
   --url ${baseUrl}/v1/models \\
   --header 'Authorization: Bearer <token>'`}
@@ -500,6 +761,9 @@ export default function ApiReference() {
         path="/health"
         title={t('apiRef.health.title')}
         description={t('apiRef.health.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
         curlExample={`curl --request GET \\
   --url ${baseUrl}/health`}
         responseExamples={[
@@ -524,13 +788,21 @@ export default function ApiReference() {
         path="/api/admin/accounts"
         title={t('apiRef.addAccount.title')}
         description={t('apiRef.addAccount.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "name": "my-account",
+  "refresh_token": "rt_XPqsKO3Ld...\\nrt_H2qdhY",
+  "proxy_url": ""
+}`}
         curlExample={`curl --request POST \\
   --url ${baseUrl}/api/admin/accounts \\
   --header 'X-Admin-Key: <admin_secret>' \\
   --header 'Content-Type: application/json' \\
   --data '{
   "name": "my-account",
-  "refresh_token": "eyJhbGciOi...",
+  "refresh_token": "rt_XPqsKO3Ld...\\nrt_H2qdhY",
   "proxy_url": ""
 }'`}
         responseExamples={[
@@ -555,6 +827,14 @@ export default function ApiReference() {
         path="/api/admin/accounts"
         title={t('apiRef.addAccountBatch.title')}
         description={t('apiRef.addAccountBatch.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "name": "batch",
+  "refresh_token": "token_1\\ntoken_2\\ntoken_3",
+  "proxy_url": ""
+}`}
         curlExample={`curl --request POST \\
   --url ${baseUrl}/api/admin/accounts \\
   --header 'X-Admin-Key: <admin_secret>' \\
@@ -580,6 +860,14 @@ export default function ApiReference() {
         path="/api/admin/accounts/at"
         title={t('apiRef.addATAccount.title')}
         description={t('apiRef.addATAccount.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "name": "at-account",
+  "access_token": "eyJhbGciOi...",
+  "proxy_url": ""
+}`}
         curlExample={`curl --request POST \\
   --url ${baseUrl}/api/admin/accounts/at \\
   --header 'X-Admin-Key: <admin_secret>' \\
@@ -608,6 +896,9 @@ export default function ApiReference() {
         path="/api/admin/accounts/import"
         title={t('apiRef.importAccounts.title')}
         description={t('apiRef.importAccounts.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
         curlExample={`# TXT 格式（每行一个 Refresh Token）
 curl --request POST \\
   --url ${baseUrl}/api/admin/accounts/import \\
@@ -652,6 +943,12 @@ curl --request POST \\
         path="/api/admin/accounts/:id"
         title={t('apiRef.deleteAccount.title')}
         description={t('apiRef.deleteAccount.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        path="/api/admin/accounts/:id"
+        title={t('apiRef.deleteAccount.title')}
+        description={t('apiRef.deleteAccount.desc')}
         curlExample={`curl --request DELETE \\
   --url ${baseUrl}/api/admin/accounts/1 \\
   --header 'X-Admin-Key: <admin_secret>'`}
@@ -672,6 +969,9 @@ curl --request POST \\
         path="/api/admin/accounts"
         title={t('apiRef.listAccounts.title')}
         description={t('apiRef.listAccounts.desc')}
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
         curlExample={`curl --request GET \\
   --url ${baseUrl}/api/admin/accounts \\
   --header 'X-Admin-Key: <admin_secret>'`}

@@ -1405,15 +1405,18 @@ type AccountRequestCount struct {
 	ErrorCount   int64
 }
 
-// GetAccountRequestCounts 按 account_id 聚合成功/失败请求数
+// GetAccountRequestCounts 按 account_id 聚合近 7 天成功/失败请求数
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
+	since := time.Now().AddDate(0, 0, -7)
 	query := `
 	SELECT account_id,
 		COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
-	FROM usage_logs GROUP BY account_id
+	FROM usage_logs
+	WHERE created_at >= $1
+	GROUP BY account_id
 	`
-	rows, err := db.conn.QueryContext(ctx, query)
+	rows, err := db.conn.QueryContext(ctx, query, since)
 	if err != nil {
 		return nil, err
 	}

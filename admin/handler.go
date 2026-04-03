@@ -47,6 +47,11 @@ type Handler struct {
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
+
+	// 账号请求统计缓存（30秒 TTL）
+	reqCountMu        sync.RWMutex
+	reqCountCache     map[int64]*database.AccountRequestCount
+	reqCountExpiresAt time.Time
 }
 
 type chartCacheEntry struct {
@@ -286,14 +291,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		accountMap[acc.DBID] = acc
 	}
 
-	// 获取每账号的请求统计（单独超时，避免被前面的查询挤占时间）
-	reqCountCtx, reqCountCancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
-	defer reqCountCancel()
-	reqCounts, err := h.db.GetAccountRequestCounts(reqCountCtx)
-	if err != nil {
-		log.Printf("获取账号请求统计失败: %v", err)
-		reqCounts = make(map[int64]*database.AccountRequestCount)
-	}
+	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
+	reqCounts := h.getCachedRequestCounts()
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
@@ -365,6 +364,32 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, accountsResponse{Accounts: accounts})
+}
+
+// getCachedRequestCounts 返回带 30 秒 TTL 的账号请求统计缓存
+func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCount {
+	h.reqCountMu.RLock()
+	if h.reqCountCache != nil && time.Now().Before(h.reqCountExpiresAt) {
+		cached := h.reqCountCache
+		h.reqCountMu.RUnlock()
+		return cached
+	}
+	h.reqCountMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	counts, err := h.db.GetAccountRequestCounts(ctx)
+	if err != nil {
+		log.Printf("获取账号请求统计失败: %v", err)
+		return make(map[int64]*database.AccountRequestCount)
+	}
+
+	h.reqCountMu.Lock()
+	h.reqCountCache = counts
+	h.reqCountExpiresAt = time.Now().Add(30 * time.Second)
+	h.reqCountMu.Unlock()
+
+	return counts
 }
 
 type addAccountReq struct {

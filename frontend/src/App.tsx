@@ -23,7 +23,7 @@ export default function App() {
           <Route path="/ops/scheduler" element={<SchedulerBoard />} />
           <Route path="/usage" element={<Usage />} />
           <Route path="/settings" element={<Settings />} />
-          <Route path="/guide" element={<Guide />} />
+          <Route path="/docs" element={<Guide />} />
           <Route path="/api-reference" element={<ApiReference />} />
         </Routes>
       </Layout>

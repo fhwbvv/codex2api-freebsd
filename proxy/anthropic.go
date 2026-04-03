@@ -203,7 +203,7 @@ func TranslateAnthropicToCodex(rawJSON []byte, modelMappingJSON string) ([]byte,
 	// 构建 input 数组
 	input := buildCodexInput(req.System, req.Messages)
 
-	// 构建输出 map
+	// 构建输出 map（对齐 PrepareResponsesBody 的字段处理）
 	out := map[string]any{
 		"model":   codexModel,
 		"stream":  true,
@@ -212,14 +212,13 @@ func TranslateAnthropicToCodex(rawJSON []byte, modelMappingJSON string) ([]byte,
 		"input":   input,
 	}
 
-	// max_tokens → max_output_tokens
-	if req.MaxTokens > 0 {
-		out["max_output_tokens"] = req.MaxTokens
-	}
+	// 注意：不设置 max_output_tokens，上游 Codex 不支持该字段
 
-	// reasoning effort
+	// reasoning effort（仅设置 effort，不设置 summary）
 	effort := resolveReasoningEffort(req.Thinking)
-	out["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
+	if effort != "" && effort != "high" {
+		out["reasoning"] = map[string]any{"effort": effort}
+	}
 
 	// tools
 	if len(req.Tools) > 0 {

@@ -21,7 +21,7 @@ const navDefs: NavDef[] = [
   { to: '/ops/scheduler', labelKey: 'nav.scheduler', icon: <Workflow className="size-[18px]" />, end: true },
   { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
   { to: '/settings', labelKey: 'nav.settings', icon: <Settings className="size-[18px]" /> },
-  { to: '/guide', labelKey: 'nav2.guide', icon: <BookOpen className="size-[18px]" /> },
+  { to: '/docs', labelKey: 'nav2.docs', icon: <BookOpen className="size-[18px]" /> },
   { to: '/api-reference', labelKey: 'nav2.apiRef', icon: <FileCode2 className="size-[18px]" /> },
 ]
 

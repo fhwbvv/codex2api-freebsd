@@ -26,7 +26,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 
-import { Trash2 } from 'lucide-react'
+import { Trash2, Eye, EyeOff } from 'lucide-react'
 
 // 默认模型映射
 const DEFAULT_MODEL_MAPPING: Record<string, string> = {
@@ -154,6 +154,7 @@ export default function Settings() {
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
+  const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set())
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
 
@@ -351,7 +352,22 @@ export default function Settings() {
                       <TableRow key={keyRow.id}>
                         <TableCell className="text-[14px] font-medium">{keyRow.name}</TableCell>
                         <TableCell>
-                          <span className="font-mono text-[20px]">{maskKey(keyRow.key)}</span>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-[14px]">
+                              {visibleKeys.has(keyRow.id) ? keyRow.key : '••••••••••••••••'}
+                            </span>
+                            <button
+                              onClick={() => setVisibleKeys(prev => {
+                                const next = new Set(prev)
+                                if (next.has(keyRow.id)) next.delete(keyRow.id)
+                                else next.add(keyRow.id)
+                                return next
+                              })}
+                              className="flex items-center justify-center size-7 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors shrink-0"
+                            >
+                              {visibleKeys.has(keyRow.id) ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                            </button>
+                          </div>
                         </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
                           {formatRelativeTime(keyRow.created_at, { variant: 'compact' })}

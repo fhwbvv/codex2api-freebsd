@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Copy, Check } from 'lucide-react'
 import PageHeader from '../components/PageHeader'
@@ -89,6 +89,9 @@ export default function Guide() {
   const [codexOs, setCodexOs] = useState<'unix' | 'windows'>('unix')
   const [claudeOs, setClaudeOs] = useState<'unix' | 'windows'>('unix')
 
+  // 动态获取当前服务地址
+  const baseUrl = useMemo(() => window.location.origin, [])
+
   const codexConfigDir = codexOs === 'windows' ? '%userprofile%\\.codex' : '~/.codex'
   const claudeConfigDir = claudeOs === 'windows' ? '%userprofile%\\.claude' : '~/.claude'
 
@@ -103,7 +106,7 @@ model_auto_compact_token_limit = 900000
 
 [model_providers.OpenAI]
 name = "OpenAI"
-base_url = "http://your-server:8080"
+base_url = "${baseUrl}/v1"
 wire_api = "responses"
 requires_openai_auth = true`
 
@@ -113,17 +116,17 @@ requires_openai_auth = true`
 
   const claudeSettingsJson = `{
   "env": {
-    "ANTHROPIC_BASE_URL": "http://your-server:8080",
+    "ANTHROPIC_BASE_URL": "${baseUrl}",
     "ANTHROPIC_AUTH_TOKEN": "YOUR_API_KEY",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
 }`
 
-  const claudeEnvUnix = `export ANTHROPIC_BASE_URL="http://your-server:8080"
+  const claudeEnvUnix = `export ANTHROPIC_BASE_URL="${baseUrl}"
 export ANTHROPIC_AUTH_TOKEN="YOUR_API_KEY"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
 
-  const claudeEnvWindows = `set ANTHROPIC_BASE_URL=http://your-server:8080
+  const claudeEnvWindows = `set ANTHROPIC_BASE_URL=${baseUrl}
 set ANTHROPIC_AUTH_TOKEN=YOUR_API_KEY
 set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
 

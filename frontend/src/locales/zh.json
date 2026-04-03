@@ -598,7 +598,7 @@
     "pagination": "共 {{total}} 个代理，第 {{page}}/{{totalPages}} 页"
   },
   "nav2": {
-    "guide": "使用教程",
+    "docs": "使用文档",
     "apiRef": "API 文档"
   },
   "guide": {
@@ -668,6 +668,32 @@
     "health": {
       "title": "Health Check",
       "desc": "检查服务状态和可用账号数量。此端点不需要认证。"
+    },
+    "accountSection": "账号管理接口",
+    "accountSectionDesc": "以下接口用于管理 Codex 账号，需要通过 X-Admin-Key 请求头传递管理密钥。",
+    "addAccount": {
+      "title": "Add Account (Refresh Token)",
+      "desc": "通过 Refresh Token 添加单个账号。添加后自动刷新 Access Token 并加入号池。name 为可选项，proxy_url 可留空。"
+    },
+    "addAccountBatch": {
+      "title": "Batch Add Accounts (Refresh Token)",
+      "desc": "批量添加账号：refresh_token 字段中用换行符 \\n 分隔多个 Token，单次最多 100 个。名称会自动追加序号后缀。"
+    },
+    "addATAccount": {
+      "title": "Add Account (Access Token)",
+      "desc": "通过 Access Token 直接添加账号（AT-only 模式，不需要 Refresh Token）。支持批量：access_token 中用换行符分隔多个 Token。"
+    },
+    "importAccounts": {
+      "title": "Import Accounts (File Upload)",
+      "desc": "通过文件上传批量导入账号。支持三种格式：txt（每行一个 RT）、json（兼容 CLIProxyAPI 凭证导出）、at_txt（每行一个 AT）。文件大小限制 2MB。"
+    },
+    "deleteAccount": {
+      "title": "Delete Account",
+      "desc": "删除指定 ID 的账号，同时从号池中移除。"
+    },
+    "listAccounts": {
+      "title": "List Accounts",
+      "desc": "列出所有账号及其状态、用量等信息。"
     }
   }
 }

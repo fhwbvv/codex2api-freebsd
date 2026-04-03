@@ -598,7 +598,7 @@
     "pagination": "{{total}} proxies, page {{page}}/{{totalPages}}"
   },
   "nav2": {
-    "guide": "Guide",
+    "docs": "Docs",
     "apiRef": "API Reference"
   },
   "guide": {
@@ -668,6 +668,32 @@
     "health": {
       "title": "Health Check",
       "desc": "Check service status and available account count. This endpoint does not require authentication."
+    },
+    "accountSection": "Account Management",
+    "accountSectionDesc": "The following endpoints are for managing Codex accounts. Requires X-Admin-Key header with admin secret.",
+    "addAccount": {
+      "title": "Add Account (Refresh Token)",
+      "desc": "Add a single account via Refresh Token. Automatically refreshes Access Token and joins the account pool. name is optional, proxy_url can be empty."
+    },
+    "addAccountBatch": {
+      "title": "Batch Add Accounts (Refresh Token)",
+      "desc": "Batch add accounts: separate multiple tokens with newline \\n in the refresh_token field. Maximum 100 per request. Names are auto-suffixed with sequence numbers."
+    },
+    "addATAccount": {
+      "title": "Add Account (Access Token)",
+      "desc": "Add account directly via Access Token (AT-only mode, no Refresh Token needed). Supports batch: separate multiple tokens with newline in access_token."
+    },
+    "importAccounts": {
+      "title": "Import Accounts (File Upload)",
+      "desc": "Batch import accounts via file upload. Supports three formats: txt (one RT per line), json (CLIProxyAPI credential export compatible), at_txt (one AT per line). Max file size 2MB."
+    },
+    "deleteAccount": {
+      "title": "Delete Account",
+      "desc": "Delete account by ID and remove from the pool."
+    },
+    "listAccounts": {
+      "title": "List Accounts",
+      "desc": "List all accounts with their status, usage and other details."
     }
   }
 }

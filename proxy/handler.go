@@ -281,12 +281,21 @@ func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries
 
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	auth := h.authMiddleware()
+
+	// /v1 前缀路由（标准路径）
 	v1 := r.Group("/v1")
-	v1.Use(h.authMiddleware())
+	v1.Use(auth)
 	v1.POST("/chat/completions", h.ChatCompletions)
 	v1.POST("/responses", h.Responses)
 	v1.POST("/messages", h.Messages)
 	v1.GET("/models", h.ListModels)
+
+	// 无前缀路由（兼容 base_url 已包含 /v1 的客户端）
+	r.POST("/chat/completions", auth, h.ChatCompletions)
+	r.POST("/responses", auth, h.Responses)
+	r.POST("/messages", auth, h.Messages)
+	r.GET("/models", auth, h.ListModels)
 }
 
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）

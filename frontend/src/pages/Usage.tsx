@@ -388,6 +388,7 @@ export default function Usage() {
                   { label: t('usage.allEndpoints'), value: '' },
                   { label: '/v1/chat/completions', value: '/v1/chat/completions' },
                   { label: '/v1/responses', value: '/v1/responses' },
+                  { label: '/v1/messages', value: '/v1/messages' },
                 ]}
               />
 

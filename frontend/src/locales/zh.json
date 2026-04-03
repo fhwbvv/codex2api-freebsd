@@ -596,5 +596,78 @@
     "test": "测试",
     "testProxy": "测试代理",
     "pagination": "共 {{total}} 个代理，第 {{page}}/{{totalPages}} 页"
+  },
+  "nav2": {
+    "guide": "使用教程",
+    "apiRef": "API 文档"
+  },
+  "guide": {
+    "title": "使用教程",
+    "description": "了解如何配置和调用 CodexProxy API 端点",
+    "copy": "复制",
+    "copied": "已复制",
+    "endpoints": "API 端点",
+    "endpointsDesc": "CodexProxy 提供三个 API 端点，兼容不同的客户端格式。",
+    "responsesTitle": "POST /v1/responses",
+    "responsesDesc": "Codex Responses API 原生端点，直接透传请求到上游。适用于 Codex CLI、OpenAI SDK 等原生客户端。",
+    "chatTitle": "POST /v1/chat/completions",
+    "chatDesc": "OpenAI Chat Completions 兼容端点。接收 OpenAI 格式请求，自动翻译为 Codex 格式转发，响应翻译回 OpenAI 格式。适用于 ChatGPT 兼容客户端。",
+    "messagesTitle": "POST /v1/messages",
+    "messagesDesc": "Anthropic Messages API 兼容端点。接收 Claude 格式请求，自动翻译为 Codex 格式转发，响应翻译回 Claude 格式。适用于 Claude Code 等 Anthropic 客户端。",
+    "codexTitle": "在 Codex CLI 中使用",
+    "codexDesc": "将以下配置文件添加到 Codex CLI 配置目录中，即可通过本代理使用 Codex 模型。",
+    "codexConfigHint": "请确保以下内容位于 config.toml 文件的开头部分",
+    "codexNoteUnix": "请确保配置目录存在。可运行 mkdir -p ~/.codex 创建目录。",
+    "codexNoteWindows": "按 Win+R，输入 %userprofile%\\.codex 打开配置目录。如目录不存在，请先手动创建。",
+    "claudeCodeTitle": "在 Claude Code 中使用",
+    "claudeCodeDesc": "设置环境变量或编辑 settings.json，即可让 Claude Code 通过本代理使用 Codex 模型。",
+    "claudeCodeNote": "其中 YOUR_API_KEY 是你在系统设置中创建的 API Key。模型映射可在系统设置中配置。",
+    "claudeEnvNote": "这些环境变量仅在当前终端会话中生效。如需永久配置，请添加到 ~/.bashrc 或 ~/.zshrc 中。",
+    "claudeSettingsNote": "或者直接编辑 Claude Code 的 settings.json 配置文件（二选一即可）。",
+    "authTitle": "认证方式",
+    "authDesc": "所有端点均支持以下认证方式（优先级从高到低）：",
+    "authBearer": "Authorization: Bearer <key>（标准方式）",
+    "authXApiKey": "x-api-key: <key>（Anthropic SDK 默认）",
+    "authAnthropicToken": "anthropic-auth-token: <key>（备用兼容）",
+    "modelMappingTitle": "模型映射",
+    "modelMappingDesc": "当使用 /v1/messages 端点时，Claude 模型名会自动映射为 Codex 模型名。映射规则可在「系统设置」中自定义。",
+    "exampleTitle": "请求示例",
+    "responsesExample": "Responses API 示例",
+    "chatExample": "Chat Completions 示例",
+    "messagesExample": "Messages API 示例（Claude Code 格式）"
+  },
+  "settings2": {
+    "modelMapping": "模型映射",
+    "modelMappingDesc": "配置 Anthropic 模型名到 Codex 模型名的映射关系（用于 /v1/messages 端点）",
+    "anthropicModel": "Anthropic 模型",
+    "codexModel": "Codex 模型",
+    "addMapping": "添加映射",
+    "messagesEndpoint": "Anthropic Messages API 兼容端点（Claude Code）"
+  },
+  "apiRef": {
+    "title": "API 文档",
+    "description": "CodexProxy API 端点参考文档，包含请求格式和响应示例",
+    "authSection": "认证",
+    "authDesc": "所有 API 请求需要通过以下方式之一传递密钥：",
+    "responses": {
+      "title": "Create Response",
+      "desc": "创建一个 Codex Responses API 响应。支持流式和非流式模式，直接透传到上游 Codex API。"
+    },
+    "chat": {
+      "title": "Create Chat Completion",
+      "desc": "创建 OpenAI Chat Completions 格式的对话补全。请求自动翻译为 Codex 格式，响应翻译回 OpenAI 格式。"
+    },
+    "messages": {
+      "title": "Create Message",
+      "desc": "创建 Anthropic Messages API 格式的消息。请求自动翻译为 Codex 格式，响应翻译回 Anthropic 格式。模型名根据系统设置中的映射表自动转换。"
+    },
+    "models": {
+      "title": "List Models",
+      "desc": "列出当前可用的所有模型。"
+    },
+    "health": {
+      "title": "Health Check",
+      "desc": "检查服务状态和可用账号数量。此端点不需要认证。"
+    }
   }
 }

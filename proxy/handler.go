@@ -285,6 +285,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.Use(h.authMiddleware())
 	v1.POST("/chat/completions", h.ChatCompletions)
 	v1.POST("/responses", h.Responses)
+	v1.POST("/messages", h.Messages)
 	v1.GET("/models", h.ListModels)
 }
 
@@ -298,6 +299,19 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		}
 
 		authHeader := c.GetHeader("Authorization")
+		// 兼容 Anthropic 客户端的多种认证方式:
+		// - x-api-key: Anthropic SDK 默认方式
+		// - ANTHROPIC_AUTH_TOKEN: Claude Code 通过此环境变量设置，
+		//   实际发送为 Authorization: Bearer <token>（已被上面覆盖）
+		//   或 anthropic-auth-token 自定义 header
+		if authHeader == "" {
+			for _, h := range []string{"x-api-key", "anthropic-auth-token"} {
+				if v := strings.TrimSpace(c.GetHeader(h)); v != "" {
+					authHeader = "Bearer " + v
+					break
+				}
+			}
+		}
 		if authHeader == "" {
 			// Use standardized error format from api package
 			api.SendError(c, api.ErrMissingAPIKey)

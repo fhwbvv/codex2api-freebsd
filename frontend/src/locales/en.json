@@ -596,5 +596,78 @@
     "test": "Test",
     "testProxy": "Test Proxy",
     "pagination": "{{total}} proxies, page {{page}}/{{totalPages}}"
+  },
+  "nav2": {
+    "guide": "Guide",
+    "apiRef": "API Reference"
+  },
+  "guide": {
+    "title": "Usage Guide",
+    "description": "Learn how to configure and call CodexProxy API endpoints",
+    "copy": "Copy",
+    "copied": "Copied",
+    "endpoints": "API Endpoints",
+    "endpointsDesc": "CodexProxy provides three API endpoints compatible with different client formats.",
+    "responsesTitle": "POST /v1/responses",
+    "responsesDesc": "Native Codex Responses API endpoint. Directly proxies requests to upstream. For Codex CLI, OpenAI SDK and other native clients.",
+    "chatTitle": "POST /v1/chat/completions",
+    "chatDesc": "OpenAI Chat Completions compatible endpoint. Accepts OpenAI format, translates to Codex format, and translates responses back. For ChatGPT compatible clients.",
+    "messagesTitle": "POST /v1/messages",
+    "messagesDesc": "Anthropic Messages API compatible endpoint. Accepts Claude format, translates to Codex format, and translates responses back. For Claude Code and other Anthropic clients.",
+    "codexTitle": "Using with Codex CLI",
+    "codexDesc": "Add the following configuration files to the Codex CLI config directory to use Codex models through this proxy.",
+    "codexConfigHint": "Make sure the following content is at the beginning of config.toml",
+    "codexNoteUnix": "Make sure the config directory exists. Run mkdir -p ~/.codex to create it.",
+    "codexNoteWindows": "Press Win+R, type %userprofile%\\.codex to open the config directory. Create it manually if it doesn't exist.",
+    "claudeCodeTitle": "Using with Claude Code",
+    "claudeCodeDesc": "Set environment variables or edit settings.json to let Claude Code use Codex models through this proxy.",
+    "claudeCodeNote": "Replace YOUR_API_KEY with the API Key created in Settings. Model mapping can be configured in Settings.",
+    "claudeEnvNote": "These environment variables only apply to the current terminal session. For permanent configuration, add them to ~/.bashrc or ~/.zshrc.",
+    "claudeSettingsNote": "Or directly edit the Claude Code settings.json config file (choose one method).",
+    "authTitle": "Authentication",
+    "authDesc": "All endpoints support the following authentication methods (in priority order):",
+    "authBearer": "Authorization: Bearer <key> (standard)",
+    "authXApiKey": "x-api-key: <key> (Anthropic SDK default)",
+    "authAnthropicToken": "anthropic-auth-token: <key> (fallback)",
+    "modelMappingTitle": "Model Mapping",
+    "modelMappingDesc": "When using the /v1/messages endpoint, Claude model names are automatically mapped to Codex model names. Mapping rules can be customized in Settings.",
+    "exampleTitle": "Request Examples",
+    "responsesExample": "Responses API Example",
+    "chatExample": "Chat Completions Example",
+    "messagesExample": "Messages API Example (Claude Code format)"
+  },
+  "settings2": {
+    "modelMapping": "Model Mapping",
+    "modelMappingDesc": "Configure Anthropic model name to Codex model name mapping (for /v1/messages endpoint)",
+    "anthropicModel": "Anthropic Model",
+    "codexModel": "Codex Model",
+    "addMapping": "Add Mapping",
+    "messagesEndpoint": "Anthropic Messages API endpoint (Claude Code)"
+  },
+  "apiRef": {
+    "title": "API Reference",
+    "description": "CodexProxy API endpoint reference documentation with request formats and response examples",
+    "authSection": "Authentication",
+    "authDesc": "All API requests require a key passed via one of the following methods:",
+    "responses": {
+      "title": "Create Response",
+      "desc": "Create a Codex Responses API response. Supports streaming and non-streaming modes, directly proxied to upstream Codex API."
+    },
+    "chat": {
+      "title": "Create Chat Completion",
+      "desc": "Create an OpenAI Chat Completions format conversation completion. Requests are automatically translated to Codex format, responses translated back to OpenAI format."
+    },
+    "messages": {
+      "title": "Create Message",
+      "desc": "Create an Anthropic Messages API format message. Requests are automatically translated to Codex format, responses translated back to Anthropic format. Model names are mapped according to the mapping table in system settings."
+    },
+    "models": {
+      "title": "List Models",
+      "desc": "List all currently available models."
+    },
+    "health": {
+      "title": "Health Check",
+      "desc": "Check service status and available account count. This endpoint does not require authentication."
+    }
   }
 }

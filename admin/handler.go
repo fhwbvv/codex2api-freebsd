@@ -1710,6 +1710,7 @@ type settingsResponse struct {
 	CacheDriver           string `json:"cache_driver"`
 	CacheLabel            string `json:"cache_label"`
 	ExpiredCleaned        int    `json:"expired_cleaned,omitempty"`
+	ModelMapping          string `json:"model_mapping"`
 }
 
 type updateSettingsReq struct {
@@ -1730,6 +1731,7 @@ type updateSettingsReq struct {
 	FastSchedulerEnabled  *bool   `json:"fast_scheduler_enabled"`
 	MaxRetries            *int    `json:"max_retries"`
 	AllowRemoteMigration  *bool   `json:"allow_remote_migration"`
+	ModelMapping          *string `json:"model_mapping"`
 }
 
 // GetSettings 获取当前系统设置
@@ -1765,6 +1767,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		DatabaseLabel:         h.databaseLabel,
 		CacheDriver:           h.cacheDriver,
 		CacheLabel:            h.cacheLabel,
+		ModelMapping:          h.store.GetModelMapping(),
 	})
 }
 
@@ -1925,6 +1928,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetAllowRemoteMigration(false)
 	}
 
+	if req.ModelMapping != nil {
+		h.store.SetModelMapping(*req.ModelMapping)
+		log.Printf("设置已更新: model_mapping")
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:        h.store.GetMaxConcurrency(),
@@ -1944,6 +1952,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FastSchedulerEnabled:  h.store.FastSchedulerEnabled(),
 		MaxRetries:            h.store.GetMaxRetries(),
 		AllowRemoteMigration:  h.store.GetAllowRemoteMigration() && hasAdminSecret,
+		ModelMapping:          h.store.GetModelMapping(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -1986,6 +1995,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CacheDriver:           h.cacheDriver,
 		CacheLabel:            h.cacheLabel,
 		ExpiredCleaned:        expiredCleaned,
+		ModelMapping:          h.store.GetModelMapping(),
 	})
 }
 

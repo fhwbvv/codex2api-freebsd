@@ -145,6 +145,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "fast_scheduler_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
+		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},

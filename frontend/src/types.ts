@@ -190,6 +190,7 @@ export interface SystemSettings {
   cache_driver: string
   cache_label: string
   expired_cleaned?: number
+  model_mapping: string
 }
 
 export interface CPAExportEntry {

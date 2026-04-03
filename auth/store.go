@@ -727,6 +727,7 @@ type Store struct {
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
 	allowRemoteMigration atomic.Bool // 是否允许远程迁移拉取账号
+	modelMapping         atomic.Value // 模型映射 JSON 字符串
 }
 
 func fastSchedulerEnabledFromEnv() bool {
@@ -778,6 +779,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	}
 	atomic.StoreInt64(&s.maxRetries, retries)
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
+	if settings.ModelMapping != "" {
+		s.modelMapping.Store(settings.ModelMapping)
+	}
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -1376,6 +1380,19 @@ func (s *Store) SetTestConcurrency(n int) {
 // GetTestConcurrency 获取当前批量测试并发数
 func (s *Store) GetTestConcurrency() int {
 	return int(atomic.LoadInt64(&s.testConcurrency))
+}
+
+// SetModelMapping 动态更新模型映射 JSON
+func (s *Store) SetModelMapping(mapping string) {
+	s.modelMapping.Store(mapping)
+}
+
+// GetModelMapping 获取当前模型映射 JSON
+func (s *Store) GetModelMapping() string {
+	if v, ok := s.modelMapping.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
 }
 
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）

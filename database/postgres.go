@@ -26,6 +26,7 @@ type AccountRow struct {
 	CooldownReason string
 	CooldownUntil  sql.NullTime
 	ErrorMessage   string
+	Locked         bool
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
@@ -201,6 +202,7 @@ func (db *DB) migrate(ctx context.Context) error {
 
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
 
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 	CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);
@@ -1403,7 +1405,7 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 // ListActive 获取所有状态为 active 的账号
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
 		FROM accounts
 		WHERE status = 'active'
 		ORDER BY id
@@ -1432,6 +1434,7 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.CooldownReason,
 			&cooldownUntilRaw,
 			&a.ErrorMessage,
+			&a.Locked,
 			&createdAtRaw,
 			&updatedAtRaw,
 		); err != nil {
@@ -1453,6 +1456,12 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// SetAccountLocked 设置账号的锁定状态
+func (db *DB) SetAccountLocked(ctx context.Context, id int64, locked bool) error {
+	_, err := db.conn.ExecContext(ctx, `UPDATE accounts SET locked = $1 WHERE id = $2`, locked, id)
+	return err
 }
 
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）

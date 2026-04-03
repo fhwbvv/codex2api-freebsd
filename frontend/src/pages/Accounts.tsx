@@ -24,7 +24,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -32,7 +32,7 @@ export default function Accounts() {
   const { t } = useTranslation()
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
-  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
@@ -112,8 +112,9 @@ export default function Accounts() {
 
   const totalAccounts = accounts.length
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
-  const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited').length
+  const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
+  const lockedAccounts = accounts.filter((account) => account.locked).length
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
   const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
@@ -125,10 +126,13 @@ export default function Accounts() {
         if (account.status !== 'active' && account.status !== 'ready') return false
         break
       case 'rate_limited':
-        if (account.status !== 'rate_limited') return false
+        if (account.status !== 'rate_limited' && account.status !== 'usage_exhausted') return false
         break
       case 'banned':
         if (account.status !== 'unauthorized') return false
+        break
+      case 'locked':
+        if (!account.locked) return false
         break
     }
     // 套餐过滤
@@ -593,6 +597,17 @@ export default function Accounts() {
     }
   }
 
+  const handleToggleLock = async (account: AccountRow) => {
+    const newLocked = !account.locked
+    try {
+      await api.toggleAccountLock(account.id, newLocked)
+      showToast(newLocked ? t('accounts.lockSuccess') : t('accounts.unlockSuccess'))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.lockFailed', { error: getErrorMessage(error) }), 'error')
+    }
+  }
+
   const handleBatchDelete = async () => {
     if (selected.size === 0) return
     const confirmed = await confirm({
@@ -635,6 +650,25 @@ export default function Accounts() {
     }
     showToast(t('accounts.batchRefreshDone', { success, fail }))
     setBatchLoading(false)
+    void reload()
+  }
+
+  const handleBatchLock = async (locked: boolean) => {
+    if (selected.size === 0) return
+    setBatchLoading(true)
+    let success = 0
+    let fail = 0
+    for (const id of selected) {
+      try {
+        await api.toggleAccountLock(id, locked)
+        success++
+      } catch {
+        fail++
+      }
+    }
+    showToast(t(locked ? 'accounts.batchLockDone' : 'accounts.batchUnlockDone', { success, fail }))
+    setBatchLoading(false)
+    setSelected(new Set())
     void reload()
   }
 
@@ -823,7 +857,7 @@ export default function Accounts() {
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>
-          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')]] as const).map(([key, label]) => (
+          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => { setStatusFilter(key); setPage(1) }}
@@ -833,7 +867,7 @@ export default function Accounts() {
                   : 'bg-muted/50 text-muted-foreground hover:bg-muted'
               }`}
             >
-              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : bannedAccounts}
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : lockedAccounts}
             </button>
           ))}
         </div>
@@ -879,6 +913,12 @@ export default function Accounts() {
             <div className="flex items-center gap-1.5">
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchRefresh()}>
                 {t('accounts.batchRefresh')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(true)}>
+                <Lock className="size-3 mr-1" />{t('accounts.lock')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(false)}>
+                <Unlock className="size-3 mr-1" />{t('accounts.unlock')}
               </Button>
               <Button variant="destructive" size="sm" disabled={batchLoading} onClick={() => void handleBatchDelete()}>
                 {t('accounts.batchDelete')}
@@ -956,6 +996,11 @@ export default function Accounts() {
                               AT
                             </span>
                           )}
+                          {account.locked && (
+                            <span className="ml-1.5 inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                              <Lock className="size-2.5 mr-0.5" />{t('accounts.lock')}
+                            </span>
+                          )}
                         </TableCell>
                         <TableCell
                           className="text-[13px] font-medium"
@@ -1018,6 +1063,15 @@ export default function Accounts() {
                               title={account.at_only ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
                             >
                               <RefreshCw className={`size-3.5 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
+                            </Button>
+                            <Button
+                              variant={account.locked ? 'default' : 'outline'}
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              onClick={() => void handleToggleLock(account)}
+                              title={account.locked ? t('accounts.unlockHint') : t('accounts.lockHint')}
+                            >
+                              {account.locked ? <Lock className="size-3.5" /> : <Unlock className="size-3.5" />}
                             </Button>
                             <Button
                               variant="destructive"

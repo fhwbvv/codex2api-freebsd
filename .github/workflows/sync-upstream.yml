@@ -54,8 +54,7 @@ jobs:
         run: |
           rsync -a --delete /tmp/upstream-codex2api/ ./ \
             --exclude '.git/' \
-            --exclude '.github/workflows/build-freebsd.yml' \
-            --exclude '.github/workflows/sync-upstream.yml' \
+            --exclude '.github/workflows/' \
             --exclude 'config/serv00.sqlite.env.example' \
             --exclude 'docs/serv00-freebsd.md' \
             --exclude 'scripts/package-freebsd.sh'

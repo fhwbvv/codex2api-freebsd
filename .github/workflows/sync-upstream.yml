@@ -18,13 +18,42 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
+      - name: Enforce 7-day sync cooldown
+        id: cooldown
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          latest_sync="$(gh api "repos/${REPO}/commits" --paginate --jq '[ .[] | select(.commit.message == "chore: sync upstream") ][0].commit.committer.date' | head -n 1)"
+          if [[ -z "$latest_sync" || "$latest_sync" == "null" ]]; then
+            echo "No previous sync commit found."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          now_ts="$(date -u +%s)"
+          latest_ts="$(date -u -d "$latest_sync" +%s)"
+          cooldown_seconds=$((7 * 24 * 60 * 60))
+          elapsed=$((now_ts - latest_ts))
+          if (( elapsed < cooldown_seconds )); then
+            remaining_days=$(((cooldown_seconds - elapsed + 86399) / 86400))
+            echo "Last sync was at $latest_sync UTC, skipping. Remaining cooldown: ${remaining_days} day(s)."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Last sync was at $latest_sync UTC, cooldown satisfied."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Clone james-6-23 upstream
+        if: steps.cooldown.outputs.should_run == 'true'
         shell: bash
         run: |
           rm -rf /tmp/upstream-codex2api
           git clone https://github.com/james-6-23/codex2api.git /tmp/upstream-codex2api
 
       - name: Sync upstream files while keeping FreeBSD automation
+        if: steps.cooldown.outputs.should_run == 'true'
         shell: bash
         run: |
           rsync -a --delete /tmp/upstream-codex2api/ ./ \
@@ -36,6 +65,7 @@ jobs:
             --exclude 'scripts/package-freebsd.sh'
 
       - name: Commit synced changes
+        if: steps.cooldown.outputs.should_run == 'true'
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -48,6 +78,7 @@ jobs:
           git commit -m "chore: sync upstream"
 
       - name: Detect upstream release tag
+        if: steps.cooldown.outputs.should_run == 'true'
         id: upstream_tag
         shell: bash
         run: |
@@ -69,12 +100,13 @@ jobs:
           fi
 
       - name: Push sync commit
+        if: steps.cooldown.outputs.should_run == 'true'
         shell: bash
         run: |
           git push origin HEAD:main
 
       - name: Create and push upstream release tag
-        if: steps.upstream_tag.outputs.should_create == 'true'
+        if: steps.cooldown.outputs.should_run == 'true' && steps.upstream_tag.outputs.should_create == 'true'
         shell: bash
         run: |
           set -euo pipefail

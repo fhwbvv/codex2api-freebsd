@@ -3,8 +3,6 @@ name: build-freebsd
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
     tags:
       - "v*"
 
@@ -51,35 +49,6 @@ jobs:
           name: ${{ env.BINARY_NAME }}
           path: dist/${{ env.BINARY_NAME }}
           if-no-files-found: error
-
-      - name: Generate release metadata
-        if: github.ref == 'refs/heads/main'
-        shell: bash
-        run: |
-          echo "RELEASE_TAG=freebsd-${GITHUB_RUN_NUMBER}-$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          echo "RELEASE_NAME=FreeBSD build #${GITHUB_RUN_NUMBER} ($(git rev-parse --short HEAD))" >> "$GITHUB_ENV"
-
-      - name: Create rolling release
-        if: github.ref == 'refs/heads/main'
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cat > release-notes.txt <<'EOF'
-          FreeBSD amd64 single-binary build for codex2api.
-
-          Recommended for serv00-style deployment.
-
-          Quick start:
-          chmod +x ./codex2api-freebsd-amd64
-          mkdir -p ./data
-          cp config/serv00.sqlite.env.example .env
-          ./codex2api-freebsd-amd64
-          EOF
-          gh release create "$RELEASE_TAG" dist/${BINARY_NAME} \
-            --target "$GITHUB_SHA" \
-            --title "$RELEASE_NAME" \
-            --notes-file release-notes.txt
 
       - name: Attach binary to tag release
         if: startsWith(github.ref, 'refs/tags/v')

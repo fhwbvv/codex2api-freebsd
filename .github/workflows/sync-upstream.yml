@@ -85,3 +85,12 @@ jobs:
           set -euo pipefail
           git tag "${{ steps.upstream_release.outputs.tag }}"
           git push origin "refs/tags/${{ steps.upstream_release.outputs.tag }}"
+
+      - name: Trigger FreeBSD build for new release tag
+        if: steps.upstream_release.outputs.should_run == 'true' && steps.upstream_release.outputs.tag != ''
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run build-freebsd.yml --ref "${{ steps.upstream_release.outputs.tag }}"

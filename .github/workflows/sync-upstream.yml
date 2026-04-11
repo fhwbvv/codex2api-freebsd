@@ -18,42 +18,38 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Enforce 7-day sync cooldown
-        id: cooldown
+      - name: Check upstream latest release
+        id: upstream_release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          latest_sync="$(gh api "repos/${REPO}/commits" --paginate --jq '[ .[] | select(.commit.message == "chore: sync upstream") ][0].commit.committer.date' | head -n 1)"
-          if [[ -z "$latest_sync" || "$latest_sync" == "null" ]]; then
-            echo "No previous sync commit found."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          latest_release_tag="$(gh api repos/james-6-23/codex2api/releases/latest --jq .tag_name)"
+          if [[ -z "$latest_release_tag" || "$latest_release_tag" == "null" ]]; then
+            echo "No upstream release tag found."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          now_ts="$(date -u +%s)"
-          latest_ts="$(date -u -d "$latest_sync" +%s)"
-          cooldown_seconds=$((7 * 24 * 60 * 60))
-          elapsed=$((now_ts - latest_ts))
-          if (( elapsed < cooldown_seconds )); then
-            remaining_days=$(((cooldown_seconds - elapsed + 86399) / 86400))
-            echo "Last sync was at $latest_sync UTC, skipping. Remaining cooldown: ${remaining_days} day(s)."
+          echo "tag=$latest_release_tag" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$latest_release_tag" >/dev/null; then
+            echo "Latest upstream release $latest_release_tag already exists locally. Skipping sync."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Last sync was at $latest_sync UTC, cooldown satisfied."
+            echo "New upstream release detected: $latest_release_tag"
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Clone james-6-23 upstream
-        if: steps.cooldown.outputs.should_run == 'true'
+        if: steps.upstream_release.outputs.should_run == 'true'
         shell: bash
         run: |
           rm -rf /tmp/upstream-codex2api
           git clone https://github.com/james-6-23/codex2api.git /tmp/upstream-codex2api
 
       - name: Sync upstream files while keeping FreeBSD automation
-        if: steps.cooldown.outputs.should_run == 'true'
+        if: steps.upstream_release.outputs.should_run == 'true'
         shell: bash
         run: |
           rsync -a --delete /tmp/upstream-codex2api/ ./ \
@@ -65,7 +61,7 @@ jobs:
             --exclude 'scripts/package-freebsd.sh'
 
       - name: Commit synced changes
-        if: steps.cooldown.outputs.should_run == 'true'
+        if: steps.upstream_release.outputs.should_run == 'true'
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -77,38 +73,16 @@ jobs:
           fi
           git commit -m "chore: sync upstream"
 
-      - name: Detect upstream release tag
-        if: steps.cooldown.outputs.should_run == 'true'
-        id: upstream_tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          upstream_tag="$(git -C /tmp/upstream-codex2api tag --sort=-version:refname | head -n 1)"
-          if [[ -z "$upstream_tag" ]]; then
-            echo "No upstream tag found."
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            echo "should_create=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "tag=$upstream_tag" >> "$GITHUB_OUTPUT"
-          if git rev-parse -q --verify "refs/tags/$upstream_tag" >/dev/null; then
-            echo "Upstream tag $upstream_tag already exists locally."
-            echo "should_create=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "New upstream tag detected: $upstream_tag"
-            echo "should_create=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Push sync commit
-        if: steps.cooldown.outputs.should_run == 'true'
+        if: steps.upstream_release.outputs.should_run == 'true'
         shell: bash
         run: |
           git push origin HEAD:main
 
       - name: Create and push upstream release tag
-        if: steps.cooldown.outputs.should_run == 'true' && steps.upstream_tag.outputs.should_create == 'true'
+        if: steps.upstream_release.outputs.should_run == 'true' && steps.upstream_release.outputs.tag != ''
         shell: bash
         run: |
           set -euo pipefail
-          git tag "${{ steps.upstream_tag.outputs.tag }}"
-          git push origin "refs/tags/${{ steps.upstream_tag.outputs.tag }}"
+          git tag "${{ steps.upstream_release.outputs.tag }}"
+          git push origin "refs/tags/${{ steps.upstream_release.outputs.tag }}"

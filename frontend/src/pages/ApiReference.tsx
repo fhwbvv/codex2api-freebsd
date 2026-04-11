@@ -410,12 +410,12 @@ export default function ApiReference() {
   const updateIndicator = useCallback((id: string) => {
     const el = navRefs.current[id]
     if (!el) return
-    const parent = el.parentElement
-    if (!parent) return
     setIndicator({
       left: el.offsetLeft,
       width: el.offsetWidth,
     })
+    // 将激活的导航项滚动到可见区域
+    el.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' })
   }, [])
 
   useEffect(() => {
@@ -457,7 +457,7 @@ export default function ApiReference() {
 
       {/* 悬浮导航栏 */}
       <div className="sticky top-2 z-30 mb-4">
-        <div className="relative flex flex-wrap items-center gap-x-0.5 gap-y-1 px-3 py-2 rounded-2xl border border-border bg-background/80 backdrop-blur-lg shadow-sm">
+        <div className="relative flex items-center gap-x-0.5 px-3 py-2 rounded-2xl border border-border bg-background/80 backdrop-blur-lg shadow-sm overflow-x-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
           {/* 滑动指示器 */}
           <div
             className="absolute top-2 h-[calc(100%-16px)] rounded-xl bg-primary/8 border border-primary/15 transition-all duration-300 ease-out pointer-events-none"
@@ -946,9 +946,6 @@ curl --request POST \\
         apiKey={firstKey}
         baseUrl={baseUrl}
         allKeys={allKeys}
-        path="/api/admin/accounts/:id"
-        title={t('apiRef.deleteAccount.title')}
-        description={t('apiRef.deleteAccount.desc')}
         curlExample={`curl --request DELETE \\
   --url ${baseUrl}/api/admin/accounts/1 \\
   --header 'X-Admin-Key: <admin_secret>'`}

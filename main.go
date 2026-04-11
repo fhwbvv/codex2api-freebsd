@@ -61,20 +61,33 @@ func main() {
 		// 初次运行，保存初始安全设置到数据库
 		log.Printf("初次运行，初始化系统默认设置...")
 		settings = &database.SystemSettings{
-			MaxConcurrency:        2,
-			GlobalRPM:             0,
-			TestModel:             "gpt-5.4",
-			TestConcurrency:       50,
-			ProxyURL:              "",
-			PgMaxConns:            50,
-			RedisPoolSize:         30,
-			AutoCleanUnauthorized: false,
-			AutoCleanRateLimited:  false,
+			MaxConcurrency:                   2,
+			GlobalRPM:                        0,
+			TestModel:                        "gpt-5.4",
+			TestConcurrency:                  50,
+			BackgroundRefreshIntervalMinutes: 2,
+			UsageProbeMaxAgeMinutes:          10,
+			RecoveryProbeIntervalMinutes:     30,
+			ProxyURL:                         "",
+			PgMaxConns:                       50,
+			RedisPoolSize:                    30,
+			AutoCleanUnauthorized:            false,
+			AutoCleanRateLimited:             false,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
 		log.Printf("警告: 读取系统设置失败: %v，将采用安全后备策略", err)
-		settings = &database.SystemSettings{MaxConcurrency: 2, GlobalRPM: 0, TestModel: "gpt-5.4", TestConcurrency: 50, PgMaxConns: 50, RedisPoolSize: 30}
+		settings = &database.SystemSettings{
+			MaxConcurrency:                   2,
+			GlobalRPM:                        0,
+			TestModel:                        "gpt-5.4",
+			TestConcurrency:                  50,
+			BackgroundRefreshIntervalMinutes: 2,
+			UsageProbeMaxAgeMinutes:          10,
+			RecoveryProbeIntervalMinutes:     30,
+			PgMaxConns:                       50,
+			RedisPoolSize:                    30,
+		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
@@ -107,6 +120,18 @@ func main() {
 	if settings.PgMaxConns > 0 {
 		db.SetMaxOpenConns(settings.PgMaxConns)
 		log.Printf("%s 连接池: max_conns=%d", cfg.Database.Label(), settings.PgMaxConns)
+	}
+
+	// 4c. 初始化 Resin 粘性代理池
+	if settings.ResinURL != "" && settings.ResinPlatformName != "" {
+		proxy.SetResinConfig(&proxy.ResinConfig{
+			BaseURL:      settings.ResinURL,
+			PlatformName: settings.ResinPlatformName,
+		})
+		// 注入 Resin URL 装饰器到 auth 包（避免 auth → proxy 循环依赖）
+		auth.ResinRequestDecorator = func(targetURL, accountID string) string {
+			return proxy.BuildReverseProxyURL(targetURL)
+		}
 	}
 
 	// 5. 初始化账号管理器
@@ -149,10 +174,8 @@ func main() {
 	r.Use(security.RequestSizeLimiter(security.MaxRequestBodySize))
 
 	// handler 不再接收 cfg.APIKeys
-	// 从环境变量读取设备指纹配置（后续可从数据库配置）
-	deviceCfg := &proxy.DeviceProfileConfig{
-		StabilizeDeviceProfile: os.Getenv("STABILIZE_DEVICE_PROFILE") == "true",
-	}
+	// 从环境变量读取 Codex 画像与 Beta 配置。
+	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）

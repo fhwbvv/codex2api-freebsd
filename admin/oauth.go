@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -39,6 +40,22 @@ type oauthSession struct {
 	RedirectURI  string
 	ProxyURL     string
 	CreatedAt    time.Time
+
+	// 回调自动捕获字段
+	CallbackCode   string    // 回调收到的 authorization code
+	CallbackState  string    // 回调收到的 state
+	CallbackAt     time.Time // 回调时间
+	ExchangeResult *oauthExchangeResult
+}
+
+// oauthExchangeResult 自动回调完成后的兑换结果
+type oauthExchangeResult struct {
+	Success  bool   `json:"success"`
+	Message  string `json:"message"`
+	ID       int64  `json:"id,omitempty"`
+	Email    string `json:"email,omitempty"`
+	PlanType string `json:"plan_type,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 type oauthSessionStore struct {
@@ -74,6 +91,18 @@ func (s *oauthSessionStore) delete(id string) {
 	s.mu.Unlock()
 }
 
+// findByState 通过 state 查找 session（回调端点使用，返回 sessionID + session）
+func (s *oauthSessionStore) findByState(state string) (string, *oauthSession, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, sess := range s.sessions {
+		if sess.State == state && time.Since(sess.CreatedAt) <= oauthSessionTTL {
+			return id, sess, true
+		}
+	}
+	return "", nil, false
+}
+
 func (s *oauthSessionStore) cleanupLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -103,6 +132,20 @@ func oauthCodeChallenge(verifier string) string {
 	return strings.TrimRight(base64.URLEncoding.EncodeToString(h[:]), "=")
 }
 
+// isLocalhostHost 判断 Host 头是否指向 localhost（含 127.0.0.1、[::1]）
+func isLocalhostHost(host string) bool {
+	// 去除端口号
+	h := host
+	if idx := strings.LastIndex(h, ":"); idx != -1 {
+		// 排除 IPv6 方括号中的冒号
+		if !strings.Contains(h[idx:], "]") {
+			h = h[:idx]
+		}
+	}
+	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
+	return h == "localhost" || h == "127.0.0.1" || h == "::1"
+}
+
 // ==================== Handlers ====================
 
 // GenerateOAuthURL 生成 Codex CLI PKCE OAuth 授权 URL
@@ -116,7 +159,19 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 
 	redirectURI := strings.TrimSpace(req.RedirectURI)
 	if redirectURI == "" {
-		redirectURI = oauthDefaultRedirectURI
+		// 自动推导回调地址：
+		// 1. 本地访问时使用请求 Host（浏览器可直接回调）
+		// 2. 远程访问时回退到 localhost 默认值，因为 OpenAI 仅注册了 localhost 回调
+		host := c.Request.Host
+		if host != "" && isLocalhostHost(host) {
+			scheme := "http"
+			if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+				scheme = "https"
+			}
+			redirectURI = fmt.Sprintf("%s://%s/auth/callback", scheme, host)
+		} else {
+			redirectURI = oauthDefaultRedirectURI
+		}
 	}
 
 	state, err := oauthRandomHex(32)
@@ -194,7 +249,9 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		proxyURL = trimmed
 	}
 
-	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), req.Code, sess.CodeVerifier, sess.RedirectURI, proxyURL)
+	// Resin 临时身份用于 OAuth 兑换（新账号尚无 DBID）
+	resinTempID := "oauth-" + req.SessionID
+	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), req.Code, sess.CodeVerifier, sess.RedirectURI, proxyURL, resinTempID)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, "授权码兑换失败: "+err.Error())
 		return
@@ -223,6 +280,11 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		return
 	}
 	h.db.InsertAccountEventAsync(id, "added", "oauth")
+
+	// Resin 租约继承
+	if proxy.IsResinEnabled() {
+		go proxy.InheritLease(resinTempID, fmt.Sprintf("%d", id))
+	}
 
 	newAcc := &auth.Account{
 		DBID:         id,
@@ -265,7 +327,7 @@ type rawOAuthTokenResp struct {
 	ExpiresIn    int64  `json:"expires_in"`
 }
 
-func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, proxyURL string) (*rawOAuthTokenResp, *auth.AccountInfo, error) {
+func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, proxyURL string, resinTempID ...string) (*rawOAuthTokenResp, *auth.AccountInfo, error) {
 	form := neturl.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("client_id", oauthClientID)
@@ -273,7 +335,17 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 	form.Set("redirect_uri", redirectURI)
 	form.Set("code_verifier", codeVerifier)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthTokenURL, strings.NewReader(form.Encode()))
+	// Resin 反代模式：改写 URL
+	targetURL := oauthTokenURL
+	tempID := ""
+	if len(resinTempID) > 0 {
+		tempID = resinTempID[0]
+	}
+	if proxy.IsResinEnabled() && tempID != "" {
+		targetURL = proxy.BuildReverseProxyURL(oauthTokenURL)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, nil, fmt.Errorf("创建请求失败: %w", err)
 	}
@@ -281,7 +353,17 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "codex-cli/0.91.0")
 
-	client := auth.BuildHTTPClient(proxyURL)
+	// Resin 反代：注入临时账号身份头
+	if proxy.IsResinEnabled() && tempID != "" {
+		req.Header.Set("X-Resin-Account", tempID)
+	}
+
+	var client *http.Client
+	if proxy.IsResinEnabled() && tempID != "" {
+		client = &http.Client{Timeout: 30 * time.Second}
+	} else {
+		client = auth.BuildHTTPClient(proxyURL)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("请求失败: %w", err)
@@ -301,3 +383,174 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 	info := auth.ParseIDToken(tokenResp.IDToken)
 	return &tokenResp, info, nil
 }
+
+// ==================== OAuth 自动回调捕获 ====================
+
+// OAuthCallback 接收 OpenAI OAuth 回调，自动完成 code exchange 并添加账号
+// GET /auth/callback?code=xxx&state=xxx
+func (h *Handler) OAuthCallback(c *gin.Context) {
+	code := c.Query("code")
+	state := c.Query("state")
+
+	if code == "" || state == "" {
+		c.HTML(http.StatusBadRequest, "", nil)
+		c.String(http.StatusBadRequest, oauthCallbackPage("授权失败", "缺少 code 或 state 参数", false))
+		return
+	}
+
+	sessionID, sess, ok := globalOAuthStore.findByState(state)
+	if !ok {
+		c.String(http.StatusBadRequest, oauthCallbackPage("授权失败", "OAuth 会话不存在或已过期，请重新发起授权", false))
+		return
+	}
+
+	// 记录回调信息
+	sess.CallbackCode = code
+	sess.CallbackState = state
+	sess.CallbackAt = time.Now()
+
+	// 执行 code exchange（Resin 临时身份）
+	resinTempID := "oauth-" + sessionID
+	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), code, sess.CodeVerifier, sess.RedirectURI, sess.ProxyURL, resinTempID)
+	if err != nil {
+		sess.ExchangeResult = &oauthExchangeResult{
+			Success: false,
+			Error:   err.Error(),
+		}
+		c.String(http.StatusOK, oauthCallbackPage("授权失败", "兑换 token 失败: "+err.Error(), false))
+		return
+	}
+
+	if tokenResp.RefreshToken == "" {
+		sess.ExchangeResult = &oauthExchangeResult{
+			Success: false,
+			Error:   "授权服务器未返回 refresh_token",
+		}
+		c.String(http.StatusOK, oauthCallbackPage("授权失败", "未获取到 refresh_token，请确认已开启 offline_access", false))
+		return
+	}
+
+	// 自动添加账号
+	name := ""
+	if accountInfo != nil && accountInfo.Email != "" {
+		name = accountInfo.Email
+	}
+	if name == "" {
+		name = "oauth-account"
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	id, err := h.db.InsertAccount(ctx, name, tokenResp.RefreshToken, sess.ProxyURL)
+	if err != nil {
+		sess.ExchangeResult = &oauthExchangeResult{
+			Success: false,
+			Error:   "账号写入数据库失败: " + err.Error(),
+		}
+		c.String(http.StatusOK, oauthCallbackPage("授权失败", "写入数据库失败: "+err.Error(), false))
+		return
+	}
+	h.db.InsertAccountEventAsync(id, "added", "oauth_callback")
+
+	// Resin 租约继承：将临时身份的 IP 租约迁移到正式 DBID
+	if proxy.IsResinEnabled() {
+		go proxy.InheritLease(resinTempID, fmt.Sprintf("%d", id))
+	}
+
+	newAcc := &auth.Account{
+		DBID:         id,
+		RefreshToken: tokenResp.RefreshToken,
+		ProxyURL:     sess.ProxyURL,
+	}
+	h.store.AddAccount(newAcc)
+
+	go func(accountID int64) {
+		refreshCtx, rCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer rCancel()
+		if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
+			log.Printf("OAuth 回调账号 %d AT 刷新失败: %v", accountID, err)
+		} else {
+			log.Printf("OAuth 回调账号 %d 已加入号池", accountID)
+		}
+	}(id)
+
+	email := ""
+	planType := ""
+	if accountInfo != nil {
+		email = accountInfo.Email
+		planType = accountInfo.PlanType
+	}
+
+	sess.ExchangeResult = &oauthExchangeResult{
+		Success:  true,
+		Message:  fmt.Sprintf("账号 %s 添加成功", name),
+		ID:       id,
+		Email:    email,
+		PlanType: planType,
+	}
+
+	log.Printf("OAuth 回调自动添加账号成功: id=%d email=%s", id, email)
+	c.String(http.StatusOK, oauthCallbackPage("授权成功", fmt.Sprintf("账号 %s 已自动添加，可以关闭此页面。", name), true))
+}
+
+// PollOAuthCallback 前端轮询回调结果
+// GET /api/admin/oauth/poll-callback?session_id=xxx
+func (h *Handler) PollOAuthCallback(c *gin.Context) {
+	sessionID := c.Query("session_id")
+	if sessionID == "" {
+		writeError(c, http.StatusBadRequest, "session_id 为必填")
+		return
+	}
+
+	sess, ok := globalOAuthStore.get(sessionID)
+	if !ok {
+		writeError(c, http.StatusNotFound, "OAuth 会话不存��或��过期")
+		return
+	}
+
+	if sess.ExchangeResult != nil {
+		// 回调已完成，返回结果并清理 session
+		c.JSON(http.StatusOK, gin.H{
+			"status": "completed",
+			"result": sess.ExchangeResult,
+		})
+		globalOAuthStore.delete(sessionID)
+		return
+	}
+
+	if sess.CallbackCode != "" {
+		// 收到回调但尚未完成兑换（罕见竞态）
+		c.JSON(http.StatusOK, gin.H{
+			"status": "processing",
+		})
+		return
+	}
+
+	// 尚未收到回调
+	c.JSON(http.StatusOK, gin.H{
+		"status": "waiting",
+	})
+}
+
+// oauthCallbackPage 生成简单的 HTML 回调结果页面
+func oauthCallbackPage(title, message string, success bool) string {
+	color := "#e53e3e"
+	icon := "&#10060;"
+	if success {
+		color = "#38a169"
+		icon = "&#10004;"
+	}
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>%s</title>
+<style>
+body{font-family:-apple-system,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f7fafc}
+.card{background:#fff;border-radius:12px;padding:40px;box-shadow:0 4px 20px rgba(0,0,0,.08);text-align:center;max-width:420px}
+.icon{font-size:48px;margin-bottom:16px}
+h1{color:%s;font-size:24px;margin:0 0 12px}
+p{color:#4a5568;line-height:1.6;margin:0}
+</style></head>
+<body><div class="card"><div class="icon">%s</div><h1>%s</h1><p>%s</p></div></body></html>`,
+		title, color, icon, title, message)
+}
+

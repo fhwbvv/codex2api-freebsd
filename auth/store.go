@@ -93,6 +93,12 @@ type Account struct {
 
 }
 
+const (
+	defaultBackgroundRefreshInterval = 2 * time.Minute
+	defaultUsageProbeMaxAge          = 10 * time.Minute
+	defaultRecoveryProbeInterval     = 30 * time.Minute
+)
+
 // SchedulerBreakdown 调度评分拆解
 type SchedulerBreakdown struct {
 	UnauthorizedPenalty float64
@@ -527,6 +533,19 @@ func (a *Account) GetUsagePercent5h() (float64, bool) {
 	return a.UsagePercent5h, a.UsagePercent5hValid
 }
 
+// ClearUsageCache 清除内存中的用量缓存，下次请求时从上游重新获取
+func (a *Account) ClearUsageCache() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.UsagePercent7d = 0
+	a.UsagePercent7dValid = false
+	a.Reset7dAt = time.Time{}
+	a.UsagePercent5h = 0
+	a.UsagePercent5hValid = false
+	a.Reset5hAt = time.Time{}
+	a.UsageUpdatedAt = time.Time{}
+}
+
 // SetReset7dAt 设置 7d 窗口重置时间
 func (a *Account) SetReset7dAt(t time.Time) {
 	a.mu.Lock()
@@ -692,27 +711,31 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
-	mu                    sync.RWMutex
-	accounts              []*Account
-	globalProxy           string
-	maxConcurrency        int64        // 每账号最大并发数
-	testConcurrency       int64        // 批量测试并发数
-	testModel             atomic.Value // 测试连接使用的模型（string）
-	db                    *database.DB
-	tokenCache            cache.TokenCache
-	usageProbeMu          sync.RWMutex
-	usageProbe            func(context.Context, *Account) error
-	usageProbeBatch       atomic.Bool
-	recoveryProbeBatch    atomic.Bool
-	autoCleanUnauthorized atomic.Bool
-	autoCleanRateLimited  atomic.Bool
-	autoCleanFullUsage    atomic.Bool
-	autoCleanError        atomic.Bool
-	autoCleanExpired      atomic.Bool
-	autoCleanupBatch      atomic.Bool
-	maxRetries            int64 // 请求失败最大重试次数（换号重试）
-	stopCh                chan struct{}
-	wg                    sync.WaitGroup
+	mu                        sync.RWMutex
+	accounts                  []*Account
+	globalProxy               string
+	maxConcurrency            int64        // 每账号最大并发数
+	testConcurrency           int64        // 批量测试并发数
+	testModel                 atomic.Value // 测试连接使用的模型（string）
+	db                        *database.DB
+	tokenCache                cache.TokenCache
+	usageProbeMu              sync.RWMutex
+	usageProbe                func(context.Context, *Account) error
+	usageProbeBatch           atomic.Bool
+	recoveryProbeBatch        atomic.Bool
+	autoCleanUnauthorized     atomic.Bool
+	autoCleanRateLimited      atomic.Bool
+	autoCleanFullUsage        atomic.Bool
+	autoCleanError            atomic.Bool
+	autoCleanExpired          atomic.Bool
+	autoCleanupBatch          atomic.Bool
+	maxRetries                int64 // 请求失败最大重试次数（换号重试）
+	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
+	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
+	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
+	backgroundRefreshWakeCh   chan struct{}
+	stopCh                    chan struct{}
+	wg                        sync.WaitGroup
 
 	// 代理池
 	proxyPool        []string // 已启用的代理 URL 列表
@@ -726,9 +749,19 @@ type Store struct {
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
-	allowRemoteMigration atomic.Bool // 是否允许远程迁移拉取账号
+	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
+	sessionMu            sync.RWMutex
+	sessionBindings      map[string]sessionAffinity
 }
+
+type sessionAffinity struct {
+	accountID int64
+	proxyURL  string
+	expiresAt time.Time
+}
+
+const sessionAffinityTTL = 30 * time.Minute
 
 func fastSchedulerEnabledFromEnv() bool {
 	for _, key := range []string{"FAST_SCHEDULER_ENABLED", "CODEX_FAST_SCHEDULER"} {
@@ -752,22 +785,30 @@ func truthyEnv(v string) bool {
 func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
-			MaxConcurrency:  2,
-			TestConcurrency: 50,
-			TestModel:       "gpt-5.4",
-			ProxyURL:        "",
+			MaxConcurrency:                   2,
+			TestConcurrency:                  50,
+			TestModel:                        "gpt-5.4",
+			BackgroundRefreshIntervalMinutes: 2,
+			UsageProbeMaxAgeMinutes:          10,
+			RecoveryProbeIntervalMinutes:     30,
+			ProxyURL:                         "",
 		}
 	}
 	s := &Store{
-		globalProxy:      settings.ProxyURL,
-		maxConcurrency:   int64(settings.MaxConcurrency),
-		testConcurrency:  int64(settings.TestConcurrency),
-		db:               db,
-		tokenCache:       tc,
-		stopCh:           make(chan struct{}),
-		proxyPoolEnabled: settings.ProxyPoolEnabled,
+		globalProxy:             settings.ProxyURL,
+		maxConcurrency:          int64(settings.MaxConcurrency),
+		testConcurrency:         int64(settings.TestConcurrency),
+		db:                      db,
+		tokenCache:              tc,
+		backgroundRefreshWakeCh: make(chan struct{}, 1),
+		stopCh:                  make(chan struct{}),
+		proxyPoolEnabled:        settings.ProxyPoolEnabled,
+		sessionBindings:         make(map[string]sessionAffinity),
 	}
 	s.testModel.Store(settings.TestModel)
+	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
+	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
+	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
@@ -991,6 +1032,61 @@ func (s *Store) SetAutoCleanExpired(enabled bool) {
 	s.autoCleanExpired.Store(enabled)
 }
 
+// SetBackgroundRefreshInterval 设置后台刷新/探针巡检间隔。
+func (s *Store) SetBackgroundRefreshInterval(d time.Duration) {
+	if d <= 0 {
+		d = defaultBackgroundRefreshInterval
+	}
+	atomic.StoreInt64(&s.backgroundRefreshInterval, int64(d))
+	select {
+	case s.backgroundRefreshWakeCh <- struct{}{}:
+	default:
+	}
+}
+
+// GetBackgroundRefreshInterval 获取后台刷新/探针巡检间隔。
+func (s *Store) GetBackgroundRefreshInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.backgroundRefreshInterval))
+	if d <= 0 {
+		return defaultBackgroundRefreshInterval
+	}
+	return d
+}
+
+// SetUsageProbeMaxAge 设置用量探针最大缓存时长。
+func (s *Store) SetUsageProbeMaxAge(d time.Duration) {
+	if d <= 0 {
+		d = defaultUsageProbeMaxAge
+	}
+	atomic.StoreInt64(&s.usageProbeMaxAge, int64(d))
+}
+
+// GetUsageProbeMaxAge 获取用量探针最大缓存时长。
+func (s *Store) GetUsageProbeMaxAge() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.usageProbeMaxAge))
+	if d <= 0 {
+		return defaultUsageProbeMaxAge
+	}
+	return d
+}
+
+// SetRecoveryProbeInterval 设置恢复探测最小间隔。
+func (s *Store) SetRecoveryProbeInterval(d time.Duration) {
+	if d <= 0 {
+		d = defaultRecoveryProbeInterval
+	}
+	atomic.StoreInt64(&s.recoveryProbeInterval, int64(d))
+}
+
+// GetRecoveryProbeInterval 获取恢复探测最小间隔。
+func (s *Store) GetRecoveryProbeInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.recoveryProbeInterval))
+	if d <= 0 {
+		return defaultRecoveryProbeInterval
+	}
+	return d
+}
+
 // CleanExpiredNow 立即执行一次过期清理，返回清理数量
 func (s *Store) CleanExpiredNow() int {
 	return s.CleanExpiredAccounts(context.Background(), 30*time.Minute)
@@ -1125,24 +1221,37 @@ func (s *Store) StartBackgroundRefresh() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		refreshTicker := time.NewTicker(2 * time.Minute)
+		refreshTimer := time.NewTimer(s.GetBackgroundRefreshInterval())
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
-		defer refreshTicker.Stop()
+		defer refreshTimer.Stop()
 		defer autoCleanupTicker.Stop()
 		defer fullUsageCleanupTicker.Stop()
 		defer expiredCleanupTicker.Stop()
 		defer rebuildSchedulerTicker.Stop()
 
+		resetRefreshTimer := func() {
+			if !refreshTimer.Stop() {
+				select {
+				case <-refreshTimer.C:
+				default:
+				}
+			}
+			refreshTimer.Reset(s.GetBackgroundRefreshInterval())
+		}
+
 		for {
 			select {
-			case <-refreshTicker.C:
+			case <-refreshTimer.C:
 				s.parallelRefreshAll(context.Background())
 				s.TriggerUsageProbeAsync()
 				s.TriggerRecoveryProbeAsync()
+				refreshTimer.Reset(s.GetBackgroundRefreshInterval())
+			case <-s.backgroundRefreshWakeCh:
+				resetRefreshTimer()
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
 			case <-fullUsageCleanupTicker.C:
@@ -1276,8 +1385,120 @@ func (s *Store) NextExcluding(exclude map[int64]bool) *Account {
 	return best
 }
 
+// BindSessionAffinity 记录会话与账号/代理的亲和关系。
+func (s *Store) BindSessionAffinity(key string, account *Account, proxyURL string) {
+	s.bindSessionAffinity(key, account, proxyURL)
+}
+
+func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL string) {
+	if s == nil || account == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+
+	s.sessionMu.Lock()
+	if s.sessionBindings == nil {
+		s.sessionBindings = make(map[string]sessionAffinity)
+	}
+	s.sessionBindings[key] = sessionAffinity{
+		accountID: account.DBID,
+		proxyURL:  strings.TrimSpace(proxyURL),
+		expiresAt: time.Now().Add(sessionAffinityTTL),
+	}
+	s.sessionMu.Unlock()
+}
+
+// UnbindSessionAffinity removes a session binding when it still points to the failed account.
+func (s *Store) UnbindSessionAffinity(key string, accountID int64) {
+	if s == nil || accountID == 0 {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+
+	s.sessionMu.Lock()
+	if binding, ok := s.sessionBindings[key]; ok && binding.accountID == accountID {
+		delete(s.sessionBindings, key)
+	}
+	s.sessionMu.Unlock()
+}
+
+// NextForSession 优先复用已绑定的账号和代理，失败时回退到普通选号。
+func (s *Store) NextForSession(key string, exclude map[int64]bool) (*Account, string) {
+	if s == nil {
+		return nil, ""
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return s.NextExcluding(exclude), ""
+	}
+
+	now := time.Now()
+	s.sessionMu.RLock()
+	binding, ok := s.sessionBindings[key]
+	s.sessionMu.RUnlock()
+
+	if ok {
+		if !binding.expiresAt.After(now) {
+			s.sessionMu.Lock()
+			if current, exists := s.sessionBindings[key]; exists && !current.expiresAt.After(now) {
+				delete(s.sessionBindings, key)
+			}
+			s.sessionMu.Unlock()
+		} else if acc := s.takeByIDExcluding(binding.accountID, exclude); acc != nil {
+			return acc, binding.proxyURL
+		}
+	}
+
+	return s.NextExcluding(exclude), ""
+}
+
+func (s *Store) takeByIDExcluding(id int64, exclude map[int64]bool) *Account {
+	if s == nil || id == 0 {
+		return nil
+	}
+	if exclude != nil && exclude[id] {
+		return nil
+	}
+
+	s.mu.RLock()
+	var target *Account
+	for _, acc := range s.accounts {
+		if acc != nil && acc.DBID == id {
+			target = acc
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if target == nil || !target.IsAvailable() {
+		return nil
+	}
+
+	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
+	now := time.Now()
+	_, _, limit, available := target.fastSchedulerSnapshot(maxConcurrency, now)
+	if !available || limit <= 0 {
+		return nil
+	}
+	if !tryAcquireAccount(target, limit) {
+		return nil
+	}
+	return target
+}
+
 // WaitForAvailable 等待可用账号（带超时的请求排队）
 func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Account {
+	acc, _ := s.WaitForSessionAvailable(ctx, "", timeout, nil)
+	return acc
+}
+
+// WaitForSessionAvailable waits for a session-preferred account and proxy pair.
+func (s *Store) WaitForSessionAvailable(ctx context.Context, key string, timeout time.Duration, exclude map[int64]bool) (*Account, string) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
@@ -1288,13 +1509,13 @@ func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Ac
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return nil, ""
 		case <-deadline.C:
-			return nil
+			return nil, ""
 		default:
-			acc := s.Next()
+			acc, proxyURL := s.NextForSession(key, exclude)
 			if acc != nil {
-				return acc
+				return acc, proxyURL
 			}
 			// 等待一下再重试（指数退避，最大 500ms）
 			backoffTimer.Reset(backoff)
@@ -1304,9 +1525,9 @@ func (s *Store) WaitForAvailable(ctx context.Context, timeout time.Duration) *Ac
 					backoff *= 2
 				}
 			case <-ctx.Done():
-				return nil
+				return nil, ""
 			case <-deadline.C:
-				return nil
+				return nil, ""
 			}
 		}
 	}
@@ -1380,6 +1601,21 @@ func (s *Store) SetTestConcurrency(n int) {
 // GetTestConcurrency 获取当前批量测试并发数
 func (s *Store) GetTestConcurrency() int {
 	return int(atomic.LoadInt64(&s.testConcurrency))
+}
+
+// GetBackgroundRefreshIntervalMinutes 获取后台巡检间隔（分钟）。
+func (s *Store) GetBackgroundRefreshIntervalMinutes() int {
+	return int(s.GetBackgroundRefreshInterval() / time.Minute)
+}
+
+// GetUsageProbeMaxAgeMinutes 获取用量探针最大缓存时长（分钟）。
+func (s *Store) GetUsageProbeMaxAgeMinutes() int {
+	return int(s.GetUsageProbeMaxAge() / time.Minute)
+}
+
+// GetRecoveryProbeIntervalMinutes 获取恢复探测最小间隔（分钟）。
+func (s *Store) GetRecoveryProbeIntervalMinutes() int {
+	return int(s.GetRecoveryProbeInterval() / time.Minute)
 }
 
 // SetModelMapping 动态更新模型映射 JSON
@@ -1872,7 +2108,7 @@ func (s *Store) parallelProbeUsage(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	for _, acc := range accounts {
-		if !acc.NeedsUsageProbe(10 * time.Minute) {
+		if !acc.NeedsUsageProbe(s.GetUsageProbeMaxAge()) {
 			continue
 		}
 		if !acc.TryBeginUsageProbe() {
@@ -1914,7 +2150,7 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	for _, acc := range accounts {
-		if !acc.NeedsRecoveryProbe(30 * time.Minute) {
+		if !acc.NeedsRecoveryProbe(s.GetRecoveryProbeInterval()) {
 			continue
 		}
 		if !acc.TryBeginRecoveryProbe() {
@@ -2144,8 +2380,9 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		defer s.tokenCache.ReleaseRefreshLock(ctx, dbID)
 	}
 
-	// 3. 执行 RT 刷新
-	td, info, err := RefreshWithRetry(ctx, rt, proxy)
+	// 3. 执行 RT 刷新（Resin 启用时传入 DBID 用于粘性代理）
+	resinID := fmt.Sprintf("%d", dbID)
+	td, info, err := RefreshWithRetry(ctx, rt, proxy, resinID)
 	if err != nil {
 		if isNonRetryable(err) {
 			acc.mu.Lock()

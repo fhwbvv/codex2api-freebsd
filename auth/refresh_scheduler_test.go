@@ -291,14 +291,14 @@ func TestRefreshSchedulerPriorityQueue(t *testing.T) {
 	scheduler := NewRefreshScheduler(&Store{}, config)
 
 	// 创建不同优先级的任务
-	acc1 := newTestAccountWithExpiry(1, 30*time.Second) // 高优先级（即将过期）
+	acc1 := newTestAccountWithExpiry(1, 1*time.Minute)  // 中优先级（即将过期但不紧急）
 	acc2 := newTestAccountWithExpiry(2, 30*time.Minute) // 低优先级
-	acc3 := newTestAccountWithExpiry(3, 10*time.Second) // 最高优先级
+	acc3 := newTestAccountWithExpiry(3, 10*time.Second) // 最高优先级（非常紧急）
 
 	// 计算预期优先级
-	p1 := scheduler.calculatePriority(acc1) // 30 + 50 = 80
+	p1 := scheduler.calculatePriority(acc1) // 30 + 50 = 80（1分钟 < 2分钟）
 	p2 := scheduler.calculatePriority(acc2) // 30
-	p3 := scheduler.calculatePriority(acc3) // 30 + 100 = 130
+	p3 := scheduler.calculatePriority(acc3) // 30 + 100 = 130（10秒 < 30秒）
 
 	scheduler.Schedule(acc1)
 	scheduler.Schedule(acc2)

@@ -24,6 +24,11 @@ const (
 	MaxRetries    = 3
 )
 
+// ResinRequestDecorator 由外部（main.go）注入，用于在 Resin 启用时改写请求 URL 和添加 Header。
+// 避免 auth → proxy 循环依赖。参数: (originalURL, accountIdentifier) → (newURL)
+// 调用方需在返回的 req 上设置 X-Resin-Account header。
+var ResinRequestDecorator func(targetURL, accountID string) string
+
 // TokenData 保存一次 RT 刷新获得的 token 信息
 type TokenData struct {
 	AccessToken  string `json:"access_token"`
@@ -41,7 +46,8 @@ type AccountInfo struct {
 }
 
 // RefreshAccessToken 用 RT 换取 AT
-func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL string) (*TokenData, *AccountInfo, error) {
+// resinAccountID 可选，Resin 启用时传入账号标识用于粘性代理
+func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
 	data := url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {ClientID},
@@ -49,14 +55,35 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 		"scope":         {RefreshScopes},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, TokenURL, strings.NewReader(data.Encode()))
+	// Resin 反代模式：改写 URL
+	targetURL := TokenURL
+	accountID := ""
+	if len(resinAccountID) > 0 {
+		accountID = resinAccountID[0]
+	}
+	if ResinRequestDecorator != nil && accountID != "" {
+		targetURL = ResinRequestDecorator(TokenURL, accountID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, nil, fmt.Errorf("创建请求失败: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	client := buildHTTPClient(proxyURL)
+	// Resin 反代：注入账号身份头
+	if ResinRequestDecorator != nil && accountID != "" {
+		req.Header.Set("X-Resin-Account", accountID)
+	}
+
+	// Resin 反代模式下使用标准 HTTP client（不走代理，Resin 处理路由）
+	var client *http.Client
+	if ResinRequestDecorator != nil && accountID != "" {
+		client = &http.Client{Timeout: 30 * time.Second}
+	} else {
+		client = buildHTTPClient(proxyURL)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, fmt.Errorf("刷新请求失败: %w", err)
@@ -102,7 +129,8 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 }
 
 // RefreshWithRetry 带重试的 RT 刷新
-func RefreshWithRetry(ctx context.Context, refreshToken string, proxyURL string) (*TokenData, *AccountInfo, error) {
+// resinAccountID 可选，Resin 启用时传入账号标识
+func RefreshWithRetry(ctx context.Context, refreshToken string, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
 	var lastErr error
 	for attempt := 0; attempt < MaxRetries; attempt++ {
 		if attempt > 0 {
@@ -114,7 +142,7 @@ func RefreshWithRetry(ctx context.Context, refreshToken string, proxyURL string)
 			}
 		}
 
-		td, info, err := RefreshAccessToken(ctx, refreshToken, proxyURL)
+		td, info, err := RefreshAccessToken(ctx, refreshToken, proxyURL, resinAccountID...)
 		if err == nil {
 			return td, info, nil
 		}

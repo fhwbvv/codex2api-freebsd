@@ -132,7 +132,7 @@ const (
 )
 
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
-var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string) (*http.Response, error)
+var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error)
 
 // ExecuteRequest 向 Codex 上游发送请求
 // sessionID 可选，用于 prompt cache 会话绑定
@@ -141,7 +141,7 @@ var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, reques
 func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (*http.Response, error) {
 	// 检查是否使用 WebSocket
 	if len(useWebsocket) > 0 && useWebsocket[0] && WebsocketExecuteFunc != nil {
-		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride)
+		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers)
 	}
 
 	if ctx == nil {
@@ -150,7 +150,6 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 	account.Mu().RLock()
 	accessToken := account.AccessToken
-	accountID := account.AccountID
 	proxyURL := account.ProxyURL
 	account.Mu().RUnlock()
 
@@ -187,46 +186,27 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 	endpoint := CodexBaseURL + "/responses"
 
+	// Resin 反向代理模式：改写 URL，使用标准 HTTP 客户端
+	var client *http.Client
+	if IsResinEnabled() {
+		endpoint = BuildReverseProxyURL(endpoint)
+		client = getResinHTTPClient(account)
+	} else {
+		client = getPooledClient(account, proxyURL)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, ErrInternalError("创建请求失败", err)
 	}
 
 	// ==================== 请求头（伪装 Codex CLI） ====================
-	// 应用设备指纹稳定化
-	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
-		profile := ResolveDeviceProfile(account, apiKey, headers, deviceCfg)
-		ApplyDeviceProfileHeaders(req, profile)
-		// 稳定化时也需要设置 Version 头，保持行为一致
-		if profile.HasVersion {
-			req.Header.Set("Version", fmt.Sprintf("%d.%d.%d", profile.Version.major, profile.Version.minor, profile.Version.patch))
-		}
-	} else {
-		// 每个账号使用确定性的 ClientProfile（UA + Version），模拟真实用户多样性
-		profile := ProfileForAccount(account.ID())
-		req.Header.Set("User-Agent", profile.UserAgent)
-		req.Header.Set("Version", profile.Version)
-	}
+	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
 
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Originator", Originator)
-	req.Header.Set("Connection", "Keep-Alive")
-	if accountID != "" {
-		req.Header.Set("Chatgpt-Account-Id", accountID)
+	// Resin 反代：注入账号身份头
+	if IsResinEnabled() {
+		req.Header.Set("X-Resin-Account", ResinAccountID(account))
 	}
-
-	// Session/Conversation 头（用于 prompt cache 绑定）
-	// 参考 CLIProxyAPI: req.Header.Set("Conversation_id", cache.ID)
-	// 参考 sub2api: headers.Set("session_id", sessionResolution.SessionID)
-	if cacheKey != "" {
-		req.Header.Set("Session_id", cacheKey)
-		req.Header.Set("Conversation_id", cacheKey)
-	}
-
-	// 获取连接池 HTTP 客户端（账号级隔离，复用 TCP/TLS 连接）
-	client := getPooledClient(account, proxyURL)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -239,21 +219,156 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	return resp, nil
 }
 
-// ResolveSessionID 从下游请求提取或生成 session ID
-// 优先级（参考 sub2api）：
-//  1. Header: session_id
-//  2. Header: conversation_id
-//  3. Body:   prompt_cache_key
-//  4. 基于 Bearer API Key 的确定性 UUID（参考 CLIProxyAPI）
-func ResolveSessionID(authHeader string, body []byte) string {
-	// 此函数由 handler 调用，将 gin.Context 的 header 传进来
+// ExecuteCompactRequest 向 Codex 上游发送 /responses/compact 请求（非流式压缩接口）
+func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
+	account.Mu().RLock()
+	accessToken := account.AccessToken
+	proxyURL := account.ProxyURL
+	account.Mu().RUnlock()
+
+	if proxyOverride != "" {
+		proxyURL = proxyOverride
+	}
+
+	if accessToken == "" {
+		return nil, ErrNoAvailableAccount()
+	}
+
+	// 与 ExecuteRequest 相同的请求体优化
+	if !gjson.GetBytes(requestBody, "instructions").Exists() {
+		requestBody, _ = sjson.SetBytes(requestBody, "instructions", "")
+	}
+	requestBody, _ = sjson.DeleteBytes(requestBody, "previous_response_id")
+	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
+	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
+	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
+
+	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
+	cacheKey := existingCacheKey
+	if cacheKey == "" && sessionID != "" {
+		cacheKey = sessionID
+		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
+	}
+
+	// compact 端点
+	endpoint := CodexBaseURL + "/responses/compact"
+
+	// Resin 反向代理模式
+	var client *http.Client
+	if IsResinEnabled() {
+		endpoint = BuildReverseProxyURL(endpoint)
+		client = getResinHTTPClient(account)
+	} else {
+		client = getPooledClient(account, proxyURL)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, ErrInternalError("创建请求失败", err)
+	}
+
+	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
+
+	if IsResinEnabled() {
+		req.Header.Set("X-Resin-Account", ResinAccountID(account))
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		if shouldRecyclePooledClient(err) {
+			recyclePooledClient(account, proxyURL)
+		}
+		return nil, ErrUpstream(0, "请求上游失败", err)
+	}
+
+	return resp, nil
+}
+
+func codexVersionFromProfile(profile deviceProfile, fallback string) string {
+	if profile.HasVersion {
+		return fmt.Sprintf("%d.%d.%d", profile.Version.major, profile.Version.minor, profile.Version.patch)
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessToken, cacheKey, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) {
+	if req == nil {
+		return
+	}
+
+	accountID := ""
+	if account != nil {
+		account.Mu().RLock()
+		accountID = account.AccountID
+		account.Mu().RUnlock()
+	}
+
+	var profile deviceProfile
+	version := ""
+	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
+		profile = ResolveDeviceProfile(account, apiKey, downstreamHeaders, deviceCfg)
+		ApplyDeviceProfileHeaders(req, profile)
+		version = codexVersionFromProfile(profile, strings.TrimSpace(deviceCfg.PackageVersion))
+	} else {
+		clientProfile := ProfileForAccount(account.ID())
+		req.Header.Set("User-Agent", clientProfile.UserAgent)
+		version = clientProfile.Version
+	}
+
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Connection", "Keep-Alive")
+	if version != "" {
+		req.Header.Set("Version", version)
+	}
+	if originator := strings.TrimSpace(downstreamHeaders.Get("Originator")); originator != "" {
+		req.Header.Set("Originator", originator)
+	} else {
+		req.Header.Set("Originator", Originator)
+	}
+	if accountID != "" {
+		req.Header.Set("Chatgpt-Account-Id", accountID)
+	}
+	if cacheKey != "" {
+		req.Header.Set("Session_id", cacheKey)
+		req.Header.Del("Conversation_id")
+	}
+}
+
+// ResolveSessionID 从下游请求提取或生成 session ID
+// 优先级：
+//  1. Header: Session_id
+//  2. Header: Conversation_id
+//  3. Header: Idempotency-Key
+//  4. Body:   prompt_cache_key
+//  5. 基于 Bearer API Key 的确定性 UUID
+func ResolveSessionID(headers http.Header, body []byte) string {
+	if headers != nil {
+		if v := strings.TrimSpace(headers.Get("Session_id")); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(headers.Get("Conversation_id")); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(headers.Get("Idempotency-Key")); v != "" {
+			return v
+		}
+	}
 	// 优先从 body 的 prompt_cache_key 提取
 	if v := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); v != "" {
 		return v
 	}
 
 	// 基于下游用户的 API Key 生成确定性 cache key（参考 CLIProxyAPI codex_executor.go:621）
+	authHeader := ""
+	if headers != nil {
+		authHeader = headers.Get("Authorization")
+	}
 	apiKey := strings.TrimPrefix(authHeader, "Bearer ")
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey != "" {

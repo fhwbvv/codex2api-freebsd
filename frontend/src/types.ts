@@ -171,6 +171,9 @@ export interface SystemSettings {
   global_rpm: number
   test_model: string
   test_concurrency: number
+  background_refresh_interval_minutes: number
+  usage_probe_max_age_minutes: number
+  recovery_probe_interval_minutes: number
   proxy_url?: string
   pg_max_conns: number
   redis_pool_size: number
@@ -191,6 +194,8 @@ export interface SystemSettings {
   cache_label: string
   expired_cleaned?: number
   model_mapping: string
+  resin_url: string
+  resin_platform_name: string
 }
 
 export interface CPAExportEntry {

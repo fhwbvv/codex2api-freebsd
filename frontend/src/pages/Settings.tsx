@@ -132,6 +132,9 @@ export default function Settings() {
     global_rpm: 0,
     test_model: '',
     test_concurrency: 50,
+    background_refresh_interval_minutes: 2,
+    usage_probe_max_age_minutes: 10,
+    recovery_probe_interval_minutes: 30,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -150,6 +153,8 @@ export default function Settings() {
     cache_driver: 'redis',
     cache_label: 'Redis',
     model_mapping: '{}',
+    resin_url: '',
+    resin_platform_name: '',
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
@@ -487,6 +492,39 @@ export default function Settings() {
                 />
                 <p className="text-xs text-muted-foreground mt-1">{t('settings.testConcurrencyRange')}</p>
               </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.backgroundRefreshInterval')}</label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={settingsForm.background_refresh_interval_minutes}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.backgroundRefreshIntervalDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.usageProbeMaxAge')}</label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={10080}
+                  value={settingsForm.usage_probe_max_age_minutes}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.usageProbeMaxAgeDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.recoveryProbeInterval')}</label>
+                <Input
+                  type="number"
+                  min={1}
+                  max={10080}
+                  value={settingsForm.recovery_probe_interval_minutes}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.recoveryProbeIntervalDesc')}</p>
+              </div>
             </div>
             {showConnectionPool ? (
               <>
@@ -672,6 +710,37 @@ export default function Settings() {
               value={settingsForm.model_mapping}
               onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
             />
+          </CardContent>
+        </Card>
+
+        {/* Resin Proxy Pool */}
+        <Card className="mb-4">
+          <CardContent className="p-6">
+            <h3 className="text-base font-semibold text-foreground mb-2">{t('settings.resinTitle')}</h3>
+            <p className="text-xs text-muted-foreground mb-4">{t('settings.resinDesc')}</p>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4">
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.resinUrl')}</label>
+                <Input
+                  placeholder="http://127.0.0.1:2260/your-token"
+                  value={settingsForm.resin_url}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_url: e.target.value }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.resinUrlDesc')}</p>
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.resinPlatformName')}</label>
+                <Input
+                  placeholder="codex2api"
+                  value={settingsForm.resin_platform_name}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_platform_name: e.target.value }))}
+                />
+                <p className="text-xs text-muted-foreground mt-1">{t('settings.resinPlatformNameDesc')}</p>
+              </div>
+            </div>
+            <Button className="mt-4" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+              {savingSettings ? t('common.saving') : t('settings.saveSettings')}
+            </Button>
           </CardContent>
         </Card>
 

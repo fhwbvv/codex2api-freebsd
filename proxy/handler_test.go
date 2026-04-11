@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -133,6 +135,40 @@ func TestSendFinalUpstreamError_Non429StatusPassthrough(t *testing.T) {
 	// 非 429 直接透传原状态码
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestCompute429CooldownPlusUsesWindowHeaders(t *testing.T) {
+	handler := &Handler{}
+	account := &auth.Account{PlanType: "plus"}
+	resp := &http.Response{
+		Header: make(http.Header),
+	}
+	resp.Header.Set("x-codex-primary-used-percent", "100")
+	resp.Header.Set("x-codex-primary-window-minutes", "300")
+	resp.Header.Set("x-codex-secondary-used-percent", "20")
+	resp.Header.Set("x-codex-secondary-window-minutes", "10080")
+
+	got := handler.compute429Cooldown(account, []byte(`{"error":{"type":"usage_limit_reached"}}`), resp)
+	want := 5 * time.Hour
+	if got != want {
+		t.Fatalf("cooldown = %v, want %v", got, want)
+	}
+}
+
+func TestCompute429CooldownPlusPrefersExactResetTime(t *testing.T) {
+	handler := &Handler{}
+	account := &auth.Account{PlanType: "plus"}
+	resp := &http.Response{
+		Header: make(http.Header),
+	}
+	resp.Header.Set("x-codex-primary-used-percent", "100")
+	resp.Header.Set("x-codex-primary-window-minutes", "10080")
+
+	got := handler.compute429Cooldown(account, []byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":1800}}`), resp)
+	want := 30 * time.Minute
+	if got != want {
+		t.Fatalf("cooldown = %v, want %v", got, want)
 	}
 }
 

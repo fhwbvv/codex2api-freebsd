@@ -109,7 +109,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
-	sessionID := ResolveSessionID(c.GetHeader("Authorization"), codexBody)
+	sessionID := ResolveSessionID(c.Request.Header, codexBody)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -119,9 +119,9 @@ func (h *Handler) Messages(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account := h.store.NextExcluding(excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
 		if account == nil {
-			account = h.store.WaitForAvailable(c.Request.Context(), 30*time.Second)
+			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
@@ -133,7 +133,10 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := h.store.NextProxy()
+		proxyURL := stickyProxyURL
+		if proxyURL == "" {
+			proxyURL = h.store.NextProxy()
+		}
 		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -162,6 +165,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(sessionID, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
@@ -184,6 +188,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
+			h.store.UnbindSessionAffinity(sessionID, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
@@ -362,6 +367,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			continue
 		}
 
+		h.store.BindSessionAffinity(sessionID, account, proxyURL)
+
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/messages, status %d): %s，已转发约 %d 字符",
@@ -424,4 +431,3 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, lastStatusCode, errType, fmt.Sprintf("Upstream returned status %d", lastStatusCode))
 	}
 }
-

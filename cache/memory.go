@@ -26,10 +26,34 @@ func NewMemory(poolSize int) TokenCache {
 	if poolSize <= 0 {
 		poolSize = 1
 	}
-	return &MemoryTokenCache{
+	tc := &MemoryTokenCache{
 		tokens:   make(map[int64]memoryTokenEntry),
 		locks:    make(map[int64]time.Time),
 		poolSize: poolSize,
+	}
+	// 启动后台定时清理过期 token 和过期锁，防止已删除账号的条目永驻内存
+	go tc.cleanupLoop()
+	return tc
+}
+
+// cleanupLoop 每 60 秒清理一次过期 token 和过期锁
+func (tc *MemoryTokenCache) cleanupLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		tc.mu.Lock()
+		for id, entry := range tc.tokens {
+			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+				delete(tc.tokens, id)
+			}
+		}
+		for id, until := range tc.locks {
+			if now.After(until) {
+				delete(tc.locks, id)
+			}
+		}
+		tc.mu.Unlock()
 	}
 }
 

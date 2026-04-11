@@ -17,9 +17,10 @@ import (
 // 自动将历史 items 注入回 input，使上游无需依赖服务端存储即可匹配 call_id。
 
 const (
-	responseCacheTTL      = 10 * time.Minute
-	responseCacheMaxItems = 10000 // 增加缓存条目数以提高命中率
-	responseCleanupInterval = 2 * time.Minute // 增加清理间隔以减少锁竞争
+	responseCacheTTL        = 10 * time.Minute
+	responseCacheMaxItems   = 2000  // 缓存条目上限，防止内存膨胀
+	responseCacheMaxPerItem = 200   // 单条缓存最大 items 数，截断过长对话
+	responseCleanupInterval = 2 * time.Minute
 )
 
 type responseCacheEntry struct {
@@ -39,9 +40,13 @@ func init() {
 
 // setResponseCache 存储响应上下文
 func setResponseCache(responseID string, items []json.RawMessage) {
+	// 截断过长对话，只保留最后 responseCacheMaxPerItem 条
+	if len(items) > responseCacheMaxPerItem {
+		items = items[len(items)-responseCacheMaxPerItem:]
+	}
+
 	respCache.mu.Lock()
 	// 超过上限时随机清理10%的条目
-	// 注意：Go map 遍历顺序是随机的，这不是真正的 LRU，但简单高效
 	if len(respCache.store) >= responseCacheMaxItems {
 		deleteCount := responseCacheMaxItems / 10
 		for k := range respCache.store {

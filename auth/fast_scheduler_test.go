@@ -8,12 +8,14 @@ import (
 
 func newFastSchedulerTestAccount(id int64, tier AccountHealthTier, score float64, limit int64) *Account {
 	return &Account{
-		DBID:                    id,
-		AccessToken:             "token",
-		Status:                  StatusReady,
-		HealthTier:              tier,
-		SchedulerScore:          score,
-		DynamicConcurrencyLimit: limit,
+		DBID:                     id,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               tier,
+		SchedulerScore:           score,
+		DispatchScore:            score,
+		BaseConcurrencyEffective: limit,
+		DynamicConcurrencyLimit:  limit,
 	}
 }
 
@@ -144,6 +146,27 @@ func TestBuildFastSchedulerFromStore(t *testing.T) {
 	sizes := scheduler.BucketSizes()
 	if sizes[HealthTierHealthy] != 1 || sizes[HealthTierWarm] != 1 {
 		t.Fatalf("unexpected bucket sizes: %#v", sizes)
+	}
+}
+
+func TestFastSchedulerProvenPhaseUsesTotalRequestsOnly(t *testing.T) {
+	premium := newFastSchedulerTestAccount(1, HealthTierHealthy, 150, 1)
+	atomic.StoreInt64(&premium.TotalRequests, 0)
+
+	proven := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 1)
+	atomic.StoreInt64(&proven.TotalRequests, 11)
+
+	scheduler := NewFastScheduler(1)
+	scheduler.Rebuild([]*Account{premium, proven})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != proven.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want proven account %d", got.DBID, proven.DBID)
 	}
 }
 

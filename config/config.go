@@ -68,6 +68,7 @@ func (c *CacheConfig) Label() string {
 type Config struct {
 	Port           int
 	AdminSecret    string
+	MaxRequestBodySize int
 	Database       DatabaseConfig
 	Cache          CacheConfig
 	UseWebsocket   bool   // 是否启用 WebSocket 传输
@@ -81,7 +82,10 @@ func Load(envPath string) (*Config, error) {
 	}
 	_ = godotenv.Load(envPath)
 
-	cfg := &Config{Port: 8080}
+	cfg := &Config{
+		Port:               8080,
+		MaxRequestBodySize: 32 * 1024 * 1024,
+	}
 
 	// Web服务端口
 	if port := os.Getenv("CODEX_PORT"); port != "" {
@@ -90,6 +94,11 @@ func Load(envPath string) (*Config, error) {
 		fmt.Sscanf(port, "%d", &cfg.Port)
 	}
 	cfg.AdminSecret = strings.TrimSpace(os.Getenv("ADMIN_SECRET"))
+	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_REQUEST_BODY_SIZE_MB")); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			cfg.MaxRequestBodySize = mb * 1024 * 1024
+		}
+	}
 
 	// WebSocket 配置
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("USE_WEBSOCKET"))); v == "true" || v == "1" {

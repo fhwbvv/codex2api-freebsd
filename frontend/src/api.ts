@@ -17,6 +17,7 @@ import type {
   StatsResponse,
   CPAExportEntry,
   SystemSettings,
+  UpdateAccountSchedulerRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
   UsageStats,
@@ -103,6 +104,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
+    request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
   toggleAccountLock: (id: number, locked: boolean) =>
     request<MessageResponse>(`/accounts/${id}/lock`, { method: 'POST', body: JSON.stringify({ locked }) }),
   resetAccountStatus: (id: number) =>

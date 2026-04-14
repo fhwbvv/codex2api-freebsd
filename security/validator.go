@@ -14,11 +14,14 @@ const (
 	MaxEmailLength        = 255
 	MaxProxyURLLength     = 500
 	MaxTokenLength        = 8192
-	MaxRequestBodySize    = 10 * 1024 * 1024 // 10MB
 	MaxHeaderSize         = 16 * 1024        // 16KB
 	AllowedModelPattern   = `^[a-zA-Z0-9._-]+$`
 	AllowedEndpointPattern = `^[a-zA-Z0-9/_-]+$`
 )
+
+const DefaultMaxRequestBodySize = 32 * 1024 * 1024 // 32MB
+
+var MaxRequestBodySize = DefaultMaxRequestBodySize
 
 // Dangerous patterns for XSS prevention
 var (

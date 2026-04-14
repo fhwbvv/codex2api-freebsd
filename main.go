@@ -166,12 +166,13 @@ func main() {
 	r.Use(api.RecoveryMiddleware())
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
+	security.MaxRequestBodySize = cfg.MaxRequestBodySize
+	r.Use(security.RequestSizeLimiter(int64(security.MaxRequestBodySize)))
 	r.Use(api.BodyCacheMiddleware())
 	r.Use(api.CORSMiddleware())
 	r.Use(api.SecurityHeadersMiddleware())
 	r.Use(loggerMiddleware())
 	r.Use(security.SecurityHeadersMiddleware())
-	r.Use(security.RequestSizeLimiter(security.MaxRequestBodySize))
 
 	// handler 不再接收 cfg.APIKeys
 	// 从环境变量读取 Codex 画像与 Beta 配置。

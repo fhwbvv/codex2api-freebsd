@@ -16,19 +16,21 @@ import (
 
 // AccountRow 数据库中的账号行
 type AccountRow struct {
-	ID             int64
-	Name           string
-	Platform       string
-	Type           string
-	Credentials    map[string]interface{}
-	ProxyURL       string
-	Status         string
-	CooldownReason string
-	CooldownUntil  sql.NullTime
-	ErrorMessage   string
-	Locked         bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                      int64
+	Name                    string
+	Platform                string
+	Type                    string
+	Credentials             map[string]interface{}
+	ProxyURL                string
+	Status                  string
+	CooldownReason          string
+	CooldownUntil           sql.NullTime
+	ErrorMessage            string
+	Locked                  bool
+	ScoreBiasOverride       sql.NullInt64
+	BaseConcurrencyOverride sql.NullInt64
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 // GetCredential 从 credentials JSONB 获取字符串字段
@@ -206,6 +208,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS score_bias_override INT NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS base_concurrency_override INT NULL;
 
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
 	CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);
@@ -914,6 +918,10 @@ type TrafficSnapshot struct {
 
 // GetUsageStats 获取使用统计（基线 + 当前日志）
 func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
+	if db.isSQLite() {
+		return db.getUsageStatsSQLite(ctx)
+	}
+
 	stats := &UsageStats{}
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
@@ -1471,7 +1479,7 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 // ListActive 获取所有状态为 active 的账号
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), score_bias_override, base_concurrency_override, created_at, updated_at
 		FROM accounts
 		WHERE status = 'active'
 		ORDER BY id
@@ -1501,6 +1509,8 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&cooldownUntilRaw,
 			&a.ErrorMessage,
 			&a.Locked,
+			&a.ScoreBiasOverride,
+			&a.BaseConcurrencyOverride,
 			&createdAtRaw,
 			&updatedAtRaw,
 		); err != nil {
@@ -1522,6 +1532,35 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
+}
+
+// UpdateAccountSchedulerConfig 更新账号调度配置。
+func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreBiasOverride sql.NullInt64, baseConcurrencyOverride sql.NullInt64) error {
+	result, err := db.conn.ExecContext(ctx, `
+		UPDATE accounts
+		SET score_bias_override = $1,
+		    base_concurrency_override = $2,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE id = $3
+	`, nullableInt64Value(scoreBiasOverride), nullableInt64Value(baseConcurrencyOverride), id)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func nullableInt64Value(v sql.NullInt64) interface{} {
+	if !v.Valid {
+		return nil
+	}
+	return v.Int64
 }
 
 // SetAccountLocked 设置账号的锁定状态

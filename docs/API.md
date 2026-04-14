@@ -295,6 +295,11 @@ data: [DONE]
       "status": "ready",
       "health_tier": "healthy",
       "scheduler_score": 100,
+      "dispatch_score": 150,
+      "score_bias_override": null,
+      "score_bias_effective": 50,
+      "base_concurrency_override": null,
+      "base_concurrency_effective": 2,
       "dynamic_concurrency_limit": 2,
       "proxy_url": "http://proxy.example.com:8080",
       "created_at": "2024-01-01T00:00:00Z",
@@ -321,6 +326,52 @@ data: [DONE]
       }
     }
   ]
+}
+```
+
+字段说明补充：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| scheduler_score | number | 原始健康分，仅反映动态调度健康状态 |
+| dispatch_score | number | 最终用于调度排序的分数；优先读取运行时快照 |
+| score_bias_override | integer/null | 手工配置的总加权分覆盖值，`null` 表示跟随套餐默认 |
+| score_bias_effective | integer | 当前生效的加权分 |
+| base_concurrency_override | integer/null | 手工配置的基础并发覆盖值，`null` 表示跟随全局 `max_concurrency` |
+| base_concurrency_effective | integer | 当前生效的基础并发值 |
+
+#### PATCH /api/admin/accounts/:id/scheduler
+
+更新账号调度配置。
+
+**请求:**
+```json
+{
+  "score_bias_override": 80,
+  "base_concurrency_override": 6
+}
+```
+
+字段可分别传 `null` 恢复自动值：
+
+```json
+{
+  "score_bias_override": null,
+  "base_concurrency_override": null
+}
+```
+
+**参数说明:**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| score_bias_override | integer/null | 否 | 总加权分覆盖值，范围 `-200..200`，`null` 表示恢复套餐默认 |
+| base_concurrency_override | integer/null | 否 | 基础并发覆盖值，范围 `1..50`，`null` 表示恢复全局默认 |
+
+**响应:**
+```json
+{
+  "message": "账号调度配置已更新"
 }
 ```
 

@@ -16,7 +16,7 @@ func TestNextForSessionPrefersBoundAccountAndProxy(t *testing.T) {
 	}
 	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")
 
-	acc, proxyURL := store.NextForSession("session-1", nil)
+	acc, proxyURL := store.NextForSession("session-1", 0, nil)
 	if acc == nil {
 		t.Fatal("expected account")
 	}
@@ -38,7 +38,31 @@ func TestNextForSessionFallsBackWhenBoundAccountExcluded(t *testing.T) {
 	}
 	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")
 
-	acc, proxyURL := store.NextForSession("session-1", map[int64]bool{2: true})
+	acc, proxyURL := store.NextForSession("session-1", 0, map[int64]bool{2: true})
+	if acc == nil {
+		t.Fatal("expected fallback account")
+	}
+	if acc.DBID != 1 {
+		t.Fatalf("account DBID = %d, want %d", acc.DBID, 1)
+	}
+	if proxyURL != "" {
+		t.Fatalf("proxyURL = %q, want empty fallback proxy", proxyURL)
+	}
+}
+
+func TestNextForSessionWithFilterFallsBackWhenBoundAccountRejected(t *testing.T) {
+	store := &Store{
+		accounts: []*Account{
+			{DBID: 1, AccessToken: "tok-1", PlanType: "pro"},
+			{DBID: 2, AccessToken: "tok-2", PlanType: "plus"},
+		},
+		maxConcurrency: 2,
+	}
+	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")
+
+	acc, proxyURL := store.NextForSessionWithFilter("session-1", 0, nil, func(acc *Account) bool {
+		return acc.GetPlanType() == "pro"
+	})
 	if acc == nil {
 		t.Fatal("expected fallback account")
 	}
@@ -63,7 +87,7 @@ func TestWaitForSessionAvailableReturnsBoundAccount(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	acc, proxyURL := store.WaitForSessionAvailable(ctx, "session-1", 50*time.Millisecond, nil)
+	acc, proxyURL := store.WaitForSessionAvailable(ctx, "session-1", 50*time.Millisecond, 0, nil)
 	if acc == nil {
 		t.Fatal("expected bound account")
 	}
@@ -87,7 +111,7 @@ func TestWaitForSessionAvailableFallsBackWhenBindingExpired(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	acc, proxyURL := store.WaitForSessionAvailable(ctx, "session-1", 50*time.Millisecond, nil)
+	acc, proxyURL := store.WaitForSessionAvailable(ctx, "session-1", 50*time.Millisecond, 0, nil)
 	if acc == nil {
 		t.Fatal("expected fallback account")
 	}
@@ -112,7 +136,7 @@ func TestWaitForSessionAvailableRespectsExcludeSet(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	acc, proxyURL := store.WaitForSessionAvailable(ctx, "session-1", 50*time.Millisecond, map[int64]bool{2: true})
+	acc, proxyURL := store.WaitForSessionAvailable(ctx, "session-1", 50*time.Millisecond, 0, map[int64]bool{2: true})
 	if acc == nil {
 		t.Fatal("expected fallback account")
 	}
@@ -136,7 +160,29 @@ func TestUnbindSessionAffinityRemovesMatchingBinding(t *testing.T) {
 
 	store.UnbindSessionAffinity("session-1", 2)
 
-	acc, proxyURL := store.NextForSession("session-1", nil)
+	acc, proxyURL := store.NextForSession("session-1", 0, nil)
+	if acc == nil {
+		t.Fatal("expected fallback account")
+	}
+	if acc.DBID != 1 {
+		t.Fatalf("account DBID = %d, want %d", acc.DBID, 1)
+	}
+	if proxyURL != "" {
+		t.Fatalf("proxyURL = %q, want empty fallback proxy", proxyURL)
+	}
+}
+
+func TestNextForSessionFallsBackWhenAPIKeyNotAllowed(t *testing.T) {
+	store := &Store{
+		accounts: []*Account{
+			{DBID: 1, AccessToken: "tok-1"},
+			{DBID: 2, AccessToken: "tok-2", AllowedAPIKeyIDs: []int64{2}, allowedAPIKeySet: map[int64]struct{}{2: {}}},
+		},
+		maxConcurrency: 2,
+	}
+	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")
+
+	acc, proxyURL := store.NextForSession("session-1", 1, nil)
 	if acc == nil {
 		t.Fatal("expected fallback account")
 	}

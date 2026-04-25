@@ -42,8 +42,8 @@ export default function StateShell({
 
   if (loading) {
     return (
-      <div className={`flex flex-col items-center justify-center gap-3 p-10 border border-border rounded-3xl bg-white/40 text-center ${minH}`} role="status" aria-live="polite">
-        <div className="size-16 flex items-center justify-center rounded-full bg-white/60">
+      <div className={`flex flex-col items-center justify-center gap-3 rounded-lg border border-border bg-card/80 p-8 text-center shadow-sm ${minH}`} role="status" aria-live="polite">
+        <div className="size-14 flex items-center justify-center rounded-full bg-muted/70">
           <div className="spinner" />
         </div>
         <strong className="text-lg font-bold text-foreground">{resolvedLoadingTitle}</strong>
@@ -54,8 +54,8 @@ export default function StateShell({
 
   if (error) {
     return (
-      <div className={`flex flex-col items-center justify-center gap-3 p-10 border border-border rounded-3xl bg-white/40 text-center ${minH}`} role="alert">
-        <div className="size-16 flex items-center justify-center rounded-full bg-destructive/12 text-destructive">
+      <div className={`flex flex-col items-center justify-center gap-3 rounded-lg border border-border bg-card/80 p-8 text-center shadow-sm ${minH}`} role="alert">
+        <div className="size-14 flex items-center justify-center rounded-full bg-destructive/12 text-destructive">
           <AlertCircle className="size-6" />
         </div>
         <strong className="text-lg font-bold text-foreground">{resolvedErrorTitle}</strong>
@@ -72,8 +72,8 @@ export default function StateShell({
 
   if (isEmpty) {
     return (
-      <div className={`flex flex-col items-center justify-center gap-3 p-10 border border-border rounded-3xl bg-white/40 text-center ${minH}`}>
-        <div className="size-16 flex items-center justify-center rounded-full bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]">
+      <div className={`flex flex-col items-center justify-center gap-3 rounded-lg border border-border bg-card/80 p-8 text-center shadow-sm ${minH}`}>
+        <div className="size-14 flex items-center justify-center rounded-full bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]">
           <Inbox className="size-6" />
         </div>
         <strong className="text-lg font-bold text-foreground">{resolvedEmptyTitle}</strong>

@@ -9,8 +9,9 @@
 - [公共 API](#公共-api)
   - [Chat Completions](#1-chat-completions)
   - [Responses](#2-responses)
-  - [List Models](#3-list-models)
-  - [Health Check](#4-health-check)
+  - [Images](#3-images)
+  - [List Models](#4-list-models)
+  - [Health Check](#5-health-check)
 - [管理 API](#管理-api)
   - [统计接口](#统计接口)
   - [账号管理](#账号管理) — 添加 RT / AT 账号、批量导入、导出、迁移
@@ -209,7 +210,60 @@ data: [DONE]
 }
 ```
 
-### 3. List Models
+### 3. Images
+
+#### 生成图片
+
+**端点:** `POST /v1/images/generations`
+
+**说明:** OpenAI Images 兼容入口。外部请求使用 `gpt-image-2`，内部按 `CLIProxyAPI/` 与 `sub2api/` 的链路转换为 Codex `/responses`：主模型为 `gpt-5.4-mini`，图像模型写入 `tools[0].model`。
+
+**请求示例:**
+```json
+{
+  "model": "gpt-image-2",
+  "prompt": "Draw a small orange cat",
+  "size": "1024x1024",
+  "quality": "high",
+  "response_format": "b64_json"
+}
+```
+
+#### 编辑图片
+
+**端点:** `POST /v1/images/edits`
+
+**说明:** 支持 JSON `images[].image_url` 和 multipart `image` / `image[]` 上传。`mask.image_url` 或 multipart `mask` 可用于遮罩编辑。
+
+**JSON 请求示例:**
+```json
+{
+  "model": "gpt-image-2",
+  "prompt": "Replace the background with aurora lights",
+  "images": [
+    {"image_url": "https://example.com/source.png"}
+  ],
+  "output_format": "png"
+}
+```
+
+**响应示例:**
+```json
+{
+  "created": 1710000000,
+  "model": "gpt-image-2",
+  "data": [
+    {
+      "b64_json": "..."
+    }
+  ],
+  "usage": {
+    "images": 1
+  }
+}
+```
+
+### 4. List Models
 
 **端点:** `GET /v1/models`
 
@@ -220,14 +274,18 @@ data: [DONE]
 {
   "object": "list",
   "data": [
+    {"id": "gpt-5.5", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.4-mini", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5", "object": "model", "owned_by": "openai"}
+    {"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-5.2", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-image-2", "object": "model", "owned_by": "openai"}
   ]
 }
 ```
 
-### 4. Health Check
+### 5. Health Check
 
 **端点:** `GET /health`
 
@@ -301,6 +359,7 @@ data: [DONE]
       "base_concurrency_override": null,
       "base_concurrency_effective": 2,
       "dynamic_concurrency_limit": 2,
+      "allowed_api_key_ids": [1, 3],
       "proxy_url": "http://proxy.example.com:8080",
       "created_at": "2024-01-01T00:00:00Z",
       "updated_at": "2024-01-01T12:00:00Z",
@@ -339,6 +398,7 @@ data: [DONE]
 | score_bias_effective | integer | 当前生效的加权分 |
 | base_concurrency_override | integer/null | 手工配置的基础并发覆盖值，`null` 表示跟随全局 `max_concurrency` |
 | base_concurrency_effective | integer | 当前生效的基础并发值 |
+| allowed_api_key_ids | integer[] | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
 
 #### PATCH /api/admin/accounts/:id/scheduler
 
@@ -348,7 +408,8 @@ data: [DONE]
 ```json
 {
   "score_bias_override": 80,
-  "base_concurrency_override": 6
+  "base_concurrency_override": 6,
+  "allowed_api_key_ids": [1, 3]
 }
 ```
 
@@ -357,7 +418,8 @@ data: [DONE]
 ```json
 {
   "score_bias_override": null,
-  "base_concurrency_override": null
+  "base_concurrency_override": null,
+  "allowed_api_key_ids": null
 }
 ```
 
@@ -367,6 +429,7 @@ data: [DONE]
 |------|------|------|------|
 | score_bias_override | integer/null | 否 | 总加权分覆盖值，范围 `-200..200`，`null` 表示恢复套餐默认 |
 | base_concurrency_override | integer/null | 否 | 基础并发覆盖值，范围 `1..50`，`null` 表示恢复全局默认 |
+| allowed_api_key_ids | integer[]/null | 否 | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
 
 **响应:**
 ```json
@@ -1085,18 +1148,57 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 #### GET /api/admin/models
 
-获取支持的模型列表。
+获取当前启用的模型列表，并返回模型注册表元数据。
 
 **响应:**
 ```json
 {
   "models": [
+    "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
-    "gpt-5",
-    "gpt-5-codex",
-    "gpt-5-codex-mini"
-  ]
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2",
+    "gpt-image-2"
+  ],
+  "items": [
+    {
+      "id": "gpt-5.3-codex-spark",
+      "enabled": true,
+      "category": "codex",
+      "source": "official_codex_docs",
+      "pro_only": true,
+      "api_key_auth_available": true
+    }
+  ],
+  "last_synced_at": "2026-04-24T00:00:00Z",
+  "source_url": "https://developers.openai.com/codex/models"
+}
+```
+
+#### POST /api/admin/models/sync
+
+从 OpenAI 官方 Codex 模型页同步模型注册表。同步只新增或更新模型元数据，不会自动删除本地模型；`gpt-image-2` 始终作为内置图像模型保留。
+
+**响应:**
+```json
+{
+  "added": 0,
+  "updated": 2,
+  "unchanged": 5,
+  "skipped": ["gpt-5.2-codex"],
+  "models": [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2",
+    "gpt-image-2"
+  ],
+  "last_synced_at": "2026-04-24T00:00:00Z",
+  "source_url": "https://developers.openai.com/codex/models"
 }
 ```
 
@@ -1176,18 +1278,13 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 | 模型 | 说明 |
 |------|------|
+| gpt-5.5 | 最新旗舰模型 |
 | gpt-5.4 | 旗舰模型 |
 | gpt-5.4-mini | 轻量版 |
-| gpt-5 | 标准版 |
-| gpt-5-codex | Codex 专用 |
-| gpt-5-codex-mini | Codex 轻量 |
-| gpt-5.1 | 旧版本 |
-| gpt-5.1-codex | 旧版本 Codex |
-| gpt-5.1-codex-mini | 旧版本 Codex 轻量 |
-| gpt-5.1-codex-max | 旧版本 Codex 最大版 |
-| gpt-5.2 | 中间版本 |
-| gpt-5.2-codex | 中间版本 Codex |
 | gpt-5.3-codex | 较新版本 |
+| gpt-5.3-codex-spark | Codex Spark 模型，仅 Pro 订阅账号可调用 |
+| gpt-5.2 | 兼容保留模型 |
+| gpt-image-2 | GPT Image 2 图像生成模型 |
 
 > 提示：实际支持的模型以 `/v1/models` 接口返回为准，文档可能未及时更新。
 ---

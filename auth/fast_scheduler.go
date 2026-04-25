@@ -167,50 +167,71 @@ func (s *FastScheduler) SetBaseLimit(baseLimit int64) {
 }
 
 func (s *FastScheduler) Acquire() *Account {
-	return s.AcquireExcluding(nil)
+	return s.AcquireExcluding(0, nil)
 }
 
 // AcquireExcluding 获取下一个可用账号，排除指定的账号 ID 集合
 // 两阶段调度：优先在验证过的账号中选取，全忙时回退到全量扫描
-func (s *FastScheduler) AcquireExcluding(exclude map[int64]bool) *Account {
+func (s *FastScheduler) AcquireExcluding(apiKeyID int64, exclude map[int64]bool) *Account {
+	return s.AcquireExcludingWithFilter(apiKeyID, exclude, nil)
+}
+
+// AcquireExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
+func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
 	if s == nil {
 		return nil
 	}
 
 	now := time.Now()
 
-	s.mu.RLock()
-	baseLimit := s.baseLimit
-	for tierIdx, tier := range fastSchedulerTierOrder {
-		bucket := s.buckets[tier]
-		if len(bucket) == 0 {
-			continue
-		}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		// 阶段 1：优先在验证过的账号（桶前部 provenBound 个）中 round-robin
-		provenBound := s.provenBounds[tierIdx]
-		if provenBound > 0 {
-			if acc := s.scanRange(bucket, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, now, exclude); acc != nil {
-				s.mu.RUnlock()
+	baseLimit := s.baseLimit
+	for {
+		changed := false
+		for tierIdx, tier := range fastSchedulerTierOrder {
+			bucket := s.buckets[tier]
+			if len(bucket) == 0 {
+				continue
+			}
+
+			// 阶段 1：优先在验证过的账号（桶前部 provenBound 个）中 round-robin
+			provenBound := s.provenBounds[tierIdx]
+			if provenBound > 0 {
+				acc, stale := s.scanRangeLocked(tier, 0, provenBound, &s.provenCurs[tierIdx], baseLimit, now, apiKeyID, exclude, filter)
+				if acc != nil {
+					return acc
+				}
+				if stale {
+					changed = true
+					break
+				}
+			}
+
+			// 阶段 2：回退到全量 round-robin
+			acc, stale := s.scanRangeLocked(tier, 0, len(bucket), &s.cursors[tierIdx], baseLimit, now, apiKeyID, exclude, filter)
+			if acc != nil {
 				return acc
 			}
+			if stale {
+				changed = true
+				break
+			}
 		}
-
-		// 阶段 2：回退到全量 round-robin
-		if acc := s.scanRange(bucket, 0, len(bucket), &s.cursors[tierIdx], baseLimit, now, exclude); acc != nil {
-			s.mu.RUnlock()
-			return acc
+		if !changed {
+			return nil
 		}
 	}
-	s.mu.RUnlock()
-	return nil
 }
 
-// scanRange 在 bucket[start:end) 范围内 round-robin 扫描可用账号
-func (s *FastScheduler) scanRange(bucket []fastSchedulerEntry, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, exclude map[int64]bool) *Account {
+// scanRangeLocked 在 bucket[start:end) 范围内 round-robin 扫描可用账号。
+// 返回 stale=true 表示桶内缓存已过期，调用方应重新开始扫描。
+func (s *FastScheduler) scanRangeLocked(expectedTier AccountHealthTier, rangeStart, rangeEnd int, cursor *atomic.Uint64, baseLimit int64, now time.Time, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, bool) {
+	bucket := s.buckets[expectedTier]
 	rangeLen := rangeEnd - rangeStart
 	if rangeLen <= 0 {
-		return nil
+		return nil, false
 	}
 	start := int(cursor.Add(1)-1) % rangeLen
 	for offset := 0; offset < rangeLen; offset++ {
@@ -221,16 +242,29 @@ func (s *FastScheduler) scanRange(bucket []fastSchedulerEntry, rangeStart, range
 		if exclude != nil && exclude[entry.dbID] {
 			continue
 		}
-		_, _, limit, _, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+		if !entry.acc.AllowsAPIKey(apiKeyID) {
+			continue
+		}
+		if filter != nil && !filter(entry.acc) {
+			continue
+		}
+		tier, _, limit, _, available := entry.acc.fastSchedulerSnapshot(baseLimit, now)
+		if tier != expectedTier {
+			s.removeLocked(entry.dbID)
+			if available && limit > 0 {
+				s.insertLocked(entry.acc, now)
+			}
+			return nil, true
+		}
 		if !available || limit <= 0 {
 			continue
 		}
 		if !tryAcquireAccount(entry.acc, limit) {
 			continue
 		}
-		return entry.acc
+		return entry.acc, false
 	}
-	return nil
+	return nil, false
 }
 
 func (s *FastScheduler) Release(acc *Account) {
@@ -339,8 +373,12 @@ func (s *FastScheduler) rebuildPositionsLocked(tier AccountHealthTier) {
 }
 
 func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (AccountHealthTier, float64, int64, bool, bool) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if isPremium5hPlan(a.PlanType) && a.UsagePercent5hValid {
+		a.recomputeSchedulerLocked(baseLimit)
+	}
 
 	tier := a.healthTierLocked()
 	score := a.DispatchScore
@@ -364,7 +402,7 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	}
 
 	available := a.Status != StatusError && tier != HealthTierBanned && a.AccessToken != ""
-	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
+	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) && !a.premium5hCooldownSuppressedLocked(now) {
 		available = false
 	}
 	// Free 账号 7d 用量耗尽，不参与调度

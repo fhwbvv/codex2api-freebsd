@@ -154,6 +154,25 @@ const requestCacheSize = 256
 // maxTools 上游 Codex API 允许的最大工具数量
 const maxTools = 128
 
+const (
+	codexImageGenerationBridgeMarker = "<codex2api-codex-image-generation>"
+	codexImageGenerationBridgeText   = codexImageGenerationBridgeMarker + "\nWhen the user asks for raster image generation or editing, use the OpenAI Responses native `image_generation` tool attached to this request. The local Codex client may not expose an `image_gen` namespace, but that does not mean image generation is unavailable. Do not ask the user to switch to CLI fallback solely because `image_gen` is absent.\n</codex2api-codex-image-generation>"
+)
+
+var responsesImageGenerationOptionFields = []string{
+	"size",
+	"quality",
+	"background",
+	"output_format",
+	"output_compression",
+	"moderation",
+	"partial_images",
+}
+
+var responsesImageGenerationUnsupportedOptionFields = []string{
+	"style",
+}
+
 type requestCacheEntry struct {
 	key [32]byte
 	req openAIRequest
@@ -168,6 +187,366 @@ type requestCache struct {
 var globalRequestCache = &requestCache{
 	order: list.New(),
 	items: make(map[[32]byte]*list.Element, requestCacheSize),
+}
+
+func firstNonEmptyAnyString(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []byte:
+		return strings.TrimSpace(string(v))
+	default:
+		return ""
+	}
+}
+
+func appendResponseTextPart(parts *[]string, raw any) {
+	text := firstNonEmptyAnyString(raw)
+	if text != "" {
+		*parts = append(*parts, text)
+	}
+}
+
+func extractResponsesPromptText(body map[string]any) string {
+	if len(body) == 0 {
+		return ""
+	}
+	if prompt := firstNonEmptyAnyString(body["prompt"]); prompt != "" {
+		return prompt
+	}
+	var parts []string
+	extractResponsesInputText(body["input"], &parts)
+	return strings.Join(parts, " ")
+}
+
+func extractResponsesInputText(raw any, parts *[]string) {
+	switch v := raw.(type) {
+	case string:
+		appendResponseTextPart(parts, v)
+	case []map[string]string:
+		for _, item := range v {
+			appendResponseTextPart(parts, item["content"])
+		}
+	case []map[string]any:
+		for _, item := range v {
+			extractResponsesMessageText(item, parts)
+		}
+	case []any:
+		for _, item := range v {
+			switch typed := item.(type) {
+			case map[string]any:
+				extractResponsesMessageText(typed, parts)
+			case map[string]string:
+				appendResponseTextPart(parts, typed["content"])
+			case string:
+				appendResponseTextPart(parts, typed)
+			}
+		}
+	}
+}
+
+func extractResponsesMessageText(item map[string]any, parts *[]string) {
+	if item == nil {
+		return
+	}
+	appendResponseTextPart(parts, item["text"])
+	content, ok := item["content"]
+	if !ok {
+		return
+	}
+	switch v := content.(type) {
+	case string:
+		appendResponseTextPart(parts, v)
+	case []any:
+		for _, rawPart := range v {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				continue
+			}
+			appendResponseTextPart(parts, part["text"])
+		}
+	case []map[string]any:
+		for _, part := range v {
+			appendResponseTextPart(parts, part["text"])
+		}
+	}
+}
+
+func hasResponsesImageGenerationTool(body map[string]any) bool {
+	rawTools, ok := body["tools"]
+	if !ok || rawTools == nil {
+		return false
+	}
+	tools, ok := rawTools.([]any)
+	if !ok {
+		return false
+	}
+	for _, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(toolMap["type"])) == "image_generation" {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureResponsesImageGenerationTool(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	defaultTool := map[string]any{
+		"type":  "image_generation",
+		"model": defaultImagesToolModel,
+	}
+	rawTools, ok := body["tools"]
+	if !ok || rawTools == nil {
+		body["tools"] = []any{defaultTool}
+		return true
+	}
+	tools, ok := rawTools.([]any)
+	if !ok {
+		body["tools"] = []any{defaultTool}
+		return true
+	}
+	for _, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(toolMap["type"])) == "image_generation" {
+			return false
+		}
+	}
+	if len(tools) >= maxTools {
+		truncated := append([]any(nil), tools[:maxTools]...)
+		truncated[maxTools-1] = defaultTool
+		body["tools"] = truncated
+		return true
+	}
+	body["tools"] = append(tools, defaultTool)
+	return true
+}
+
+func firstResponsesImageGenerationTool(body map[string]any) map[string]any {
+	rawTools, ok := body["tools"]
+	if !ok || rawTools == nil {
+		return nil
+	}
+	tools, ok := rawTools.([]any)
+	if !ok {
+		return nil
+	}
+	for _, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(toolMap["type"])) == "image_generation" {
+			return toolMap
+		}
+	}
+	return nil
+}
+
+func moveTopLevelResponsesImageOptions(body map[string]any) bool {
+	toolMap := firstResponsesImageGenerationTool(body)
+	if len(body) == 0 || toolMap == nil {
+		return false
+	}
+	modified := false
+	for _, key := range responsesImageGenerationOptionFields {
+		value, exists := body[key]
+		if !exists || value == nil {
+			continue
+		}
+		_, toolHas := toolMap[key]
+		if key == "output_format" && strings.TrimSpace(firstNonEmptyAnyString(toolMap["format"])) != "" {
+			toolHas = true
+		}
+		if key == "output_compression" {
+			if _, hasAlias := toolMap["compression"]; hasAlias {
+				toolHas = true
+			}
+		}
+		if !toolHas {
+			toolMap[key] = value
+		}
+		delete(body, key)
+		modified = true
+	}
+	for _, key := range responsesImageGenerationUnsupportedOptionFields {
+		if _, exists := body[key]; exists {
+			delete(body, key)
+			modified = true
+		}
+	}
+	return modified
+}
+
+func normalizeResponsesImageGenerationTools(body map[string]any, promptText string) bool {
+	rawTools, ok := body["tools"]
+	if !ok || rawTools == nil {
+		return false
+	}
+	tools, ok := rawTools.([]any)
+	if !ok {
+		return false
+	}
+	modified := false
+	for _, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if !ok || strings.TrimSpace(firstNonEmptyAnyString(toolMap["type"])) != "image_generation" {
+			continue
+		}
+		rawModel := strings.TrimSpace(firstNonEmptyAnyString(toolMap["model"]))
+		toolModel, defaultSize := normalizeImageToolModelForPrompt(rawModel, promptText)
+		if rawModel != toolModel {
+			toolMap["model"] = toolModel
+			modified = true
+		}
+		sizeValue, hasSize := toolMap["size"]
+		sizeString, sizeIsString := sizeValue.(string)
+		if defaultSize != "" && (!hasSize || (sizeIsString && strings.TrimSpace(sizeString) == "")) {
+			toolMap["size"] = defaultSize
+			modified = true
+		}
+		if _, ok := toolMap["output_format"]; !ok {
+			if value := strings.TrimSpace(firstNonEmptyAnyString(toolMap["format"])); value != "" {
+				toolMap["output_format"] = value
+			} else {
+				toolMap["output_format"] = "png"
+			}
+			modified = true
+		}
+		if _, ok := toolMap["output_compression"]; !ok {
+			if value, exists := toolMap["compression"]; exists && value != nil {
+				toolMap["output_compression"] = value
+				modified = true
+			}
+		}
+		if _, ok := toolMap["format"]; ok {
+			delete(toolMap, "format")
+			modified = true
+		}
+		if _, ok := toolMap["compression"]; ok {
+			delete(toolMap, "compression")
+			modified = true
+		}
+		for _, key := range responsesImageGenerationUnsupportedOptionFields {
+			if _, ok := toolMap[key]; ok {
+				delete(toolMap, key)
+				modified = true
+			}
+		}
+	}
+	return modified
+}
+
+func normalizeResponsesPromptCompat(body map[string]any) bool {
+	rawPrompt, hasPrompt := body["prompt"]
+	if len(body) == 0 || !hasPrompt {
+		return false
+	}
+	if _, hasInput := body["input"]; !hasInput {
+		if prompt := strings.TrimSpace(firstNonEmptyAnyString(rawPrompt)); prompt != "" {
+			body["input"] = prompt
+		}
+	}
+	delete(body, "prompt")
+	return true
+}
+
+func applyResponsesImageGenerationBridgeInstructions(body map[string]any) bool {
+	if len(body) == 0 || !hasResponsesImageGenerationTool(body) {
+		return false
+	}
+	existing, _ := body["instructions"].(string)
+	if strings.Contains(existing, codexImageGenerationBridgeMarker) {
+		return false
+	}
+	existing = strings.TrimRight(existing, " \t\r\n")
+	if strings.TrimSpace(existing) == "" {
+		body["instructions"] = codexImageGenerationBridgeText
+		return true
+	}
+	body["instructions"] = existing + "\n\n" + codexImageGenerationBridgeText
+	return true
+}
+
+func normalizeResponsesImageOnlyModel(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	imageModel := strings.TrimSpace(firstNonEmptyAnyString(body["model"]))
+	if !isImageOnlyModel(imageModel) {
+		return false
+	}
+
+	modified := false
+	tools, _ := body["tools"].([]any)
+	imageToolIndex := -1
+	for i, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(toolMap["type"])) == "image_generation" {
+			imageToolIndex = i
+			break
+		}
+	}
+	if imageToolIndex < 0 {
+		tools = append(tools, map[string]any{
+			"type":  "image_generation",
+			"model": imageModel,
+		})
+		imageToolIndex = len(tools) - 1
+		body["tools"] = tools
+		modified = true
+	}
+
+	if toolMap, ok := tools[imageToolIndex].(map[string]any); ok {
+		if strings.TrimSpace(firstNonEmptyAnyString(toolMap["model"])) == "" {
+			toolMap["model"] = imageModel
+			modified = true
+		}
+	}
+
+	if _, ok := body["tool_choice"]; !ok {
+		body["tool_choice"] = map[string]any{"type": "image_generation"}
+		modified = true
+	}
+	if imageModel != defaultImagesMainModel {
+		modified = true
+	}
+	body["model"] = defaultImagesMainModel
+	return modified
+}
+
+func truncateToolsPreservingImageGeneration(tools []any) []any {
+	if len(tools) <= maxTools {
+		return tools
+	}
+	imageIndex := -1
+	for i, rawTool := range tools {
+		toolMap, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(toolMap["type"])) == "image_generation" {
+			imageIndex = i
+			break
+		}
+	}
+	if imageIndex < 0 || imageIndex < maxTools {
+		return tools[:maxTools]
+	}
+	truncated := append([]any(nil), tools[:maxTools]...)
+	truncated[maxTools-1] = tools[imageIndex]
+	return truncated
 }
 
 func (c *requestCache) get(key [32]byte) (openAIRequest, bool) {
@@ -276,12 +655,16 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		body["include"] = []string{"reasoning.encrypted_content"}
 	}
 
+	normalizeResponsesImageOnlyModel(body)
+	normalizeResponsesPromptCompat(body)
+
 	// 2. 字符串 input → 数组包装（Codex 要求 input 为 list）
 	if inputStr, ok := body["input"].(string); ok {
 		body["input"] = []map[string]string{
 			{"role": "user", "content": inputStr},
 		}
 	}
+	promptText := extractResponsesPromptText(body)
 
 	// 3. reasoning_effort → reasoning.effort 自动转换 + 钳位
 	if re, ok := body["reasoning_effort"].(string); ok && re != "" {
@@ -319,7 +702,7 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	// 5. 工具描述补充 + schema 清理 + 上游数量限制
 	if tools, ok := body["tools"].([]any); ok {
 		if len(tools) > maxTools {
-			tools = tools[:maxTools]
+			tools = truncateToolsPreservingImageGeneration(tools)
 			body["tools"] = tools
 		}
 		toolDescDefaults := map[string]string{
@@ -345,6 +728,10 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 			}
 		}
 	}
+	ensureResponsesImageGenerationTool(body)
+	moveTopLevelResponsesImageOptions(body)
+	normalizeResponsesImageGenerationTools(body, promptText)
+	applyResponsesImageGenerationBridgeInstructions(body)
 
 	// 6. 展开 previous_response_id
 	prevID, _ := body["previous_response_id"].(string)

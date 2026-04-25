@@ -22,10 +22,10 @@ export default function StatCard({ icon, iconClass, label, value, sub }: StatCar
       <CardContent className="flex flex-col justify-between gap-2 p-4">
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
-            <label className="block text-[11px] font-bold tracking-[0.12em] uppercase text-muted-foreground">
+            <label className="block text-[11px] font-bold uppercase text-muted-foreground">
               {label}
             </label>
-            <div className="mt-2 text-[28px] font-bold leading-none tracking-tighter text-foreground">
+            <div className="mt-2 text-[26px] font-bold leading-none text-foreground">
               {value}
             </div>
           </div>

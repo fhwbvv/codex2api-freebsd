@@ -86,6 +86,8 @@ Rate limits are returned in response headers:
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | Create chat completion |
 | `/v1/responses` | POST | Create response (Codex native) |
+| `/v1/images/generations` | POST | Create image generation |
+| `/v1/images/edits` | POST | Create image edit |
 | `/health` | GET | Health check |
 
 ### Admin API Endpoints
@@ -137,6 +139,7 @@ Rate limits are returned in response headers:
 | `/api/admin/settings` | GET | 获取系统设置 |
 | `/api/admin/settings` | PUT | 更新系统设置 |
 | `/api/admin/models` | GET | 获取支持模型列表 |
+| `/api/admin/models/sync` | POST | 从 OpenAI 官方 Codex 模型页同步模型注册表 |
 
 **用量统计:**
 
@@ -160,12 +163,13 @@ Rate limits are returned in response headers:
 
 ### Model Support
 
-Supported models include:
+Built-in fallback models include:
+- `gpt-5.5`
 - `gpt-5.4`
 - `gpt-5.4-mini`
-- `gpt-5`
-- `gpt-5-codex`
-- `gpt-5-codex-mini`
-- `gpt-5.1`, `gpt-5.1-codex`, etc.
+- `gpt-5.3-codex`
+- `gpt-5.3-codex-spark` (requires a Pro subscription account)
+- `gpt-5.2`
+- `gpt-image-2`
 
-See the OpenAPI spec for the complete list.
+Use `/api/admin/models/sync` to merge newer official Codex models into the runtime registry. The sync never removes local models and always keeps `gpt-image-2`.

@@ -97,17 +97,17 @@ export default function AuthGate({ children }: PropsWithChildren) {
 
   if (status === 'need_login') {
     return (
-      <div className="flex items-center justify-center min-h-dvh bg-gradient-to-br from-slate-50 via-white to-blue-50/30">
+      <div className="flex items-center justify-center min-h-dvh bg-background">
         <div className="w-full max-w-[400px] mx-4">
-          <div className="text-center mb-8">
-            <img src={logoImg} alt="Codex2API" className="w-16 h-16 rounded-2xl object-cover shadow-[0_4px_20px_hsl(258_60%_63%/0.2)] mx-auto mb-4" />
-            <h1 className="text-[28px] font-bold bg-gradient-to-br from-[hsl(258,60%,63%)] to-[hsl(210,80%,60%)] bg-clip-text text-transparent">
+          <div className="text-center mb-6">
+            <img src={logoImg} alt="Codex2API" className="size-14 rounded-lg object-cover shadow-sm mx-auto mb-4" />
+            <h1 className="text-[26px] font-bold text-foreground">
               Codex2API
             </h1>
             <p className="text-sm text-muted-foreground mt-1">{t('auth.subtitle')}</p>
           </div>
 
-          <div className="rounded-3xl border border-border bg-white/80 shadow-xl shadow-black/[0.03] p-6 backdrop-blur-sm">
+          <div className="rounded-lg border border-border bg-card p-5 shadow-sm">
             <div className="space-y-4">
               <div>
                 <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.adminSecret')}</label>
@@ -118,7 +118,7 @@ export default function AuthGate({ children }: PropsWithChildren) {
                   onKeyDown={(e) => { if (e.key === 'Enter') void handleLogin() }}
                   placeholder={t('auth.placeholder')}
                   autoFocus
-                  className="w-full h-11 px-4 rounded-xl border border-border bg-white text-[15px] outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
+                  className="w-full h-10 px-3.5 rounded-md border border-input bg-background text-[15px] outline-none transition-all focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
                 />
               </div>
 
@@ -129,7 +129,7 @@ export default function AuthGate({ children }: PropsWithChildren) {
               <button
                 onClick={() => void handleLogin()}
                 disabled={submitting}
-                className="w-full h-11 rounded-xl bg-gradient-to-r from-[hsl(258,60%,63%)] to-[hsl(210,80%,60%)] text-white font-semibold text-[15px] shadow-lg shadow-primary/20 transition-all hover:opacity-90 disabled:opacity-50"
+                className="w-full h-10 rounded-md bg-primary text-primary-foreground font-semibold text-[15px] shadow-sm transition-colors hover:bg-primary/90 disabled:opacity-50"
               >
                 {submitting ? t('common.loading') : t('auth.login')}
               </button>

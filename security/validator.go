@@ -3,6 +3,7 @@
 package security
 
 import (
+	"net/url"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -10,12 +11,12 @@ import (
 
 // Validation constants
 const (
-	MaxModelLength        = 100
-	MaxEmailLength        = 255
-	MaxProxyURLLength     = 500
-	MaxTokenLength        = 8192
-	MaxHeaderSize         = 16 * 1024        // 16KB
-	AllowedModelPattern   = `^[a-zA-Z0-9._-]+$`
+	MaxModelLength         = 100
+	MaxEmailLength         = 255
+	MaxProxyURLLength      = 500
+	MaxTokenLength         = 8192
+	MaxHeaderSize          = 16 * 1024 // 16KB
+	AllowedModelPattern    = `^[a-zA-Z0-9._-]+$`
 	AllowedEndpointPattern = `^[a-zA-Z0-9/_-]+$`
 )
 
@@ -167,7 +168,7 @@ func MaskSensitiveData(input string) string {
 		return input
 	}
 
-	result := input
+	result := MaskURLCredentials(input)
 	for _, pattern := range sensitivePatterns {
 		result = pattern.ReplaceAllString(result, "${1}****MASKED****")
 	}
@@ -176,6 +177,21 @@ func MaskSensitiveData(input string) string {
 	result = uuidPattern.ReplaceAllString(result, "****UUID-MASKED****")
 
 	return result
+}
+
+// MaskURLCredentials masks password-like userinfo in URL strings for logs.
+func MaskURLCredentials(input string) string {
+	parsed, err := url.Parse(input)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User == nil {
+		return input
+	}
+	username := parsed.User.Username()
+	if _, hasPassword := parsed.User.Password(); hasPassword {
+		parsed.User = url.UserPassword(username, "redacted")
+	} else {
+		parsed.User = url.User(username)
+	}
+	return parsed.String()
 }
 
 // MaskAPIKey masks an API key for display (show only first 4 and last 4 chars)

@@ -1,17 +1,15 @@
-import type { ChangeEvent, KeyboardEvent } from 'react'
-import { useCallback, useState } from 'react'
+import type { ChangeEvent, ReactNode } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
-import { getTimezone, setTimezone } from '../utils/time'
+import { formatBeijingTime, getTimezone, setTimezone } from '../utils/time'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
-import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { APIKeyRow, HealthResponse, SystemSettings } from '../types'
+import type { HealthResponse, ModelInfo, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
-import { formatRelativeTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -25,8 +23,9 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { cn } from '@/lib/utils'
 
-import { Trash2, Eye, EyeOff } from 'lucide-react'
+import { ExternalLink, RefreshCw, Save, Trash2 } from 'lucide-react'
 
 // 默认模型映射
 const DEFAULT_MODEL_MAPPING: Record<string, string> = {
@@ -35,7 +34,7 @@ const DEFAULT_MODEL_MAPPING: Record<string, string> = {
   'claude-haiku-4-5-20251001': 'gpt-5.4-mini',
   'claude-haiku-4-5': 'gpt-5.4-mini',
   'claude-sonnet-4-6': 'gpt-5.3-codex',
-  'claude-sonnet-4-5-20250929': 'gpt-5.2-codex',
+  'claude-sonnet-4-5-20250929': 'gpt-5.2',
   'claude-opus-4-5-20251101': 'gpt-5.3-codex',
 }
 
@@ -113,9 +112,71 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
   )
 }
 
-function maskKey(key: string): string {
-  if (!key || key.length < 12) return key
-  return key.slice(0, 7) + '???????' + key.slice(-4)
+function SettingsCard({
+  title,
+  description,
+  children,
+  className,
+  footer,
+}: {
+  title: string
+  description?: string
+  children: ReactNode
+  className?: string
+  footer?: ReactNode
+}) {
+  return (
+    <Card className={cn('py-0', className)}>
+      <CardContent className="p-5">
+        <div className="mb-4">
+          <h3 className="text-base font-semibold leading-tight text-foreground">{title}</h3>
+          {description ? (
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{description}</p>
+          ) : null}
+        </div>
+        {children}
+        {footer ? <div className="mt-5 border-t border-border pt-4">{footer}</div> : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function SettingField({
+  label,
+  description,
+  warning,
+  children,
+  className,
+}: {
+  label: string
+  description?: string
+  warning?: string
+  children: ReactNode
+  className?: string
+}) {
+  return (
+    <div className={cn('min-w-0 space-y-2', className)}>
+      <label className="block text-sm font-semibold leading-none text-foreground">{label}</label>
+      {children}
+      {description ? <p className="text-xs leading-relaxed text-muted-foreground">{description}</p> : null}
+      {warning ? <p className="text-xs leading-relaxed text-amber-600">{warning}</p> : null}
+    </div>
+  )
+}
+
+function StatusTile({
+  label,
+  children,
+}: {
+  label: string
+  children: ReactNode
+}) {
+  return (
+    <div className="flex min-h-[76px] flex-col justify-between gap-2 rounded-lg border border-border bg-muted/25 p-3">
+      <span className="text-[11px] font-bold uppercase text-muted-foreground">{label}</span>
+      <div className="text-sm font-semibold text-foreground">{children}</div>
+    </div>
+  )
 }
 
 export default function Settings() {
@@ -124,9 +185,6 @@ export default function Settings() {
     { label: t('common.disabled'), value: 'false' },
     { label: t('common.enabled'), value: 'true' },
   ]
-  const [newKeyName, setNewKeyName] = useState('')
-  const [newKeyValue, setNewKeyValue] = useState('')
-  const [createdKey, setCreatedKey] = useState<string | null>(null)
   const [settingsForm, setSettingsForm] = useState<SystemSettings>({
     max_concurrency: 2,
     global_rpm: 0,
@@ -159,95 +217,33 @@ export default function Settings() {
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
-  const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set())
+  const [modelItems, setModelItems] = useState<ModelInfo[]>([])
+  const [modelsLastSyncedAt, setModelsLastSyncedAt] = useState<string | undefined>()
+  const [modelsSourceURL, setModelsSourceURL] = useState('')
+  const [syncingModels, setSyncingModels] = useState(false)
   const { toast, showToast } = useToast()
-  const { confirm, confirmDialog } = useConfirmDialog()
 
   const loadSettingsData = useCallback(async () => {
-    const [health, keysResponse, settings, modelsResp] = await Promise.all([api.getHealth(), api.getAPIKeys(), api.getSettings(), api.getModels()])
+    const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
     setSettingsForm(settings)
     setLoadedAdminSecret(settings.admin_secret ?? '')
     setModelList(modelsResp.models ?? [])
+    setModelItems(modelsResp.items ?? [])
+    setModelsLastSyncedAt(modelsResp.last_synced_at)
+    setModelsSourceURL(modelsResp.source_url ?? '')
     return {
       health,
-      keys: keysResponse.keys ?? [],
     }
   }, [])
 
   const { data, loading, error, reload } = useDataLoader<{
     health: HealthResponse | null
-    keys: APIKeyRow[]
   }>({
     initialData: {
       health: null,
-      keys: [],
     },
     load: loadSettingsData,
   })
-
-  const handleCreateKey = async () => {
-    try {
-      const result = await api.createAPIKey(newKeyName.trim() || 'default', newKeyValue.trim() || undefined)
-      setCreatedKey(result.key)
-      setNewKeyName('')
-      setNewKeyValue('')
-      showToast(t('settings.keyCreateSuccess'))
-      void reload()
-    } catch (error) {
-      showToast(`${t('settings.createFailed')}: ${getErrorMessage(error)}`, 'error')
-    }
-  }
-
-  const handleDeleteKey = async (id: number) => {
-    const confirmed = await confirm({
-      title: t('settings.deleteKeyTitle'),
-      description: t('settings.deleteKeyDesc'),
-      confirmText: t('settings.confirmDelete'),
-      tone: 'destructive',
-      confirmVariant: 'destructive',
-    })
-    if (!confirmed) {
-      return
-    }
-
-    try {
-      await api.deleteAPIKey(id)
-      showToast(t('settings.keyDeleted'))
-      void reload()
-    } catch (error) {
-      showToast(`${t('settings.deleteFailed')}: ${getErrorMessage(error)}`, 'error')
-    }
-  }
-
-  const handleCopy = async (text: string) => {
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text)
-        showToast(t('common.copied'))
-        return
-      }
-
-      const textarea = document.createElement('textarea')
-      textarea.value = text
-      textarea.setAttribute('readonly', 'true')
-      textarea.style.position = 'fixed'
-      textarea.style.opacity = '0'
-      textarea.style.pointerEvents = 'none'
-      document.body.appendChild(textarea)
-      textarea.select()
-      textarea.setSelectionRange(0, text.length)
-      const copied = document.execCommand('copy')
-      document.body.removeChild(textarea)
-
-      if (!copied) {
-        throw new Error('copy failed')
-      }
-
-      showToast(t('common.copied'))
-    } catch {
-      showToast(t('common.copyFailed'), 'error')
-    }
-  }
 
   const handleSaveSettings = async () => {
     setSavingSettings(true)
@@ -275,11 +271,58 @@ export default function Settings() {
     }
   }
 
-  const { health, keys } = data
+  const handleSyncModels = async () => {
+    setSyncingModels(true)
+    try {
+      const result = await api.syncModels()
+      setModelList(result.models ?? [])
+      setModelItems(result.items ?? [])
+      setModelsLastSyncedAt(result.last_synced_at)
+      setModelsSourceURL(result.source_url ?? '')
+      showToast(t('settings.modelsSyncSuccess', {
+        added: result.added,
+        updated: result.updated,
+        skipped: result.skipped?.length ?? 0,
+      }))
+    } catch (error) {
+      showToast(`${t('settings.modelsSyncFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setSyncingModels(false)
+    }
+  }
+
+  const { health } = data
   const isExternalDatabase = settingsForm.database_driver === 'postgres'
   const isExternalCache = settingsForm.cache_driver === 'redis'
   const showConnectionPool = isExternalDatabase || isExternalCache
   const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
+  const saveButtonLabel = savingSettings ? t('common.saving') : t('settings.saveSettings')
+  const visibleModelItems = useMemo(() => {
+    if (modelItems.length > 0) {
+      return modelItems
+    }
+    return modelList.map((id) => ({
+      id,
+      enabled: true,
+      category: id.includes('image') ? 'image' : 'codex',
+      source: 'builtin',
+      pro_only: id === 'gpt-5.3-codex-spark',
+      api_key_auth_available: id !== 'gpt-5.5',
+    }))
+  }, [modelItems, modelList])
+  const textModelOptions = visibleModelItems
+    .filter((model) => model.enabled && model.category !== 'image' && !model.id.includes('image'))
+    .map((model) => ({ label: model.id, value: model.id }))
+  const enabledModelCount = visibleModelItems.filter((model) => model.enabled).length
+  const modelsLastSyncedLabel = modelsLastSyncedAt ? formatBeijingTime(modelsLastSyncedAt) : t('settings.modelsNeverSynced')
+  const modelsSourceLabel = modelsSourceURL || 'https://developers.openai.com/codex/models'
+  const renderSaveButton = (className?: string) => (
+    <Button className={className} onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+      <Save className="size-4" />
+      {saveButtonLabel}
+    </Button>
+  )
+
   return (
     <StateShell
       variant="page"
@@ -294,335 +337,204 @@ export default function Settings() {
         <PageHeader
           title={t('settings.title')}
           description={t('settings.description')}
+          actions={renderSaveButton('max-sm:w-full')}
         />
 
-        {/* API Keys */}
-        <Card className="mb-4">
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between gap-4 mb-4">
-              <h3 className="text-base font-semibold text-foreground">{t('settings.apiKeys')}</h3>
+        <div className="space-y-4">
+          <SettingsCard title={t('settings.systemStatus')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(180px,1fr))] gap-3">
+              <StatusTile label={t('settings.service')}>
+                <Badge variant={health?.status === 'ok' ? 'default' : 'destructive'} className="gap-1.5">
+                  <span className={`size-1.5 rounded-full ${health?.status === 'ok' ? 'bg-emerald-500' : 'bg-red-400'}`} />
+                  {health?.status === 'ok' ? t('common.running') : t('common.error')}
+                </Badge>
+              </StatusTile>
+              <StatusTile label={t('settings.accountsLabel')}>
+                {health?.available ?? 0} / {health?.total ?? 0}
+              </StatusTile>
+              <StatusTile label={settingsForm.database_label}>
+                <Badge variant="default" className="gap-1.5">
+                  <span className="size-1.5 rounded-full bg-emerald-500" />
+                  {isExternalDatabase ? t('common.connected') : t('common.running')}
+                </Badge>
+              </StatusTile>
+              <StatusTile label={settingsForm.cache_label}>
+                <Badge variant="default" className="gap-1.5">
+                  <span className="size-1.5 rounded-full bg-emerald-500" />
+                  {isExternalCache ? t('common.connected') : t('common.running')}
+                </Badge>
+              </StatusTile>
             </div>
+          </SettingsCard>
 
-            <div className="flex gap-2 mb-4 flex-wrap">
-              <Input
-                className="flex-[1_1_120px]"
-                placeholder={t('settings.keyNamePlaceholder')}
-                value={newKeyName}
-                onChange={(event: ChangeEvent<HTMLInputElement>) => setNewKeyName(event.target.value)}
-              />
-              <Input
-                className="flex-[2_1_240px]"
-                placeholder={t('settings.keyValuePlaceholder')}
-                value={newKeyValue}
-                onChange={(event: ChangeEvent<HTMLInputElement>) => setNewKeyValue(event.target.value)}
-                onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => {
-                  if (event.key === 'Enter') {
-                    void handleCreateKey()
-                  }
-                }}
-              />
-              <Button onClick={() => void handleCreateKey()} className="whitespace-nowrap">
-                {t('settings.createKey')}
-              </Button>
-            </div>
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(360px,1.05fr)]">
+            <SettingsCard title={t('settings.trafficProtection')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(210px,1fr))] gap-4">
+                <SettingField label={t('settings.maxConcurrency')} description={t('settings.maxConcurrencyRange')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={settingsForm.max_concurrency}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_concurrency: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.globalRpm')} description={t('settings.globalRpmRange')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    value={settingsForm.global_rpm}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, global_rpm: parseInt(e.target.value) || 0 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.maxRetries')} description={t('settings.maxRetriesRange')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={settingsForm.max_retries}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_retries: parseInt(e.target.value) || 0 }))}
+                  />
+                </SettingField>
+              </div>
+            </SettingsCard>
 
-            {createdKey ? (
-              <div className="p-3 mb-4 rounded-xl bg-[hsl(var(--success-bg))] border border-[hsl(var(--success))]/20 text-sm">
-                <div className="font-semibold mb-1 text-[hsl(var(--success))]">{t('settings.keyCreated')}</div>
-                <div className="flex items-center gap-2">
-                  <code className="flex-1 font-mono text-[13px] break-all">{createdKey}</code>
-                  <Button variant="outline" size="sm" onClick={() => void handleCopy(createdKey)}>{t('common.copy')}</Button>
-                </div>
+            <SettingsCard title={t('settings.scheduler')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4">
+                <SettingField label={t('settings.testModelLabel')} description={t('settings.testModelHint')}>
+	                  <Select
+	                    value={settingsForm.test_model}
+	                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
+	                    options={textModelOptions}
+	                  />
+                </SettingField>
+                <SettingField label={t('settings.testConcurrency')} description={t('settings.testConcurrencyRange')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={200}
+                    value={settingsForm.test_concurrency}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, test_concurrency: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.backgroundRefreshInterval')} description={t('settings.backgroundRefreshIntervalDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={1440}
+                    value={settingsForm.background_refresh_interval_minutes}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.usageProbeMaxAge')} description={t('settings.usageProbeMaxAgeDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={10080}
+                    value={settingsForm.usage_probe_max_age_minutes}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.recoveryProbeInterval')} description={t('settings.recoveryProbeIntervalDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={10080}
+                    value={settingsForm.recovery_probe_interval_minutes}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.fastSchedulerEnabled')} description={t('settings.fastSchedulerEnabledDesc')}>
+                  <Select
+                    value={settingsForm.fast_scheduler_enabled ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, fast_scheduler_enabled: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
               </div>
-            ) : null}
+            </SettingsCard>
+          </div>
 
-            <StateShell
-              variant="section"
-              isEmpty={keys.length === 0}
-              emptyTitle={t('settings.noKeys')}
-              emptyDescription={t('settings.noKeysDesc')}
-            >
-              <div className="overflow-auto border border-border rounded-xl">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="text-[13px] font-semibold">{t('common.name')}</TableHead>
-                      <TableHead className="text-[13px] font-semibold">{t('common.key')}</TableHead>
-                      <TableHead className="text-[13px] font-semibold">{t('common.createdAt')}</TableHead>
-                      <TableHead className="text-[13px] font-semibold">{t('common.actions')}</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {keys.map((keyRow) => (
-                      <TableRow key={keyRow.id}>
-                        <TableCell className="text-[14px] font-medium">{keyRow.name}</TableCell>
-                        <TableCell>
-                          <div className="flex items-center gap-2">
-                            <span className="font-mono text-[14px]">
-                              {visibleKeys.has(keyRow.id) ? keyRow.raw_key : keyRow.key}
-                            </span>
-                            <button
-                              onClick={() => setVisibleKeys(prev => {
-                                const next = new Set(prev)
-                                if (next.has(keyRow.id)) next.delete(keyRow.id)
-                                else next.add(keyRow.id)
-                                return next
-                              })}
-                              className="flex items-center justify-center size-7 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors shrink-0"
-                            >
-                              {visibleKeys.has(keyRow.id) ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-                            </button>
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-[14px] text-muted-foreground">
-                          {formatRelativeTime(keyRow.created_at, { variant: 'compact' })}
-                        </TableCell>
-                        <TableCell>
-                          <Button variant="destructive" size="sm" onClick={() => void handleDeleteKey(keyRow.id)}>
-                            {t('common.delete')}
-                          </Button>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </div>
-            </StateShell>
-
-            <div className="text-xs text-muted-foreground mt-3">
-              {t('settings.keyAuthNote')}
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* System Status */}
-        <Card className="mb-4">
-          <CardContent className="p-6">
-            <h3 className="text-base font-semibold text-foreground mb-4">{t('settings.systemStatus')}</h3>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-3.5">
-              <div className="flex flex-col gap-1.5 p-3.5 rounded-2xl bg-white/40 border border-border">
-                <label className="text-xs font-bold text-muted-foreground">{t('settings.service')}</label>
-                <div className="text-[15px] font-semibold">
-                  <Badge variant={health?.status === 'ok' ? 'default' : 'destructive'} className="gap-1.5">
-                    <span className={`size-1.5 rounded-full ${health?.status === 'ok' ? 'bg-emerald-500' : 'bg-red-400'}`} />
-                    {health?.status === 'ok' ? t('common.running') : t('common.error')}
-                  </Badge>
-                </div>
-              </div>
-              <div className="flex flex-col gap-1.5 p-3.5 rounded-2xl bg-white/40 border border-border">
-                <label className="text-xs font-bold text-muted-foreground">{t('settings.accountsLabel')}</label>
-                <div className="text-[15px] font-semibold">{health?.available ?? 0} / {health?.total ?? 0}</div>
-              </div>
-              <div className="flex flex-col gap-1.5 p-3.5 rounded-2xl bg-white/40 border border-border">
-                <label className="text-xs font-bold text-muted-foreground">{settingsForm.database_label}</label>
-                <div className="text-[15px] font-semibold">
-                  <Badge variant="default" className="gap-1.5">
-                    <span className="size-1.5 rounded-full bg-emerald-500" />
-                    {isExternalDatabase ? t('common.connected') : t('common.running')}
-                  </Badge>
-                </div>
-              </div>
-              <div className="flex flex-col gap-1.5 p-3.5 rounded-2xl bg-white/40 border border-border">
-                <label className="text-xs font-bold text-muted-foreground">{settingsForm.cache_label}</label>
-                <div className="text-[15px] font-semibold">
-                  <Badge variant="default" className="gap-1.5">
-                    <span className="size-1.5 rounded-full bg-emerald-500" />
-                    {isExternalCache ? t('common.connected') : t('common.running')}
-                  </Badge>
-                </div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Protection Settings */}
-        <Card className="mb-4">
-          <CardContent className="p-6">
-            <h3 className="text-base font-semibold text-foreground mb-4">{t('settings.trafficProtection')}</h3>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4 mb-4">
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.maxConcurrency')}</label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={50}
-                  value={settingsForm.max_concurrency}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_concurrency: parseInt(e.target.value) || 1 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.maxConcurrencyRange')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.globalRpm')}</label>
-                <Input
-                  type="number"
-                  min={0}
-                  value={settingsForm.global_rpm}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, global_rpm: parseInt(e.target.value) || 0 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.globalRpmRange')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.maxRetries')}</label>
-                <Input
-                  type="number"
-                  min={0}
-                  max={10}
-                  value={settingsForm.max_retries}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_retries: parseInt(e.target.value) || 0 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.maxRetriesRange')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.testModelLabel')}</label>
-                <Select
-                  value={settingsForm.test_model}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
-                  options={modelList.map((model) => ({ label: model, value: model }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.testModelHint')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.testConcurrency')}</label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={200}
-                  value={settingsForm.test_concurrency}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, test_concurrency: parseInt(e.target.value) || 1 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.testConcurrencyRange')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.backgroundRefreshInterval')}</label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={1440}
-                  value={settingsForm.background_refresh_interval_minutes}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.backgroundRefreshIntervalDesc')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.usageProbeMaxAge')}</label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={10080}
-                  value={settingsForm.usage_probe_max_age_minutes}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.usageProbeMaxAgeDesc')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.recoveryProbeInterval')}</label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={10080}
-                  value={settingsForm.recovery_probe_interval_minutes}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.recoveryProbeIntervalDesc')}</p>
-              </div>
-            </div>
-            {showConnectionPool ? (
-              <>
-                <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.connectionPool')}</h3>
-                <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4 mb-4">
-                  {isExternalDatabase ? (
-                    <div>
-                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.pgMaxConns')}</label>
-                      <Input
-                        type="number"
-                        min={5}
-                        max={500}
-                        value={settingsForm.pg_max_conns}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, pg_max_conns: parseInt(e.target.value) || 50 }))}
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">{t('settings.pgMaxConnsRange')}</p>
-                    </div>
-                  ) : null}
-                  {isExternalCache ? (
-                    <div>
-                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.redisPoolSize')}</label>
-                      <Input
-                        type="number"
-                        min={5}
-                        max={500}
-                        value={settingsForm.redis_pool_size}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, redis_pool_size: parseInt(e.target.value) || 30 }))}
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">{t('settings.redisPoolSizeRange')}</p>
-                    </div>
-                  ) : null}
-                </div>
-              </>
-            ) : null}
-            <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.autoCleanup')}</h3>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.autoCleanUnauthorized')}</label>
+          <SettingsCard title={t('settings.autoCleanup')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-4">
+              <SettingField label={t('settings.autoCleanUnauthorized')} description={t('settings.autoCleanUnauthorizedDesc')}>
                 <Select
                   value={settingsForm.auto_clean_unauthorized ? 'true' : 'false'}
                   onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_unauthorized: value === 'true' }))}
                   options={booleanOptions}
                 />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanUnauthorizedDesc')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.autoCleanRateLimited')}</label>
+              </SettingField>
+              <SettingField label={t('settings.autoCleanRateLimited')} description={t('settings.autoCleanRateLimitedDesc')}>
                 <Select
                   value={settingsForm.auto_clean_rate_limited ? 'true' : 'false'}
                   onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_rate_limited: value === 'true' }))}
                   options={booleanOptions}
                 />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanRateLimitedDesc')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.autoCleanFullUsage')}</label>
+              </SettingField>
+              <SettingField label={t('settings.autoCleanFullUsage')} description={t('settings.autoCleanFullUsageDesc')}>
                 <Select
                   value={settingsForm.auto_clean_full_usage ? 'true' : 'false'}
                   onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_full_usage: value === 'true' }))}
                   options={booleanOptions}
                 />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanFullUsageDesc')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.autoCleanError')}</label>
+              </SettingField>
+              <SettingField label={t('settings.autoCleanError')} description={t('settings.autoCleanErrorDesc')}>
                 <Select
                   value={settingsForm.auto_clean_error ? 'true' : 'false'}
                   onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_error: value === 'true' }))}
                   options={booleanOptions}
                 />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanErrorDesc')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.autoCleanExpired')}</label>
+              </SettingField>
+              <SettingField label={t('settings.autoCleanExpired')} description={t('settings.autoCleanExpiredDesc')}>
                 <Select
                   value={settingsForm.auto_clean_expired ? 'true' : 'false'}
                   onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_expired: value === 'true' }))}
                   options={booleanOptions}
                 />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.autoCleanExpiredDesc')}</p>
-              </div>
+              </SettingField>
             </div>
-            <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.scheduler')}</h3>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.fastSchedulerEnabled')}</label>
-                <Select
-                  value={settingsForm.fast_scheduler_enabled ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, fast_scheduler_enabled: value === 'true' }))}
-                  options={booleanOptions}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.fastSchedulerEnabledDesc')}</p>
+          </SettingsCard>
+
+          <div className="grid gap-4 xl:grid-cols-2">
+            <SettingsCard title={t('settings.security')}>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-4">
+                <SettingField
+                  label={t('settings.adminSecret')}
+                  description={t('settings.adminSecretDesc')}
+                  warning={settingsForm.admin_auth_source === 'env' ? t('settings.adminSecretEnvOverride') : undefined}
+                >
+                  <Input
+                    type="text"
+                    placeholder={t('settings.adminSecretPlaceholder')}
+                    value={settingsForm.admin_secret}
+                    disabled={settingsForm.admin_auth_source === 'env'}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => {
+                      const nextSecret = e.target.value
+                      return {
+                        ...f,
+                        admin_secret: nextSecret,
+                        allow_remote_migration: nextSecret.trim() === '' ? false : f.allow_remote_migration,
+                      }
+                    })}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.allowRemoteMigration')}
+                  description={t('settings.allowRemoteMigrationDesc')}
+                  warning={!canConfigureRemoteMigration ? t('settings.allowRemoteMigrationRequiresSecret') : undefined}
+                >
+                  <Select
+                    value={settingsForm.allow_remote_migration ? 'true' : 'false'}
+                    disabled={!canConfigureRemoteMigration}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, allow_remote_migration: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
               </div>
-            </div>
-            <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.display')}</h3>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.timezone')}</label>
+            </SettingsCard>
+
+            <SettingsCard title={t('settings.display')}>
+              <SettingField label={t('settings.timezone')} description={t('settings.timezoneDesc')}>
                 <Select
                   value={getTimezone()}
                   onValueChange={(value) => {
@@ -655,137 +567,166 @@ export default function Settings() {
                     { label: '(GMT+12:00) Pacific/Auckland', value: 'Pacific/Auckland' },
                   ]}
                 />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.timezoneDesc')}</p>
-              </div>
-            </div>
-            <h3 className="text-base font-semibold text-foreground mb-4 mt-6">{t('settings.security')}</h3>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4 mb-4">
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.adminSecret')}</label>
-                <Input
-                  type="text"
-                  placeholder={t('settings.adminSecretPlaceholder')}
-                  value={settingsForm.admin_secret}
-                  disabled={settingsForm.admin_auth_source === 'env'}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => {
-                    const nextSecret = e.target.value
-                    return {
-                      ...f,
-                      admin_secret: nextSecret,
-                      allow_remote_migration: nextSecret.trim() === '' ? false : f.allow_remote_migration,
-                    }
-                  })}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.adminSecretDesc')}</p>
-                {settingsForm.admin_auth_source === 'env' ? (
-                  <p className="text-xs text-amber-600 mt-1">{t('settings.adminSecretEnvOverride')}</p>
-                ) : null}
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.allowRemoteMigration')}</label>
-                <Select
-                  value={settingsForm.allow_remote_migration ? 'true' : 'false'}
-                  disabled={!canConfigureRemoteMigration}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, allow_remote_migration: value === 'true' }))}
-                  options={booleanOptions}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.allowRemoteMigrationDesc')}</p>
-                {!canConfigureRemoteMigration ? (
-                  <p className="text-xs text-amber-600 mt-1">{t('settings.allowRemoteMigrationRequiresSecret')}</p>
-                ) : null}
-              </div>
-            </div>
-            <Button onClick={() => void handleSaveSettings()} disabled={savingSettings}>
-              {savingSettings ? t('common.saving') : t('settings.saveSettings')}
-            </Button>
-          </CardContent>
-        </Card>
+              </SettingField>
+            </SettingsCard>
+          </div>
 
-        {/* Model Mapping */}
-        <Card className="mb-4">
-          <CardContent className="p-6">
-            <h3 className="text-base font-semibold text-foreground mb-2">{t('settings2.modelMapping')}</h3>
-            <p className="text-xs text-muted-foreground mb-4">{t('settings2.modelMappingDesc')}</p>
-            <ModelMappingEditor
-              value={settingsForm.model_mapping}
-              onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
-            />
-          </CardContent>
-        </Card>
-
-        {/* Resin Proxy Pool */}
-        <Card className="mb-4">
-          <CardContent className="p-6">
-            <h3 className="text-base font-semibold text-foreground mb-2">{t('settings.resinTitle')}</h3>
-            <p className="text-xs text-muted-foreground mb-4">{t('settings.resinDesc')}</p>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4">
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.resinUrl')}</label>
-                <Input
-                  placeholder="http://127.0.0.1:2260/your-token"
-                  value={settingsForm.resin_url}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_url: e.target.value }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.resinUrlDesc')}</p>
-              </div>
-              <div>
-                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('settings.resinPlatformName')}</label>
-                <Input
-                  placeholder="codex2api"
-                  value={settingsForm.resin_platform_name}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_platform_name: e.target.value }))}
-                />
-                <p className="text-xs text-muted-foreground mt-1">{t('settings.resinPlatformNameDesc')}</p>
+          <SettingsCard title={showConnectionPool ? t('settings.connectionPool') : t('settings.resinTitle')} description={showConnectionPool ? undefined : t('settings.resinDesc')}>
+            <div className="space-y-5">
+              {showConnectionPool ? (
+                <div className="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-4">
+                  {isExternalDatabase ? (
+                    <SettingField label={t('settings.pgMaxConns')} description={t('settings.pgMaxConnsRange')}>
+                      <Input
+                        type="number"
+                        min={5}
+                        max={500}
+                        value={settingsForm.pg_max_conns}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, pg_max_conns: parseInt(e.target.value) || 50 }))}
+                      />
+                    </SettingField>
+                  ) : null}
+                  {isExternalCache ? (
+                    <SettingField label={t('settings.redisPoolSize')} description={t('settings.redisPoolSizeRange')}>
+                      <Input
+                        type="number"
+                        min={5}
+                        max={500}
+                        value={settingsForm.redis_pool_size}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, redis_pool_size: parseInt(e.target.value) || 30 }))}
+                      />
+                    </SettingField>
+                  ) : null}
+                </div>
+              ) : null}
+              {showConnectionPool ? (
+                <div className="border-t border-border pt-4">
+                  <h4 className="text-sm font-semibold text-foreground">{t('settings.resinTitle')}</h4>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t('settings.resinDesc')}</p>
+                </div>
+              ) : null}
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(260px,1fr))] gap-4">
+                <SettingField label={t('settings.resinUrl')} description={t('settings.resinUrlDesc')}>
+                  <Input
+                    placeholder="http://127.0.0.1:2260/your-token"
+                    value={settingsForm.resin_url}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_url: e.target.value }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.resinPlatformName')} description={t('settings.resinPlatformNameDesc')}>
+                  <Input
+                    placeholder="codex2api"
+                    value={settingsForm.resin_platform_name}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, resin_platform_name: e.target.value }))}
+                  />
+                </SettingField>
               </div>
             </div>
-            <Button className="mt-4" onClick={() => void handleSaveSettings()} disabled={savingSettings}>
-              {savingSettings ? t('common.saving') : t('settings.saveSettings')}
-            </Button>
-          </CardContent>
-        </Card>
+          </SettingsCard>
 
-        {/* API Endpoints */}
-        <Card>
-          <CardContent className="p-6">
-            <h3 className="text-base font-semibold text-foreground mb-4">{t('settings.apiEndpoints')}</h3>
-            <div className="overflow-auto border border-border rounded-xl">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead className="text-[13px] font-semibold">{t('settings.method')}</TableHead>
-                    <TableHead className="text-[13px] font-semibold">{t('settings.path')}</TableHead>
-                    <TableHead className="text-[13px] font-semibold">{t('settings.endpointDesc')}</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  <TableRow>
-                    <TableCell><Badge variant="default" className="text-[13px]">POST</Badge></TableCell>
-                    <TableCell className="font-mono text-[20px]">/v1/chat/completions</TableCell>
-                    <TableCell className="text-[14px] text-muted-foreground">{t('settings.openaiCompat')}</TableCell>
-                  </TableRow>
-                  <TableRow>
-                    <TableCell><Badge variant="outline" className="text-[13px]">POST</Badge></TableCell>
-                    <TableCell className="font-mono text-[20px]">/v1/responses</TableCell>
-                    <TableCell className="text-[14px] text-muted-foreground">{t('settings.responsesApi')}</TableCell>
-                  </TableRow>
-                  <TableRow>
-                    <TableCell><Badge variant="outline" className="text-[13px]">POST</Badge></TableCell>
-                    <TableCell className="font-mono text-[20px]">/v1/messages</TableCell>
-                    <TableCell className="text-[14px] text-muted-foreground">{t('settings2.messagesEndpoint')}</TableCell>
-                  </TableRow>
-                  <TableRow>
-                    <TableCell><Badge variant="secondary" className="text-[13px]">GET</Badge></TableCell>
-                    <TableCell className="font-mono text-[20px]">/v1/models</TableCell>
-                    <TableCell className="text-[14px] text-muted-foreground">{t('settings.modelList')}</TableCell>
-                  </TableRow>
-                </TableBody>
-              </Table>
-            </div>
-          </CardContent>
-        </Card>
+	          <div className="grid gap-4 xl:grid-cols-2">
+	            <SettingsCard title={t('settings.modelRegistry')} description={t('settings.modelRegistryDesc')}>
+	              <div className="space-y-4">
+	                <div className="grid grid-cols-[repeat(auto-fit,minmax(150px,1fr))] gap-3">
+	                  <StatusTile label={t('settings.modelsEnabled')}>
+	                    {enabledModelCount}
+	                  </StatusTile>
+	                  <StatusTile label={t('settings.modelsLastSynced')}>
+	                    <span className="text-xs font-semibold">{modelsLastSyncedLabel}</span>
+	                  </StatusTile>
+	                </div>
+	                <div className="flex flex-wrap items-center justify-between gap-2">
+	                  <a
+	                    href={modelsSourceLabel}
+	                    target="_blank"
+	                    rel="noreferrer"
+	                    className="inline-flex min-w-0 items-center gap-1.5 text-xs font-medium text-primary hover:underline"
+	                  >
+	                    <ExternalLink className="size-3.5 shrink-0" />
+	                    <span className="truncate">{modelsSourceLabel}</span>
+	                  </a>
+	                  <Button size="sm" variant="outline" onClick={() => void handleSyncModels()} disabled={syncingModels}>
+	                    <RefreshCw className={cn('size-4', syncingModels && 'animate-spin')} />
+	                    {syncingModels ? t('settings.modelsSyncing') : t('settings.syncUpstreamModels')}
+	                  </Button>
+	                </div>
+	                <div className="flex max-h-[170px] flex-wrap gap-2 overflow-auto rounded-lg border border-border bg-muted/20 p-3">
+	                  {visibleModelItems.map((model) => (
+	                    <div key={model.id} className="flex flex-wrap items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1.5">
+	                      <span className="font-mono text-xs font-semibold text-foreground">{model.id}</span>
+	                      <Badge variant={model.source === 'official_codex_docs' ? 'default' : 'secondary'} className="text-[11px]">
+	                        {model.source === 'official_codex_docs' ? t('settings.modelSourceOfficial') : t('settings.modelSourceBuiltin')}
+	                      </Badge>
+	                      {model.pro_only ? <Badge variant="outline" className="text-[11px]">{t('settings.modelProOnly')}</Badge> : null}
+	                      {model.category === 'image' ? <Badge variant="outline" className="text-[11px]">{t('settings.modelImage')}</Badge> : null}
+	                    </div>
+	                  ))}
+	                </div>
+	              </div>
+	            </SettingsCard>
+
+	            <SettingsCard title={t('settings2.modelMapping')} description={t('settings2.modelMappingDesc')}>
+	              <ModelMappingEditor
+	                value={settingsForm.model_mapping}
+	                onChange={(v) => setSettingsForm(f => ({ ...f, model_mapping: v }))}
+	              />
+	            </SettingsCard>
+	          </div>
+
+	          <div className="grid gap-4">
+	            <SettingsCard title={t('settings.apiEndpoints')}>
+	              <div className="data-table-shell">
+	                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="text-[12px] font-semibold">{t('settings.method')}</TableHead>
+                      <TableHead className="text-[12px] font-semibold">{t('settings.path')}</TableHead>
+                      <TableHead className="text-[12px] font-semibold">{t('settings.endpointDesc')}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    <TableRow>
+                      <TableCell><Badge variant="default" className="text-[12px]">POST</Badge></TableCell>
+                      <TableCell className="font-mono text-[13px]">/v1/chat/completions</TableCell>
+                      <TableCell className="text-[13px] text-muted-foreground">{t('settings.openaiCompat')}</TableCell>
+                    </TableRow>
+                    <TableRow>
+                      <TableCell><Badge variant="outline" className="text-[12px]">POST</Badge></TableCell>
+                      <TableCell className="font-mono text-[13px]">/v1/responses</TableCell>
+                      <TableCell className="text-[13px] text-muted-foreground">{t('settings.responsesApi')}</TableCell>
+                    </TableRow>
+                    <TableRow>
+                      <TableCell><Badge variant="outline" className="text-[12px]">POST</Badge></TableCell>
+                      <TableCell className="font-mono text-[13px]">/v1/messages</TableCell>
+                      <TableCell className="text-[13px] text-muted-foreground">{t('settings2.messagesEndpoint')}</TableCell>
+                    </TableRow>
+                    <TableRow>
+                      <TableCell><Badge variant="outline" className="text-[12px]">POST</Badge></TableCell>
+                      <TableCell className="font-mono text-[13px]">/v1/images/generations</TableCell>
+                      <TableCell className="text-[13px] text-muted-foreground">{t('settings.imageGenerationApi')}</TableCell>
+                    </TableRow>
+                    <TableRow>
+                      <TableCell><Badge variant="outline" className="text-[12px]">POST</Badge></TableCell>
+                      <TableCell className="font-mono text-[13px]">/v1/images/edits</TableCell>
+                      <TableCell className="text-[13px] text-muted-foreground">{t('settings.imageEditApi')}</TableCell>
+                    </TableRow>
+                    <TableRow>
+                      <TableCell><Badge variant="secondary" className="text-[12px]">GET</Badge></TableCell>
+                      <TableCell className="font-mono text-[13px]">/v1/models</TableCell>
+                      <TableCell className="text-[13px] text-muted-foreground">{t('settings.modelList')}</TableCell>
+                    </TableRow>
+                  </TableBody>
+                </Table>
+              </div>
+            </SettingsCard>
+          </div>
+
+          <div className="flex justify-end">
+            {renderSaveButton('max-sm:w-full')}
+          </div>
+        </div>
 
         <ToastNotice toast={toast} />
-        {confirmDialog}
       </>
     </StateShell>
   )

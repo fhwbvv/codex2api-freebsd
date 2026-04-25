@@ -10,12 +10,14 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest, AddATAccountRequest } from '../types'
+import type { AccountRow, AddAccountRequest, AddATAccountRequest, APIKeyRow } from '../types'
 import { getErrorMessage } from '../utils/error'
+import { formatCompactEmail } from '../lib/utils'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import {
   Table,
   TableBody,
@@ -24,7 +26,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -34,7 +36,7 @@ export default function Accounts() {
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
-  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'locked'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'plus' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
@@ -46,6 +48,8 @@ export default function Accounts() {
   const [submitting, setSubmitting] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set())
+  const [authJsonExportingIds, setAuthJsonExportingIds] = useState<Set<number>>(new Set())
+  const [authJsonModal, setAuthJsonModal] = useState<{ account: AccountRow; json: string } | null>(null)
   const [batchLoading, setBatchLoading] = useState(false)
   const [batchTesting, setBatchTesting] = useState(false)
   const [cleaningBanned, setCleaningBanned] = useState(false)
@@ -59,6 +63,7 @@ export default function Accounts() {
   const [scoreInput, setScoreInput] = useState('')
   const [concurrencyMode, setConcurrencyMode] = useState<'default' | 'custom'>('default')
   const [concurrencyInput, setConcurrencyInput] = useState('')
+  const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<number[]>([])
   const [importing, setImporting] = useState(false)
   const [showImportPicker, setShowImportPicker] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -90,14 +95,22 @@ export default function Accounts() {
   const { confirm, confirmDialog } = useConfirmDialog()
 
   const loadAccounts = useCallback(async () => {
-    const data = await api.getAccounts()
-    return data.accounts ?? []
+    const [accountsResponse, apiKeysResponse] = await Promise.all([api.getAccounts(), api.getAPIKeys()])
+    return {
+      accounts: accountsResponse.accounts ?? [],
+      apiKeys: apiKeysResponse.keys ?? [],
+    }
   }, [])
 
-  const { data: accounts, loading, error, reload, reloadSilently } = useDataLoader<AccountRow[]>({
-    initialData: [],
+  const { data, loading, error, reload, reloadSilently } = useDataLoader<{ accounts: AccountRow[]; apiKeys: APIKeyRow[] }>({
+    initialData: {
+      accounts: [],
+      apiKeys: [],
+    },
     load: loadAccounts,
   })
+  const accounts = data.accounts
+  const apiKeys = data.apiKeys
   const usageBootstrapReloadedRef = useRef(false)
 
   useEffect(() => {
@@ -120,6 +133,7 @@ export default function Accounts() {
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
   const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
+  const errorAccounts = accounts.filter((account) => account.status === 'error').length
   const lockedAccounts = accounts.filter((account) => account.locked).length
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
@@ -136,6 +150,9 @@ export default function Accounts() {
         break
       case 'banned':
         if (account.status !== 'unauthorized') return false
+        break
+      case 'error':
+        if (account.status !== 'error') return false
         break
       case 'locked':
         if (!account.locked) return false
@@ -546,6 +563,41 @@ export default function Accounts() {
     }
   }
 
+  const handleGenerateAuthJSON = async (account: AccountRow) => {
+    setAuthJsonExportingIds((prev) => new Set(prev).add(account.id))
+    try {
+      const blob = await api.downloadAccountAuthJSON(account.id)
+      const json = formatJSONText(await blob.text())
+      setAuthJsonModal({ account, json })
+      showToast(t('accounts.authJsonGenerated'))
+    } catch (error) {
+      showToast(t('accounts.authJsonFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setAuthJsonExportingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(account.id)
+        return next
+      })
+    }
+  }
+
+  const handleCopyAuthJSON = async () => {
+    if (!authJsonModal) return
+    try {
+      await copyTextToClipboard(authJsonModal.json)
+      showToast(t('accounts.authJsonCopied'))
+    } catch (error) {
+      showToast(t('accounts.authJsonCopyFailed', { error: getErrorMessage(error) }), 'error')
+    }
+  }
+
+  const handleExportAuthJSON = () => {
+    if (!authJsonModal) return
+    const blob = new Blob([`${authJsonModal.json}\n`], { type: 'application/json' })
+    downloadBlob(blob, 'auth.json')
+    showToast(t('accounts.authJsonExported'))
+  }
+
   const handleMigrate = async () => {
     setMigrating(true)
     setShowMigrate(false)
@@ -794,6 +846,7 @@ export default function Accounts() {
     setScoreInput(account.score_bias_override === null || account.score_bias_override === undefined ? '' : String(account.score_bias_override))
     setConcurrencyMode(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? 'default' : 'custom')
     setConcurrencyInput(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? '' : String(account.base_concurrency_override))
+    setAllowedAPIKeySelection(filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys))
   }
 
   const closeSchedulerEditor = (force = false) => {
@@ -803,6 +856,7 @@ export default function Accounts() {
     setScoreInput('')
     setConcurrencyMode('default')
     setConcurrencyInput('')
+    setAllowedAPIKeySelection([])
   }
 
   const parsedScoreBias = scoreMode === 'custom' ? parseIntegerInput(scoreInput) : null
@@ -843,6 +897,7 @@ export default function Accounts() {
       const payload = {
         score_bias_override: scoreMode === 'custom' ? parsedScoreBias : null,
         base_concurrency_override: concurrencyMode === 'custom' ? parsedBaseConcurrency : null,
+        allowed_api_key_ids: allowedAPIKeySelection,
       }
       await api.updateAccountScheduler(editingAccount.id, payload)
       showToast(t('accounts.schedulerSaveSuccess'))
@@ -864,7 +919,7 @@ export default function Accounts() {
       onDrop={(e) => void handleDrop(e)}
     >
       {dragging && (
-        <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary bg-primary/5 backdrop-blur-sm">
+        <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center rounded-lg border-2 border-dashed border-primary bg-primary/5 backdrop-blur-sm">
           <div className="flex flex-col items-center gap-2 text-primary">
             <Upload className="size-10" />
             <span className="text-lg font-semibold">{t('accounts.dropToImport')}</span>
@@ -887,7 +942,7 @@ export default function Accounts() {
           description={t('accounts.description')}
           onRefresh={() => void reload()}
           actions={(
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center justify-end gap-1.5">
               <Button variant="outline" size="sm" disabled={batchTesting} onClick={() => void handleBatchTest()}>
                 <FlaskConical className="size-3" />
                 {batchTesting ? t('accounts.batchTesting') : t('accounts.batchTest')}
@@ -953,31 +1008,32 @@ export default function Accounts() {
           )}
         />
 
-        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-5">
           <CompactStat label={t('accounts.totalAccounts')} chipLabel={t('accounts.filterAll')} value={totalAccounts} tone="neutral" />
           <CompactStat label={t('accounts.normalAccounts')} chipLabel={t('accounts.filterNormal')} value={normalAccounts} tone="success" />
           <CompactStat label={t('accounts.rateLimited')} chipLabel={t('accounts.filterRateLimited')} value={rateLimitedAccounts} tone="warning" />
           <CompactStat label={t('accounts.bannedAccounts')} chipLabel={t('accounts.filterBanned')} value={bannedAccounts} tone="danger" />
+          <CompactStat label={t('accounts.errorAccounts')} chipLabel={t('accounts.filterError')} value={errorAccounts} tone="danger" />
         </div>
 
-        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
+        <div className="toolbar-surface mb-3 flex flex-wrap items-center gap-2">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>
-          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
+          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['error', t('accounts.filterError')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => { setStatusFilter(key); setPage(1) }}
-              className={`rounded-full px-3 py-1 font-semibold transition-colors ${
+              className={`rounded-md px-2.5 py-1 font-semibold transition-colors ${
                 statusFilter === key
                   ? 'bg-primary text-primary-foreground'
                   : 'bg-muted/50 text-muted-foreground hover:bg-muted'
               }`}
             >
-              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : lockedAccounts}
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : key === 'error' ? errorAccounts : lockedAccounts}
             </button>
           ))}
         </div>
 
-        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
+        <div className="toolbar-surface mb-3 flex flex-wrap items-center gap-2">
           <span className="font-semibold text-foreground">{t('accounts.schedulerView')}</span>
           <SchedulerChip label={t('accounts.healthy')} value={healthyAccounts} tone="success" />
           <SchedulerChip label={t('accounts.warm')} value={warmAccounts} tone="warning" />
@@ -985,8 +1041,8 @@ export default function Accounts() {
           <SchedulerChip label={t('status.unauthorized')} value={bannedAccounts} tone="neutral" />
         </div>
 
-        <div className="mb-4 flex items-center gap-2">
-          <div className="relative w-64">
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <div className="relative w-72 max-sm:w-full">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
             <Input
               className="pl-9 h-8 rounded-lg text-[13px]"
@@ -1013,9 +1069,9 @@ export default function Accounts() {
         </div>
 
         {selected.size > 0 && (
-          <div className="flex items-center justify-between gap-3 px-4 py-2.5 mb-4 rounded-2xl bg-primary/10 border border-primary/20 text-sm font-semibold text-primary">
+          <div className="sticky top-2 z-20 mb-4 flex items-center justify-between gap-3 rounded-lg border border-primary/20 bg-card/95 px-3 py-2.5 text-sm font-semibold text-primary shadow-lg backdrop-blur-sm max-lg:flex-col max-lg:items-stretch">
             <span>{t('common.selected', { count: selected.size })}</span>
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center justify-end gap-1.5 max-lg:justify-start">
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchRefresh()}>
                 {t('accounts.batchRefresh')}
               </Button>
@@ -1039,7 +1095,7 @@ export default function Accounts() {
         )}
 
         <Card>
-          <CardContent className="p-6">
+          <CardContent className="p-4">
             <StateShell
               variant="section"
               isEmpty={accounts.length === 0}
@@ -1047,14 +1103,14 @@ export default function Accounts() {
               emptyDescription={t('accounts.noDataDesc')}
               action={<Button onClick={() => setShowAdd(true)}>{t('accounts.addAccount')}</Button>}
             >
-              <div className="overflow-auto border border-border rounded-xl">
+              <div className="data-table-shell">
                 <Table>
                   <TableHeader>
                     <TableRow>
                       <TableHead className="w-10">
                         <input
                           type="checkbox"
-                          className="size-4 cursor-pointer accent-[hsl(var(--primary))]"
+                          className="size-4 cursor-pointer accent-primary"
                           checked={allPageSelected}
                           onChange={toggleSelectAll}
                         />
@@ -1091,14 +1147,14 @@ export default function Accounts() {
                         <TableCell>
                           <input
                             type="checkbox"
-                            className="size-4 cursor-pointer accent-[hsl(var(--primary))]"
+                            className="size-4 cursor-pointer accent-primary"
                             checked={selected.has(account.id)}
                             onChange={() => toggleSelect(account.id)}
                           />
                         </TableCell>
                         <TableCell className="text-[14px] font-mono text-muted-foreground">{account.id}</TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
-                          {account.email || '-'}
+                          {formatCompactEmail(account.email)}
                           {account.at_only && (
                             <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                               AT
@@ -1180,6 +1236,16 @@ export default function Accounts() {
                               title={account.at_only ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
                             >
                               <RefreshCw className={`size-3.5 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              disabled={authJsonExportingIds.has(account.id) || account.at_only}
+                              onClick={() => void handleGenerateAuthJSON(account)}
+                              title={account.at_only ? t('accounts.authJsonDisabled') : t('accounts.generateAuthJson')}
+                            >
+                              <FileJson className="size-3.5" />
                             </Button>
                             <Button
                               variant={account.locked ? 'default' : 'outline'}
@@ -1564,6 +1630,53 @@ export default function Accounts() {
         </Modal>
 
         <Modal
+          show={Boolean(authJsonModal)}
+          title={t('accounts.authJsonModalTitle')}
+          contentClassName="sm:max-w-[720px]"
+          onClose={() => setAuthJsonModal(null)}
+        >
+          {authJsonModal && (
+            <div className="space-y-4">
+              <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
+                <FileJson className="mt-0.5 size-5 shrink-0 text-primary" />
+                <div className="min-w-0 space-y-1">
+                  <div className="text-sm font-semibold text-foreground">
+                    {authJsonModal.account.email || `ID ${authJsonModal.account.id}`}
+                  </div>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {t('accounts.authJsonModalDesc')}
+                  </p>
+                </div>
+              </div>
+
+              <div>
+                <div className="mb-2 text-xs font-semibold text-muted-foreground">{t('accounts.authJsonPreview')}</div>
+                <textarea
+                  readOnly
+                  value={authJsonModal.json}
+                  className="min-h-[260px] w-full resize-y rounded-lg border border-border bg-muted/30 p-3 text-[12px] leading-relaxed text-muted-foreground outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/10"
+                  style={{ fontFamily: 'var(--font-geist-mono)' }}
+                />
+              </div>
+
+              <div className="flex flex-wrap justify-end gap-2">
+                <Button variant="outline" onClick={() => setAuthJsonModal(null)}>
+                  {t('common.close')}
+                </Button>
+                <Button variant="outline" onClick={() => void handleCopyAuthJSON()}>
+                  <Copy className="size-4" />
+                  {t('accounts.copyAuthJson')}
+                </Button>
+                <Button onClick={handleExportAuthJSON}>
+                  <Download className="size-4" />
+                  {t('accounts.exportAuthJson')}
+                </Button>
+              </div>
+            </div>
+          )}
+        </Modal>
+
+        <Modal
           show={showMigrate}
           title={t('accounts.migrateTitle')}
           contentClassName="sm:max-w-[520px]"
@@ -1621,7 +1734,7 @@ export default function Accounts() {
         <Modal
           show={Boolean(editingAccount)}
           title={t('accounts.schedulerEditTitle')}
-          contentClassName="sm:max-w-[680px]"
+          contentClassName="sm:max-w-[760px]"
           onClose={closeSchedulerEditor}
           footer={(
             <>
@@ -1711,6 +1824,24 @@ export default function Accounts() {
                 </div>
               </div>
 
+              <div className="rounded-xl border border-border p-4">
+                <div className="text-sm font-semibold text-foreground">{t('accounts.allowedAPIKeysLabel')}</div>
+                <div className="mt-1 text-xs text-muted-foreground">{t('accounts.allowedAPIKeysHint')}</div>
+                <div className="mt-3">
+                  <APIKeyMultiSelect
+                    options={apiKeys}
+                    value={allowedAPIKeySelection}
+                    disabled={apiKeys.length === 0}
+                    onChange={setAllowedAPIKeySelection}
+                    allLabel={t('accounts.allowedAPIKeysAll')}
+                    selectedLabel={t('accounts.allowedAPIKeysSelected', { count: allowedAPIKeySelection.length })}
+                    placeholder={t('accounts.allowedAPIKeysPlaceholder')}
+                    emptyLabel={t('accounts.allowedAPIKeysNoOptions')}
+                    emptyHint={t('accounts.allowedAPIKeysNoOptionsHint')}
+                  />
+                </div>
+              </div>
+
               <div className="rounded-xl border border-border bg-white/60 px-4 py-4 dark:bg-white/5">
                 <div className="text-sm font-semibold text-foreground">{t('accounts.schedulerPreviewTitle')}</div>
                 <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -1780,6 +1911,163 @@ function downloadBlob(blob: Blob, filename: string) {
   a.click()
   document.body.removeChild(a)
   URL.revokeObjectURL(url)
+}
+
+function formatJSONText(text: string) {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2)
+  } catch {
+    return text
+  }
+}
+
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'true')
+  textarea.style.position = 'fixed'
+  textarea.style.top = '-1000px'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  document.body.removeChild(textarea)
+  if (!copied) {
+    throw new Error('copy failed')
+  }
+}
+
+function filterExistingAPIKeyIDs(selected: number[], apiKeys: APIKeyRow[]): number[] {
+  if (!selected.length || !apiKeys.length) {
+    return []
+  }
+  const existing = new Set(apiKeys.map((item) => item.id))
+  return [...new Set(selected.filter((id) => existing.has(id)))].sort((a, b) => a - b)
+}
+
+function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
+  const name = apiKey.name?.trim() || `API Key #${apiKey.id}`
+  return `${name} · ${apiKey.key}`
+}
+
+function APIKeyMultiSelect({
+  options,
+  value,
+  disabled,
+  onChange,
+  allLabel,
+  selectedLabel,
+  placeholder,
+  emptyLabel,
+  emptyHint,
+}: {
+  options: APIKeyRow[]
+  value: number[]
+  disabled: boolean
+  onChange: (value: number[]) => void
+  allLabel: string
+  selectedLabel: string
+  placeholder: string
+  emptyLabel: string
+  emptyHint: string
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleEscape)
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [open])
+
+  const summary = value.length === 0 ? allLabel : selectedLabel
+
+  const toggleOption = (id: number) => {
+    if (disabled) return
+    if (value.includes(id)) {
+      onChange(value.filter((item) => item !== id))
+      return
+    }
+    onChange([...value, id].sort((a, b) => a - b))
+  }
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        type="button"
+        disabled={disabled}
+        className={`flex w-full items-center justify-between gap-3 rounded-md border border-input bg-background px-3.5 py-3 text-left shadow-xs transition-[border-color,box-shadow] ${
+          disabled
+            ? 'cursor-not-allowed opacity-70'
+            : 'hover:border-primary/30 hover:bg-accent/40'
+        } ${open ? 'border-primary/35 ring-[3px] ring-primary/10' : ''}`}
+        onClick={() => {
+          if (!disabled) {
+            setOpen((current) => !current)
+          }
+        }}
+      >
+        <div className="min-w-0">
+          <div className="truncate text-[15px] text-foreground">{summary}</div>
+          <div className="mt-0.5 truncate text-xs text-muted-foreground">
+            {disabled ? emptyHint : placeholder}
+          </div>
+        </div>
+        <ChevronDown className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+
+      {open ? (
+        <div className="absolute left-0 right-0 top-[calc(100%+0.5rem)] z-50 overflow-hidden rounded-lg border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm">
+          {options.length === 0 ? (
+            <div className="px-4 py-3 text-sm text-muted-foreground">{emptyLabel}</div>
+          ) : (
+            <div className="max-h-72 space-y-1 overflow-auto p-2">
+              {options.map((option) => {
+                const checked = value.includes(option.id)
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className={`flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left transition-colors ${
+                      checked ? 'bg-primary/10 text-primary' : 'text-foreground hover:bg-accent/70'
+                    }`}
+                    onClick={() => toggleOption(option.id)}
+                  >
+                    <span className={`flex size-4 items-center justify-center rounded border ${checked ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-transparent'}`}>
+                      <Check className="size-3" />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-sm">{formatAPIKeyOptionLabel(option)}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      ) : null}
+    </div>
+  )
 }
 
 function TogglePill({
@@ -1929,12 +2217,12 @@ function CompactStat({
   }[tone]
 
   return (
-    <div className="flex items-center justify-between rounded-2xl border border-border bg-white/65 px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
+    <div className="flex items-center justify-between rounded-lg border border-border bg-card/85 px-3 py-2.5 shadow-sm">
       <div className="min-w-0">
         <div className="text-[12px] font-semibold text-muted-foreground">{label}</div>
-        <div className="mt-1 text-[24px] font-bold leading-none tracking-tight text-foreground">{value}</div>
+        <div className="mt-1 text-[24px] font-bold leading-none text-foreground">{value}</div>
       </div>
-      <div className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] font-semibold ${toneStyle.chip}`}>
+      <div className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[12px] font-semibold ${toneStyle.chip}`}>
         <span className={`size-2 rounded-full ${toneStyle.dot}`} />
         {chipLabel ?? label}
       </div>
@@ -2021,6 +2309,40 @@ function formatTestOutput(text: string) {
   }
 }
 
+const DEFAULT_TEST_MODEL = 'gpt-5.4'
+
+function isConnectionTestModel(model: string) {
+  const value = model.trim().toLowerCase()
+  return value !== '' && !value.includes('image')
+}
+
+function extractTextModels(modelsResp: Awaited<ReturnType<typeof api.getModels>>) {
+  if (modelsResp.items && modelsResp.items.length > 0) {
+    return modelsResp.items
+      .filter((item) => item.enabled && item.category !== 'image' && !item.id.includes('image'))
+      .map((item) => item.id)
+  }
+  return (modelsResp.models ?? []).filter(isConnectionTestModel)
+}
+
+function uniqueTestModels(models: string[], preferredModel?: string) {
+  const seen = new Set<string>()
+  const result: string[] = []
+  const candidates = [
+    preferredModel ?? '',
+    ...models,
+    DEFAULT_TEST_MODEL,
+  ]
+
+  for (const model of candidates) {
+    const value = model.trim()
+    if (!isConnectionTestModel(value) || seen.has(value)) continue
+    seen.add(value)
+    result.push(value)
+  }
+  return result
+}
+
 function TestConnectionModal({
   account,
   onClose,
@@ -2035,6 +2357,9 @@ function TestConnectionModal({
   const [status, setStatus] = useState<'connecting' | 'streaming' | 'success' | 'error'>('connecting')
   const [errorMsg, setErrorMsg] = useState('')
   const [model, setModel] = useState('')
+  const [selectedModel, setSelectedModel] = useState('')
+  const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [modelOptionsReady, setModelOptionsReady] = useState(false)
   const abortRef = useRef<AbortController | null>(null)
   const outputEndRef = useRef<HTMLDivElement>(null)
   const settledRef = useRef(false)
@@ -2047,11 +2372,51 @@ function TestConnectionModal({
     onSettledRef.current()
   }, [])
 
+  const modelSelectOptions = useMemo(
+    () => uniqueTestModels(modelOptions, selectedModel).map((item) => ({ label: item, value: item })),
+    [modelOptions, selectedModel]
+  )
+
   useEffect(() => {
+    let active = true
+
+    const loadModels = async () => {
+      try {
+        const [modelsResp, settings] = await Promise.all([api.getModels(), api.getSettings()])
+        if (!active) return
+
+	        const upstreamModels = extractTextModels(modelsResp)
+	        const preferredModel = isConnectionTestModel(settings.test_model) ? settings.test_model : DEFAULT_TEST_MODEL
+	        const nextModels = uniqueTestModels(upstreamModels, preferredModel)
+	        setModelOptions(nextModels)
+	        setSelectedModel((current) => current || nextModels[0] || DEFAULT_TEST_MODEL)
+	      } catch {
+	        if (!active) return
+	        const fallbackModels = uniqueTestModels([], DEFAULT_TEST_MODEL)
+	        setModelOptions(fallbackModels)
+	        setSelectedModel((current) => current || fallbackModels[0])
+      } finally {
+        if (active) {
+          setModelOptionsReady(true)
+        }
+      }
+    }
+
+    void loadModels()
+
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!modelOptionsReady || !selectedModel) return
+
     // 重置状态（StrictMode 二次 mount 时清理上一次的残留）
     setOutput([])
     setStatus('connecting')
     setErrorMsg('')
+    setModel(selectedModel)
     settledRef.current = false
 
     const controller = new AbortController()
@@ -2061,7 +2426,8 @@ function TestConnectionModal({
       if (controller.signal.aborted) return
 
       try {
-        const res = await fetch(`/api/admin/accounts/${account.id}/test`, {
+        const params = new URLSearchParams({ model: selectedModel })
+        const res = await fetch(`/api/admin/accounts/${account.id}/test?${params.toString()}`, {
           signal: controller.signal,
           headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {},
         })
@@ -2101,7 +2467,7 @@ function TestConnectionModal({
 
               switch (event.type) {
                 case 'test_start':
-                  setModel(event.model || '')
+                  setModel(event.model || selectedModel)
                   setStatus('streaming')
                   break
                 case 'content':
@@ -2164,7 +2530,7 @@ function TestConnectionModal({
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [account.id, markSettled, t])
+  }, [account.id, markSettled, modelOptionsReady, selectedModel, t])
 
   useEffect(() => {
     outputEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -2211,16 +2577,20 @@ function TestConnectionModal({
           <span className={`flex items-center gap-1.5 text-sm font-semibold ${statusColor}`}>
             {statusLabel}
           </span>
-          {model && (
-            <span className="max-w-full rounded-md bg-muted px-2 py-0.5 font-mono text-xs break-all text-muted-foreground">
-              {model}
-            </span>
-          )}
+          <Select
+            className="w-52 max-w-full"
+            compact
+            value={selectedModel}
+            onValueChange={setSelectedModel}
+            options={modelSelectOptions}
+            placeholder={model || t('settings.testModel')}
+            disabled={!modelOptionsReady || modelSelectOptions.length === 0}
+          />
         </div>
 
         {(output.length > 0 || status === 'connecting' || status === 'streaming') && (
           <div
-            className="min-h-[80px] max-h-[240px] overflow-auto rounded-xl border border-border bg-muted/30 p-3 text-[20px] leading-[1.8] whitespace-pre-wrap break-all"
+            className="min-h-[80px] max-h-[240px] overflow-auto rounded-lg border border-border bg-muted/30 p-3 text-[13px] leading-relaxed whitespace-pre-wrap break-all"
             style={{ fontFamily: 'var(--font-geist-mono)' }}
           >
             {output.length === 0 && status === 'connecting' && (
@@ -2235,7 +2605,7 @@ function TestConnectionModal({
           <div className="max-h-[40vh] overflow-auto rounded-xl border border-red-200 bg-red-50 p-3.5 text-red-600 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
             <div className="mb-2 text-sm font-semibold">{t('accounts.failureDetails')}</div>
             <pre
-              className="text-[20px] leading-[1.8] whitespace-pre-wrap break-all"
+              className="text-[13px] leading-relaxed whitespace-pre-wrap break-all"
               style={{ fontFamily: 'var(--font-geist-mono)' }}
             >
               {formattedErrorMsg}

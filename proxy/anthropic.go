@@ -13,18 +13,18 @@ import (
 
 // anthropicRequest 表示 Anthropic Messages API 请求
 type anthropicRequest struct {
-	Model       string              `json:"model"`
-	MaxTokens   int                 `json:"max_tokens"`
-	System      json.RawMessage     `json:"system,omitempty"`
-	Messages    []anthropicMessage  `json:"messages"`
-	Tools       []anthropicTool     `json:"tools,omitempty"`
-	Stream      bool                `json:"stream,omitempty"`
-	Temperature *float64            `json:"temperature,omitempty"`
-	TopP        *float64            `json:"top_p,omitempty"`
-	StopSeqs    []string            `json:"stop_sequences,omitempty"`
-	Thinking    *anthropicThinking  `json:"thinking,omitempty"`
-	ToolChoice  json.RawMessage     `json:"tool_choice,omitempty"`
-	Metadata    json.RawMessage     `json:"metadata,omitempty"`
+	Model       string             `json:"model"`
+	MaxTokens   int                `json:"max_tokens"`
+	System      json.RawMessage    `json:"system,omitempty"`
+	Messages    []anthropicMessage `json:"messages"`
+	Tools       []anthropicTool    `json:"tools,omitempty"`
+	Stream      bool               `json:"stream,omitempty"`
+	Temperature *float64           `json:"temperature,omitempty"`
+	TopP        *float64           `json:"top_p,omitempty"`
+	StopSeqs    []string           `json:"stop_sequences,omitempty"`
+	Thinking    *anthropicThinking `json:"thinking,omitempty"`
+	ToolChoice  json.RawMessage    `json:"tool_choice,omitempty"`
+	Metadata    json.RawMessage    `json:"metadata,omitempty"`
 }
 
 type anthropicThinking struct {
@@ -113,7 +113,7 @@ var defaultAnthropicModelMap = map[string]string{
 	"claude-haiku-4-5-20251001":  "gpt-5.4-mini",
 	"claude-haiku-4-5":           "gpt-5.4-mini",
 	"claude-sonnet-4-6":          "gpt-5.3-codex",
-	"claude-sonnet-4-5-20250929": "gpt-5.2-codex",
+	"claude-sonnet-4-5-20250929": "gpt-5.2",
 	"claude-opus-4-5-20251101":   "gpt-5.3-codex",
 	"claude-sonnet-4-5-20250514": "gpt-5.4",
 	"claude-sonnet-4-5":          "gpt-5.4",
@@ -128,7 +128,7 @@ var defaultAnthropicModelMap = map[string]string{
 
 // resolveAnthropicModel 将 Anthropic 模型名解析为 Codex 模型名
 // 优先使用数据库中的动态映射，回退到默认映射
-func resolveAnthropicModel(model string, dynamicMappingJSON string) string {
+func resolveAnthropicModel(model string, dynamicMappingJSON string, supportedModels []string) string {
 	// 1. 尝试动态映射（从系统设置）
 	if dynamicMappingJSON != "" && dynamicMappingJSON != "{}" {
 		var dynamicMap map[string]string
@@ -145,7 +145,7 @@ func resolveAnthropicModel(model string, dynamicMappingJSON string) string {
 	}
 
 	// 3. 允许直接传入 Codex 模型名
-	for _, supported := range SupportedModels {
+	for _, supported := range supportedModels {
 		if model == supported {
 			return model
 		}
@@ -161,8 +161,8 @@ func resolveAnthropicModel(model string, dynamicMappingJSON string) string {
 	}
 
 	// 5. 默认
-	if len(SupportedModels) > 0 {
-		return SupportedModels[0]
+	if len(supportedModels) > 0 {
+		return supportedModels[0]
 	}
 	return "gpt-5.4"
 }
@@ -192,13 +192,19 @@ func fromCodexCallID(codexID string) string {
 // TranslateAnthropicToCodex 将 Anthropic Messages 请求转换为 Codex Responses 格式
 // 返回: (codex 请求体, 原始 Anthropic model 名, error)
 func TranslateAnthropicToCodex(rawJSON []byte, modelMappingJSON string) ([]byte, string, error) {
+	return TranslateAnthropicToCodexWithModels(rawJSON, modelMappingJSON, SupportedModels)
+}
+
+// TranslateAnthropicToCodexWithModels 将 Anthropic Messages 请求转换为 Codex Responses 格式
+// 返回: (codex 请求体, 原始 Anthropic model 名, error)
+func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string, supportedModels []string) ([]byte, string, error) {
 	var req anthropicRequest
 	if err := json.Unmarshal(rawJSON, &req); err != nil {
 		return nil, "", fmt.Errorf("parse anthropic request: %w", err)
 	}
 
 	originalModel := req.Model
-	codexModel := resolveAnthropicModel(req.Model, modelMappingJSON)
+	codexModel := resolveAnthropicModel(req.Model, modelMappingJSON, supportedModels)
 
 	// 构建 input 数组
 	input := buildCodexInput(req.System, req.Messages)
@@ -774,8 +780,8 @@ func (t *anthropicStreamTranslator) handleCompleted(data []byte) []anthropicStre
 			StopReason: stopReason,
 		},
 		Usage: &anthropicUsage{
-			InputTokens:         t.inputTokens,
-			OutputTokens:        t.outputTokens,
+			InputTokens:          t.inputTokens,
+			OutputTokens:         t.outputTokens,
 			CacheReadInputTokens: t.cachedTokens,
 		},
 	})
@@ -945,8 +951,8 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 	usage := gjson.GetBytes(completedData, "response.usage")
 	if usage.Exists() {
 		resp.Usage = anthropicUsage{
-			InputTokens:         int(usage.Get("input_tokens").Int()),
-			OutputTokens:        int(usage.Get("output_tokens").Int()),
+			InputTokens:          int(usage.Get("input_tokens").Int()),
+			OutputTokens:         int(usage.Get("output_tokens").Int()),
 			CacheReadInputTokens: int(usage.Get("input_tokens_details.cached_tokens").Int()),
 		}
 	}

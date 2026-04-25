@@ -9,6 +9,7 @@ services:
     env_file:
       - .env
     volumes:
+      - image-assets:/data
       - ./logs:/app/logs
     depends_on:
       postgres:
@@ -69,3 +70,5 @@ volumes:
     name: codex2api_pgdata
   redisdata:
     name: codex2api_redisdata
+  image-assets:
+    name: codex2api_image-assets

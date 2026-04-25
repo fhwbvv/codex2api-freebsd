@@ -551,6 +551,139 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /images/generations:
+    post:
+      summary: Create image generation
+      description: OpenAI Images compatible endpoint backed by Codex Responses image_generation.
+      operationId: createImageGeneration
+      tags:
+        - Images
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                model:
+                  type: string
+                  example: gpt-image-2
+                prompt:
+                  type: string
+                size:
+                  type: string
+                  example: 1024x1024
+                quality:
+                  type: string
+                  example: high
+                response_format:
+                  type: string
+                  enum: [b64_json, url]
+                stream:
+                  type: boolean
+      responses:
+        '200':
+          description: Image generation response
+          content:
+            application/json:
+              schema:
+                type: object
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /images/edits:
+    post:
+      summary: Create image edit
+      description: OpenAI Images compatible edit endpoint. Supports JSON image_url and multipart uploads.
+      operationId: createImageEdit
+      tags:
+        - Images
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt, images]
+              properties:
+                model:
+                  type: string
+                  example: gpt-image-2
+                prompt:
+                  type: string
+                images:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      image_url:
+                        type: string
+                mask:
+                  type: object
+                  properties:
+                    image_url:
+                      type: string
+                output_format:
+                  type: string
+                  example: png
+                response_format:
+                  type: string
+                  enum: [b64_json, url]
+                stream:
+                  type: boolean
+          multipart/form-data:
+            schema:
+              type: object
+              required: [prompt, image]
+              properties:
+                model:
+                  type: string
+                  example: gpt-image-2
+                prompt:
+                  type: string
+                image:
+                  type: string
+                  format: binary
+                mask:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Image edit response
+          content:
+            application/json:
+              schema:
+                type: object
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Authentication error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /health:
     servers:
       - url: http://localhost:8080

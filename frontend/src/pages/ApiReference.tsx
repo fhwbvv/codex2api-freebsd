@@ -393,6 +393,8 @@ export default function ApiReference() {
     { id: 'auth', label: t('apiRef.authSection'), method: '' },
     { id: 'responses', label: '/v1/responses', method: 'POST' },
     { id: 'chat', label: '/v1/chat/completions', method: 'POST' },
+    { id: 'images-generations', label: '/v1/images/generations', method: 'POST' },
+    { id: 'images-edits', label: '/v1/images/edits', method: 'POST' },
     { id: 'messages', label: '/v1/messages', method: 'POST' },
     { id: 'models', label: '/v1/models', method: 'GET' },
     { id: 'health', label: '/health', method: 'GET' },
@@ -646,6 +648,87 @@ export default function ApiReference() {
         ]}
       />
 
+      {/* POST /v1/images/generations */}
+      <EndpointDoc
+        id="images-generations"
+        method="POST"
+        path="/v1/images/generations"
+        title="Create image"
+        description="OpenAI Images compatible endpoint backed by Codex Responses image_generation."
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "model": "gpt-image-2",
+  "prompt": "Draw a small orange cat",
+  "size": "1024x1024",
+  "quality": "high"
+}`}
+        curlExample={`curl --request POST \\
+  --url ${baseUrl}/v1/images/generations \\
+  --header 'Authorization: Bearer <token>' \\
+  --header 'Content-Type: application/json' \\
+  --data '{
+  "model": "gpt-image-2",
+  "prompt": "Draw a small orange cat",
+  "response_format": "b64_json"
+}'`}
+        responseExamples={[
+          { code: 200, body: `{
+  "created": 1710000000,
+  "model": "gpt-image-2",
+  "data": [
+    {
+      "b64_json": "..."
+    }
+  ],
+  "usage": {
+    "images": 1
+  }
+}` },
+        ]}
+      />
+
+      {/* POST /v1/images/edits */}
+      <EndpointDoc
+        id="images-edits"
+        method="POST"
+        path="/v1/images/edits"
+        title="Edit image"
+        description="OpenAI Images compatible edit endpoint. JSON image_url and multipart image uploads are supported."
+        apiKey={firstKey}
+        baseUrl={baseUrl}
+        allKeys={allKeys}
+        defaultBody={`{
+  "model": "gpt-image-2",
+  "prompt": "Replace the background with aurora lights",
+  "images": [
+    {"image_url": "https://example.com/source.png"}
+  ],
+  "output_format": "png"
+}`}
+        curlExample={`curl --request POST \\
+  --url ${baseUrl}/v1/images/edits \\
+  --header 'Authorization: Bearer <token>' \\
+  --header 'Content-Type: application/json' \\
+  --data '{
+  "model": "gpt-image-2",
+  "prompt": "Replace the background with aurora lights",
+  "images": [{"image_url": "https://example.com/source.png"}]
+}'`}
+        responseExamples={[
+          { code: 200, body: `{
+  "created": 1710000000,
+  "model": "gpt-image-2",
+  "data": [
+    {
+      "b64_json": "..."
+    }
+  ]
+}` },
+        ]}
+      />
+
       {/* POST /v1/messages */}
       <EndpointDoc
         id="messages"
@@ -735,13 +818,13 @@ export default function ApiReference() {
           { code: 200, body: `{
   "object": "list",
   "data": [
+    {"id": "gpt-5.5", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.4-mini", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.2-codex", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.1-codex", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.1-codex-mini", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.1-codex-max", "object": "model", "owned_by": "openai"}
+    {"id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-5.2", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-image-2", "object": "model", "owned_by": "openai"}
   ]
 }` },
           { code: 401, body: `{

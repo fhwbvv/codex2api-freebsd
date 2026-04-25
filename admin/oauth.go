@@ -132,20 +132,6 @@ func oauthCodeChallenge(verifier string) string {
 	return strings.TrimRight(base64.URLEncoding.EncodeToString(h[:]), "=")
 }
 
-// isLocalhostHost 判断 Host 头是否指向 localhost（含 127.0.0.1、[::1]）
-func isLocalhostHost(host string) bool {
-	// 去除端口号
-	h := host
-	if idx := strings.LastIndex(h, ":"); idx != -1 {
-		// 排除 IPv6 方括号中的冒号
-		if !strings.Contains(h[idx:], "]") {
-			h = h[:idx]
-		}
-	}
-	h = strings.TrimPrefix(strings.TrimSuffix(h, "]"), "[")
-	return h == "localhost" || h == "127.0.0.1" || h == "::1"
-}
-
 // ==================== Handlers ====================
 
 // GenerateOAuthURL 生成 Codex CLI PKCE OAuth 授权 URL
@@ -159,19 +145,9 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 
 	redirectURI := strings.TrimSpace(req.RedirectURI)
 	if redirectURI == "" {
-		// 自动推导回调地址：
-		// 1. 本地访问时使用请求 Host（浏览器可直接回调）
-		// 2. 远程访问时回退到 localhost 默认值，因为 OpenAI 仅注册了 localhost 回调
-		host := c.Request.Host
-		if host != "" && isLocalhostHost(host) {
-			scheme := "http"
-			if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-				scheme = "https"
-			}
-			redirectURI = fmt.Sprintf("%s://%s/auth/callback", scheme, host)
-		} else {
-			redirectURI = oauthDefaultRedirectURI
-		}
+		// OpenAI OAuth 仅注册了 localhost:1455 回调，始终使用固定默认值
+		// 避免因请求 Host 端口不同（如 localhost:3000）导致回调校验失败（#80）
+		redirectURI = oauthDefaultRedirectURI
 	}
 
 	state, err := oauthRandomHex(32)
@@ -262,10 +238,16 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		writeError(c, http.StatusBadGateway, "授权服务器未返回 refresh_token，请确认已开启 offline_access scope")
 		return
 	}
+	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken: tokenResp.RefreshToken,
+		accessToken:  tokenResp.AccessToken,
+		idToken:      tokenResp.IDToken,
+		expiresIn:    tokenResp.ExpiresIn,
+	})
 
 	name := strings.TrimSpace(req.Name)
-	if name == "" && accountInfo != nil && accountInfo.Email != "" {
-		name = accountInfo.Email
+	if name == "" && seed.email != "" {
+		name = seed.email
 	}
 	if name == "" {
 		name = "oauth-account"
@@ -279,6 +261,10 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "账号写入数据库失败: "+err.Error())
 		return
 	}
+	if err := h.db.UpdateCredentials(ctx, id, tokenCredentialMap(seed)); err != nil {
+		writeError(c, http.StatusInternalServerError, "Token 写入数据库失败: "+err.Error())
+		return
+	}
 	h.db.InsertAccountEventAsync(id, "added", "oauth")
 
 	// Resin 租约继承
@@ -286,28 +272,20 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		go proxy.InheritLease(resinTempID, fmt.Sprintf("%d", id))
 	}
 
-	newAcc := &auth.Account{
-		DBID:         id,
-		RefreshToken: tokenResp.RefreshToken,
-		ProxyURL:     proxyURL,
-	}
+	newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 	h.store.AddAccount(newAcc)
-
-	go func(accountID int64) {
-		refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-			log.Printf("OAuth 账号 %d AT 刷新失败: %v", accountID, err)
-		} else {
-			log.Printf("OAuth 账号 %d 已加入号池", accountID)
-		}
-	}(id)
 
 	email := ""
 	planType := ""
 	if accountInfo != nil {
 		email = accountInfo.Email
 		planType = accountInfo.PlanType
+	}
+	if email == "" {
+		email = seed.email
+	}
+	if planType == "" {
+		planType = seed.planType
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -379,8 +357,11 @@ func doOAuthCodeExchange(ctx context.Context, code, codeVerifier, redirectURI, p
 	if err := json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, nil, fmt.Errorf("解析响应失败: %w", err)
 	}
+	if strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return nil, nil, fmt.Errorf("token 兑换响应缺少 access_token")
+	}
 
-	info := auth.ParseIDToken(tokenResp.IDToken)
+	info := accountInfoFromTokens(tokenResp.IDToken, tokenResp.AccessToken)
 	return &tokenResp, info, nil
 }
 
@@ -429,11 +410,17 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		c.String(http.StatusOK, oauthCallbackPage("授权失败", "未获取到 refresh_token，请确认已开启 offline_access", false))
 		return
 	}
+	seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken: tokenResp.RefreshToken,
+		accessToken:  tokenResp.AccessToken,
+		idToken:      tokenResp.IDToken,
+		expiresIn:    tokenResp.ExpiresIn,
+	})
 
 	// 自动添加账号
 	name := ""
-	if accountInfo != nil && accountInfo.Email != "" {
-		name = accountInfo.Email
+	if seed.email != "" {
+		name = seed.email
 	}
 	if name == "" {
 		name = "oauth-account"
@@ -451,6 +438,14 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		c.String(http.StatusOK, oauthCallbackPage("授权失败", "写入数据库失败: "+err.Error(), false))
 		return
 	}
+	if err := h.db.UpdateCredentials(ctx, id, tokenCredentialMap(seed)); err != nil {
+		sess.ExchangeResult = &oauthExchangeResult{
+			Success: false,
+			Error:   "Token 写入数据库失败: " + err.Error(),
+		}
+		c.String(http.StatusOK, oauthCallbackPage("授权失败", "写入 token 失败: "+err.Error(), false))
+		return
+	}
 	h.db.InsertAccountEventAsync(id, "added", "oauth_callback")
 
 	// Resin 租约继承：将临时身份的 IP 租约迁移到正式 DBID
@@ -458,28 +453,20 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		go proxy.InheritLease(resinTempID, fmt.Sprintf("%d", id))
 	}
 
-	newAcc := &auth.Account{
-		DBID:         id,
-		RefreshToken: tokenResp.RefreshToken,
-		ProxyURL:     sess.ProxyURL,
-	}
+	newAcc := accountFromCredentialSeed(id, sess.ProxyURL, seed)
 	h.store.AddAccount(newAcc)
-
-	go func(accountID int64) {
-		refreshCtx, rCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer rCancel()
-		if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-			log.Printf("OAuth 回调账号 %d AT 刷新失败: %v", accountID, err)
-		} else {
-			log.Printf("OAuth 回调账号 %d 已加入号池", accountID)
-		}
-	}(id)
 
 	email := ""
 	planType := ""
 	if accountInfo != nil {
 		email = accountInfo.Email
 		planType = accountInfo.PlanType
+	}
+	if email == "" {
+		email = seed.email
+	}
+	if planType == "" {
+		planType = seed.planType
 	}
 
 	sess.ExchangeResult = &oauthExchangeResult{
@@ -553,4 +540,3 @@ p{color:#4a5568;line-height:1.6;margin:0}
 <body><div class="card"><div class="icon">%s</div><h1>%s</h1><p>%s</p></div></body></html>`,
 		title, color, icon, title, message)
 }
-

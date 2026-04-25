@@ -188,7 +188,7 @@ export default function Proxies() {
             {t('proxies.description')}
           </p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center justify-end gap-2">
           {/* Pool Toggle Switch */}
           <div className="flex items-center gap-3" title={!canEnable && !poolEnabled ? t('proxies.addFirstProxy') : undefined}>
             <span className={`text-sm font-medium ${poolEnabled ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}`}>
@@ -210,7 +210,7 @@ export default function Proxies() {
           {selected.size > 0 && (
             <button
               onClick={handleBatchDelete}
-              className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-destructive/10 border border-destructive/30 text-destructive hover:bg-destructive/20 transition-all"
+              className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm font-semibold text-destructive transition-colors hover:bg-destructive/20"
             >
               <Trash2 className="size-4" />
               {t('proxies.deleteSelected', { count: selected.size })}
@@ -221,7 +221,7 @@ export default function Proxies() {
             <button
               onClick={handleTestAll}
               disabled={testAllLoading}
-              className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border border-border text-foreground hover:bg-muted/50 transition-all disabled:opacity-50"
+              className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm font-semibold text-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
             >
               {testAllLoading ? <Loader2 className="size-4 animate-spin" /> : <Zap className="size-4" />}
               {testAllLoading ? t('proxies.testingAll') : t('proxies.testAll')}
@@ -230,7 +230,7 @@ export default function Proxies() {
 
           <button
             onClick={() => setShowAdd(!showAdd)}
-            className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-primary text-primary-foreground hover:opacity-90 transition-opacity shadow-sm"
+            className="flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground shadow-sm transition-colors hover:bg-primary/90"
           >
             <Plus className="size-4" />
             {t('proxies.addProxy')}
@@ -250,7 +250,7 @@ export default function Proxies() {
               value={addInput}
               onChange={e => setAddInput(e.target.value)}
               placeholder={"http://user:pass@ip:port\nsocks5://ip:port"}
-              className="w-full h-32 px-3 py-2 text-sm rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
+              className="w-full h-32 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
             />
             <div className="flex items-center gap-3">
               <input
@@ -258,12 +258,12 @@ export default function Proxies() {
                 value={addLabel}
                 onChange={e => setAddLabel(e.target.value)}
                 placeholder={t('proxies.labelPlaceholder')}
-                className="flex-1 px-3 py-2 text-sm rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                className="flex-1 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-primary/30"
               />
               <button
                 onClick={handleAdd}
                 disabled={addLoading || !addInput.trim()}
-                className="px-5 py-2 rounded-xl text-sm font-semibold bg-primary text-primary-foreground hover:opacity-90 transition-opacity disabled:opacity-50 shadow-sm"
+                className="px-5 py-2 rounded-md text-sm font-semibold bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 shadow-sm"
               >
                 {addLoading ? t('proxies.adding') : t('proxies.confirmAdd')}
               </button>
@@ -311,7 +311,7 @@ export default function Proxies() {
             </div>
           ) : (
             <>
-              <div className="overflow-x-auto">
+              <div className="data-table-shell">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-border text-left text-muted-foreground">
@@ -360,7 +360,7 @@ export default function Proxies() {
                               >
                                 {revealedIds.has(p.id) ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
                               </button>
-                              <span className="font-mono text-[20px] font-bold break-all text-foreground">
+                              <span className="font-mono text-[13px] font-medium break-all text-foreground">
                                 {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
                               </span>
                             </div>
@@ -394,7 +394,7 @@ export default function Proxies() {
                           {/* IP */}
                           <td className="p-3">
                             {p.test_ip ? (
-                              <span className="text-[20px] font-mono font-bold text-foreground whitespace-nowrap">{p.test_ip}</span>
+                              <span className="text-[13px] font-mono font-medium text-foreground whitespace-nowrap">{p.test_ip}</span>
                             ) : (
                               <span className="text-xs text-muted-foreground">-</span>
                             )}

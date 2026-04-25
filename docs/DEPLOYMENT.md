@@ -224,11 +224,21 @@ DATABASE_NAME=codex2api
 # Redis 配置
 CACHE_DRIVER=redis
 REDIS_ADDR=redis:6379
+REDIS_USERNAME=
 REDIS_PASSWORD=your-redis-password
 REDIS_DB=0
+REDIS_TLS=false
+REDIS_INSECURE_SKIP_VERIFY=false
 
 # 时区
 TZ=Asia/Shanghai
+```
+
+云 Redis（如 Aiven、Upstash）通常需要 TLS，可直接使用平台提供的 `rediss://` 连接串：
+
+```env
+CACHE_DRIVER=redis
+REDIS_ADDR=rediss://default:your-redis-password@your-redis-host:6379/0
 ```
 
 **可选配置:**

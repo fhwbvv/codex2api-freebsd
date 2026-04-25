@@ -18,8 +18,8 @@ import (
 
 const (
 	responseCacheTTL        = 10 * time.Minute
-	responseCacheMaxItems   = 2000  // 缓存条目上限，防止内存膨胀
-	responseCacheMaxPerItem = 200   // 单条缓存最大 items 数，截断过长对话
+	responseCacheMaxItems   = 2000 // 缓存条目上限，防止内存膨胀
+	responseCacheMaxPerItem = 200  // 单条缓存最大 items 数，截断过长对话
 	responseCleanupInterval = 2 * time.Minute
 )
 
@@ -151,27 +151,28 @@ func expandPreviousResponse(codexBody []byte) ([]byte, string) {
 
 // cacheCompletedResponse 从 response.completed 事件中提取 response.id 和 response.output，
 // 与当前请求的 expanded input 合并后存入缓存。
-// 仅在响应包含 function_call 时才缓存，避免为普通对话浪费内存。
+// 仅在响应包含需要 call_id 续链的 Codex 工具调用时才缓存，避免为普通对话浪费内存。
 func cacheCompletedResponse(expandedInputRaw []byte, completedData []byte) {
 	respID := gjson.GetBytes(completedData, "response.id").String()
 	if respID == "" {
 		return
 	}
 
-	// 仅在响应包含 function_call 时才缓存（普通对话无需 previous_response_id 展开）
+	// 仅在响应包含 Codex 工具调用时才缓存（普通对话无需 previous_response_id 展开）。
+	// image_generation_call / web_search_call 虽然也是 *_call 结尾，但不属于 call_id 工具续链体系。
 	output := gjson.GetBytes(completedData, "response.output")
 	if !output.IsArray() {
 		return
 	}
-	hasFunctionCall := false
+	hasToolCallContext := false
 	output.ForEach(func(_, item gjson.Result) bool {
-		if item.Get("type").String() == "function_call" {
-			hasFunctionCall = true
+		if isCodexToolCallContextType(item.Get("type").String()) {
+			hasToolCallContext = true
 			return false
 		}
 		return true
 	})
-	if !hasFunctionCall {
+	if !hasToolCallContext {
 		return
 	}
 
@@ -194,5 +195,19 @@ func cacheCompletedResponse(expandedInputRaw []byte, completedData []byte) {
 
 	if len(items) > 0 {
 		setResponseCache(respID, items)
+	}
+}
+
+func isCodexToolCallContextType(typ string) bool {
+	switch typ {
+	case "function_call",
+		"tool_call",
+		"local_shell_call",
+		"tool_search_call",
+		"custom_tool_call",
+		"mcp_tool_call":
+		return true
+	default:
+		return false
 	}
 }

@@ -35,6 +35,9 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 			t.Errorf("Header %s = %q, expected %q", header, value, expected)
 		}
 	}
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "img-src 'self' data: blob:") {
+		t.Errorf("Content-Security-Policy = %q, expected blob: image previews to be allowed", csp)
+	}
 }
 
 func TestRateLimitMiddleware(t *testing.T) {

@@ -87,6 +87,92 @@ func TestFastSchedulerRoundRobinWithinTier(t *testing.T) {
 	}
 }
 
+func TestStoreNextExcludingRespectsAPIKeyWhitelist(t *testing.T) {
+	restricted := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	restricted.SetAllowedAPIKeyIDs([]int64{2})
+	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
+
+	store := &Store{
+		accounts:       []*Account{restricted, fallback},
+		maxConcurrency: 1,
+	}
+
+	got := store.NextExcluding(1, nil)
+	if got == nil {
+		t.Fatal("NextExcluding() returned nil")
+	}
+	defer store.Release(got)
+
+	if got.DBID != 2 {
+		t.Fatalf("NextExcluding() picked dbID=%d, want 2", got.DBID)
+	}
+}
+
+func TestStoreNextExcludingWithFilterRespectsPlanFilter(t *testing.T) {
+	plus := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	plus.PlanType = "plus"
+	pro := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
+	pro.PlanType = "pro"
+
+	store := &Store{
+		accounts:       []*Account{plus, pro},
+		maxConcurrency: 1,
+	}
+
+	got := store.NextExcludingWithFilter(0, nil, func(acc *Account) bool {
+		return acc.GetPlanType() == "pro"
+	})
+	if got == nil {
+		t.Fatal("NextExcludingWithFilter() returned nil")
+	}
+	defer store.Release(got)
+
+	if got.DBID != 2 {
+		t.Fatalf("NextExcludingWithFilter() picked dbID=%d, want 2", got.DBID)
+	}
+}
+
+func TestFastSchedulerAcquireExcludingRespectsAPIKeyWhitelist(t *testing.T) {
+	restricted := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	restricted.SetAllowedAPIKeyIDs([]int64{2})
+	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
+
+	scheduler := NewFastScheduler(1)
+	scheduler.Rebuild([]*Account{restricted, fallback})
+
+	got := scheduler.AcquireExcluding(1, nil)
+	if got == nil {
+		t.Fatal("AcquireExcluding() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != 2 {
+		t.Fatalf("AcquireExcluding() picked dbID=%d, want 2", got.DBID)
+	}
+}
+
+func TestFastSchedulerAcquireExcludingWithFilterRespectsPlanFilter(t *testing.T) {
+	plus := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	plus.PlanType = "plus"
+	pro := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
+	pro.PlanType = "pro"
+
+	scheduler := NewFastScheduler(1)
+	scheduler.Rebuild([]*Account{plus, pro})
+
+	got := scheduler.AcquireExcludingWithFilter(0, nil, func(acc *Account) bool {
+		return acc.GetPlanType() == "pro"
+	})
+	if got == nil {
+		t.Fatal("AcquireExcludingWithFilter() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != 2 {
+		t.Fatalf("AcquireExcludingWithFilter() picked dbID=%d, want 2", got.DBID)
+	}
+}
+
 func TestFastSchedulerUpdateMovesAccountBetweenBuckets(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 2)
 	scheduler := NewFastScheduler(2)
@@ -238,6 +324,59 @@ func TestStoreFastSchedulerTracksCooldownTransition(t *testing.T) {
 		t.Fatal("Next() returned nil after ClearCooldown()")
 	}
 	store.Release(got)
+}
+
+func TestFastSchedulerPremium5hRateLimitUsesSingleConcurrencyAndRecoversAfterReset(t *testing.T) {
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		PlanType:            "plus",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent5h:      100,
+		UsagePercent5hValid: true,
+		Reset5hAt:           time.Now().Add(30 * time.Minute),
+	}
+
+	scheduler := NewFastScheduler(4)
+	scheduler.Rebuild([]*Account{acc})
+
+	sizes := scheduler.BucketSizes()
+	if sizes[HealthTierRisky] != 1 {
+		t.Fatalf("risky bucket size = %d, want 1", sizes[HealthTierRisky])
+	}
+
+	first := scheduler.Acquire()
+	if first == nil {
+		t.Fatal("first Acquire() returned nil")
+	}
+
+	second := scheduler.Acquire()
+	if second != nil {
+		t.Fatal("second Acquire() should be nil while premium 5h rate limit is active")
+	}
+
+	acc.mu.Lock()
+	acc.Reset5hAt = time.Now().Add(-time.Minute)
+	acc.mu.Unlock()
+	scheduler.Release(first)
+
+	third := scheduler.Acquire()
+	if third == nil {
+		t.Fatal("third Acquire() returned nil after premium 5h reset expired")
+	}
+	fourth := scheduler.Acquire()
+	if fourth == nil {
+		t.Fatal("fourth Acquire() returned nil, want recovered concurrency after reset")
+	}
+
+	sizes = scheduler.BucketSizes()
+	if sizes[HealthTierHealthy] != 1 || sizes[HealthTierRisky] != 0 {
+		t.Fatalf("unexpected bucket sizes after reset recovery: %#v", sizes)
+	}
+
+	scheduler.Release(third)
+	scheduler.Release(fourth)
 }
 
 func TestFastSchedulerEnabledFromEnv(t *testing.T) {

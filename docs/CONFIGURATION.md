@@ -60,6 +60,12 @@ Codex2API 采用三层配置架构：
 | `DATABASE_NAME` | 是 | - | PostgreSQL 数据库名 |
 | `DATABASE_SSLMODE` | 否 | disable | SSL 模式: disable/require/verify-full |
 
+### 生图工作台
+
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `IMAGE_ASSET_DIR` | 否 | `/data/images` | 管理台生图工作台保存图片文件的服务器目录；Docker 部署建议持久化 `/data` |
+
 #### SQLite 模式
 
 | 变量 | 必填 | 默认值 | 说明 |
@@ -74,9 +80,14 @@ Codex2API 采用三层配置架构：
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `CACHE_DRIVER` | 是 | redis | 固定值: redis |
-| `REDIS_ADDR` | 是 | - | Redis 地址，如 `redis:6379` |
-| `REDIS_PASSWORD` | 否 | - | Redis 密码 |
+| `REDIS_ADDR` | 是 | - | Redis 地址，支持 `redis:6379`、`redis://default:pass@host:6379/0`、`rediss://default:pass@host:6379/0` |
+| `REDIS_USERNAME` | 否 | - | Redis ACL 用户名；URL 中已包含用户名时可不填 |
+| `REDIS_PASSWORD` | 否 | - | Redis 密码；URL 中已包含密码时可不填 |
 | `REDIS_DB` | 否 | 0 | Redis 数据库编号 |
+| `REDIS_TLS` | 否 | false | 为 `host:port` 形式的 Redis 启用 TLS；`rediss://` 会自动启用 |
+| `REDIS_INSECURE_SKIP_VERIFY` | 否 | false | 跳过 TLS 证书校验，仅建议自签证书或排障时使用 |
+
+> Aiven、Upstash 等云 Redis 通常要求 TLS。优先使用平台提供的 `rediss://...` 连接串；如果只填写 `host:port`，请设置 `REDIS_TLS=true`，否则可能在启动时出现 `Redis 连接失败: EOF`。
 
 #### 内存缓存模式
 
@@ -164,8 +175,11 @@ DATABASE_SSLMODE=disable
 # 缓存配置 (Redis)
 CACHE_DRIVER=redis
 REDIS_ADDR=redis:6379
+REDIS_USERNAME=
 REDIS_PASSWORD=your-redis-password
 REDIS_DB=0
+REDIS_TLS=false
+REDIS_INSECURE_SKIP_VERIFY=false
 ```
 
 ### SQLite 轻量环境 (.env)
@@ -183,6 +197,7 @@ TZ=Asia/Shanghai
 # 数据库配置 (SQLite)
 DATABASE_DRIVER=sqlite
 DATABASE_PATH=/data/codex2api.db
+IMAGE_ASSET_DIR=/data/images
 
 # 缓存配置 (内存)
 CACHE_DRIVER=memory
@@ -209,8 +224,10 @@ DATABASE_NAME=codex2api
 # 本地 Redis
 CACHE_DRIVER=redis
 REDIS_ADDR=localhost:6379
+REDIS_USERNAME=
 REDIS_PASSWORD=
 REDIS_DB=0
+REDIS_TLS=false
 
 TZ=Asia/Shanghai
 ```

@@ -16,7 +16,6 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
-import AccountTrendChart from '../components/AccountTrendChart'
 import { useDataLoader } from '../hooks/useDataLoader'
 import type { OpsOverviewResponse } from '../types'
 import { Button } from '@/components/ui/button'
@@ -108,7 +107,7 @@ export default function Operations() {
                     value={`${overview.postgres.usage_percent.toFixed(1)}%`}
                     sub={t('ops.pgConn', { open: overview.postgres.open, max: overview.postgres.max_open || '∞' })}
                     icon={<Database className="size-5" />}
-                    tone={overview.postgres.healthy ? getPercentTone(overview.postgres.usage_percent, 75, 90) : 'danger'}
+                    tone={getDatabaseTone(overview)}
                     t={t}
                   />
                   <OpsMetricCard
@@ -116,7 +115,7 @@ export default function Operations() {
                     value={`${overview.redis.usage_percent.toFixed(1)}%`}
                     sub={t('ops.redisConn', { open: overview.redis.total_conns, max: overview.redis.pool_size || '-' })}
                     icon={<Server className="size-5" />}
-                    tone={overview.redis.healthy ? getPercentTone(overview.redis.usage_percent, 70, 90) : 'danger'}
+                    tone={getCacheTone(overview)}
                     t={t}
                   />
                   <OpsMetricCard
@@ -172,7 +171,6 @@ export default function Operations() {
             </Card>
           </>
         ) : null}
-        <AccountTrendChart />
       </>
     </StateShell>
   )
@@ -233,10 +231,10 @@ function OpsMetricCard({
 
         <div className="mt-5 flex items-end justify-between gap-3">
           <div className="min-w-0">
-            <div className="text-[34px] font-bold leading-none tracking-tighter text-foreground">{value}</div>
+            <div className="text-[32px] font-bold leading-none text-foreground">{value}</div>
             <div className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{sub}</div>
           </div>
-          <div className={`flex size-11 shrink-0 items-center justify-center rounded-2xl ${toneStyle.icon}`}>
+          <div className={`flex size-11 shrink-0 items-center justify-center rounded-lg ${toneStyle.icon}`}>
             {icon}
           </div>
         </div>
@@ -247,9 +245,9 @@ function OpsMetricCard({
 
 function SummaryPill({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-2xl border border-border bg-white/65 px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
-      <div className="text-[12px] font-bold tracking-[0.14em] uppercase text-muted-foreground">{label}</div>
-      <div className="mt-2 text-[20px] font-bold tracking-tight text-foreground">{value}</div>
+    <div className="rounded-lg border border-border bg-card/85 px-3 py-2.5 shadow-sm">
+      <div className="text-[12px] font-bold uppercase text-muted-foreground">{label}</div>
+      <div className="mt-2 text-[20px] font-bold text-foreground">{value}</div>
     </div>
   )
 }
@@ -258,6 +256,18 @@ function getPercentTone(value: number, warningThreshold: number, dangerThreshold
   if (value >= dangerThreshold) return 'danger'
   if (value >= warningThreshold) return 'warning'
   return 'normal'
+}
+
+function getDatabaseTone(overview: OpsOverviewResponse): MetricTone {
+  if (!overview.postgres.healthy) return 'danger'
+  if (overview.database_driver === 'sqlite') return 'normal'
+  return getPercentTone(overview.postgres.usage_percent, 75, 90)
+}
+
+function getCacheTone(overview: OpsOverviewResponse): MetricTone {
+  if (!overview.redis.healthy) return 'danger'
+  if (overview.cache_driver === 'memory') return 'normal'
+  return getPercentTone(overview.redis.usage_percent, 70, 90)
 }
 
 function formatBytes(bytes: number): string {

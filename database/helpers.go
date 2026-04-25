@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -68,6 +69,27 @@ func parseDBTimeString(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("无法解析时间值: %q", value)
 }
 
+func sqliteTimeParam(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format("2006-01-02 15:04:05")
+}
+
+func (db *DB) timeRangeArgs(start, end time.Time) (interface{}, interface{}) {
+	if db != nil && db.isSQLite() {
+		return sqliteTimeParam(start), sqliteTimeParam(end)
+	}
+	return start, end
+}
+
+func (db *DB) timeArg(value time.Time) interface{} {
+	if db != nil && db.isSQLite() {
+		return sqliteTimeParam(value)
+	}
+	return value
+}
+
 func decodeCredentials(raw interface{}) map[string]interface{} {
 	data := bytesFromDBValue(raw)
 	if len(data) == 0 {
@@ -107,6 +129,107 @@ func mergeCredentialMaps(base map[string]interface{}, updates map[string]interfa
 	return base
 }
 
+func normalizePositiveInt64Slice(values []int64) []int64 {
+	if len(values) == 0 {
+		return []int64{}
+	}
+
+	unique := make(map[int64]struct{}, len(values))
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, exists := unique[value]; exists {
+			continue
+		}
+		unique[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i] < result[j]
+	})
+	if len(result) == 0 {
+		return []int64{}
+	}
+	return result
+}
+
+func int64FromJSONValue(value interface{}) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int8:
+		return int64(typed), true
+	case int16:
+		return int64(typed), true
+	case int32:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case uint:
+		return int64(typed), true
+	case uint8:
+		return int64(typed), true
+	case uint16:
+		return int64(typed), true
+	case uint32:
+		return int64(typed), true
+	case uint64:
+		if typed > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(typed), true
+	case float32:
+		value := int64(typed)
+		if float32(value) != typed {
+			return 0, false
+		}
+		return value, true
+	case float64:
+		value := int64(typed)
+		if float64(value) != typed {
+			return 0, false
+		}
+		return value, true
+	case json.Number:
+		value, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return value, true
+	default:
+		return 0, false
+	}
+}
+
+func int64SliceFromValue(value interface{}) []int64 {
+	if value == nil {
+		return []int64{}
+	}
+
+	switch typed := value.(type) {
+	case []int64:
+		return normalizePositiveInt64Slice(typed)
+	case []int:
+		values := make([]int64, 0, len(typed))
+		for _, item := range typed {
+			values = append(values, int64(item))
+		}
+		return normalizePositiveInt64Slice(values)
+	case []interface{}:
+		values := make([]int64, 0, len(typed))
+		for _, item := range typed {
+			if parsed, ok := int64FromJSONValue(item); ok {
+				values = append(values, parsed)
+			}
+		}
+		return normalizePositiveInt64Slice(values)
+	default:
+		return []int64{}
+	}
+}
+
 func credentialString(raw interface{}, key string) string {
 	credentials := decodeCredentials(raw)
 	if credentials == nil {
@@ -124,6 +247,18 @@ func credentialString(raw interface{}, key string) string {
 	default:
 		return fmt.Sprintf("%v", typed)
 	}
+}
+
+func credentialInt64Slice(raw interface{}, key string) []int64 {
+	credentials := decodeCredentials(raw)
+	if credentials == nil {
+		return []int64{}
+	}
+	value, ok := credentials[key]
+	if !ok {
+		return []int64{}
+	}
+	return int64SliceFromValue(value)
 }
 
 func accountEmailFromRawCredentials(raw interface{}) string {

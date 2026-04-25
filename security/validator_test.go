@@ -83,6 +83,7 @@ func TestMaskSensitiveData(t *testing.T) {
 		{"sk-abcdef1234567890abcdef", "sk-****MASKED****"},
 		{"hello world", "hello world"},
 		{"token=550e8400-e29b-41d4-a716-446655440000", "token=****UUID-MASKED****"},
+		{"http://user:secret@proxy.example:8080", "http://user:redacted@proxy.example:8080"},
 	}
 
 	for _, test := range tests {
@@ -139,7 +140,7 @@ func TestValidateModelName(t *testing.T) {
 	}{
 		{"gpt-5.4", false},
 		{"gpt-5-codex", false},
-		{"", false}, // empty is allowed
+		{"", false},                      // empty is allowed
 		{strings.Repeat("a", 101), true}, // too long
 		{"model<script>", true},          // invalid chars
 	}
@@ -179,8 +180,8 @@ func TestSecureCompare(t *testing.T) {
 
 func TestSafeTruncate(t *testing.T) {
 	tests := []struct {
-		input   string
-		maxLen  int
+		input    string
+		maxLen   int
 		expected string
 	}{
 		{"hello world", 5, "hello"},

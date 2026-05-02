@@ -526,6 +526,80 @@ func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 	return modified
 }
 
+// normalizeResponsesCompactionItems converts {"type":"compaction","summary":"..."}
+// items in body["input"] into developer-role messages so the upstream Codex
+// /responses endpoint accepts them. Items with empty or missing summary text
+// are dropped. Codex CLI compresses prior turns into compaction items expecting
+// them to be forwarded as conversation context; the upstream rejects the type
+// with "Invalid input type 'compaction' at index N", so we translate in place.
+func normalizeResponsesCompactionItems(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	const summaryPrefix = "[Conversation summary from earlier turns]\n"
+
+	modified := false
+	out := make([]any, 0, len(inputItems))
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		if firstNonEmptyAnyString(itemMap["type"]) != "compaction" {
+			out = append(out, raw)
+			continue
+		}
+
+		summaryText := compactionSummaryText(itemMap["summary"])
+		if summaryText == "" {
+			summaryText = compactionSummaryText(itemMap["text"])
+		}
+		if summaryText == "" {
+			modified = true
+			continue
+		}
+
+		out = append(out, map[string]any{
+			"type": "message",
+			"role": "developer",
+			"content": []any{
+				map[string]any{
+					"type": "input_text",
+					"text": summaryPrefix + summaryText,
+				},
+			},
+		})
+		modified = true
+	}
+
+	if modified {
+		body["input"] = out
+	}
+	return modified
+}
+
+// compactionSummaryText extracts a usable summary string from a compaction
+// item's summary field. Strings pass through trimmed; non-string values are
+// JSON-serialized so the model still receives the original payload as text.
+func compactionSummaryText(raw any) string {
+	if raw == nil {
+		return ""
+	}
+	if s, ok := raw.(string); ok {
+		return strings.TrimSpace(s)
+	}
+	if b, err := json.Marshal(raw); err == nil {
+		return strings.TrimSpace(string(b))
+	}
+	return ""
+}
+
 func truncateToolsPreservingImageGeneration(tools []any) []any {
 	if len(tools) <= maxTools {
 		return tools
@@ -667,23 +741,24 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 	promptText := extractResponsesPromptText(body)
 
 	// 3. reasoning_effort → reasoning.effort 自动转换 + 钳位
-	if re, ok := body["reasoning_effort"].(string); ok && re != "" {
-		reasoning, _ := body["reasoning"].(map[string]any)
-		if reasoning == nil {
-			reasoning = map[string]any{}
-		}
-		if _, hasEffort := reasoning["effort"]; !hasEffort {
-			reasoning["effort"] = re
-			body["reasoning"] = reasoning
+	if re, ok := body["reasoning_effort"].(string); ok {
+		if normalized := normalizeReasoningEffort(re); normalized != "" {
+			reasoning, _ := body["reasoning"].(map[string]any)
+			if reasoning == nil {
+				reasoning = map[string]any{}
+			}
+			if _, hasEffort := reasoning["effort"]; !hasEffort {
+				reasoning["effort"] = normalized
+				body["reasoning"] = reasoning
+			}
 		}
 	}
 	if reasoning, ok := body["reasoning"].(map[string]any); ok {
-		if effort, ok := reasoning["effort"].(string); ok && effort != "" {
-			switch strings.ToLower(effort) {
-			case "low", "medium", "high", "xhigh":
-				// 合法值，保留
-			default:
-				reasoning["effort"] = "high"
+		if effort, ok := reasoning["effort"].(string); ok {
+			if normalized := normalizeReasoningEffort(effort); normalized != "" {
+				reasoning["effort"] = normalized
+			} else {
+				delete(reasoning, "effort")
 			}
 		}
 	}
@@ -748,6 +823,8 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 			body["input"] = append(cachedItems, currentInput...)
 		}
 	}
+	// 6b. 把 input[] 中的 compaction 项翻译为 developer message（上游不识别 compaction）
+	normalizeResponsesCompactionItems(body)
 
 	// 保存展开后的 input 原始 JSON（用于响应缓存链路）
 	var expandedInputRaw string
@@ -762,9 +839,10 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
-		"logit_bias", "response_format", "serviceTier",
+		"logit_bias", "response_format", "serviceTier", "metadata",
 		"stream_options", "reasoning_effort", "truncation", "context_management",
-		"disable_response_storage", "verbosity",
+		"disable_response_storage", "verbosity", "previous_response_id",
+		"prompt_cache_retention", "safety_identifier",
 	} {
 		delete(body, field)
 	}
@@ -788,12 +866,15 @@ func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
 
 // normalizeReasoningEffort 将 reasoning_effort 钳位到上游支持的值
 func normalizeReasoningEffort(effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
 	if effort == "" {
 		return ""
 	}
-	switch strings.ToLower(effort) {
+	switch effort {
 	case "low", "medium", "high", "xhigh":
 		return effort
+	case "max":
+		return "xhigh"
 	default:
 		return "high"
 	}
@@ -1150,14 +1231,38 @@ func schemaDeclaresArray(schema map[string]interface{}) bool {
 // ==================== 响应翻译: Codex SSE → OpenAI SSE ====================
 
 // UsageInfo token 使用统计
+type TokenDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
 type UsageInfo struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-	InputTokens      int `json:"input_tokens,omitempty"`
-	OutputTokens     int `json:"output_tokens,omitempty"`
-	ReasoningTokens  int `json:"reasoning_tokens,omitempty"`
-	CachedTokens     int `json:"cached_tokens,omitempty"`
+	PromptTokens        int           `json:"prompt_tokens"`
+	CompletionTokens    int           `json:"completion_tokens"`
+	TotalTokens         int           `json:"total_tokens"`
+	InputTokens         int           `json:"input_tokens,omitempty"`
+	OutputTokens        int           `json:"output_tokens,omitempty"`
+	ReasoningTokens     int           `json:"reasoning_tokens,omitempty"`
+	CachedTokens        int           `json:"cached_tokens,omitempty"`
+	PromptTokensDetails *TokenDetails `json:"prompt_tokens_details,omitempty"`
+	InputTokensDetails  *TokenDetails `json:"input_tokens_details,omitempty"`
+}
+
+func newUsageInfo(inputTokens, outputTokens, reasoningTokens, cachedTokens int) *UsageInfo {
+	usage := &UsageInfo{
+		PromptTokens:     inputTokens,
+		CompletionTokens: outputTokens,
+		TotalTokens:      inputTokens + outputTokens,
+		InputTokens:      inputTokens,
+		OutputTokens:     outputTokens,
+		ReasoningTokens:  reasoningTokens,
+		CachedTokens:     cachedTokens,
+	}
+	if cachedTokens > 0 {
+		details := &TokenDetails{CachedTokens: cachedTokens}
+		usage.PromptTokensDetails = details
+		usage.InputTokensDetails = details
+	}
+	return usage
 }
 
 // newContentChunk 构建文本内容流式块
@@ -1492,15 +1597,7 @@ func extractUsageFromResult(usage gjson.Result) *UsageInfo {
 	outputTokens := int(usage.Get("output_tokens").Int())
 	reasoningTokens := int(usage.Get("output_tokens_details.reasoning_tokens").Int())
 	cachedTokens := int(usage.Get("input_tokens_details.cached_tokens").Int())
-	return &UsageInfo{
-		PromptTokens:     inputTokens,
-		CompletionTokens: outputTokens,
-		TotalTokens:      inputTokens + outputTokens,
-		InputTokens:      inputTokens,
-		OutputTokens:     outputTokens,
-		ReasoningTokens:  reasoningTokens,
-		CachedTokens:     cachedTokens,
-	}
+	return newUsageInfo(inputTokens, outputTokens, reasoningTokens, cachedTokens)
 }
 
 // ExtractToolCallsFromOutput 从 response.completed 事件的 output 数组中提取 function_call 项

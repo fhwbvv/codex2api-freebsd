@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -54,6 +55,28 @@ func TestBuildAdminImageGenerationRequestOmitsAutoSize(t *testing.T) {
 	}
 	if payload["quality"] != "high" || payload["output_format"] != "png" {
 		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestImageJobJPEGFallbackDecision(t *testing.T) {
+	req := imageGenerationJobPayload{OutputFormat: "png"}
+	if !shouldFallbackImageJobToJPEG(req, http.StatusBadGateway, fmt.Errorf("upstream image generation failed (server_error): An error occurred while processing your request")) {
+		t.Fatalf("expected PNG server_error to fall back to JPEG")
+	}
+	openAIProcessingErr := "upstream image generation failed (server_error): An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID e412a5aa-0f63-45a9-bef9-f856ec589574 in your message."
+	if !shouldFallbackImageJobToJPEG(req, http.StatusBadGateway, fmt.Errorf("%s", openAIProcessingErr)) {
+		t.Fatalf("expected OpenAI processing server_error to fall back to JPEG")
+	}
+	if shouldFallbackImageJobToJPEG(req, http.StatusTooManyRequests, fmt.Errorf("rate limit reached")) {
+		t.Fatalf("rate limit should not fall back to JPEG")
+	}
+	if shouldFallbackImageJobToJPEG(imageGenerationJobPayload{OutputFormat: "jpeg"}, http.StatusBadGateway, fmt.Errorf("server_error")) {
+		t.Fatalf("non-PNG format should not fall back to JPEG")
+	}
+
+	fallback := jpegFallbackImageJobRequest(imageGenerationJobPayload{OutputFormat: "png", Background: "transparent"})
+	if fallback.OutputFormat != "jpeg" || fallback.Background != "opaque" {
+		t.Fatalf("fallback request = %#v, want jpeg with opaque background", fallback)
 	}
 }
 

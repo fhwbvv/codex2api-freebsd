@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	defaultDeviceProfileUserAgent      = "codex_cli_rs/0.117.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464"
-	defaultDeviceProfilePackageVersion = "0.117.0"
-	defaultDeviceProfileRuntimeVersion = "0.117.0"
+	defaultDeviceProfileUserAgent      = latestCodexCLIUserAgentPrefix
+	defaultDeviceProfilePackageVersion = latestCodexCLIVersion
+	defaultDeviceProfileRuntimeVersion = latestCodexCLIVersion
 	defaultDeviceProfileOS             = "MacOS"
 	defaultDeviceProfileArch           = "arm64"
 	deviceProfileTTL                   = 7 * 24 * time.Hour

@@ -183,6 +183,66 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsCodexUpstreamTransportToHTTP(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_UPSTREAM_TRANSPORT", "")
+	t.Setenv("USE_WEBSOCKET", "")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.CodexUpstreamTransport; got != "http" {
+		t.Fatalf("CodexUpstreamTransport = %q, want http", got)
+	}
+	if cfg.UseWebsocket {
+		t.Fatal("UseWebsocket = true, want false")
+	}
+}
+
+func TestLoadHonorsCodexUpstreamTransportWS(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_UPSTREAM_TRANSPORT", "websocket")
+	t.Setenv("USE_WEBSOCKET", "")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.CodexUpstreamTransport; got != "ws" {
+		t.Fatalf("CodexUpstreamTransport = %q, want ws", got)
+	}
+	if !cfg.UseWebsocket {
+		t.Fatal("UseWebsocket = false, want true")
+	}
+}
+
+func TestLoadKeepsLegacyUseWebsocketCompatibility(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_UPSTREAM_TRANSPORT", "")
+	t.Setenv("USE_WEBSOCKET", "true")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.CodexUpstreamTransport; got != "ws" {
+		t.Fatalf("CodexUpstreamTransport = %q, want ws", got)
+	}
+	if !cfg.UseWebsocket {
+		t.Fatal("UseWebsocket = false, want true")
+	}
+}
+
 func TestLoadReadsRedisTLSSettings(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",

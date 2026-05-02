@@ -6,13 +6,20 @@ export interface ToastState {
   type: ToastType
 }
 
-export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'paused' | string
+export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | string
 
 export interface StatsResponse {
   total: number
   available: number
   error: number
   today_requests: number
+}
+
+export interface AccountUsageWindow {
+  requests: number
+  tokens: number
+  account_billed?: number
+  user_billed?: number
 }
 
 export interface AccountRow {
@@ -53,12 +60,29 @@ export interface AccountRow {
   last_used_at?: ISODateString
   success_requests?: number
   error_requests?: number
+  retry_error_requests?: number
+  rate_limit_attempts?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
+  usage_5h_detail?: AccountUsageWindow
+  usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
   cooldown_until?: ISODateString
+  cooldown_reason?: string
+  model_cooldowns?: Array<{
+    model: string
+    reason: string
+    reset_at: ISODateString
+    remaining_seconds: number
+  }>
+  enabled?: boolean
   locked?: boolean
+  // 图片配额信息
+  image_quota_remaining?: number
+  image_quota_total?: number
+  today_used_count?: number
+  image_quota_reset_at?: ISODateString
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
@@ -199,6 +223,7 @@ export interface SystemSettings {
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   max_retries: number
+  max_rate_limit_retries: number
   allow_remote_migration: boolean
   database_driver: string
   database_label: string
@@ -208,6 +233,82 @@ export interface SystemSettings {
   model_mapping: string
   resin_url: string
   resin_platform_name: string
+  prompt_filter_enabled: boolean
+  prompt_filter_mode: 'monitor' | 'warn' | 'block' | string
+  prompt_filter_threshold: number
+  prompt_filter_strict_threshold: number
+  prompt_filter_log_matches: boolean
+  prompt_filter_max_text_length: number
+  prompt_filter_sensitive_words: string
+  prompt_filter_custom_patterns: string
+  prompt_filter_disabled_patterns: string
+}
+
+export interface PromptFilterMatch {
+  name: string
+  weight: number
+  category: string
+  strict: boolean
+}
+
+export interface PromptFilterVerdict {
+  enabled: boolean
+  mode: string
+  action: 'allow' | 'warn' | 'block' | string
+  score: number
+  raw_score: number
+  threshold: number
+  strict_hit: boolean
+  matched: PromptFilterMatch[]
+  text_preview: string
+  reason: string
+  extracted_chars: number
+}
+
+export interface PromptFilterLog {
+  id: number
+  created_at: ISODateString
+  source: string
+  endpoint: string
+  model: string
+  action: string
+  mode: string
+  score: number
+  threshold: number
+  matched_patterns: string
+  text_preview: string
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
+  client_ip: string
+  error_code: string
+}
+
+export interface PromptFilterLogsResponse {
+  logs: PromptFilterLog[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export interface PromptFilterTestResponse {
+  verdict: PromptFilterVerdict
+}
+
+export interface PromptFilterRule {
+  name: string
+  pattern: string
+  weight: number
+  category?: string
+  strict?: boolean
+  enabled?: boolean
+  builtin?: boolean
+}
+
+export interface PromptFilterRulesResponse {
+  builtin_patterns: PromptFilterRule[]
+  custom_patterns: PromptFilterRule[]
+  disabled_patterns: string[]
 }
 
 export interface ModelInfo {
@@ -257,8 +358,12 @@ export interface UsageStats {
   total_prompt_tokens: number
   total_completion_tokens: number
   total_cached_tokens: number
+  total_account_billed: number
+  total_user_billed: number
   today_requests: number
   today_tokens: number
+  today_account_billed: number
+  today_user_billed: number
   rpm: number
   tpm: number
   avg_duration_ms: number
@@ -270,6 +375,7 @@ export interface UsageLog {
   account_id: number
   endpoint: string
   model: string
+  effective_model: string
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
@@ -296,6 +402,16 @@ export interface UsageLog {
   image_size: string
   account_email: string
   created_at: ISODateString
+  account_billed: number
+  user_billed: number
+  input_cost: number
+  output_cost: number
+  cache_read_cost: number
+  total_cost: number
+  input_price_per_mtoken: number
+  output_price_per_mtoken: number
+  cache_read_price_per_mtoken: number
+  rate_multiplier: number
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>
@@ -365,6 +481,8 @@ export interface ImageAsset {
   job_id: number
   template_id: number
   filename: string
+  proxy_url?: string
+  thumbnail_url?: string
   mime_type: string
   bytes: number
   width: number
@@ -434,6 +552,7 @@ export interface CreateImageJobPayload {
   output_format?: string
   background?: string
   style?: string
+  upscale?: string
   api_key_id?: number
   template_id?: number
 }

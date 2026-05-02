@@ -49,7 +49,7 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 		return nil
 	case http.StatusTooManyRequests:
 		h.store.ReportRequestFailure(account, "client", 0)
-		proxy.Apply429Cooldown(h.store, account, nil, resp)
+		proxy.Apply429Cooldown(h.store, account, nil, resp, h.store.GetTestModel())
 		return nil
 	default:
 		if resp.StatusCode >= 500 {

@@ -93,7 +93,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		case http.StatusUnauthorized:
 			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
 		case http.StatusTooManyRequests:
-			proxy.Apply429Cooldown(h.store, account, errBody, resp)
+			proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
 		}
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
 		return
@@ -404,8 +404,12 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		// 跳过没有 token 的账号
 		account.Mu().RLock()
 		hasToken := account.AccessToken != ""
+		hasRefreshToken := account.RefreshToken != ""
 		account.Mu().RUnlock()
 		if !hasToken {
+			if !hasRefreshToken {
+				h.store.MarkError(account, "批量测试失败: 账号缺少 access_token 和 refresh_token")
+			}
 			atomic.AddInt64(&failedCount, 1)
 			continue
 		}
@@ -418,6 +422,7 @@ func (h *Handler) BatchTest(c *gin.Context) {
 
 			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 			if err != nil {
+				h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
 				atomic.AddInt64(&failedCount, 1)
 				return
 			}
@@ -438,9 +443,12 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				atomic.AddInt64(&bannedCount, 1)
 			case http.StatusTooManyRequests:
 				proxy.SyncCodexUsageState(h.store, acc, resp)
-				proxy.Apply429Cooldown(h.store, acc, body, resp)
+				proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
 				atomic.AddInt64(&rateLimitCount, 1)
 			default:
+				if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
+					h.store.MarkError(acc, fmt.Sprintf("批量测试上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+				}
 				atomic.AddInt64(&failedCount, 1)
 			}
 		}(account)
@@ -455,4 +463,26 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		"banned":       bannedCount,
 		"rate_limited": rateLimitCount,
 	})
+}
+
+func shouldMarkBatchTestAccountError(statusCode int, body []byte) bool {
+	msg := strings.ToLower(string(body))
+	if statusCode == http.StatusForbidden {
+		return true
+	}
+	if statusCode == http.StatusBadRequest {
+		for _, needle := range []string{
+			"invalid_grant",
+			"invalid_client",
+			"unauthorized_client",
+			"access_denied",
+			"account_deactivated",
+			"unsupported_country_region_territory",
+		} {
+			if strings.Contains(msg, needle) {
+				return true
+			}
+		}
+	}
+	return false
 }

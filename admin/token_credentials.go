@@ -9,6 +9,7 @@ import (
 
 type tokenCredentialSeed struct {
 	refreshToken string
+	sessionToken string
 	accessToken  string
 	idToken      string
 	accountID    string
@@ -21,6 +22,7 @@ type tokenCredentialSeed struct {
 
 func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed {
 	seed.refreshToken = strings.TrimSpace(seed.refreshToken)
+	seed.sessionToken = strings.TrimSpace(seed.sessionToken)
 	seed.accessToken = strings.TrimSpace(seed.accessToken)
 	seed.idToken = strings.TrimSpace(seed.idToken)
 	seed.accountID = strings.TrimSpace(seed.accountID)
@@ -40,9 +42,6 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 		}
 	}
 
-	if seed.expiresAt.IsZero() && seed.expiresAtRaw != "" {
-		seed.expiresAt = parseCredentialExpiresAt(seed.expiresAtRaw)
-	}
 	if seed.expiresAt.IsZero() && seed.expiresIn > 0 {
 		seed.expiresAt = time.Now().Add(time.Duration(seed.expiresIn) * time.Second)
 	}
@@ -50,6 +49,9 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 		if info := auth.ParseAccessToken(seed.accessToken); info != nil && !info.ExpiresAt.IsZero() {
 			seed.expiresAt = info.ExpiresAt
 		}
+	}
+	if seed.expiresAt.IsZero() && seed.expiresAtRaw != "" {
+		seed.expiresAt = parseCredentialExpiresAt(seed.expiresAtRaw)
 	}
 	if seed.expiresAt.IsZero() && seed.accessToken != "" {
 		seed.expiresAt = time.Now().Add(time.Hour)
@@ -83,6 +85,9 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	if seed.refreshToken != "" {
 		credentials["refresh_token"] = seed.refreshToken
 	}
+	if seed.sessionToken != "" {
+		credentials["session_token"] = seed.sessionToken
+	}
 	if seed.accessToken != "" {
 		credentials["access_token"] = seed.accessToken
 	}
@@ -109,6 +114,7 @@ func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSe
 	return &auth.Account{
 		DBID:         id,
 		RefreshToken: seed.refreshToken,
+		SessionToken: seed.sessionToken,
 		AccessToken:  seed.accessToken,
 		ExpiresAt:    seed.expiresAt,
 		AccountID:    seed.accountID,

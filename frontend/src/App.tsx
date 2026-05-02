@@ -12,6 +12,7 @@ import ApiReference from './pages/ApiReference'
 import APIKeys from './pages/APIKeys'
 import Usage from './pages/Usage'
 import ImageStudio from './pages/ImageStudio'
+import PromptFilter from './pages/PromptFilter'
 
 export default function App() {
   return (
@@ -24,6 +25,8 @@ export default function App() {
           <Route path="/proxies" element={<Proxies />} />
           <Route path="/images" element={<Navigate to="/images/studio" replace />} />
           <Route path="/images/:view" element={<ImageStudio />} />
+          <Route path="/prompt-filter" element={<Navigate to="/prompt-filter/overview" replace />} />
+          <Route path="/prompt-filter/:view" element={<PromptFilter />} />
           <Route path="/ops" element={<Operations />} />
           <Route path="/ops/scheduler" element={<SchedulerBoard />} />
           <Route path="/usage" element={<Usage />} />

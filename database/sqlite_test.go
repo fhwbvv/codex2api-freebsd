@@ -22,6 +22,51 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLiteAccountsEnabledDefaultsAndCanToggle(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "test", "rt", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+
+	rows, err := db.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive 返回错误: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListActive 返回 %d 条，want 1", len(rows))
+	}
+	if !rows[0].Enabled {
+		t.Fatal("new account Enabled = false, want true")
+	}
+
+	if err := db.SetAccountEnabled(ctx, id, false); err != nil {
+		t.Fatalf("SetAccountEnabled 返回错误: %v", err)
+	}
+	rows, err = db.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive 返回错误: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListActive 返回 %d 条，want 1", len(rows))
+	}
+	if rows[0].Enabled {
+		t.Fatal("disabled account Enabled = true, want false")
+	}
+
+	if err := db.SetAccountEnabled(ctx, id+1, false); err != sql.ErrNoRows {
+		t.Fatalf("SetAccountEnabled missing account error = %v, want sql.ErrNoRows", err)
+	}
+}
+
 func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -36,10 +81,146 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
+	}
+}
+
+func TestSQLiteModelCooldownPersistence(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	resetAt := time.Now().Add(15 * time.Minute).Truncate(time.Second)
+	if err := db.SetModelCooldown(ctx, 42, "gpt-5.4", "model_capacity", resetAt); err != nil {
+		t.Fatalf("SetModelCooldown 返回错误: %v", err)
+	}
+
+	rows, err := db.ListActiveModelCooldowns(ctx)
+	if err != nil {
+		t.Fatalf("ListActiveModelCooldowns 返回错误: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListActiveModelCooldowns 返回 %d 条，want 1", len(rows))
+	}
+	if rows[0].AccountID != 42 || rows[0].Model != "gpt-5.4" || rows[0].Reason != "model_capacity" {
+		t.Fatalf("cooldown row = %#v", rows[0])
+	}
+
+	if err := db.ClearModelCooldown(ctx, 42, "gpt-5.4"); err != nil {
+		t.Fatalf("ClearModelCooldown 返回错误: %v", err)
+	}
+	rows, err = db.ListActiveModelCooldowns(ctx)
+	if err != nil {
+		t.Fatalf("ListActiveModelCooldowns 返回错误: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("ListActiveModelCooldowns 返回 %d 条，want 0", len(rows))
+	}
+}
+
+func TestAccountRequestCountsSeparateRetryAttempts(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	logs := []*UsageLogInput{
+		{AccountID: 7, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 200},
+		{AccountID: 7, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 429, IsRetryAttempt: true, AttemptIndex: 1, UpstreamErrorKind: "model_capacity"},
+		{AccountID: 7, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 500, IsRetryAttempt: false, AttemptIndex: 2, UpstreamErrorKind: "server"},
+	}
+	for _, usageLog := range logs {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	counts, err := db.GetAccountRequestCounts(ctx)
+	if err != nil {
+		t.Fatalf("GetAccountRequestCounts 返回错误: %v", err)
+	}
+	got := counts[7]
+	if got == nil {
+		t.Fatal("account 7 counts missing")
+	}
+	if got.SuccessCount != 1 || got.ErrorCount != 1 || got.RetryErrorCount != 1 || got.RateLimitAttemptCount != 1 {
+		t.Fatalf("counts = %#v, want success=1 error=1 retry=1 rateLimit=1", got)
+	}
+}
+
+func TestSQLiteUsageStatsBaselineHasBillingColumns(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	columns, err := db.sqliteTableColumns(context.Background(), "usage_stats_baseline")
+	if err != nil {
+		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
+	}
+
+	for _, name := range []string{"account_billed", "user_billed"} {
+		if _, ok := columns[name]; !ok {
+			t.Fatalf("usage_stats_baseline 缺少列 %q", name)
+		}
+	}
+}
+
+func TestUsageLogsPersistEffectiveModel(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:        1,
+		Endpoint:         "/v1/messages",
+		InboundEndpoint:  "/v1/messages",
+		UpstreamEndpoint: "/v1/responses",
+		Model:            "claude-haiku-4-5-20251001",
+		EffectiveModel:   "gpt-5.4",
+		StatusCode:       200,
+		ReasoningEffort:  "high",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+	if logs[0].Model != "claude-haiku-4-5-20251001" {
+		t.Fatalf("Model = %q, want claude-haiku-4-5-20251001", logs[0].Model)
+	}
+	if logs[0].EffectiveModel != "gpt-5.4" {
+		t.Fatalf("EffectiveModel = %q, want gpt-5.4", logs[0].EffectiveModel)
+	}
+	if logs[0].ReasoningEffort != "high" {
+		t.Fatalf("ReasoningEffort = %q, want high", logs[0].ReasoningEffort)
 	}
 }
 
@@ -82,6 +263,100 @@ func TestUsageLogsPersistImageMetadata(t *testing.T) {
 	got := logs[0]
 	if got.ImageCount != 1 || got.ImageWidth != 3840 || got.ImageHeight != 2160 || got.ImageBytes != 2457600 || got.ImageFormat != "png" || got.ImageSize != "3840x2160" {
 		t.Fatalf("image metadata = %#v", got)
+	}
+}
+
+func TestUsageLogsReturnBillingFields(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:        1,
+		Endpoint:         "/v1/responses",
+		InboundEndpoint:  "/v1/responses",
+		UpstreamEndpoint: "/v1/responses",
+		Model:            "gpt-5.5",
+		StatusCode:       200,
+		InputTokens:      476,
+		OutputTokens:     252,
+		TotalTokens:      728,
+		ServiceTier:      "default",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+
+	got := logs[0]
+	want := calculateCost(476, 252, 0, "gpt-5.5", "default")
+	if got.AccountBilled != want || got.UserBilled != want {
+		t.Fatalf("billing = account %.12f user %.12f, want %.12f", got.AccountBilled, got.UserBilled, want)
+	}
+	if got.InputCost <= 0 || got.OutputCost <= 0 || got.TotalCost != want {
+		t.Fatalf("billing breakdown = input %.12f output %.12f total %.12f, want total %.12f", got.InputCost, got.OutputCost, got.TotalCost, want)
+	}
+}
+
+func TestUsageStatsIncludeBillingTotals(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	for _, usageLog := range []*UsageLogInput{
+		{
+			AccountID:    1,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.5",
+			StatusCode:   200,
+			InputTokens:  1000,
+			OutputTokens: 500,
+			TotalTokens:  1500,
+		},
+		{
+			AccountID:    1,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.5",
+			StatusCode:   499,
+			InputTokens:  1000,
+			OutputTokens: 500,
+			TotalTokens:  1500,
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	stats, err := db.GetUsageStats(ctx)
+	if err != nil {
+		t.Fatalf("GetUsageStats 返回错误: %v", err)
+	}
+
+	want := calculateCost(1000, 500, 0, "gpt-5.5", "")
+	if stats.TotalAccountBilled != want || stats.TotalUserBilled != want {
+		t.Fatalf("total billing = account %.12f user %.12f, want %.12f", stats.TotalAccountBilled, stats.TotalUserBilled, want)
+	}
+	if stats.TodayAccountBilled != want || stats.TodayUserBilled != want {
+		t.Fatalf("today billing = account %.12f user %.12f, want %.12f", stats.TodayAccountBilled, stats.TodayUserBilled, want)
 	}
 }
 
@@ -170,6 +445,39 @@ func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
 	}
 	if !deletedAt.Valid || deletedAt.String == "" {
 		t.Fatal("deleted_at 未迁移")
+	}
+}
+
+func TestListActiveIncludesErrorAccounts(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "error-account", "rt-error", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+	if err := db.SetError(ctx, id, "batch test failed"); err != nil {
+		t.Fatalf("SetError 返回错误: %v", err)
+	}
+
+	rows, err := db.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive 返回错误: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ListActive 返回 %d 条，want 1", len(rows))
+	}
+	if rows[0].Status != "error" {
+		t.Fatalf("status = %q, want error", rows[0].Status)
+	}
+	if rows[0].ErrorMessage != "batch test failed" {
+		t.Fatalf("error_message = %q, want batch test failed", rows[0].ErrorMessage)
 	}
 }
 

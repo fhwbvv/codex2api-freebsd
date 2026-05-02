@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,15 @@ const (
 	// Codex WebSocket 端点
 	CodexWsEndpoint = "/responses"
 )
+
+func shouldSendWebsocketUserAgent() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_WS_SEND_USER_AGENT"))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // ==================== WebSocket 执行器 ====================
 
@@ -164,8 +174,10 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 
 	// 3. 注入 prompt_cache_key
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String())
-	if existingCacheKey == "" && sessionID != "" {
+	if sessionID != "" {
 		wsBody, _ = sjson.SetBytes(wsBody, "prompt_cache_key", sessionID)
+	} else if existingCacheKey != "" {
+		wsBody, _ = sjson.SetBytes(wsBody, "prompt_cache_key", existingCacheKey)
 	}
 
 	// 4. 设置请求类型和 stream
@@ -185,24 +197,29 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 	// Beta header 启用 WebSocket 响应 API
 	headers.Set("OpenAI-Beta", responsesWebsocketBetaHeader)
 
-	// User-Agent 和版本
-	account := &auth.Account{}
-	if accountID != "" {
-		account.AccountID = accountID
-		if id, err := strconv.ParseInt(accountID, 10, 64); err == nil {
-			account.DBID = id
+	if shouldSendWebsocketUserAgent() {
+		account := &auth.Account{}
+		if accountID != "" {
+			account.AccountID = accountID
+			if id, err := strconv.ParseInt(accountID, 10, 64); err == nil {
+				account.DBID = id
+			}
 		}
-	}
-	if proxy.IsDeviceProfileStabilizationEnabled(deviceCfg) {
-		profile := proxy.ResolveDeviceProfile(account, apiKey, ginHeaders, deviceCfg)
-		headers.Set("User-Agent", profile.UserAgent)
-		if version := strings.TrimSpace(profile.PackageVersion); version != "" {
-			headers.Set("Version", version)
+		if proxy.IsDeviceProfileStabilizationEnabled(deviceCfg) {
+			profile := proxy.ResolveDeviceProfile(account, apiKey, ginHeaders, deviceCfg)
+			headers.Set("User-Agent", profile.UserAgent)
+			if version := strings.TrimSpace(profile.PackageVersion); version != "" {
+				headers.Set("Version", version)
+			}
+		} else if userAgent := strings.TrimSpace(ginHeaders.Get("User-Agent")); proxy.IsCodexOfficialClientByHeaders(userAgent, ginHeaders.Get("Originator")) && userAgent != "" {
+			headers.Set("User-Agent", userAgent)
+			if version := strings.TrimSpace(ginHeaders.Get("Version")); version != "" {
+				headers.Set("Version", version)
+			}
+		} else {
+			headers.Set("User-Agent", proxy.MinimalCodexCLIUserAgentForHeaders())
+			headers.Set("Version", proxy.LatestCodexCLIVersionForHeaders())
 		}
-	} else {
-		profile := proxy.ProfileForAccount(account.ID())
-		headers.Set("User-Agent", profile.UserAgent)
-		headers.Set("Version", profile.Version)
 	}
 	if betaFeatures := strings.TrimSpace(ginHeaders.Get("X-Codex-Beta-Features")); betaFeatures != "" {
 		headers.Set("X-Codex-Beta-Features", betaFeatures)
@@ -211,10 +228,15 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 	}
 
 	// Originator
-	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" {
+	if originator := strings.TrimSpace(ginHeaders.Get("Originator")); originator != "" && proxy.IsCodexOfficialClientByHeaders("", originator) {
 		headers.Set("Originator", originator)
 	} else {
 		headers.Set("Originator", proxy.Originator)
+	}
+	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Responsesapi-Include-Timing-Metrics"} {
+		if value := strings.TrimSpace(ginHeaders.Get(name)); value != "" {
+			headers.Set(name, value)
+		}
 	}
 
 	// Account ID
@@ -222,6 +244,7 @@ func (e *Executor) prepareWebsocketHeaders(accessToken, accountID, sessionID, ap
 		headers.Set("Chatgpt-Account-Id", accountID)
 	}
 	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
+		headers.Set("Session_id", sessionID)
 		headers.Set("Conversation_id", sessionID)
 	}
 

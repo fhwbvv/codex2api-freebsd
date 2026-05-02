@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/tidwall/gjson"
 )
 
@@ -38,6 +40,39 @@ func TestBuildImagesResponsesRequestMatchesReferenceChain(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "input.0.content.0.text").String(); got != "draw a cat" {
 		t.Fatalf("prompt = %q, want draw a cat", got)
+	}
+}
+
+func TestNextImageAccountPrefersPlusOrHigherPlan(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "free-token", PlanType: "free"})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "plus-token", PlanType: "plus"})
+	handler := &Handler{store: store}
+
+	account, _ := handler.nextImageAccount(0, nil)
+	if account == nil {
+		t.Fatal("nextImageAccount returned nil")
+	}
+	defer store.Release(account)
+
+	if account.DBID != 2 {
+		t.Fatalf("nextImageAccount picked account %d, want plus account 2", account.DBID)
+	}
+}
+
+func TestNextImageAccountFallsBackToFreeWhenNoPaidAccountAvailable(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "free-token", PlanType: "free"})
+	handler := &Handler{store: store}
+
+	account, _ := handler.nextImageAccount(0, nil)
+	if account == nil {
+		t.Fatal("nextImageAccount returned nil")
+	}
+	defer store.Release(account)
+
+	if account.DBID != 1 {
+		t.Fatalf("nextImageAccount picked account %d, want fallback free account 1", account.DBID)
 	}
 }
 
@@ -233,5 +268,17 @@ func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 	}
 	if got := gjson.GetBytes(out, "usage.images").Int(); got != 1 {
 		t.Fatalf("usage.images = %d, want 1", got)
+	}
+}
+
+func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
+	upstream := `data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"An error occurred while processing your request. Please include the request ID req-123."}}}` + "\n\n"
+
+	_, _, _, _, err := collectImagesResponse(strings.NewReader(upstream), "b64_json", "gpt-image-2")
+	if err == nil {
+		t.Fatal("collectImagesResponse returned nil error")
+	}
+	if got := err.Error(); !strings.Contains(got, "server_error") || !strings.Contains(got, "req-123") {
+		t.Fatalf("error = %q, want upstream code and request id", got)
 	}
 }

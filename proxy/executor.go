@@ -3,9 +3,14 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,7 +39,7 @@ func (e *poolEntry) touch() {
 	e.lastUsed.Store(time.Now().UnixNano())
 }
 
-var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL
+var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL|transportMode
 
 // clientPoolTTL 未使用超过此时间的 Client 将被淘汰
 const clientPoolTTL = 5 * time.Minute
@@ -65,8 +70,24 @@ func evictExpiredClients() {
 	})
 }
 
-func clientPoolKey(account *auth.Account, proxyURL string) string {
-	return fmt.Sprintf("%d|%s", account.ID(), proxyURL)
+const (
+	codexTransportModeStandard   = "standard"
+	codexTransportModeUTLSChrome = "utls_chrome"
+)
+
+func codexTransportModeFromEnv() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_TRANSPORT_MODE"))) {
+	case "", "standard", "go", "default":
+		return codexTransportModeStandard
+	case "utls", "utls_chrome", "chrome":
+		return codexTransportModeUTLSChrome
+	default:
+		return codexTransportModeStandard
+	}
+}
+
+func clientPoolKey(account *auth.Account, proxyURL, transportMode string) string {
+	return fmt.Sprintf("%d|%s|%s", account.ID(), strings.TrimSpace(proxyURL), transportMode)
 }
 
 func shouldRecyclePooledClient(err error) bool {
@@ -81,7 +102,7 @@ func shouldRecyclePooledClient(err error) bool {
 }
 
 func recyclePooledClient(account *auth.Account, proxyURL string) {
-	key := clientPoolKey(account, proxyURL)
+	key := clientPoolKey(account, proxyURL, codexTransportModeFromEnv())
 	if v, ok := clientPool.LoadAndDelete(key); ok {
 		v.(*poolEntry).client.CloseIdleConnections()
 	}
@@ -98,16 +119,84 @@ func recyclePooledClientForAccount(account *auth.Account) {
 	recyclePooledClient(account, proxyURL)
 }
 
+func newCodexStandardTransport(proxyURL string) http.RoundTripper {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 1
+	transport.IdleConnTimeout = 30 * time.Second
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = baseDialer.DialContext
+	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
+		log.Printf("[CodexTransport] 代理配置失败，回退直连: proxy=%s err=%v", proxyURL, err)
+		transport.Proxy = nil
+		transport.DialContext = baseDialer.DialContext
+	}
+	return transport
+}
+
+func newCodexTransport(proxyURL string) http.RoundTripper {
+	switch codexTransportModeFromEnv() {
+	case codexTransportModeUTLSChrome:
+		return NewUTLSTransport(proxyURL)
+	default:
+		return newCodexStandardTransport(proxyURL)
+	}
+}
+
+func codexFingerprintDebugEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_FINGERPRINT_DEBUG"))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func shortHashForLog(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:6])
+}
+
+func logCodexFingerprintDebug(kind string, account *auth.Account, proxyURL string, headers http.Header) {
+	if !codexFingerprintDebugEnabled() {
+		return
+	}
+	accountID := int64(0)
+	if account != nil {
+		accountID = account.ID()
+	}
+	userAgent := strings.TrimSpace(headers.Get("User-Agent"))
+	originator := strings.TrimSpace(headers.Get("Originator"))
+	log.Printf("[CodexFingerprint] kind=%s account_id=%d transport_mode=%s proxy_enabled=%t official_client=%t ua_hash=%s originator=%s session_hash=%s stainless_present=%t",
+		kind,
+		accountID,
+		codexTransportModeFromEnv(),
+		strings.TrimSpace(proxyURL) != "",
+		IsCodexOfficialClientByHeaders(userAgent, originator),
+		shortHashForLog(userAgent),
+		originator,
+		shortHashForLog(headers.Get("Session_id")),
+		headers.Get("X-Stainless-Package-Version") != "" ||
+			headers.Get("X-Stainless-Runtime-Version") != "" ||
+			headers.Get("X-Stainless-Os") != "" ||
+			headers.Get("X-Stainless-Arch") != "",
+	)
+}
+
 // getPooledClient 获取或创建连接池中的 HTTP Client（按账号隔离，TTL 自动淘汰）
 func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
-	key := clientPoolKey(account, proxyURL)
+	transportMode := codexTransportModeFromEnv()
+	key := clientPoolKey(account, proxyURL, transportMode)
 	if v, ok := clientPool.Load(key); ok {
 		entry := v.(*poolEntry)
 		entry.touch()
 		return entry.client
 	}
 
-	transport := NewUTLSTransport(proxyURL)
+	transport := newCodexTransport(proxyURL)
 
 	entry := &poolEntry{
 		client: &http.Client{
@@ -131,8 +220,23 @@ const (
 	Originator   = "codex_cli_rs"
 )
 
+var codexAllowedForwardHeaders = []string{
+	"X-Codex-Turn-State",
+	"X-Codex-Turn-Metadata",
+	"X-Client-Request-Id",
+}
+
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
 var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error)
+
+func IsolateCodexSessionID(apiKeyID int64, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || apiKeyID <= 0 {
+		return raw
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("api-key:%d:%s", apiKeyID, raw)))
+	return hex.EncodeToString(sum[:8])
+}
 
 // ExecuteRequest 向 Codex 上游发送请求
 // sessionID 可选，用于 prompt cache 会话绑定
@@ -179,7 +283,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	// 3. 注入 prompt_cache_key（如果请求体中没有，且 sessionID 不为空）
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey
-	if cacheKey == "" && sessionID != "" {
+	if sessionID != "" {
 		cacheKey = sessionID
 		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
 	}
@@ -207,6 +311,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if IsResinEnabled() {
 		req.Header.Set("X-Resin-Account", ResinAccountID(account))
 	}
+	logCodexFingerprintDebug("http", account, proxyURL, req.Header)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -249,7 +354,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey
-	if cacheKey == "" && sessionID != "" {
+	if sessionID != "" {
 		cacheKey = sessionID
 		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
 	}
@@ -276,6 +381,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	if IsResinEnabled() {
 		req.Header.Set("X-Resin-Account", ResinAccountID(account))
 	}
+	logCodexFingerprintDebug("compact", account, proxyURL, req.Header)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -295,6 +401,24 @@ func codexVersionFromProfile(profile deviceProfile, fallback string) string {
 	return strings.TrimSpace(fallback)
 }
 
+func codexVersionFromUserAgent(userAgent, fallback string) string {
+	if version, ok := parseCodexCLIVersion(userAgent); ok {
+		return fmt.Sprintf("%d.%d.%d", version.major, version.minor, version.patch)
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func applyCodexAllowedForwardHeaders(req *http.Request, downstreamHeaders http.Header) {
+	if req == nil || downstreamHeaders == nil {
+		return
+	}
+	for _, name := range codexAllowedForwardHeaders {
+		if value := strings.TrimSpace(downstreamHeaders.Get(name)); value != "" {
+			req.Header.Set(name, value)
+		}
+	}
+}
+
 func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessToken, cacheKey, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) {
 	if req == nil {
 		return
@@ -311,12 +435,23 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	version := ""
 	if IsDeviceProfileStabilizationEnabled(deviceCfg) {
 		profile = ResolveDeviceProfile(account, apiKey, downstreamHeaders, deviceCfg)
-		ApplyDeviceProfileHeaders(req, profile)
 		version = codexVersionFromProfile(profile, strings.TrimSpace(deviceCfg.PackageVersion))
+		if strings.TrimSpace(profile.UserAgent) != "" {
+			req.Header.Set("User-Agent", profile.UserAgent)
+		}
 	} else {
-		clientProfile := ProfileForAccount(account.ID())
-		req.Header.Set("User-Agent", clientProfile.UserAgent)
-		version = clientProfile.Version
+		userAgent := strings.TrimSpace(downstreamHeaders.Get("User-Agent"))
+		originator := strings.TrimSpace(downstreamHeaders.Get("Originator"))
+		if IsCodexOfficialClientByHeaders(userAgent, originator) && userAgent != "" {
+			req.Header.Set("User-Agent", userAgent)
+			version = firstNonEmptyHeader(downstreamHeaders, "Version", codexVersionFromUserAgent(userAgent, latestCodexCLIVersion))
+		} else {
+			req.Header.Set("User-Agent", latestCodexCLIUserAgentPrefix)
+			version = latestCodexCLIVersion
+		}
+	}
+	if version == "" {
+		version = latestCodexCLIVersion
 	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -326,11 +461,12 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	if version != "" {
 		req.Header.Set("Version", version)
 	}
-	if originator := strings.TrimSpace(downstreamHeaders.Get("Originator")); originator != "" {
+	if originator := strings.TrimSpace(downstreamHeaders.Get("Originator")); originator != "" && IsCodexOfficialClientByHeaders("", originator) {
 		req.Header.Set("Originator", originator)
 	} else {
 		req.Header.Set("Originator", Originator)
 	}
+	applyCodexAllowedForwardHeaders(req, downstreamHeaders)
 	if accountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", accountID)
 	}

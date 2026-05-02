@@ -21,6 +21,7 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 - [目录结构](#目录结构)
 - [常见注意事项](#常见注意事项)
 - [免责声明](#免责声明与开源协议)
+- [Star History](#star-history)
 
 ---
 
@@ -409,6 +410,16 @@ codex2api/
 - 本项目仅供学习、研究与技术交流使用。
 - 本项目采用 `MIT License` 开源协议。
 - 项目不对任何直接或间接使用后果提供担保；生产环境使用风险由使用者自行承担。
+
+---
+
+## Star History
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
+  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
+  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
+</picture>
 
 ---
 

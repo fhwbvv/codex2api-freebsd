@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -121,6 +122,49 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	}
 }
 
+func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(auth.NewStore(nil, nil, nil), nil, nil, nil)
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"compaction","summary":"previous context was compacted"}
+		]
+	}`)
+
+	tests := []struct {
+		name    string
+		path    string
+		handler gin.HandlerFunc
+	}{
+		{name: "responses", path: "/v1/responses", handler: handler.Responses},
+		{name: "responses compact", path: "/v1/responses/compact", handler: handler.ResponsesCompact},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = req
+
+			test.handler(ginCtx)
+
+			if recorder.Code == http.StatusBadRequest && strings.Contains(recorder.Body.String(), "invalid_input_type") {
+				t.Fatalf("compaction input type was rejected by local validation: %s", recorder.Body.String())
+			}
+			if recorder.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want %d after validation passes; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestExtractResponseImageGenerationOutputDedupes(t *testing.T) {
 	event := []byte(`{"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","result":"` + tinyPNGBase64 + `","output_format":"png"}}`)
 	seen := make(map[string]struct{})
@@ -209,8 +253,69 @@ func TestAccountFilterForSparkRequiresPro(t *testing.T) {
 	if filter(&auth.Account{PlanType: "plus"}) {
 		t.Fatal("spark filter should reject non-pro accounts")
 	}
-	if accountFilterForModel("gpt-5.3-codex") != nil {
-		t.Fatal("non-spark model should not add account filter")
+	normalFilter := accountFilterForModel("gpt-5.3-codex")
+	if normalFilter == nil || !normalFilter(&auth.Account{PlanType: "plus"}) {
+		t.Fatal("non-spark model filter should allow available accounts")
+	}
+	cooled := &auth.Account{PlanType: "pro"}
+	cooled.SetModelCooldownUntil("gpt-5.3-codex-spark", "model_capacity", time.Now().Add(time.Minute))
+	if filter(cooled) {
+		t.Fatal("filter should reject model-cooled accounts")
+	}
+}
+
+func TestClassify429UsageLimitExactResetUsesAccountCooldown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	decision := classify429RateLimit(&auth.Account{PlanType: "team"}, []byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":120}}`), nil, now, "gpt-5.4")
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "usage_limit" {
+		t.Fatalf("decision = %#v, want account usage_limit", decision)
+	}
+	if decision.Cooldown != 120*time.Second {
+		t.Fatalf("Cooldown = %v, want 120s", decision.Cooldown)
+	}
+}
+
+func TestClassify429CapacityUsesModelCooldown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	body := []byte(`{"error":{"message":"Selected model is at capacity. Please try a different model."}}`)
+	decision := classify429RateLimit(&auth.Account{PlanType: "team"}, body, nil, now, "gpt-5.4")
+	if decision.Scope != rateLimitScopeModel || decision.Reason != "model_capacity" {
+		t.Fatalf("decision = %#v, want model capacity cooldown", decision)
+	}
+	if decision.Cooldown != 5*time.Minute {
+		t.Fatalf("Cooldown = %v, want 5m", decision.Cooldown)
+	}
+}
+
+func TestClassify429Header7dUsesAccountCooldown(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-secondary-used-percent", "100")
+	resp.Header.Set("x-codex-secondary-window-minutes", "10080")
+	resp.Header.Set("x-codex-secondary-reset-after-seconds", "3600")
+	decision := classify429RateLimit(&auth.Account{PlanType: "team"}, nil, resp, now, "gpt-5.4")
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited_7d" {
+		t.Fatalf("decision = %#v, want 7d account cooldown", decision)
+	}
+	if decision.Cooldown != time.Hour {
+		t.Fatalf("Cooldown = %v, want 1h", decision.Cooldown)
+	}
+}
+
+func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
+	generalRetries := 0
+	rateLimitRetries := 0
+	if !shouldRetryHTTPStatus(http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+		t.Fatal("first 429 should consume rate-limit retry budget")
+	}
+	if shouldRetryHTTPStatus(http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+		t.Fatal("second 429 should be blocked by rate-limit retry budget")
+	}
+	if !shouldRetryHTTPStatus(http.StatusServiceUnavailable, &generalRetries, &rateLimitRetries, 2, 1) {
+		t.Fatal("503 should still use general retry budget")
+	}
+	if generalRetries != 1 || rateLimitRetries != 1 {
+		t.Fatalf("budgets = general %d rate %d, want 1/1", generalRetries, rateLimitRetries)
 	}
 }
 
@@ -380,10 +485,10 @@ func TestApply429CooldownPremiumMarks5hRateLimitFromWindow(t *testing.T) {
 	resp.Header.Set("x-codex-primary-window-minutes", "300")
 	resp.Header.Set("x-codex-primary-reset-after-seconds", "900")
 
-	decision := Apply429Cooldown(store, account, []byte(`{"error":{"type":"usage_limit_reached"}}`), resp)
+	decision := Apply429Cooldown(store, account, []byte(`{"error":{"type":"usage_limit_reached"}}`), resp, "gpt-5.4")
 
-	if !decision.Premium5h {
-		t.Fatal("expected premium 5h decision")
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited_5h" {
+		t.Fatalf("decision = %#v, want premium 5h account decision", decision)
 	}
 	if !account.IsPremium5hRateLimited() {
 		t.Fatal("expected account to enter premium 5h rate limited state")
@@ -400,20 +505,20 @@ func TestApply429CooldownPremiumMarks5hRateLimitFromWindow(t *testing.T) {
 	}
 }
 
-func TestApply429CooldownPremiumFallsBackToFiveHoursWithoutExactReset(t *testing.T) {
+func TestApply429CooldownUnknown429UsesModelCooldown(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	account := &auth.Account{DBID: 102, PlanType: "pro"}
 
-	decision := Apply429Cooldown(store, account, []byte(`{"error":{"type":"rate_limit_error","message":"Too many requests"}}`), &http.Response{Header: make(http.Header)})
+	decision := Apply429Cooldown(store, account, []byte(`{"error":{"type":"rate_limit_error","message":"Too many requests"}}`), &http.Response{Header: make(http.Header)}, "gpt-5.4")
 
-	if !decision.Premium5h {
-		t.Fatal("expected premium 5h fallback decision")
+	if decision.Scope != rateLimitScopeModel {
+		t.Fatalf("decision.Scope = %q, want model", decision.Scope)
 	}
-	if got := decision.ResetAt.Sub(time.Now()); got < 4*time.Hour+59*time.Minute || got > 5*time.Hour+time.Minute {
-		t.Fatalf("resetAt delta = %v, want about 5h", got)
+	if got := decision.ResetAt.Sub(time.Now()); got < 4*time.Minute || got > 6*time.Minute {
+		t.Fatalf("resetAt delta = %v, want about 5m", got)
 	}
-	if !account.IsPremium5hRateLimited() {
-		t.Fatal("expected account to be marked premium 5h rate limited")
+	if !account.IsModelRateLimited("gpt-5.4") {
+		t.Fatal("expected model cooldown")
 	}
 }
 

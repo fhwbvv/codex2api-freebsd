@@ -168,6 +168,53 @@ func TestParseImportJSONTokensRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestImportTokensFromTextFilesReadsAllUploadedFiles(t *testing.T) {
+	files := []uploadedImportFile{
+		{name: "one.txt", data: append([]byte{0xef, 0xbb, 0xbf}, []byte("rt-1\nrt-shared\n")...)},
+		{name: "two.txt", data: []byte("rt-2\nrt-shared\n")},
+	}
+
+	tokens := importTokensFromTextFiles(files, func(token string) importToken {
+		return importToken{refreshToken: token}
+	})
+
+	if len(tokens) != 3 {
+		t.Fatalf("tokens len = %d, want 3", len(tokens))
+	}
+	for i, want := range []string{"rt-1", "rt-shared", "rt-2"} {
+		if tokens[i].refreshToken != want {
+			t.Fatalf("tokens[%d] = %q, want %q", i, tokens[i].refreshToken, want)
+		}
+	}
+}
+
+func TestReadUploadedImportFilesReadsRepeatedFileFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	req := newMultipartRequest(t, map[string]string{
+		"one.txt": "rt-1",
+		"two.txt": "rt-2",
+	})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	files, err := readUploadedImportFiles(ctx)
+	if err != nil {
+		t.Fatalf("readUploadedImportFiles returned error: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files len = %d, want 2", len(files))
+	}
+	got := map[string]bool{}
+	for _, file := range files {
+		got[string(file.data)] = true
+	}
+	if !got["rt-1"] || !got["rt-2"] {
+		t.Fatalf("files = %+v, want both uploaded files", files)
+	}
+}
+
 func TestImportAccountsJSONReturnsExistingNoTokenMessageForUnsupportedJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -219,14 +266,22 @@ func TestImportAccountsJSONRejectsInvalidJSONFile(t *testing.T) {
 func newMultipartJSONRequest(t *testing.T, filename string, content string) *http.Request {
 	t.Helper()
 
+	return newMultipartRequest(t, map[string]string{filename: content})
+}
+
+func newMultipartRequest(t *testing.T, files map[string]string) *http.Request {
+	t.Helper()
+
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("file", filename)
-	if err != nil {
-		t.Fatalf("CreateFormFile: %v", err)
-	}
-	if _, err := part.Write([]byte(content)); err != nil {
-		t.Fatalf("part.Write: %v", err)
+	for filename, content := range files {
+		part, err := writer.CreateFormFile("file", filename)
+		if err != nil {
+			t.Fatalf("CreateFormFile: %v", err)
+		}
+		if _, err := part.Write([]byte(content)); err != nil {
+			t.Fatalf("part.Write: %v", err)
+		}
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("writer.Close: %v", err)

@@ -654,6 +654,7 @@ func ValidateInput() ValidationRule {
 			"item_reference":          true,
 			"image_generation_call":   true,
 			"web_search_call":         true,
+			"compaction":              true,
 			"file":                    true,
 			"image":                   true,
 		}

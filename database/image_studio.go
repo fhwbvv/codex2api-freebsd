@@ -77,6 +77,8 @@ type ImageAsset struct {
 	TemplateID    int64     `json:"template_id"`
 	Filename      string    `json:"filename"`
 	StoragePath   string    `json:"-"`
+	ProxyURL      string    `json:"proxy_url,omitempty"`
+	ThumbnailURL  string    `json:"thumbnail_url,omitempty"`
 	MimeType      string    `json:"mime_type"`
 	Bytes         int       `json:"bytes"`
 	Width         int       `json:"width"`
@@ -325,6 +327,15 @@ func (db *DB) MarkImageJobFailed(ctx context.Context, id int64, message string, 
 		SET status=$1, error_message=$2, duration_ms=$3, completed_at=CURRENT_TIMESTAMP
 		WHERE id=$4
 	`, ImageJobFailed, message, durationMs, id)
+	return err
+}
+
+func (db *DB) UpdateImageGenerationJobParamsJSON(ctx context.Context, id int64, paramsJSON string) error {
+	_, err := db.conn.ExecContext(ctx, `
+		UPDATE image_generation_jobs
+		SET params_json=$1
+		WHERE id=$2
+	`, paramsJSON, id)
 	return err
 }
 

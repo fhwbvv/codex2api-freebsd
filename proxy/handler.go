@@ -49,6 +49,30 @@ func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int
 	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, filter)
 }
 
+func (h *Handler) shouldUseWebsocketForHTTP() bool {
+	if h == nil || h.cfg == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(h.cfg.CodexUpstreamTransport)) {
+	case "ws":
+		return true
+	case "http", "auto":
+		return false
+	default:
+		return h.cfg.UseWebsocket
+	}
+}
+
+func (h *Handler) resolveProxyForAttempt(account *auth.Account, stickyProxyURL string) string {
+	if proxyURL := strings.TrimSpace(stickyProxyURL); proxyURL != "" {
+		return proxyURL
+	}
+	if h == nil || h.store == nil {
+		return ""
+	}
+	return h.store.ResolveProxyForAccount(account)
+}
+
 type usageLimitDetails struct {
 	message         string
 	planType        string
@@ -77,10 +101,17 @@ const (
 )
 
 type codex429Decision struct {
-	Premium5h bool
-	ResetAt   time.Time
-	Cooldown  time.Duration
+	Scope    string
+	Reason   string
+	Model    string
+	ResetAt  time.Time
+	Cooldown time.Duration
 }
+
+const (
+	rateLimitScopeAccount = "account"
+	rateLimitScopeModel   = "model"
+)
 
 const (
 	contextAPIKeyID     = "apiKeyID"
@@ -118,14 +149,18 @@ func isProOnlyModel(model string) bool {
 }
 
 func accountFilterForModel(model string) auth.AccountFilter {
-	if !isProOnlyModel(model) {
-		return nil
-	}
+	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {
 		if account == nil {
 			return false
 		}
-		return strings.EqualFold(strings.TrimSpace(account.GetPlanType()), "pro")
+		if model != "" && account.IsModelRateLimited(model) {
+			return false
+		}
+		if isProOnlyModel(model) {
+			return strings.EqualFold(strings.TrimSpace(account.GetPlanType()), "pro")
+		}
+		return true
 	}
 }
 
@@ -527,11 +562,28 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 }
 
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）
+//
+// 安全策略（fail-closed）：
+//   - 默认情况下，未配置任何 API Key 时直接拒绝请求（503），避免裸奔账号池。
+//   - 仅当显式设置 CODEX_ALLOW_ANONYMOUS=true 时才在无密钥情况下放行（兼容内网/测试）。
 func (h *Handler) authMiddleware() gin.HandlerFunc {
+	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
-		// 如果没有配置任何密钥，跳过鉴权
+		// 如果没有配置任何密钥
 		if !h.hasAnyKeys() {
-			c.Next()
+			if allowAnonymous {
+				// 显式允许匿名访问（旧行为，仅在 CODEX_ALLOW_ANONYMOUS=true 时启用）
+				c.Next()
+				return
+			}
+			// fail-closed：未配置 API Key 即拒绝，避免账号池被未授权调用
+			security.SecurityAuditLog("V1_BLOCKED_NO_KEYS", fmt.Sprintf("path=%s ip=%s", c.Request.URL.Path, c.ClientIP()))
+			api.SendError(c, api.NewAPIError(
+				api.ErrCodeServiceUnavailable,
+				"Service is not configured: no API key has been created yet. Please add at least one API key in the admin dashboard, or set CODEX_ALLOW_ANONYMOUS=true to disable this check.",
+				api.ErrorTypeServer,
+			))
+			c.Abort()
 			return
 		}
 
@@ -585,6 +637,13 @@ func (h *Handler) getMaxRetries() int {
 	return h.store.GetMaxRetries()
 }
 
+func (h *Handler) getMaxRateLimitRetries() int {
+	if h == nil || h.store == nil {
+		return 1
+	}
+	return h.store.GetMaxRateLimitRetries()
+}
+
 const (
 	logStatusClientClosed        = 499
 	logStatusUpstreamStreamBreak = 598
@@ -592,7 +651,57 @@ const (
 
 // isRetryableStatus 检查是否可重试的上游状态码
 func isRetryableStatus(code int) bool {
-	return code == http.StatusTooManyRequests || code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
+	return code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
+}
+
+func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+	if statusCode == http.StatusTooManyRequests {
+		if rateLimitRetries == nil || *rateLimitRetries >= maxRateLimitRetries {
+			return false
+		}
+		*rateLimitRetries++
+		return true
+	}
+	if !isRetryableStatus(statusCode) {
+		return false
+	}
+	if generalRetries == nil || *generalRetries >= maxGeneralRetries {
+		return false
+	}
+	*generalRetries++
+	return true
+}
+
+func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries int) bool {
+	if err == nil || generalRetries == nil || *generalRetries >= maxGeneralRetries {
+		return false
+	}
+	if IsRetryableError(err) || classifyTransportFailure(err) != "" {
+		*generalRetries++
+		return true
+	}
+	return false
+}
+
+func upstreamErrorKind(statusCode int, decision codex429Decision) string {
+	switch statusCode {
+	case http.StatusTooManyRequests:
+		if decision.Reason != "" {
+			return decision.Reason
+		}
+		return "rate_limited"
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		return "payment_required"
+	case http.StatusServiceUnavailable, http.StatusInternalServerError, http.StatusBadGateway, http.StatusGatewayTimeout:
+		return "server"
+	default:
+		if statusCode >= 400 {
+			return "client"
+		}
+		return ""
+	}
 }
 
 func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
@@ -651,6 +760,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendMissingFieldError(c, "model")
 		return
 	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses", model) {
+		return
+	}
 
 	rawBody = normalizeServiceTierField(rawBody)
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
@@ -674,12 +786,14 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
-	var lastErr error
+	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	generalRetries := 0
+	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
@@ -697,11 +811,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
-		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		useWebsocket := h.shouldUseWebsocketForHTTP()
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -718,7 +830,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -736,8 +849,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
-			lastErr = reqErr
-			continue
+			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				continue
+			}
+			ErrorToGinResponse(c, reqErr)
+			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -753,21 +869,26 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:        account.ID(),
-				Endpoint:         "/v1/responses",
-				Model:            model,
-				StatusCode:       resp.StatusCode,
-				DurationMs:       durationMs,
-				ReasoningEffort:  reasoningEffort,
-				InboundEndpoint:  "/v1/responses",
-				UpstreamEndpoint: "/v1/responses",
-				Stream:           isStream,
-				ServiceTier:      serviceTier,
+				AccountID:         account.ID(),
+				Endpoint:          "/v1/responses",
+				Model:             model,
+				StatusCode:        resp.StatusCode,
+				DurationMs:        durationMs,
+				ReasoningEffort:   reasoningEffort,
+				InboundEndpoint:   "/v1/responses",
+				UpstreamEndpoint:  "/v1/responses",
+				Stream:            isStream,
+				ServiceTier:       serviceTier,
+				IsRetryAttempt:    shouldRetry,
+				AttemptIndex:      attempt + 1,
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
 			})
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -906,15 +1027,12 @@ func (h *Handler) Responses(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
-			lastErr = readErr
-			if lastErr == nil {
-				lastErr = errors.New(outcome.failureMessage)
-			}
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
 		}
 
@@ -975,22 +1093,15 @@ func (h *Handler) Responses(c *gin.Context) {
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
+			h.store.ClearModelCooldown(account, effectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
 		return
-	}
-
-	// 所有重试都失败
-	if lastErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
-		})
-	} else if lastStatusCode != 0 {
-		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 	}
 }
 
@@ -1035,6 +1146,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		sendImageOnlyModelError(c, model)
 		return
 	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/responses/compact", model) {
+		return
+	}
 
 	rawBody = normalizeServiceTierField(rawBody)
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
@@ -1060,12 +1174,14 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 	// 带重试的上游请求
 	maxRetries := h.getMaxRetries()
-	var lastErr error
+	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	generalRetries := 0
+	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
@@ -1082,10 +1198,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
@@ -1095,7 +1209,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1112,8 +1227,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			}
 
 			log.Printf("compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
-			lastErr = reqErr
-			continue
+			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				continue
+			}
+			ErrorToGinResponse(c, reqErr)
+			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -1128,20 +1246,25 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			excludeAccounts[account.ID()] = true
 
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", model, errBody)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:        account.ID(),
-				Endpoint:         "/v1/responses/compact",
-				Model:            model,
-				StatusCode:       resp.StatusCode,
-				DurationMs:       durationMs,
-				ReasoningEffort:  reasoningEffort,
-				InboundEndpoint:  "/v1/responses/compact",
-				UpstreamEndpoint: "/v1/responses/compact",
-				ServiceTier:      serviceTier,
+				AccountID:         account.ID(),
+				Endpoint:          "/v1/responses/compact",
+				Model:             model,
+				StatusCode:        resp.StatusCode,
+				DurationMs:        durationMs,
+				ReasoningEffort:   reasoningEffort,
+				InboundEndpoint:   "/v1/responses/compact",
+				UpstreamEndpoint:  "/v1/responses/compact",
+				ServiceTier:       serviceTier,
+				IsRetryAttempt:    shouldRetry,
+				AttemptIndex:      attempt + 1,
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
 			})
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -1153,6 +1276,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 		// 成功：直接透传响应体
 		SyncCodexUsageState(h.store, account, resp)
+		h.store.ClearModelCooldown(account, effectiveModel)
 
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -1190,15 +1314,6 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		h.store.Release(account)
 		c.Data(http.StatusOK, "application/json", respBody)
 		return
-	}
-
-	// 所有重试都失败
-	if lastErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
-		})
-	} else if lastStatusCode != 0 {
-		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 	}
 }
 
@@ -1244,6 +1359,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		})
 		return
 	}
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/chat/completions", model) {
+		return
+	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -1267,12 +1385,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
-	var lastErr error
+	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	generalRetries := 0
+	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
 			// 排队等待可用账号（最多 30s）
@@ -1290,11 +1410,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
-		useWebsocket := h.cfg != nil && h.cfg.UseWebsocket
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		useWebsocket := h.shouldUseWebsocketForHTTP()
 
 		// 提取 API Key 用于设备指纹稳定化
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -1311,7 +1429,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1329,8 +1448,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
-			lastErr = reqErr
-			continue
+			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				continue
+			}
+			ErrorToGinResponse(c, reqErr)
+			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -1346,21 +1468,26 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", model, errBody)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:        account.ID(),
-				Endpoint:         "/v1/chat/completions",
-				Model:            model,
-				StatusCode:       resp.StatusCode,
-				DurationMs:       durationMs,
-				ReasoningEffort:  reasoningEffort,
-				InboundEndpoint:  "/v1/chat/completions",
-				UpstreamEndpoint: "/v1/responses",
-				Stream:           isStream,
-				ServiceTier:      serviceTier,
+				AccountID:         account.ID(),
+				Endpoint:          "/v1/chat/completions",
+				Model:             model,
+				StatusCode:        resp.StatusCode,
+				DurationMs:        durationMs,
+				ReasoningEffort:   reasoningEffort,
+				InboundEndpoint:   "/v1/chat/completions",
+				UpstreamEndpoint:  "/v1/responses",
+				Stream:            isStream,
+				ServiceTier:       serviceTier,
+				IsRetryAttempt:    shouldRetry,
+				AttemptIndex:      attempt + 1,
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
 			})
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
 
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -1493,15 +1620,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
-			lastErr = readErr
-			if lastErr == nil {
-				lastErr = errors.New(outcome.failureMessage)
-			}
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
 		}
 
@@ -1561,22 +1685,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
-			recyclePooledClientForAccount(account)
+			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
+			h.store.ClearModelCooldown(account, effectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
 		return
-	}
-
-	// 所有重试都失败
-	if lastErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"},
-		})
-	} else if lastStatusCode != 0 {
-		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 	}
 }
 
@@ -1704,6 +1821,35 @@ func parseRetryAfterResetAt(body []byte, now time.Time) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+func parseUsageLimitResetAt(body []byte, now time.Time) (time.Time, bool) {
+	if strings.TrimSpace(gjson.GetBytes(body, "error.type").String()) != "usage_limit_reached" {
+		return time.Time{}, false
+	}
+	return parseRetryAfterResetAt(body, now)
+}
+
+func isCodexModelCapacityError(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	candidates := []string{
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "message").String(),
+		string(body),
+	}
+	for _, candidate := range candidates {
+		lower := strings.ToLower(strings.TrimSpace(candidate))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "selected model is at capacity") ||
+			strings.Contains(lower, "model is at capacity. please try a different model") {
+			return true
+		}
+	}
+	return false
+}
+
 func codexWindowType(windowMinutes float64) codexRateLimitWindow {
 	switch {
 	case windowMinutes >= 1440:
@@ -1799,53 +1945,66 @@ func responseHasCodex5hHeaders(resp *http.Response) bool {
 	return secondary.valid && codexWindowType(secondary.windowMin) == codexRateLimitWindow5h
 }
 
-func classify429RateLimit(account *auth.Account, body []byte, resp *http.Response, now time.Time) codex429Decision {
-	if account != nil && account.IsPremium5hPlan() {
-		windowType, resetAt, hasWindowReset := classifyCodex429Window(resp, now)
-		exactResetAt, hasExactReset := parseRetryAfterResetAt(body, now)
-
-		switch windowType {
-		case codexRateLimitWindow5h:
-			if hasExactReset {
-				resetAt = exactResetAt
-			} else if !hasWindowReset {
-				resetAt = now.Add(5 * time.Hour)
-			}
-			return codex429Decision{
-				Premium5h: true,
-				ResetAt:   resetAt,
-				Cooldown:  time.Until(resetAt),
-			}
-		case codexRateLimitWindow7d, codexRateLimitWindowShort:
-			// 明确不是 5h 窗口时，保持原有 cooldown 语义。
-		default:
-			if hasExactReset {
-				return codex429Decision{
-					Premium5h: true,
-					ResetAt:   exactResetAt,
-					Cooldown:  time.Until(exactResetAt),
-				}
-			}
-			resetAt = now.Add(5 * time.Hour)
-			return codex429Decision{
-				Premium5h: true,
-				ResetAt:   resetAt,
-				Cooldown:  5 * time.Hour,
-			}
+func classify429RateLimit(account *auth.Account, body []byte, resp *http.Response, now time.Time, model string) codex429Decision {
+	if resetAt, ok := parseUsageLimitResetAt(body, now); ok {
+		reason := "usage_limit"
+		if account != nil && account.IsPremium5hPlan() && responseHasCodex5hHeaders(resp) {
+			reason = "rate_limited_5h"
+		}
+		return codex429Decision{
+			Scope:    rateLimitScopeAccount,
+			Reason:   reason,
+			ResetAt:  resetAt,
+			Cooldown: resetAt.Sub(now),
 		}
 	}
 
-	cooldown := compute429Cooldown(account, body, resp)
-	return codex429Decision{Cooldown: cooldown}
+	windowType, resetAt, hasWindowReset := classifyCodex429Window(resp, now)
+	switch windowType {
+	case codexRateLimitWindow5h:
+		if !hasWindowReset {
+			resetAt = now.Add(5 * time.Hour)
+		}
+		return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited_5h", ResetAt: resetAt, Cooldown: resetAt.Sub(now)}
+	case codexRateLimitWindow7d:
+		if !hasWindowReset {
+			resetAt = now.Add(7 * 24 * time.Hour)
+		}
+		return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited_7d", ResetAt: resetAt, Cooldown: resetAt.Sub(now)}
+	}
+
+	model = strings.TrimSpace(model)
+	if model != "" {
+		reason := "rate_limited_model"
+		if isCodexModelCapacityError(body) {
+			reason = "model_capacity"
+		}
+		return codex429Decision{
+			Scope:    rateLimitScopeModel,
+			Reason:   reason,
+			Model:    model,
+			Cooldown: 5 * time.Minute,
+		}
+	}
+
+	cooldown := 5 * time.Minute
+	resetAt = now.Add(cooldown)
+	return codex429Decision{Scope: rateLimitScopeAccount, Reason: "rate_limited", ResetAt: resetAt, Cooldown: cooldown}
 }
 
-// Apply429Cooldown 统一处理 429 对账号状态的影响，premium 5h 场景优先写入显式限流态。
-func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, resp *http.Response) codex429Decision {
-	decision := classify429RateLimit(account, body, resp, time.Now())
+// Apply429Cooldown 统一处理 429 对账号状态的影响。
+func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, resp *http.Response, model string) codex429Decision {
+	decision := classify429RateLimit(account, body, resp, time.Now(), model)
 	if store == nil || account == nil {
 		return decision
 	}
-	if decision.Premium5h {
+	if decision.Scope == rateLimitScopeModel {
+		cooldown := store.MarkModelCooldown(account, decision.Model, decision.Cooldown, decision.Reason)
+		decision.ResetAt = cooldown.ResetAt
+		decision.Cooldown = time.Until(cooldown.ResetAt)
+		return decision
+	}
+	if account.IsPremium5hPlan() && decision.Scope == rateLimitScopeAccount && decision.Reason == "rate_limited_5h" {
 		store.MarkPremium5hRateLimited(account, decision.ResetAt)
 		return decision
 	}
@@ -1855,14 +2014,19 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 
 // applyCooldown 根据上游状态码设置智能冷却
 func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []byte, resp *http.Response) {
+	h.applyCooldownForModel(account, statusCode, body, resp, "")
+}
+
+func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
 	switch statusCode {
 	case http.StatusTooManyRequests:
-		decision := Apply429Cooldown(h.store, account, body, resp)
-		if decision.Premium5h {
-			log.Printf("账号 %d 触发 premium 5h 限流 (plan=%s)，重置时间 %s", account.ID(), account.GetPlanType(), decision.ResetAt.Format(time.RFC3339))
-			return
+		decision := Apply429Cooldown(h.store, account, body, resp, model)
+		if decision.Scope == rateLimitScopeModel {
+			log.Printf("账号 %d 模型 %s 触发短时限流 (reason=%s)，冷却到 %s", account.ID(), decision.Model, decision.Reason, decision.ResetAt.Format(time.RFC3339))
+			return decision
 		}
-		log.Printf("账号 %d 被限速 (plan=%s)，冷却 %v", account.ID(), account.GetPlanType(), decision.Cooldown)
+		log.Printf("账号 %d 被限速 (plan=%s, reason=%s)，冷却到 %s", account.ID(), account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
+		return decision
 	case http.StatusUnauthorized:
 		// 原子标志瞬间置位，阻止其他并发请求再选到该账号
 		atomic.StoreInt32(&account.Disabled, 1)
@@ -1870,7 +2034,7 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 		if isMissingScopeUnauthorized(body) {
 			log.Printf("账号 %d 收到 missing_scope 401，保留在号池", account.ID())
 			atomic.StoreInt32(&account.Disabled, 0)
-			return
+			return codex429Decision{}
 		}
 
 		if h.store.GetAutoCleanUnauthorized() {
@@ -1886,7 +2050,10 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 		} else {
 			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
 		}
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		h.store.MarkCooldown(account, 30*time.Minute, "payment_required")
 	}
+	return codex429Decision{}
 }
 
 // compute429Cooldown 根据计划类型和 Codex 响应精确计算 429 冷却时间

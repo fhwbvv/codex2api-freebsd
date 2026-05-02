@@ -114,6 +114,16 @@ func TestSQLiteImageStudioTablesAndPersistence(t *testing.T) {
 	if job.Status != ImageJobQueued || job.APIKeyID != 7 || job.ParamsJSON == "" {
 		t.Fatalf("queued job = %#v", job)
 	}
+	if err := db.UpdateImageGenerationJobParamsJSON(ctx, jobID, `{"output_format":"jpeg"}`); err != nil {
+		t.Fatalf("UpdateImageGenerationJobParamsJSON 返回错误: %v", err)
+	}
+	job, err = db.GetImageGenerationJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("GetImageGenerationJob after params update 返回错误: %v", err)
+	}
+	if job.ParamsJSON != `{"output_format":"jpeg"}` {
+		t.Fatalf("params_json = %q, want jpeg fallback params", job.ParamsJSON)
+	}
 	if err := db.MarkImageJobRunning(ctx, jobID); err != nil {
 		t.Fatalf("MarkImageJobRunning 返回错误: %v", err)
 	}

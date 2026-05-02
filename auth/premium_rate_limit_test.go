@@ -20,15 +20,15 @@ func newPremium5hTestAccount(plan string, resetAt time.Time) *Account {
 	}
 }
 
-func TestPremium5hRateLimitedAccountRemainsSchedulable(t *testing.T) {
+func TestPremium5hRateLimitedAccountIsFencedFromScheduling(t *testing.T) {
 	acc := newPremium5hTestAccount("plus", time.Now().Add(45*time.Minute))
 
 	snapshot := acc.GetSchedulerDebugSnapshot(4)
 	if got := acc.RuntimeStatus(); got != "rate_limited" {
 		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
 	}
-	if !acc.IsAvailable() {
-		t.Fatal("IsAvailable() = false, want true for premium 5h rate limited account")
+	if acc.IsAvailable() {
+		t.Fatal("IsAvailable() = true, want false for premium 5h rate limited account")
 	}
 	if snapshot.HealthTier != string(HealthTierRisky) {
 		t.Fatalf("HealthTier = %q, want %q", snapshot.HealthTier, HealthTierRisky)
@@ -40,6 +40,9 @@ func TestPremium5hRateLimitedAccountRemainsSchedulable(t *testing.T) {
 
 func TestPremium5hRateLimitExpiresAndUsageProbeResumes(t *testing.T) {
 	acc := newPremium5hTestAccount("team", time.Now().Add(-time.Minute))
+	acc.Status = StatusCooldown
+	acc.CooldownReason = "rate_limited"
+	acc.CooldownUtil = time.Now().Add(-time.Minute)
 
 	snapshot := acc.GetSchedulerDebugSnapshot(4)
 	if got := acc.RuntimeStatus(); got != "active" {

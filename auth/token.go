@@ -20,6 +20,7 @@ import (
 // OpenAI OAuth 常量（与 CLIProxyAPI / sub2api 一致）
 const (
 	TokenURL      = "https://auth.openai.com/oauth/token"
+	SessionURL    = "https://chatgpt.com/api/auth/session"
 	ClientID      = "app_EMoamEEZ73f0CkXaXp7hrann"
 	RefreshScopes = "openid profile email"
 	MaxRetries    = 3
@@ -181,6 +182,127 @@ func RefreshWithRetry(ctx context.Context, refreshToken string, proxyURL string,
 		lastErr = err
 	}
 	return nil, nil, fmt.Errorf("刷新失败（重试 %d 次）: %w", MaxRetries, lastErr)
+}
+
+// RefreshWithSessionToken 用 ChatGPT Web session_token 回退换取新的 AT。
+func RefreshWithSessionToken(ctx context.Context, sessionToken string, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
+	sessionToken = strings.TrimSpace(sessionToken)
+	if sessionToken == "" {
+		return nil, nil, fmt.Errorf("session_token 为空")
+	}
+
+	targetURL := SessionURL
+	accountID := ""
+	if len(resinAccountID) > 0 {
+		accountID = resinAccountID[0]
+	}
+	if ResinRequestDecorator != nil && accountID != "" {
+		targetURL = ResinRequestDecorator(SessionURL, accountID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("创建 session 请求失败: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "CodexProxy/1.9")
+	req.AddCookie(&http.Cookie{Name: "__Secure-next-auth.session-token", Value: sessionToken})
+	if ResinRequestDecorator != nil && accountID != "" {
+		req.Header.Set("X-Resin-Account", accountID)
+	}
+
+	var client *http.Client
+	if ResinRequestDecorator != nil && accountID != "" {
+		client = &http.Client{Timeout: 30 * time.Second}
+	} else {
+		client = buildHTTPClient(proxyURL)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("session 刷新请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("读取 session 响应失败: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("session 刷新失败 (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	var sessionResp struct {
+		AccessToken string `json:"accessToken"`
+		Expires     string `json:"expires"`
+		User        struct {
+			Email string `json:"email"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(body, &sessionResp); err != nil {
+		return nil, nil, fmt.Errorf("解析 session 响应失败: %w", err)
+	}
+	accessToken := strings.TrimSpace(sessionResp.AccessToken)
+	if accessToken == "" {
+		return nil, nil, fmt.Errorf("session 响应缺少 accessToken")
+	}
+
+	expiresAt := parseSessionExpiresAt(sessionResp.Expires)
+	if expiresAt.IsZero() {
+		expiresAt = time.Now().Add(time.Hour)
+	}
+	td := &TokenData{
+		AccessToken: accessToken,
+		ExpiresIn:   int64(time.Until(expiresAt).Seconds()),
+		ExpiresAt:   expiresAt,
+	}
+	if td.ExpiresIn <= 0 {
+		td.ExpiresIn = 3600
+		td.ExpiresAt = time.Now().Add(time.Hour)
+	}
+
+	info := &AccountInfo{}
+	if atInfo := ParseAccessToken(accessToken); atInfo != nil {
+		info.Email = atInfo.Email
+		info.ChatGPTAccountID = atInfo.ChatGPTAccountID
+		info.PlanType = atInfo.PlanType
+	}
+	if info.Email == "" {
+		info.Email = strings.TrimSpace(sessionResp.User.Email)
+	}
+	return td, info, nil
+}
+
+func RefreshWithSessionTokenRetry(ctx context.Context, sessionToken string, proxyURL string, resinAccountID ...string) (*TokenData, *AccountInfo, error) {
+	var lastErr error
+	for attempt := 0; attempt < MaxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			select {
+			case <-ctx.Done():
+				return nil, nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		td, info, err := RefreshWithSessionToken(ctx, sessionToken, proxyURL, resinAccountID...)
+		if err == nil {
+			return td, info, nil
+		}
+		lastErr = err
+	}
+	return nil, nil, fmt.Errorf("session 刷新失败（重试 %d 次）: %w", MaxRetries, lastErr)
+}
+
+func parseSessionExpiresAt(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if parsed, err := time.Parse(layout, raw); err == nil {
+			return parsed
+		}
+	}
+	return time.Time{}
 }
 
 // isNonRetryable 判断是否不可重试的认证错误

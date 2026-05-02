@@ -183,11 +183,129 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 	if got := req.Header.Get("Version"); got != "0.120.0" {
 		t.Fatalf("Version = %q", got)
 	}
-	if got := req.Header.Get("Originator"); got != "custom-originator" {
-		t.Fatalf("Originator = %q", got)
+	if got := req.Header.Get("Originator"); got != Originator {
+		t.Fatalf("Originator = %q, want fallback %q", got, Originator)
 	}
 	if got := req.Header.Get("Chatgpt-Account-Id"); got != "acct-42" {
 		t.Fatalf("Chatgpt-Account-Id = %q", got)
+	}
+	for _, name := range []string{"X-Stainless-Package-Version", "X-Stainless-Runtime-Version", "X-Stainless-Os", "X-Stainless-Arch"} {
+		if got := req.Header.Get(name); got != "" {
+			t.Fatalf("%s = %q, want empty", name, got)
+		}
+	}
+}
+
+func TestApplyCodexRequestHeadersUsesMinimalFallbackByDefault(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+
+	acc := &auth.Account{
+		DBID:      42,
+		AccountID: "acct-42",
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, http.Header{})
+
+	if got := req.Header.Get("User-Agent"); got != latestCodexCLIUserAgentPrefix {
+		t.Fatalf("User-Agent = %q, want minimal Codex CLI %q", got, latestCodexCLIUserAgentPrefix)
+	}
+	if got := req.Header.Get("Version"); got != latestCodexCLIVersion {
+		t.Fatalf("Version = %q, want %q", got, latestCodexCLIVersion)
+	}
+}
+
+func TestApplyCodexRequestHeadersPreservesOfficialClientHeaders(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	acc := &auth.Account{DBID: 42, AccountID: "acct-42"}
+	downstreamHeaders := http.Header{
+		"User-Agent":            []string{"codex_vscode/1.2.3"},
+		"Originator":            []string{"codex_vscode"},
+		"Version":               []string{"1.2.3"},
+		"X-Codex-Turn-State":    []string{"turn-state"},
+		"X-Codex-Turn-Metadata": []string{"turn-metadata"},
+		"X-Client-Request-Id":   []string{"req-123"},
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "cache-key-1", "api-key-1", nil, downstreamHeaders)
+
+	if got := req.Header.Get("User-Agent"); got != "codex_vscode/1.2.3" {
+		t.Fatalf("User-Agent = %q", got)
+	}
+	if got := req.Header.Get("Originator"); got != "codex_vscode" {
+		t.Fatalf("Originator = %q", got)
+	}
+	if got := req.Header.Get("Version"); got != "1.2.3" {
+		t.Fatalf("Version = %q", got)
+	}
+	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id"} {
+		if got := req.Header.Get(name); got != downstreamHeaders.Get(name) {
+			t.Fatalf("%s = %q, want %q", name, got, downstreamHeaders.Get(name))
+		}
+	}
+}
+
+func TestApplyCodexRequestHeadersFallsBackForNonOfficialClient(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+	acc := &auth.Account{DBID: 42}
+	downstreamHeaders := http.Header{
+		"User-Agent": []string{"curl/8.0"},
+		"Originator": []string{"opencode"},
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "", "api-key-1", nil, downstreamHeaders)
+
+	if got := req.Header.Get("User-Agent"); got != latestCodexCLIUserAgentPrefix {
+		t.Fatalf("User-Agent = %q, want %q", got, latestCodexCLIUserAgentPrefix)
+	}
+	if got := req.Header.Get("Originator"); got != Originator {
+		t.Fatalf("Originator = %q, want %q", got, Originator)
+	}
+	if got := req.Header.Get("Version"); got != latestCodexCLIVersion {
+		t.Fatalf("Version = %q, want %q", got, latestCodexCLIVersion)
+	}
+}
+
+func TestCodexTransportModeDefaultsToStandard(t *testing.T) {
+	t.Setenv("CODEX_TRANSPORT_MODE", "")
+	if _, ok := newCodexTransport("").(*http.Transport); !ok {
+		t.Fatalf("newCodexTransport default = %T, want *http.Transport", newCodexTransport(""))
+	}
+}
+
+func TestCodexTransportModeCanUseUTLSChrome(t *testing.T) {
+	t.Setenv("CODEX_TRANSPORT_MODE", "utls_chrome")
+	if _, ok := newCodexTransport("").(*utlsRoundTripper); !ok {
+		t.Fatalf("newCodexTransport utls_chrome = %T, want *utlsRoundTripper", newCodexTransport(""))
+	}
+}
+
+func TestClientPoolKeyIncludesTransportMode(t *testing.T) {
+	acc := &auth.Account{DBID: 42}
+	standard := clientPoolKey(acc, "http://proxy", codexTransportModeStandard)
+	utlsChrome := clientPoolKey(acc, "http://proxy", codexTransportModeUTLSChrome)
+	if standard == utlsChrome {
+		t.Fatalf("clientPoolKey should include transport mode, got %q", standard)
+	}
+}
+
+func TestIsolateCodexSessionIDUsesAPIKeyScope(t *testing.T) {
+	raw := "session-1"
+	if got := IsolateCodexSessionID(0, raw); got != raw {
+		t.Fatalf("IsolateCodexSessionID without api key = %q, want %q", got, raw)
+	}
+	first := IsolateCodexSessionID(1, raw)
+	second := IsolateCodexSessionID(2, raw)
+	if first == raw || second == raw || first == second {
+		t.Fatalf("expected distinct isolated session ids, got first=%q second=%q raw=%q", first, second, raw)
 	}
 }
 

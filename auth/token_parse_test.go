@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // makeTestJWT 构造一个不签名的测试 JWT（header.payload.signature）
@@ -98,5 +99,48 @@ func TestRefreshAccessTokenRejectsEmptyAccessToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "access_token") {
 		t.Fatalf("error = %q, want access_token detail", err.Error())
+	}
+}
+
+func TestRefreshWithSessionToken(t *testing.T) {
+	accessToken := makeTestJWT(map[string]interface{}{
+		"exp": time.Now().Add(time.Hour).Unix(),
+		"https://api.openai.com/profile": map[string]interface{}{
+			"email": "session@example.com",
+		},
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Resin-Account"); got != "account-1" {
+			t.Fatalf("X-Resin-Account = %q, want account-1", got)
+		}
+		cookie, err := r.Cookie("__Secure-next-auth.session-token")
+		if err != nil {
+			t.Fatalf("missing session cookie: %v", err)
+		}
+		if cookie.Value != "st-old" {
+			t.Fatalf("session cookie = %q, want st-old", cookie.Value)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"accessToken":"` + accessToken + `","expires":"` + time.Now().Add(time.Hour).Format(time.RFC3339) + `","user":{"email":"session@example.com"}}`))
+	}))
+	defer server.Close()
+
+	oldDecorator := ResinRequestDecorator
+	ResinRequestDecorator = func(targetURL, accountID string) string {
+		return server.URL
+	}
+	defer func() {
+		ResinRequestDecorator = oldDecorator
+	}()
+
+	td, info, err := RefreshWithSessionToken(context.Background(), "st-old", "", "account-1")
+	if err != nil {
+		t.Fatalf("RefreshWithSessionToken returned error: %v", err)
+	}
+	if td.AccessToken != accessToken {
+		t.Fatalf("AccessToken = %q, want %q", td.AccessToken, accessToken)
+	}
+	if info.Email != "session@example.com" {
+		t.Fatalf("Email = %q, want session@example.com", info.Email)
 	}
 }

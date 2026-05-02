@@ -26,7 +26,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -36,7 +36,7 @@ export default function Accounts() {
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
-  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'locked'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'plus' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
@@ -111,20 +111,47 @@ export default function Accounts() {
   })
   const accounts = data.accounts
   const apiKeys = data.apiKeys
-  const usageBootstrapReloadedRef = useRef(false)
+  const usageReloadAttemptsRef = useRef<Map<number, number>>(new Map())
 
   useEffect(() => {
-    const hasMissingUsage = accounts.some(
-      (account) => account.plan_type?.toLowerCase() === 'free' && (account.usage_percent_7d === null || account.usage_percent_7d === undefined)
-    )
-    if (!hasMissingUsage || usageBootstrapReloadedRef.current) {
+    const needsUsageReload = (account: AccountRow) => {
+      if (account.status !== 'active' && account.status !== 'ready') {
+        return false
+      }
+
+      const plan = (account.plan_type || '').toLowerCase()
+      const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
+      const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
+
+      if (plan === 'free') {
+        return !has7d
+      }
+      if (plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus') {
+        return !has5h || !has7d
+      }
+      return !has7d
+    }
+
+    const missingUsageIds = accounts.filter(needsUsageReload).map((account) => account.id)
+    const missingUsageIdSet = new Set(missingUsageIds)
+    for (const id of Array.from(usageReloadAttemptsRef.current.keys())) {
+      if (!missingUsageIdSet.has(id)) {
+        usageReloadAttemptsRef.current.delete(id)
+      }
+    }
+
+    const retryIds = missingUsageIds.filter((id) => (usageReloadAttemptsRef.current.get(id) ?? 0) < 6)
+    if (retryIds.length === 0) {
       return
     }
 
-    usageBootstrapReloadedRef.current = true
+    for (const id of retryIds) {
+      usageReloadAttemptsRef.current.set(id, (usageReloadAttemptsRef.current.get(id) ?? 0) + 1)
+    }
+
     const timer = window.setTimeout(() => {
       void reloadSilently()
-    }, 4000)
+    }, 2500)
 
     return () => window.clearTimeout(timer)
   }, [accounts, reloadSilently])
@@ -134,6 +161,7 @@ export default function Accounts() {
   const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
   const errorAccounts = accounts.filter((account) => account.status === 'error').length
+  const disabledAccounts = accounts.filter((account) => account.enabled === false).length
   const lockedAccounts = accounts.filter((account) => account.locked).length
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
@@ -153,6 +181,9 @@ export default function Accounts() {
         break
       case 'error':
         if (account.status !== 'error') return false
+        break
+      case 'disabled':
+        if (account.enabled !== false) return false
         break
       case 'locked':
         if (!account.locked) return false
@@ -196,6 +227,18 @@ export default function Accounts() {
       setPage(totalPages)
     }
   }, [page, totalPages])
+
+  useEffect(() => {
+    if (!accounts.some((account) => account.status === 'refreshing')) {
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      void reloadSilently()
+    }, 2000)
+
+    return () => window.clearTimeout(timer)
+  }, [accounts, reloadSilently])
 
   const toggleSelect = (id: number) => {
     setSelected((prev) => {
@@ -440,8 +483,9 @@ export default function Accounts() {
       const jsonFiles = validFiles.filter(f => f.name.split('.').pop()?.toLowerCase() === 'json')
 
       if (jsonFiles.length > 0) {
-        await importFiles([...jsonFiles, ...txtFiles], 'json')
-      } else if (txtFiles.length > 0) {
+        await importFiles(jsonFiles, 'json')
+      }
+      if (txtFiles.length > 0) {
         await importFiles(txtFiles, 'txt')
       }
       return
@@ -464,21 +508,22 @@ export default function Accounts() {
     }
 
     if (jsonFiles.length > 0) {
-      await importFiles([...jsonFiles, ...txtFiles], 'json')
-    } else if (txtFiles.length > 0) {
+      await importFiles(jsonFiles, 'json')
+    }
+    if (txtFiles.length > 0) {
       await importFiles(txtFiles, 'txt')
     }
   }
 
   const handleFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-    if (!file.name.endsWith('.txt')) {
+    const files = Array.from(event.target.files ?? [])
+    if (files.length === 0) return
+    if (files.some((file) => !file.name.toLowerCase().endsWith('.txt'))) {
       showToast(t('accounts.selectTxtFile'), 'error')
       return
     }
     setShowImportPicker(false)
-    await importFiles([file], 'txt')
+    await importFiles(files, 'txt')
     if (fileInputRef.current) fileInputRef.current.value = ''
   }
 
@@ -491,14 +536,14 @@ export default function Accounts() {
   }
 
   const handleAtFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0]
-    if (!file) return
-    if (!file.name.endsWith('.txt')) {
+    const files = Array.from(event.target.files ?? [])
+    if (files.length === 0) return
+    if (files.some((file) => !file.name.toLowerCase().endsWith('.txt'))) {
       showToast(t('accounts.selectTxtFile'), 'error')
       return
     }
     setShowImportPicker(false)
-    await importFiles([file], 'at_txt')
+    await importFiles(files, 'at_txt')
     if (atFileInputRef.current) atFileInputRef.current.value = ''
   }
 
@@ -522,8 +567,9 @@ export default function Accounts() {
     const jsonFiles = validFiles.filter(f => f.name.split('.').pop()?.toLowerCase() === 'json')
 
     if (jsonFiles.length > 0) {
-      await importFiles([...jsonFiles, ...txtFiles], 'json')
-    } else if (txtFiles.length > 0) {
+      await importFiles(jsonFiles, 'json')
+    }
+    if (txtFiles.length > 0) {
       await importFiles(txtFiles, 'txt')
     }
 
@@ -673,6 +719,17 @@ export default function Accounts() {
     }
   }
 
+  const handleToggleEnabled = async (account: AccountRow) => {
+    const nextEnabled = account.enabled === false
+    try {
+      await api.toggleAccountEnabled(account.id, nextEnabled)
+      showToast(nextEnabled ? t('accounts.enableSuccess') : t('accounts.disableSuccess'))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.enableFailed', { error: getErrorMessage(error) }), 'error')
+    }
+  }
+
   const handleBatchDelete = async () => {
     if (selected.size === 0) return
     const confirmed = await confirm({
@@ -735,6 +792,28 @@ export default function Accounts() {
     setBatchLoading(false)
     setSelected(new Set())
     void reload()
+  }
+
+  const handleBatchEnabled = async (enabled: boolean) => {
+    if (selected.size === 0) return
+    setBatchLoading(true)
+    let success = 0
+    let fail = 0
+    try {
+      for (const id of selected) {
+        try {
+          await api.toggleAccountEnabled(id, enabled)
+          success++
+        } catch {
+          fail++
+        }
+      }
+      showToast(t(enabled ? 'accounts.batchEnableDone' : 'accounts.batchDisableDone', { success, fail }))
+      setSelected(new Set())
+      void reload()
+    } finally {
+      setBatchLoading(false)
+    }
   }
 
   const handleResetStatus = async (account: AccountRow) => {
@@ -979,6 +1058,7 @@ export default function Accounts() {
                 ref={fileInputRef}
                 type="file"
                 accept=".txt"
+                multiple
                 className="hidden"
                 onChange={(e) => void handleFileImport(e)}
               />
@@ -994,6 +1074,7 @@ export default function Accounts() {
                 ref={atFileInputRef}
                 type="file"
                 accept=".txt"
+                multiple
                 className="hidden"
                 onChange={(e) => void handleAtFileImport(e)}
               />
@@ -1018,7 +1099,7 @@ export default function Accounts() {
 
         <div className="toolbar-surface mb-3 flex flex-wrap items-center gap-2">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>
-          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['error', t('accounts.filterError')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
+          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['error', t('accounts.filterError')], ['disabled', t('accounts.filterDisabled')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => { setStatusFilter(key); setPage(1) }}
@@ -1028,7 +1109,7 @@ export default function Accounts() {
                   : 'bg-muted/50 text-muted-foreground hover:bg-muted'
               }`}
             >
-              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : key === 'error' ? errorAccounts : lockedAccounts}
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : key === 'error' ? errorAccounts : key === 'disabled' ? disabledAccounts : lockedAccounts}
             </button>
           ))}
         </div>
@@ -1075,6 +1156,12 @@ export default function Accounts() {
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchRefresh()}>
                 {t('accounts.batchRefresh')}
               </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchEnabled(true)}>
+                <Power className="size-3 mr-1" />{t('accounts.enable')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchEnabled(false)}>
+                <PowerOff className="size-3 mr-1" />{t('accounts.disable')}
+              </Button>
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(true)}>
                 <Lock className="size-3 mr-1" />{t('accounts.lock')}
               </Button>
@@ -1115,7 +1202,7 @@ export default function Accounts() {
                           onChange={toggleSelectAll}
                         />
                       </TableHead>
-                      <TableHead className="text-[13px] font-semibold">ID</TableHead>
+                      <TableHead className="text-[13px] font-semibold">{t('accounts.sequence')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.email')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.plan')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.status')}</TableHead>
@@ -1142,7 +1229,7 @@ export default function Accounts() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {pagedAccounts.map((account) => (
+                    {pagedAccounts.map((account, index) => (
                       <TableRow key={account.id} className={selected.has(account.id) ? 'bg-primary/5' : ''}>
                         <TableCell>
                           <input
@@ -1152,12 +1239,19 @@ export default function Accounts() {
                             onChange={() => toggleSelect(account.id)}
                           />
                         </TableCell>
-                        <TableCell className="text-[14px] font-mono text-muted-foreground">{account.id}</TableCell>
+                        <TableCell className="text-[14px] font-mono text-muted-foreground" title={`ID ${account.id}`}>
+                          {(currentPage - 1) * pageSize + index + 1}
+                        </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
                           {formatCompactEmail(account.email)}
                           {account.at_only && (
                             <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                               AT
+                            </span>
+                          )}
+                          {account.enabled === false && (
+                            <span className="ml-1.5 inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
+                              <PowerOff className="size-2.5 mr-0.5" />{t('accounts.disabled')}
                             </span>
                           )}
                           {account.locked && (
@@ -1177,6 +1271,12 @@ export default function Accounts() {
                             {account.cooldown_until && (account.status === 'rate_limited' || account.status === 'error') && (
                               <CooldownTimer until={account.cooldown_until} />
                             )}
+                            {(account.model_cooldowns?.length ?? 0) > 0 && (
+                              <div className="text-[11px] leading-tight text-amber-600">
+                                model {account.model_cooldowns?.[0]?.model}
+                                {(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ''}
+                              </div>
+                            )}
                             <div className="text-[11px] text-muted-foreground">
                               {t('accounts.healthSummary', {
                                 health: formatHealthTier(account.health_tier, t),
@@ -1187,10 +1287,17 @@ export default function Accounts() {
                           </div>
                         </TableCell>
                         <TableCell>
-                          <div className="flex items-center gap-2 text-[13px]">
-                            <span className="text-emerald-600 font-medium">{account.success_requests ?? 0}</span>
-                            <span className="text-muted-foreground">/</span>
-                            <span className="text-red-500 font-medium">{account.error_requests ?? 0}</span>
+                          <div className="space-y-0.5 text-[13px]">
+                            <div className="flex items-center gap-2">
+                              <span className="text-emerald-600 font-medium">{account.success_requests ?? 0}</span>
+                              <span className="text-muted-foreground">/</span>
+                              <span className="text-red-500 font-medium">{account.error_requests ?? 0}</span>
+                            </div>
+                            {((account.retry_error_requests ?? 0) > 0 || (account.rate_limit_attempts ?? 0) > 0) && (
+                              <div className="text-[11px] text-muted-foreground">
+                                retry {account.retry_error_requests ?? 0} · 429 {account.rate_limit_attempts ?? 0}
+                              </div>
+                            )}
                           </div>
                         </TableCell>
                         <TableCell>
@@ -1246,6 +1353,15 @@ export default function Accounts() {
                               title={account.at_only ? t('accounts.authJsonDisabled') : t('accounts.generateAuthJson')}
                             >
                               <FileJson className="size-3.5" />
+                            </Button>
+                            <Button
+                              variant={account.enabled === false ? 'default' : 'outline'}
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              onClick={() => void handleToggleEnabled(account)}
+                              title={account.enabled === false ? t('accounts.enableHint') : t('accounts.disableHint')}
+                            >
+                              {account.enabled === false ? <Power className="size-3.5" /> : <PowerOff className="size-3.5" />}
                             </Button>
                             <Button
                               variant={account.locked ? 'default' : 'outline'}
@@ -2633,6 +2749,17 @@ function formatResetAt(resetAt: string | undefined): string | null {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+function formatCompactUsageNumber(value?: number): string {
+  const n = Number(value || 0)
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}K`
+  return String(n)
+}
+
+function hasUsageWindowDetail(detail?: AccountRow['usage_5h_detail']): boolean {
+  return Boolean(detail && ((detail.requests ?? 0) > 0 || (detail.tokens ?? 0) > 0))
+}
+
 // 用量进度条颜色
 function usageBarColor(pct: number): string {
   if (pct >= 90) return 'bg-red-500'
@@ -2641,8 +2768,11 @@ function usageBarColor(pct: number): string {
 }
 
 // 单行用量进度条
-function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt?: string }) {
+function UsageBar({ label, pct, resetAt, detail }: { label: string; pct: number; resetAt?: string; detail?: AccountRow['usage_5h_detail'] }) {
   const resetText = formatResetAt(resetAt)
+  const detailText = hasUsageWindowDetail(detail)
+    ? `${formatCompactUsageNumber(detail?.requests)} req / ${formatCompactUsageNumber(detail?.tokens)} tok`
+    : ''
   return (
     <div>
       <div className="flex items-center gap-1.5">
@@ -2652,7 +2782,30 @@ function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt
         </div>
         <span className="text-[12px] font-semibold w-[42px] text-right shrink-0">{pct.toFixed(1)}%</span>
       </div>
+      {detailText && <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">{detailText}</div>}
       {resetText && <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">⏱ {resetText}</div>}
+    </div>
+  )
+}
+
+function UsageWindowStat({ label, detail }: { label: string; detail?: AccountRow['usage_5h_detail'] }) {
+  if (!detail || !hasUsageWindowDetail(detail)) return null
+
+  const accountBilledText = typeof detail.account_billed === 'number' ? detail.account_billed.toFixed(4) : ''
+  const userBilledText = typeof detail.user_billed === 'number' ? detail.user_billed.toFixed(4) : ''
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+        <span className="w-5 shrink-0">{label}</span>
+        <span>{formatCompactUsageNumber(detail?.requests)} req / {formatCompactUsageNumber(detail?.tokens)} tok</span>
+      </div>
+      {(accountBilledText || userBilledText) && (
+        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-6">
+          {accountBilledText && <span>账号: ${accountBilledText}</span>}
+          {userBilledText && <span>用户: ${userBilledText}</span>}
+        </div>
+      )}
     </div>
   )
 }
@@ -2662,30 +2815,48 @@ function UsageCell({ account }: { account: AccountRow }) {
   const plan = (account.plan_type || '').toLowerCase()
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
+  const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail)
+  const has5hDetail = hasUsageWindowDetail(account.usage_5h_detail)
 
   if (plan === 'free') {
-    if (!has7d) return <span className="text-[12px] text-muted-foreground">-</span>
+    if (!has7d && !has7dDetail) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
-      <div className="w-40">
-        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />
+      <div className="w-48">
+        {has7d ? (
+          <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} detail={account.usage_7d_detail} />
+        ) : (
+          <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
+        )}
       </div>
     )
   }
 
   if (plan === 'pro' || plan === 'team' || plan === 'plus' || plan === 'teamplus') {
-    if (!has5h && !has7d) return <span className="text-[12px] text-muted-foreground">-</span>
+    if (!has5h && !has7d && !has5hDetail && !has7dDetail) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
-      <div className="w-48 space-y-1.5">
-        {has5h && <UsageBar label="5h" pct={account.usage_percent_5h!} resetAt={account.reset_5h_at} />}
-        {has7d && <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />}
+      <div className="w-52 space-y-1.5">
+        {has5h ? (
+          <UsageBar label="5h" pct={account.usage_percent_5h!} resetAt={account.reset_5h_at} detail={account.usage_5h_detail} />
+        ) : (
+          <UsageWindowStat label="5h" detail={account.usage_5h_detail} />
+        )}
+        {has7d ? (
+          <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} detail={account.usage_7d_detail} />
+        ) : (
+          <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
+        )}
       </div>
     )
   }
 
-  if (has7d) {
+  if (has7d || has7dDetail) {
     return (
-      <div className="w-40">
-        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />
+      <div className="w-48">
+        {has7d ? (
+          <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} detail={account.usage_7d_detail} />
+        ) : (
+          <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
+        )}
       </div>
     )
   }

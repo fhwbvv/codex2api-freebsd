@@ -13,6 +13,7 @@ const statusConfig: Record<string, { variant: 'default' | 'secondary' | 'destruc
   usage_exhausted: { variant: 'secondary', dotColor: 'bg-yellow-500' },
   unauthorized: { variant: 'destructive', dotColor: 'bg-red-500' },
   error: { variant: 'destructive', dotColor: 'bg-red-400' },
+  refreshing: { variant: 'secondary', dotColor: 'bg-blue-500 animate-pulse' },
   paused: { variant: 'outline', dotColor: 'bg-blue-500' },
 }
 

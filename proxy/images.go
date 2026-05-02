@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -604,6 +605,9 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/generations", imageModel) {
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -700,6 +704,9 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 
 	style := strings.TrimSpace(c.PostForm("style"))
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+		return
+	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
@@ -787,6 +794,9 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -834,6 +844,21 @@ func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte
 	return req
 }
 
+func imagePreferredAccountFilter(account *auth.Account) bool {
+	if account == nil {
+		return false
+	}
+	return auth.IsPlusOrHigherPlan(account.GetPlanType())
+}
+
+func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
+	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, imagePreferredAccountFilter)
+	if account != nil {
+		return account, stickyProxyURL
+	}
+	return h.nextAccountForSession("", apiKeyID, exclude)
+}
+
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
 	if err := validateResponsesImageGenerationSizes(responsesBody); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
@@ -842,13 +867,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 
 	apiKeyID := requestAPIKeyID(c)
 	maxRetries := h.getMaxRetries()
-	var lastErr error
+	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	generalRetries := 0
+	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession("", apiKeyID, excludeAccounts)
+	for attempt := 0; ; attempt++ {
+		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts)
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts)
 			if account == nil {
@@ -862,17 +889,14 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 		deviceCfg := h.deviceCfg
 		if deviceCfg == nil {
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), h.cfg != nil && h.cfg.UseWebsocket)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), h.shouldUseWebsocketForHTTP())
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
@@ -884,8 +908,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
-			lastErr = reqErr
-			continue
+			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				continue
+			}
+			ErrorToGinResponse(c, reqErr)
+			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -899,8 +926,24 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			logUpstreamError(inboundEndpoint, resp.StatusCode, requestModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			h.logUsageForRequest(c, &database.UsageLogInput{
+				AccountID:         account.ID(),
+				Endpoint:          inboundEndpoint,
+				Model:             requestModel,
+				StatusCode:        resp.StatusCode,
+				DurationMs:        durationMs,
+				InboundEndpoint:   inboundEndpoint,
+				UpstreamEndpoint:  "/v1/responses",
+				Stream:            stream,
+				IsRetryAttempt:    shouldRetry,
+				AttemptIndex:      attempt + 1,
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
+			})
+			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -969,17 +1012,13 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		if readErr != nil {
 			h.store.ReportRequestFailure(account, "transport", time.Duration(logInput.DurationMs)*time.Millisecond)
 		} else {
+			h.store.ClearModelCooldown(account, requestModel)
 			h.store.ReportRequestSuccess(account, time.Duration(logInput.DurationMs)*time.Millisecond)
 		}
 		h.store.Release(account)
 		return
 	}
 
-	if lastErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"}})
-	} else if lastStatusCode != 0 {
-		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
-	}
 }
 
 func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
@@ -1031,8 +1070,11 @@ func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string)
 			out, readErr = buildImagesAPIResponse(results, createdAt, usageRaw, firstMeta, responseFormat)
 			imageLogInfo = imageUsageLogInfoFromImages(results)
 			return false
+		case "error":
+			readErr = imageGenerationFailureError(data)
+			return false
 		case "response.failed":
-			readErr = fmt.Errorf("upstream image generation failed")
+			readErr = imageGenerationFailureError(data)
 			return false
 		}
 		return true
@@ -1147,8 +1189,12 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				imageCount++
 			}
 			return false
+		case "error":
+			readErr = imageGenerationFailureError(data)
+			writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+			return false
 		case "response.failed":
-			readErr = fmt.Errorf("upstream image generation failed")
+			readErr = imageGenerationFailureError(data)
 			writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
 			return false
 		}
@@ -1171,6 +1217,36 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
 	}
 	return usage, imageCount, firstTokenMs, imageLogInfo, readErr
+}
+
+func imageGenerationFailureError(payload []byte) error {
+	message := firstNonEmptyImageErrorField(
+		gjson.GetBytes(payload, "error.message").String(),
+		gjson.GetBytes(payload, "response.error.message").String(),
+		gjson.GetBytes(payload, "error").String(),
+	)
+	code := firstNonEmptyImageErrorField(
+		gjson.GetBytes(payload, "error.code").String(),
+		gjson.GetBytes(payload, "response.error.code").String(),
+		gjson.GetBytes(payload, "error.type").String(),
+		gjson.GetBytes(payload, "response.error.type").String(),
+	)
+	if message == "" {
+		message = "upstream image generation failed"
+	}
+	if code != "" && !strings.Contains(strings.ToLower(message), strings.ToLower(code)) {
+		return fmt.Errorf("upstream image generation failed (%s): %s", code, message)
+	}
+	return fmt.Errorf("upstream image generation failed: %s", message)
+}
+
+func firstNonEmptyImageErrorField(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func extractImagesFromResponsesCompleted(payload []byte, fallbackModel string) ([]imageCallResult, int64, []byte, imageCallResult, *UsageInfo, error) {

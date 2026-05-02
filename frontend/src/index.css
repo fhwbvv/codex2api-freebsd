@@ -145,6 +145,19 @@
   }
 }
 
+@keyframes image-notice-marquee {
+  0%, 12% {
+    transform: translateX(0);
+  }
+  88%, 100% {
+    transform: translateX(var(--image-notice-marquee-distance, 0));
+  }
+}
+
+.animate-image-notice-marquee {
+  animation: image-notice-marquee 4.5s ease-in-out both;
+}
+
 /* Spinner */
 @keyframes spin {
   to { transform: rotate(360deg); }

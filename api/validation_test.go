@@ -58,6 +58,23 @@ func TestValidateResponsesAPIRequestAllowsCodexToolInputTypes(t *testing.T) {
 	}
 }
 
+func TestValidateResponsesAPIRequestAllowsCompactionInputType(t *testing.T) {
+	result := ValidateResponsesAPIRequest(
+		[]byte(`{
+			"model":"gpt-5.4",
+			"input":[
+				{"type":"message","role":"user","content":"hello"},
+				{"type":"compaction","summary":"previous context was compacted"}
+			]
+		}`),
+		[]string{"gpt-5.4"},
+	)
+
+	if !result.Valid {
+		t.Fatalf("expected compaction input type to be valid, got %#v", result.Errors)
+	}
+}
+
 func TestValidateResponsesAPIRequestRejectsUnknownInputType(t *testing.T) {
 	result := ValidateResponsesAPIRequest(
 		[]byte(`{"model":"gpt-5.4","input":[{"type":"unknown_call","call_id":"call_1"}]}`),

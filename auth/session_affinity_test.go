@@ -28,6 +28,25 @@ func TestNextForSessionPrefersBoundAccountAndProxy(t *testing.T) {
 	}
 }
 
+func TestBindSessionAffinityUsesConfigurableTTL(t *testing.T) {
+	t.Setenv("CODEX_SESSION_AFFINITY_TTL", "2h")
+	store := &Store{}
+	account := &Account{DBID: 1, AccessToken: "tok-1"}
+
+	before := time.Now()
+	store.bindSessionAffinity("session-ttl", account, "http://proxy-1")
+
+	store.sessionMu.RLock()
+	binding, ok := store.sessionBindings["session-ttl"]
+	store.sessionMu.RUnlock()
+	if !ok {
+		t.Fatal("expected session binding")
+	}
+	if binding.expiresAt.Before(before.Add(2*time.Hour - time.Second)) {
+		t.Fatalf("expiresAt too early: got %s want about 2h from now", binding.expiresAt)
+	}
+}
+
 func TestNextForSessionFallsBackWhenBoundAccountExcluded(t *testing.T) {
 	store := &Store{
 		accounts: []*Account{

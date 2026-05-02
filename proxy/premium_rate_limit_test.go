@@ -33,10 +33,10 @@ func TestApply429CooldownPremium5hWindowMarksRateLimited(t *testing.T) {
 	resp.Header.Set("x-codex-primary-window-minutes", "300")
 	resp.Header.Set("x-codex-primary-reset-after-seconds", "1800")
 
-	decision := Apply429Cooldown(store, acc, nil, resp)
+	decision := Apply429Cooldown(store, acc, nil, resp, "gpt-5.4")
 
-	if !decision.Premium5h {
-		t.Fatal("Apply429Cooldown() should classify premium 5h window as Premium5h")
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != "rate_limited_5h" {
+		t.Fatalf("Apply429Cooldown() = %#v, want premium 5h account cooldown", decision)
 	}
 	if !acc.IsPremium5hRateLimited() {
 		t.Fatal("account should enter premium 5h rate_limited state")
@@ -44,15 +44,15 @@ func TestApply429CooldownPremium5hWindowMarksRateLimited(t *testing.T) {
 	if got := acc.RuntimeStatus(); got != "rate_limited" {
 		t.Fatalf("RuntimeStatus() = %q, want %q", got, "rate_limited")
 	}
-	if !acc.IsAvailable() {
-		t.Fatal("IsAvailable() = false, want true while premium 5h limit is active")
+	if acc.IsAvailable() {
+		t.Fatal("IsAvailable() = true, want false while premium 5h limit is active")
 	}
 	if got := acc.GetDynamicConcurrencyLimit(); got != 1 {
 		t.Fatalf("GetDynamicConcurrencyLimit() = %d, want 1", got)
 	}
 }
 
-func TestApply429CooldownPremiumFallsBackTo5hWhenResetUnknown(t *testing.T) {
+func TestApply429CooldownUnknown429SetsModelCooldown(t *testing.T) {
 	store := newProxyPremiumTestStore()
 	acc := &auth.Account{
 		DBID:        1,
@@ -62,16 +62,16 @@ func TestApply429CooldownPremiumFallsBackTo5hWhenResetUnknown(t *testing.T) {
 	}
 
 	start := time.Now()
-	decision := Apply429Cooldown(store, acc, []byte(`{"error":{"type":"usage_limit_reached"}}`), nil)
+	decision := Apply429Cooldown(store, acc, []byte(`{"error":{"type":"usage_limit_reached"}}`), nil, "gpt-5.4")
 
-	if !decision.Premium5h {
-		t.Fatal("Apply429Cooldown() should fallback to premium 5h when no reset details are available")
+	if decision.Scope != rateLimitScopeModel {
+		t.Fatalf("Apply429Cooldown().Scope = %q, want model", decision.Scope)
 	}
-	if decision.ResetAt.Before(start.Add(4*time.Hour+59*time.Minute)) || decision.ResetAt.After(start.Add(5*time.Hour+time.Minute)) {
-		t.Fatalf("ResetAt = %v, want about 5h from now", decision.ResetAt)
+	if decision.ResetAt.Before(start.Add(4*time.Minute)) || decision.ResetAt.After(start.Add(6*time.Minute)) {
+		t.Fatalf("ResetAt = %v, want about 5m from now", decision.ResetAt)
 	}
-	if !acc.IsPremium5hRateLimited() {
-		t.Fatal("account should enter premium 5h rate_limited state after fallback")
+	if !acc.IsModelRateLimited("gpt-5.4") {
+		t.Fatal("account model should enter short cooldown")
 	}
 }
 

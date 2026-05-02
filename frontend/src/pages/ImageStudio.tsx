@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { NavLink, useNavigate, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
@@ -16,13 +16,14 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { Copy, Download, Eye, Image as ImageIcon, Loader2, Play, RefreshCcw, Save, Search, Sparkles, Star, Trash2, X } from 'lucide-react'
+import { Copy, Download, Eye, Image as ImageIcon, Loader2, Pencil, Play, Plus, RefreshCcw, Save, Search, Sparkles, Star, Trash2, X } from 'lucide-react'
 
 const IMAGE_VIEWS = ['studio', 'prompts', 'gallery', 'history'] as const
 type ImageView = typeof IMAGE_VIEWS[number]
@@ -33,11 +34,32 @@ type ImageJobStatusFilter = 'all' | typeof IMAGE_JOB_STATUSES[number]
 const IMAGE_ASSET_CACHE_DB = 'codex2api-image-assets'
 const IMAGE_ASSET_CACHE_STORE = 'assets'
 const IMAGE_ASSET_CACHE_VERSION = 1
+const IMAGE_MODEL_2K_ALIAS = 'gpt-image-2-2k'
+const IMAGE_MODEL_4K_ALIAS = 'gpt-image-2-4k'
+const IMAGE_NOTICE_KEYS = [
+  'images.notices.pngFallback',
+  'images.notices.transparent',
+  'images.notices.highQuality',
+  'images.notices.accountRouting',
+]
+
+type TemplateEditorDraft = {
+  id: number | null
+  name: string
+  tags: string
+  prompt: string
+  model: string
+  size: string
+  quality: string
+  outputFormat: string
+  background: string
+  style: string
+}
 
 const IMAGE_MODELS = [
   { label: 'gpt-image-2', value: 'gpt-image-2' },
-  { label: 'gpt-image-2-2k', value: 'gpt-image-2-2k' },
-  { label: 'gpt-image-2-4k', value: 'gpt-image-2-4k' },
+  { label: IMAGE_MODEL_2K_ALIAS, value: IMAGE_MODEL_2K_ALIAS },
+  { label: IMAGE_MODEL_4K_ALIAS, value: IMAGE_MODEL_4K_ALIAS },
 ]
 
 const SIZE_OPTIONS = [
@@ -53,6 +75,9 @@ const SIZE_OPTIONS = [
   { label: '2880x2880', value: '2880x2880' },
 ]
 
+const SIZE_2K_VALUES = new Set(['auto', '2048x2048', '2560x1440', '1440x2560'])
+const SIZE_4K_VALUES = new Set(['auto', '3840x2160', '2160x3840', '2880x2880'])
+
 const QUALITY_OPTIONS = [
   { label: 'Auto', value: 'auto' },
   { label: 'High', value: 'high' },
@@ -66,11 +91,7 @@ const FORMAT_OPTIONS = [
   { label: 'JPEG', value: 'jpeg' },
 ]
 
-const BACKGROUND_OPTIONS = [
-  { label: 'Auto', value: 'auto' },
-  { label: 'Opaque', value: 'opaque' },
-  { label: 'Transparent', value: 'transparent' },
-]
+const UPSCALE_VALUES = ['', '2k', '4k'] as const
 
 const STYLE_PRESETS = [
   {
@@ -132,8 +153,67 @@ function tagsToText(tags?: string[]): string {
   return (tags ?? []).join(', ')
 }
 
+function sizeOptionsForModel(model: string) {
+  switch (model) {
+    case IMAGE_MODEL_2K_ALIAS:
+      return SIZE_OPTIONS.filter(option => SIZE_2K_VALUES.has(option.value))
+    case IMAGE_MODEL_4K_ALIAS:
+      return SIZE_OPTIONS.filter(option => SIZE_4K_VALUES.has(option.value))
+    default:
+      return SIZE_OPTIONS
+  }
+}
+
+function normalizeImageSizeForModel(model: string, size: string): string {
+  const value = stringsTrimOrAuto(size)
+  return sizeOptionsForModel(model).some(option => option.value === value) ? value : 'auto'
+}
+
+function stringsTrimOrAuto(value: string): string {
+  return value.trim() || 'auto'
+}
+
+function emptyTemplateDraft(): TemplateEditorDraft {
+  return {
+    id: null,
+    name: '',
+    tags: '',
+    prompt: '',
+    model: 'gpt-image-2',
+    size: 'auto',
+    quality: 'auto',
+    outputFormat: 'png',
+    background: 'auto',
+    style: '',
+  }
+}
+
+function templateDraftFromTemplate(template: ImagePromptTemplate): TemplateEditorDraft {
+  const model = template.model || 'gpt-image-2'
+  return {
+    id: template.id,
+    name: template.name,
+    tags: tagsToText(template.tags),
+    prompt: template.prompt,
+    model,
+    size: normalizeImageSizeForModel(model, template.size || 'auto'),
+    quality: template.quality || 'auto',
+    outputFormat: template.output_format || 'png',
+    background: template.background || 'auto',
+    style: template.style || '',
+  }
+}
+
 function assetResolution(asset: ImageAsset): string {
   return asset.actual_size || (asset.width > 0 && asset.height > 0 ? `${asset.width}x${asset.height}` : asset.requested_size || '-')
+}
+
+function imageAssetFormat(asset: ImageAsset): string {
+  const outputFormat = asset.output_format?.trim()
+  if (outputFormat) return outputFormat.toUpperCase()
+  const mimeType = asset.mime_type?.trim()
+  if (mimeType) return mimeType.replace(/^image\//i, '').toUpperCase()
+  return '-'
 }
 
 function jobParams(job?: ImageGenerationJob | null): Partial<CreateImageJobPayload> {
@@ -178,6 +258,23 @@ function assetDisplayFrameClass(asset: ImageAsset, compact: boolean, gallery: bo
   if (ratio > 0.88) return 'aspect-square'
   if (ratio > 0.68) return 'aspect-[4/5]'
   return 'aspect-[3/4]'
+}
+
+function normalizeUpscale(value?: string): string {
+  const normalized = (value || '').trim().toLowerCase()
+  return UPSCALE_VALUES.includes(normalized as typeof UPSCALE_VALUES[number]) ? normalized : ''
+}
+
+function assetThumbnailURL(asset: ImageAsset, imageURLs: Record<number, string>): string | undefined {
+  return asset.thumbnail_url || asset.proxy_url || imageURLs[asset.id]
+}
+
+function assetPreviewURL(asset: ImageAsset, imageURLs: Record<number, string>): string | undefined {
+  return asset.proxy_url || imageURLs[asset.id] || asset.thumbnail_url
+}
+
+function hasServerImageURL(asset: ImageAsset): boolean {
+  return Boolean(asset.thumbnail_url || asset.proxy_url)
 }
 
 type CachedImageAsset = {
@@ -315,7 +412,9 @@ export default function ImageStudio() {
   const [templateSearch, setTemplateSearch] = useState('')
   const [selectedTag, setSelectedTag] = useState('')
   const [selectedTemplateId, setSelectedTemplateId] = useState<number | null>(null)
-  const [editingTemplateId, setEditingTemplateId] = useState<number | null>(null)
+  const [templateDialogOpen, setTemplateDialogOpen] = useState(false)
+  const [templateDialogDraft, setTemplateDialogDraft] = useState<TemplateEditorDraft>(() => emptyTemplateDraft())
+  const [templateDialogSaving, setTemplateDialogSaving] = useState(false)
 
   const [prompt, setPrompt] = useState('')
   const [model, setModel] = useState('gpt-image-2')
@@ -323,6 +422,7 @@ export default function ImageStudio() {
   const [quality, setQuality] = useState('auto')
   const [outputFormat, setOutputFormat] = useState('png')
   const [background, setBackground] = useState('auto')
+  const [upscale, setUpscale] = useState('')
   const [style, setStyle] = useState('')
   const [apiKeyID, setAPIKeyID] = useState('')
   const [templateName, setTemplateName] = useState('')
@@ -350,11 +450,6 @@ export default function ImageStudio() {
     templates.forEach(template => template.tags.forEach(tag => tags.add(tag)))
     return Array.from(tags).sort((a, b) => a.localeCompare(b))
   }, [templates])
-  const selectedTemplate = useMemo(() => {
-    if (!selectedTemplateId) return null
-    return templates.find(template => template.id === selectedTemplateId) ?? null
-  }, [selectedTemplateId, templates])
-
   const loadTemplates = useCallback(async () => {
     const res = await api.getImagePromptTemplates({ q: templateSearch || undefined, tag: selectedTag || undefined })
     setTemplates(res.templates ?? [])
@@ -426,6 +521,7 @@ export default function ImageStudio() {
 
   useEffect(() => {
     const activeIDs = new Set(visibleAssets.map(asset => asset.id))
+    const serverURLIDs = new Set(visibleAssets.filter(hasServerImageURL).map(asset => asset.id))
     activeAssetIDsRef.current = activeIDs
 
     setAssetURLs(prev => {
@@ -433,7 +529,7 @@ export default function ImageStudio() {
       const next = { ...prev }
       for (const [id, url] of Object.entries(prev)) {
         const assetID = Number(id)
-        if (!activeIDs.has(assetID)) {
+        if (!activeIDs.has(assetID) || serverURLIDs.has(assetID)) {
           URL.revokeObjectURL(url)
           delete next[assetID]
           assetURLRequestsRef.current.delete(assetID)
@@ -447,6 +543,7 @@ export default function ImageStudio() {
     })
 
     visibleAssets.forEach(asset => {
+      if (hasServerImageURL(asset)) return
       if (assetURLsRef.current[asset.id] || assetURLRequestsRef.current.has(asset.id)) return
       assetURLRequestsRef.current.add(asset.id)
       void (async () => {
@@ -506,10 +603,11 @@ export default function ImageStudio() {
   }, [currentJob, historyJobs, jobs])
 
   const fillTemplate = (template: ImagePromptTemplate) => {
+    const nextModel = template.model || 'gpt-image-2'
     setSelectedTemplateId(template.id)
     setPrompt(template.prompt)
-    setModel(template.model || 'gpt-image-2')
-    setSize(template.size || 'auto')
+    setModel(nextModel)
+    setSize(normalizeImageSizeForModel(nextModel, template.size || 'auto'))
     setQuality(template.quality || 'auto')
     setOutputFormat(template.output_format || 'png')
     setBackground(template.background || 'auto')
@@ -520,31 +618,38 @@ export default function ImageStudio() {
 
   const applyTemplate = (template: ImagePromptTemplate) => {
     fillTemplate(template)
-    setEditingTemplateId(null)
     navigate('/images/studio')
   }
 
-  const resetTemplateEditor = () => {
-    setEditingTemplateId(null)
-    setTemplateName('')
-    setTemplateTags('')
+  const selectTemplateForGeneration = (value: string) => {
+    if (!value) {
+      setSelectedTemplateId(null)
+      return
+    }
+    const template = templates.find(item => item.id === Number(value))
+    if (!template) return
+    fillTemplate(template)
   }
 
-  const beginNewTemplate = () => {
-    setSelectedTemplateId(null)
-    setEditingTemplateId(null)
-    setPrompt('')
-    setModel('gpt-image-2')
-    setSize('auto')
-    setQuality('auto')
-    setOutputFormat('png')
-    setBackground('auto')
-    setStyle('')
-    setTemplateName('')
-    setTemplateTags('')
+  const openNewTemplateDialog = () => {
+    setTemplateDialogDraft(emptyTemplateDraft())
+    setTemplateDialogOpen(true)
   }
 
-  const saveTemplate = async () => {
+  const openEditTemplateDialog = (template: ImagePromptTemplate) => {
+    setTemplateDialogDraft(templateDraftFromTemplate(template))
+    setTemplateDialogOpen(true)
+  }
+
+  const updateTemplateDialogDraft = (patch: Partial<TemplateEditorDraft>) => {
+    setTemplateDialogDraft(prev => ({ ...prev, ...patch }))
+  }
+
+  const saveCurrentPromptAsTemplate = async () => {
+    if (!prompt.trim()) {
+      showToast(t('images.promptRequired'), 'error')
+      return
+    }
     const payload: ImagePromptTemplatePayload = {
       name: templateName.trim() || prompt.trim().slice(0, 24) || t('images.untitledTemplate'),
       prompt,
@@ -557,24 +662,49 @@ export default function ImageStudio() {
       tags: parseTags(templateTags),
     }
     try {
-      if (editingTemplateId) {
-        await api.updateImagePromptTemplate(editingTemplateId, payload)
-        showToast(t('images.templateUpdated'), 'success')
-      } else {
-        await api.createImagePromptTemplate(payload)
-        showToast(t('images.templateSaved'), 'success')
-      }
-      resetTemplateEditor()
+      await api.createImagePromptTemplate(payload)
+      showToast(t('images.templateSaved'), 'success')
+      setTemplateName('')
+      setTemplateTags('')
       await loadTemplates()
     } catch (err) {
       showToast(err instanceof Error ? err.message : t('images.saveFailed'), 'error')
     }
   }
 
-  const editTemplate = (template: ImagePromptTemplate) => {
-    fillTemplate(template)
-    setEditingTemplateId(template.id)
-    navigate('/images/prompts')
+  const saveTemplateDialog = async () => {
+    if (!templateDialogDraft.prompt.trim()) {
+      showToast(t('images.promptRequired'), 'error')
+      return
+    }
+    const payload: ImagePromptTemplatePayload = {
+      name: templateDialogDraft.name.trim() || templateDialogDraft.prompt.trim().slice(0, 24) || t('images.untitledTemplate'),
+      prompt: templateDialogDraft.prompt,
+      model: templateDialogDraft.model,
+      size: templateDialogDraft.size === 'auto' ? '' : templateDialogDraft.size,
+      quality: templateDialogDraft.quality === 'auto' ? '' : templateDialogDraft.quality,
+      output_format: templateDialogDraft.outputFormat,
+      background: templateDialogDraft.background === 'auto' ? '' : templateDialogDraft.background,
+      style: templateDialogDraft.style,
+      tags: parseTags(templateDialogDraft.tags),
+    }
+    setTemplateDialogSaving(true)
+    try {
+      if (templateDialogDraft.id) {
+        await api.updateImagePromptTemplate(templateDialogDraft.id, payload)
+        showToast(t('images.templateUpdated'), 'success')
+      } else {
+        await api.createImagePromptTemplate(payload)
+        showToast(t('images.templateSaved'), 'success')
+      }
+      setTemplateDialogOpen(false)
+      setTemplateDialogDraft(emptyTemplateDraft())
+      await loadTemplates()
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : t('images.saveFailed'), 'error')
+    } finally {
+      setTemplateDialogSaving(false)
+    }
   }
 
   const toggleFavorite = async (template: ImagePromptTemplate) => {
@@ -608,7 +738,10 @@ export default function ImageStudio() {
     try {
       await api.deleteImagePromptTemplate(template.id)
       if (selectedTemplateId === template.id) setSelectedTemplateId(null)
-      if (editingTemplateId === template.id) resetTemplateEditor()
+      if (templateDialogDraft.id === template.id) {
+        setTemplateDialogOpen(false)
+        setTemplateDialogDraft(emptyTemplateDraft())
+      }
       await loadTemplates()
       showToast(t('images.templateDeleted'), 'success')
     } catch (err) {
@@ -625,6 +758,7 @@ export default function ImageStudio() {
     if (size !== 'auto') payload.size = size
     if (quality !== 'auto') payload.quality = quality
     if (background !== 'auto') payload.background = background
+    if (upscale) payload.upscale = upscale
     if (style.trim()) payload.style = style.trim()
     if (apiKeyID) payload.api_key_id = Number(apiKeyID)
     if (selectedTemplateId) payload.template_id = selectedTemplateId
@@ -651,22 +785,26 @@ export default function ImageStudio() {
 
   const rerunFromJob = (job: ImageGenerationJob) => {
     const params = jobParams(job)
+    const nextModel = params.model || 'gpt-image-2'
+    const nextSize = normalizeImageSizeForModel(nextModel, params.size || 'auto')
     setPrompt(job.prompt)
-    setModel(params.model || 'gpt-image-2')
-    setSize(params.size || 'auto')
+    setModel(nextModel)
+    setSize(nextSize)
     setQuality(params.quality || 'auto')
     setOutputFormat(params.output_format || 'png')
     setBackground(params.background || 'auto')
+    setUpscale(normalizeUpscale(params.upscale))
     setStyle(params.style || '')
     setSelectedTemplateId(params.template_id ? Number(params.template_id) : null)
     navigate('/images/studio')
     void submitJob({
       prompt: job.prompt,
-      model: params.model || 'gpt-image-2',
-      size: params.size && params.size !== 'auto' ? params.size : undefined,
+      model: nextModel,
+      size: nextSize !== 'auto' ? nextSize : undefined,
       quality: params.quality && params.quality !== 'auto' ? params.quality : undefined,
       output_format: params.output_format || 'png',
       background: params.background && params.background !== 'auto' ? params.background : undefined,
+      upscale: normalizeUpscale(params.upscale) || undefined,
       style: params.style,
       api_key_id: apiKeyID ? Number(apiKeyID) : undefined,
       template_id: params.template_id ? Number(params.template_id) : undefined,
@@ -681,11 +819,13 @@ export default function ImageStudio() {
       return
     }
     if (asset.revised_prompt) {
+      const nextModel = asset.model || 'gpt-image-2'
       setPrompt(asset.revised_prompt)
-      setModel(asset.model || 'gpt-image-2')
+      setModel(nextModel)
+      setSize(current => normalizeImageSizeForModel(nextModel, current))
       setOutputFormat(asset.output_format || 'png')
       navigate('/images/studio')
-      void submitJob({ prompt: asset.revised_prompt, model: asset.model || 'gpt-image-2', output_format: asset.output_format || 'png' })
+      void submitJob({ prompt: asset.revised_prompt, model: nextModel, output_format: asset.output_format || 'png' })
     }
   }
 
@@ -792,16 +932,74 @@ export default function ImageStudio() {
   const filteredHistoryJobs = historyStatusFilter === 'all'
     ? historyJobs
     : historyJobs.filter(job => job.status === historyStatusFilter)
+  const templateSelectOptions = templates.length > 0
+    ? [{ label: t('images.noTemplateSelected'), value: '' }, ...templates.map(template => ({ label: template.name || `#${template.id}`, value: String(template.id) }))]
+    : [{ label: t('images.noTemplates'), value: '' }]
+  const sizeOptions = useMemo(() => sizeOptionsForModel(model), [model])
+  const backgroundOptions = useMemo(() => [
+    { label: t('images.backgroundOptions.auto'), value: 'auto' },
+    { label: t('images.backgroundOptions.opaque'), value: 'opaque' },
+    { label: t('images.backgroundOptions.transparent'), value: 'transparent' },
+  ], [t])
+  const upscaleOptions = useMemo(() => [
+    { label: t('images.upscaleOptions.none'), value: '' },
+    { label: t('images.upscaleOptions.2k'), value: '2k' },
+    { label: t('images.upscaleOptions.4k'), value: '4k' },
+  ], [t])
+  const hasGenerationDraft = Boolean(
+    prompt.trim() ||
+    selectedTemplateId ||
+    templateName.trim() ||
+    templateTags.trim() ||
+    style.trim() ||
+    model !== 'gpt-image-2' ||
+    size !== 'auto' ||
+    quality !== 'auto' ||
+    outputFormat !== 'png' ||
+    background !== 'auto' ||
+    upscale ||
+    apiKeyID
+  )
+
+  const clearGenerationForm = () => {
+    setSelectedTemplateId(null)
+    setPrompt('')
+    setModel('gpt-image-2')
+    setSize('auto')
+    setQuality('auto')
+    setOutputFormat('png')
+    setBackground('auto')
+    setUpscale('')
+    setStyle('')
+    setAPIKeyID('')
+    setTemplateName('')
+    setTemplateTags('')
+  }
+
+  const changeGenerationModel = (value: string) => {
+    setModel(value)
+    setSize(current => normalizeImageSizeForModel(value, current))
+  }
 
   const generationForm = (
     <Card className="xl:sticky xl:top-4">
       <CardContent className="flex flex-col gap-4 xl:min-h-[calc(100dvh-168px)]">
+        <Field label={t('images.selectTemplate')}>
+          <Select
+            value={selectedTemplateId ? String(selectedTemplateId) : ''}
+            onValueChange={selectTemplateForGeneration}
+            options={templateSelectOptions}
+            disabled={templates.length === 0}
+          />
+        </Field>
+
         <div className="grid gap-3 md:grid-cols-3">
-          <Field label={t('images.model')}><Select value={model} onValueChange={setModel} options={IMAGE_MODELS} compact /></Field>
-          <Field label={t('images.size')}><Select value={size} onValueChange={setSize} options={SIZE_OPTIONS} compact /></Field>
+          <Field label={t('images.model')}><Select value={model} onValueChange={changeGenerationModel} options={IMAGE_MODELS} compact /></Field>
+          <Field label={t('images.size')}><Select value={size} onValueChange={setSize} options={sizeOptions} compact /></Field>
           <Field label={t('images.quality')}><Select value={quality} onValueChange={setQuality} options={QUALITY_OPTIONS} compact /></Field>
           <Field label={t('images.format')}><Select value={outputFormat} onValueChange={setOutputFormat} options={FORMAT_OPTIONS} compact /></Field>
-          <Field label={t('images.background')}><Select value={background} onValueChange={setBackground} options={BACKGROUND_OPTIONS} compact /></Field>
+          <Field label={t('images.background')}><Select value={background} onValueChange={setBackground} options={backgroundOptions} compact /></Field>
+          <Field label={t('images.localUpscale')}><Select value={upscale} onValueChange={setUpscale} options={upscaleOptions} compact /></Field>
           <Field label={t('images.apiKey')}>
             <Select
               value={apiKeyID}
@@ -834,31 +1032,42 @@ export default function ImageStudio() {
             <Input value={templateTags} onChange={e => setTemplateTags(e.target.value)} placeholder={t('images.templateTags')} />
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" className="flex-1" onClick={() => void saveTemplate()}><Save className="size-4" />{editingTemplateId ? t('images.updateTemplate') : t('images.saveTemplate')}</Button>
-            {editingTemplateId && <Button variant="ghost" onClick={resetTemplateEditor}>{t('common.cancel')}</Button>}
+            <Button variant="outline" className="flex-1" disabled={!prompt.trim()} onClick={() => void saveCurrentPromptAsTemplate()}><Save className="size-4" />{t('images.saveTemplate')}</Button>
           </div>
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
           <div className="text-xs text-muted-foreground">{size === 'auto' ? t('images.autoSizeHint') : t('images.explicitSizeHint', { size })}</div>
-          <Button disabled={submitting || !prompt.trim()} onClick={() => void submitJob()}>
-            {submitting ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
-            {t('images.generate')}
-          </Button>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button variant="outline" disabled={submitting || !hasGenerationDraft} onClick={clearGenerationForm}>
+              <X className="size-4" />
+              {t('images.clearSelection')}
+            </Button>
+            <Button disabled={submitting || !prompt.trim()} onClick={() => void submitJob()}>
+              {submitting ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
+              {t('images.generate')}
+            </Button>
+          </div>
         </div>
       </CardContent>
     </Card>
   )
 
   const templateLibrary = (
-    <div className="space-y-3 xl:sticky xl:top-4">
+    <div className="space-y-3">
       <div className="toolbar-surface">
         <div className="mb-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-2 font-semibold text-foreground">
             <Sparkles className="size-4 text-primary" />
             {t('images.templates')}
           </div>
-          <Badge variant="outline" className="text-[11px]">{templates.length}</Badge>
+          <div className="flex items-center gap-2">
+            <Badge variant="outline" className="text-[11px]">{templates.length}</Badge>
+            <Button size="sm" onClick={openNewTemplateDialog}>
+              <Plus className="size-4" />
+              {t('images.newTemplate')}
+            </Button>
+          </div>
         </div>
         <div className="relative">
           <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -878,15 +1087,15 @@ export default function ImageStudio() {
         )}
       </div>
 
-      <div className="grid gap-2 sm:grid-cols-2 xl:max-h-[calc(100dvh-260px)] xl:grid-cols-1 xl:overflow-y-auto xl:pr-1">
+      <div className="grid gap-2 sm:grid-cols-2 2xl:grid-cols-3">
         {templates.map(template => (
           <TemplateCard
             key={template.id}
             template={template}
             active={selectedTemplateId === template.id}
-            onApply={() => activeView === 'prompts' ? editTemplate(template) : applyTemplate(template)}
+            onApply={() => applyTemplate(template)}
             onFavorite={() => void toggleFavorite(template)}
-            onEdit={() => editTemplate(template)}
+            onEdit={() => openEditTemplateDialog(template)}
             onDelete={() => void deleteTemplate(template)}
           />
         ))}
@@ -898,74 +1107,6 @@ export default function ImageStudio() {
         </div>
       )}
     </div>
-  )
-
-  const templateEditor = (
-    <Card className="overflow-hidden">
-      <CardContent className="p-0">
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border bg-muted/20 px-5 py-4">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="text-base font-semibold">{t('images.templateEditor')}</h2>
-              {selectedTemplate && <Badge variant="outline" className="text-[11px]">#{selectedTemplate.id}</Badge>}
-            </div>
-            <p className="mt-1 text-sm text-muted-foreground">{t('images.promptManagerHint')}</p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" size="sm" onClick={beginNewTemplate}>{t('images.newTemplate')}</Button>
-            {selectedTemplate && <Button variant="outline" size="sm" onClick={() => applyTemplate(selectedTemplate)}><Play className="size-4" />{t('images.applyToStudio')}</Button>}
-            <Button size="sm" disabled={!prompt.trim()} onClick={() => void saveTemplate()}><Save className="size-4" />{editingTemplateId ? t('images.updateTemplate') : t('images.saveTemplate')}</Button>
-          </div>
-        </div>
-
-        <div className="grid min-h-[680px] lg:grid-cols-[minmax(0,1fr)_360px]">
-          <main className="space-y-4 p-5">
-            <div>
-              <h3 className="text-sm font-semibold">{t('images.templateContent')}</h3>
-              <p className="mt-1 text-sm text-muted-foreground">{t('images.templateContentHint')}</p>
-            </div>
-
-            <Field label={t('images.style')}>
-              <Input value={style} onChange={e => setStyle(e.target.value)} placeholder={t('images.stylePlaceholder')} />
-            </Field>
-
-            <Field label={t('images.prompt')}>
-              <textarea
-                value={prompt}
-                onChange={e => setPrompt(e.target.value)}
-                className="min-h-[460px] w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm leading-6 shadow-xs outline-none transition-[border-color,box-shadow] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
-                placeholder={t('images.promptPlaceholder')}
-              />
-            </Field>
-          </main>
-
-          <aside className="space-y-4 border-t border-border bg-muted/10 p-5 lg:border-l lg:border-t-0">
-            <section className="space-y-3">
-              <div>
-                <h3 className="text-sm font-semibold">{t('images.templateDetails')}</h3>
-                <p className="mt-1 text-xs leading-5 text-muted-foreground">{selectedTemplate ? t('images.templateDetailsHint') : t('images.newTemplateHint')}</p>
-              </div>
-              <Field label={t('images.templateName')}>
-                <Input value={templateName} onChange={e => setTemplateName(e.target.value)} placeholder={t('images.templateName')} />
-              </Field>
-              <Field label={t('images.templateTags')}>
-                <Input value={templateTags} onChange={e => setTemplateTags(e.target.value)} placeholder={t('images.templateTags')} />
-              </Field>
-            </section>
-
-            {selectedTemplate && (
-              <section className="grid gap-2 rounded-lg border border-border bg-background/65 p-3">
-                <TemplateMeta label={t('images.usageCount')} value={String(selectedTemplate.usage_count ?? 0)} />
-                <TemplateMeta label={t('images.lastUsedAt')} value={selectedTemplate.last_used_at ? formatBeijingTime(selectedTemplate.last_used_at) : t('images.neverUsed')} />
-                <TemplateMeta label={t('images.updatedAt')} value={selectedTemplate.updated_at ? formatBeijingTime(selectedTemplate.updated_at) : '-'} />
-              </section>
-            )}
-
-            <StylePresetPicker value={style} onChange={setStyle} onApply={() => showToast(t('images.stylePresetApplied'), 'success')} compact />
-          </aside>
-        </div>
-      </CardContent>
-    </Card>
   )
 
   const currentJobPanel = (
@@ -993,7 +1134,7 @@ export default function ImageStudio() {
             {latestAsset && (
               <AssetCard
                 asset={latestAsset}
-                imageURL={assetURLs[latestAsset.id]}
+                imageURL={assetThumbnailURL(latestAsset, assetURLs)}
                 prompt={currentJob.prompt}
                 compact
                 onPreview={() => setPreviewAsset(latestAsset)}
@@ -1134,7 +1275,7 @@ export default function ImageStudio() {
           <AssetCard
             key={asset.id}
             asset={asset}
-            imageURL={assetURLs[asset.id]}
+            imageURL={assetThumbnailURL(asset, assetURLs)}
             prompt={promptForAsset(asset)}
             gallery
             onPreview={() => setPreviewAsset(asset)}
@@ -1154,7 +1295,10 @@ export default function ImageStudio() {
 
   return (
     <>
-      <PageHeader title={t('images.title')} description={t('images.description')} />
+      <div className="relative">
+        <PageHeader title={t('images.title')} description={t('images.description')} />
+        {activeView === 'studio' && <ImageNoticeCarousel />}
+      </div>
       <ImageStudioTabs activeView={activeView} />
       <ToastNotice toast={toast} />
       {confirmDialog}
@@ -1170,10 +1314,7 @@ export default function ImageStudio() {
       )}
 
       {activeView === 'prompts' && (
-        <div className="grid gap-4 xl:grid-cols-[340px_minmax(0,1fr)] 2xl:grid-cols-[360px_minmax(0,1fr)]">
-          <aside>{templateLibrary}</aside>
-          <main>{templateEditor}</main>
-        </div>
+        <div>{templateLibrary}</div>
       )}
 
       {activeView === 'gallery' && galleryView}
@@ -1182,7 +1323,7 @@ export default function ImageStudio() {
 
       <AssetPreviewDialog
         asset={previewAsset}
-        imageURL={previewAsset ? assetURLs[previewAsset.id] : undefined}
+        imageURL={previewAsset ? assetPreviewURL(previewAsset, assetURLs) : undefined}
         prompt={previewAsset ? promptForAsset(previewAsset) : ''}
         open={Boolean(previewAsset)}
         onClose={() => setPreviewAsset(null)}
@@ -1192,7 +1333,89 @@ export default function ImageStudio() {
         onSaveTemplate={asset => void saveAssetPromptAsTemplate(asset)}
         onDelete={asset => void deleteAsset(asset)}
       />
+      <TemplateEditorDialog
+        open={templateDialogOpen}
+        draft={templateDialogDraft}
+        saving={templateDialogSaving}
+        onClose={() => setTemplateDialogOpen(false)}
+        onChange={updateTemplateDialogDraft}
+        onSave={() => void saveTemplateDialog()}
+        onApplyStylePreset={() => showToast(t('images.stylePresetApplied'), 'success')}
+      />
     </>
+  )
+}
+
+function ImageNoticeCarousel() {
+  const { t } = useTranslation()
+  const [index, setIndex] = useState(0)
+  const [paused, setPaused] = useState(false)
+  const [overflowDistance, setOverflowDistance] = useState(0)
+  const textFrameRef = useRef<HTMLDivElement>(null)
+  const textRef = useRef<HTMLDivElement>(null)
+  const currentIndex = index % IMAGE_NOTICE_KEYS.length
+  const notice = t(IMAGE_NOTICE_KEYS[currentIndex])
+
+  useEffect(() => {
+    if (paused || IMAGE_NOTICE_KEYS.length <= 1) return
+    const timer = window.setInterval(() => {
+      setIndex(value => (value + 1) % IMAGE_NOTICE_KEYS.length)
+    }, 4500)
+    return () => window.clearInterval(timer)
+  }, [paused])
+
+  useLayoutEffect(() => {
+    const measure = () => {
+      const frame = textFrameRef.current
+      const text = textRef.current
+      if (!frame || !text) {
+        setOverflowDistance(0)
+        return
+      }
+      setOverflowDistance(Math.max(0, text.scrollWidth - frame.clientWidth))
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
+  }, [notice])
+
+  return (
+    <div className="-mt-3 mb-4 flex justify-center md:absolute md:inset-x-0 md:top-0 md:mt-0 md:mb-0">
+      <div
+        className="flex h-10 w-full max-w-[620px] items-center gap-3 rounded-xl border border-primary/20 bg-primary/6 px-4 text-primary shadow-sm backdrop-blur-sm transition-colors hover:bg-primary/8 focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/45"
+        tabIndex={0}
+        role="status"
+        aria-live="polite"
+        onMouseEnter={() => setPaused(true)}
+        onMouseLeave={() => setPaused(false)}
+        onFocus={() => setPaused(true)}
+        onBlur={() => setPaused(false)}
+      >
+        <Sparkles className="size-4 shrink-0" />
+        <div ref={textFrameRef} className="relative min-w-0 flex-1 overflow-hidden">
+          <div
+            key={currentIndex}
+            ref={textRef}
+            className={`inline-block whitespace-nowrap text-sm font-semibold ${overflowDistance > 0 && !paused ? 'animate-image-notice-marquee' : ''}`}
+            style={overflowDistance > 0 ? { '--image-notice-marquee-distance': `-${overflowDistance}px` } as React.CSSProperties : undefined}
+          >
+            {notice}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {IMAGE_NOTICE_KEYS.map((key, dotIndex) => (
+            <button
+              key={key}
+              type="button"
+              aria-current={dotIndex === currentIndex ? 'true' : undefined}
+              aria-label={t('images.noticeDotLabel', { index: dotIndex + 1, total: IMAGE_NOTICE_KEYS.length })}
+              className={`size-2 rounded-full border-0 p-0 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/45 ${dotIndex === currentIndex ? 'bg-primary' : 'bg-primary/25 hover:bg-primary/45'}`}
+              onClick={() => setIndex(dotIndex)}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -1240,12 +1463,103 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
   )
 }
 
-function TemplateMeta({ label, value }: { label: string; value: string }) {
+function TemplateEditorDialog({
+  open,
+  draft,
+  saving,
+  onClose,
+  onChange,
+  onSave,
+  onApplyStylePreset,
+}: {
+  open: boolean
+  draft: TemplateEditorDraft
+  saving: boolean
+  onClose: () => void
+  onChange: (patch: Partial<TemplateEditorDraft>) => void
+  onSave: () => void
+  onApplyStylePreset: () => void
+}) {
+  const { t } = useTranslation()
+  const editing = Boolean(draft.id)
+  const sizeOptions = useMemo(() => sizeOptionsForModel(draft.model), [draft.model])
+  const backgroundOptions = useMemo(() => [
+    { label: t('images.backgroundOptions.auto'), value: 'auto' },
+    { label: t('images.backgroundOptions.opaque'), value: 'opaque' },
+    { label: t('images.backgroundOptions.transparent'), value: 'transparent' },
+  ], [t])
+
+  const changeModel = (value: string) => {
+    onChange({ model: value, size: normalizeImageSizeForModel(value, draft.size) })
+  }
+
   return (
-    <div className="min-w-0 rounded-md bg-muted/40 px-3 py-2">
-      <div className="text-[11px] font-semibold text-muted-foreground">{label}</div>
-      <div className="mt-1 truncate text-sm font-medium text-foreground">{value}</div>
-    </div>
+    <Dialog open={open} onOpenChange={nextOpen => { if (!nextOpen) onClose() }}>
+      <DialogContent className="!flex max-h-[calc(100dvh-1rem)] !w-[min(980px,calc(100vw-1rem))] !max-w-none flex-col gap-0 overflow-hidden p-0">
+        <DialogHeader className="border-b border-border px-5 pb-4 pr-12 pt-5">
+          <DialogTitle>{editing ? t('images.editTemplate') : t('images.createTemplate')}</DialogTitle>
+          <DialogDescription>{t('images.templateDialogDesc')}</DialogDescription>
+        </DialogHeader>
+
+        <div className="grid min-h-0 flex-1 gap-5 overflow-y-auto p-5 lg:grid-cols-[minmax(0,1fr)_320px]">
+          <main className="space-y-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label={t('images.templateName')}>
+                <Input value={draft.name} onChange={e => onChange({ name: e.target.value })} placeholder={t('images.templateName')} />
+              </Field>
+              <Field label={t('images.templateTags')}>
+                <Input value={draft.tags} onChange={e => onChange({ tags: e.target.value })} placeholder={t('images.templateTags')} />
+              </Field>
+            </div>
+
+            <Field label={t('images.style')}>
+              <Input value={draft.style} onChange={e => onChange({ style: e.target.value })} placeholder={t('images.stylePlaceholder')} />
+            </Field>
+
+            <StylePresetPicker value={draft.style} onChange={value => onChange({ style: value })} onApply={onApplyStylePreset} compact />
+
+            <Field label={t('images.prompt')}>
+              <textarea
+                value={draft.prompt}
+                onChange={e => onChange({ prompt: e.target.value })}
+                className="min-h-[360px] w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm leading-6 shadow-xs outline-none transition-[border-color,box-shadow] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
+                placeholder={t('images.promptPlaceholder')}
+              />
+            </Field>
+          </main>
+
+          <aside className="space-y-3 rounded-md border border-border/70 bg-muted/15 p-4">
+            <div>
+              <h3 className="text-sm font-semibold">{t('images.templateDetails')}</h3>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('images.newTemplateHint')}</p>
+            </div>
+            <Field label={t('images.model')}>
+              <Select value={draft.model} onValueChange={changeModel} options={IMAGE_MODELS} compact />
+            </Field>
+            <Field label={t('images.size')}>
+              <Select value={draft.size} onValueChange={value => onChange({ size: value })} options={sizeOptions} compact />
+            </Field>
+            <Field label={t('images.quality')}>
+              <Select value={draft.quality} onValueChange={value => onChange({ quality: value })} options={QUALITY_OPTIONS} compact />
+            </Field>
+            <Field label={t('images.format')}>
+              <Select value={draft.outputFormat} onValueChange={value => onChange({ outputFormat: value })} options={FORMAT_OPTIONS} compact />
+            </Field>
+            <Field label={t('images.background')}>
+              <Select value={draft.background} onValueChange={value => onChange({ background: value })} options={backgroundOptions} compact />
+            </Field>
+          </aside>
+        </div>
+
+        <DialogFooter className="border-t border-border px-5 py-4">
+          <Button variant="outline" disabled={saving} onClick={onClose}>{t('common.cancel')}</Button>
+          <Button disabled={saving || !draft.prompt.trim()} onClick={onSave}>
+            {saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />}
+            {editing ? t('images.updateTemplate') : t('images.saveTemplate')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -1336,7 +1650,7 @@ function TemplateCard({
       <div className="flex items-center justify-between gap-2">
         <span className="text-[11px] text-muted-foreground">{template.model || 'gpt-image-2'}</span>
         <div className="flex gap-1">
-          <Button size="icon-xs" variant="ghost" onClick={onEdit} aria-label={t('images.updateTemplate')}><Save className="size-3" /></Button>
+          <Button size="icon-xs" variant="ghost" onClick={onEdit} aria-label={t('images.editTemplate')}><Pencil className="size-3" /></Button>
           <Button size="icon-xs" variant="ghost" onClick={onDelete} aria-label={t('common.delete')}><Trash2 className="size-3" /></Button>
         </div>
       </div>
@@ -1419,8 +1733,8 @@ function HistoryJobCard({
                     onClick={() => onPreview(asset)}
                     aria-label={t('images.openPreview')}
                   >
-                    {imageURLs[asset.id] ? (
-                      <img src={imageURLs[asset.id]} alt={job.prompt || asset.filename} className="h-full w-full object-contain" />
+                    {assetThumbnailURL(asset, imageURLs) ? (
+                      <img src={assetThumbnailURL(asset, imageURLs)} alt={job.prompt || asset.filename} className="h-full w-full object-contain" />
                     ) : (
                       <span className="flex h-full w-full items-center justify-center text-muted-foreground">
                         <ImageIcon className="size-5" />
@@ -1519,7 +1833,7 @@ function AssetCard({
           <span>{assetResolution(asset)}</span>
           <span className="text-right">{formatBytes(asset.bytes)}</span>
           <span>{asset.model}</span>
-          <span className="text-right">{asset.output_format?.toUpperCase() || asset.mime_type}</span>
+          <span className="text-right">{imageAssetFormat(asset)}</span>
         </div>
         {gallery ? (
           <div className="flex flex-wrap gap-1">
@@ -1595,9 +1909,10 @@ function AssetPreviewDialog({
         </div>
         <div className="shrink-0 border-t border-border bg-background p-2.5 sm:p-3">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div className="grid w-full grid-cols-2 gap-2 sm:w-auto sm:min-w-[300px]">
+            <div className="grid w-full grid-cols-2 gap-2 sm:w-auto sm:min-w-[450px] sm:grid-cols-3">
               <PreviewMeta label={t('images.resolution')} value={assetResolution(asset)} />
               <PreviewMeta label={t('images.fileSize')} value={formatBytes(asset.bytes)} />
+              <PreviewMeta label={t('images.format')} value={imageAssetFormat(asset)} />
             </div>
             <TooltipProvider>
               <div className="flex w-full items-center justify-end gap-1.5 sm:w-auto">

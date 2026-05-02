@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imageproc"
+	"github.com/codex2api/internal/signedasset"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -30,6 +32,7 @@ import (
 
 const defaultImageAssetDir = "/data/images"
 const maxInlineImageAssetCacheBytes = 64 * 1024 * 1024
+const defaultSignedImageThumbKB = 32
 
 type imagePromptTemplatePayload struct {
 	Name         *string  `json:"name"`
@@ -52,12 +55,20 @@ type imageGenerationJobPayload struct {
 	OutputFormat string `json:"output_format"`
 	Background   string `json:"background"`
 	Style        string `json:"style"`
+	Upscale      string `json:"upscale"`
 	APIKeyID     int64  `json:"api_key_id"`
 	TemplateID   int64  `json:"template_id"`
 }
 
 type imageJobResponse struct {
 	Job *database.ImageGenerationJob `json:"job"`
+}
+
+type imageAssetFileOptions struct {
+	download        bool
+	private         bool
+	thumbKB         int
+	requireAssetDir bool
 }
 
 type imagePromptTemplatesResponse struct {
@@ -255,6 +266,7 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 	}
 	req.Background = normalizeOptionalImageParam(req.Background)
 	req.Style = normalizeOptionalImageParam(req.Style)
+	req.Upscale = imageproc.NormalizeUpscale(req.Upscale)
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
@@ -265,6 +277,9 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 	}
 	paramsJSON, _ := json.Marshal(req)
 	keyID, keyName, keyMasked := imageJobAPIKeyMeta(apiKey)
+	if h.inspectImageStudioPromptFilter(c, proxy.AppendImageStyleToPrompt(req.Prompt, req.Style), req.Model, keyID, keyName, keyMasked) {
+		return
+	}
 	jobID, err := h.db.InsertImageGenerationJob(ctx, database.ImageGenerationJobInput{
 		Prompt:       req.Prompt,
 		ParamsJSON:   string(paramsJSON),
@@ -284,6 +299,19 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	log.Printf("[image-studio] job=%d queued model=%s size=%s quality=%s format=%s background=%s upscale=%s style=%t api_key=%s template=%d prompt=%q",
+		jobID,
+		imageLogValue(req.Model),
+		imageLogValue(req.Size),
+		imageLogValue(req.Quality),
+		imageLogValue(req.OutputFormat),
+		imageLogValue(req.Background),
+		imageLogValue(req.Upscale),
+		strings.TrimSpace(req.Style) != "",
+		imageLogAPIKeyLabel(keyID, keyName, keyMasked),
+		req.TemplateID,
+		imageLogPromptPreview(req.Prompt),
+	)
 	go h.runImageGenerationJob(jobID, req, apiKey)
 	c.JSON(http.StatusOK, imageJobResponse{Job: job})
 }
@@ -297,6 +325,7 @@ func (h *Handler) ListImageGenerationJobs(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	decorateImageJobPage(result)
 	c.JSON(http.StatusOK, result)
 }
 
@@ -320,6 +349,7 @@ func (h *Handler) GetImageGenerationJob(c *gin.Context) {
 	if c.Query("include_cache") == "1" {
 		h.attachImageJobAssetCachePayload(job)
 	}
+	decorateImageJobAssets(job)
 	c.JSON(http.StatusOK, imageJobResponse{Job: job})
 }
 
@@ -353,6 +383,9 @@ func (h *Handler) ListImageAssets(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	if result != nil {
+		decorateImageAssets(result.Assets)
+	}
 	c.JSON(http.StatusOK, result)
 }
 
@@ -373,24 +406,145 @@ func (h *Handler) GetImageAssetFile(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
-	if _, err := os.Stat(asset.StoragePath); err != nil {
+	h.serveImageAssetFile(c, asset, imageAssetFileOptions{
+		download: c.Query("download") == "1",
+		private:  true,
+		thumbKB:  imageproc.ClampThumbKB(queryInt(c, "thumb_kb")),
+	})
+}
+
+func (h *Handler) GetSignedImageAssetFile(c *gin.Context) {
+	id, err := parsePositiveIDParam(c, "id")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效 ID")
+		return
+	}
+	exp, err := strconv.ParseInt(strings.TrimSpace(c.Query("exp")), 10, 64)
+	if err != nil || exp <= 0 {
+		writeError(c, http.StatusBadRequest, "签名参数无效")
+		return
+	}
+	thumbKB := imageproc.ClampThumbKB(queryInt(c, "thumb_kb"))
+	if !signedasset.VerifyImageAssetURL(id, exp, thumbKB, strings.TrimSpace(c.Query("sig")), time.Now()) {
+		writeError(c, http.StatusForbidden, "图片链接已失效")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	asset, err := h.db.GetImageAsset(ctx, id)
+	if err == sql.ErrNoRows {
+		writeError(c, http.StatusNotFound, "图片不存在")
+		return
+	}
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.serveImageAssetFile(c, asset, imageAssetFileOptions{
+		thumbKB:         thumbKB,
+		requireAssetDir: true,
+	})
+}
+
+func (h *Handler) serveImageAssetFile(c *gin.Context, asset *database.ImageAsset, opts imageAssetFileOptions) {
+	if asset == nil || strings.TrimSpace(asset.StoragePath) == "" {
 		writeError(c, http.StatusNotFound, "图片文件不存在")
 		return
 	}
-	disposition := "inline"
-	if c.Query("download") == "1" {
-		disposition = "attachment"
+	if opts.requireAssetDir && !imageAssetPathAllowed(asset.StoragePath) {
+		writeError(c, http.StatusNotFound, "图片文件不存在")
+		return
 	}
+	info, err := os.Stat(asset.StoragePath)
+	if err != nil || info.IsDir() {
+		writeError(c, http.StatusNotFound, "图片文件不存在")
+		return
+	}
+
 	c.Request.Header.Del("If-Modified-Since")
 	c.Request.Header.Del("If-None-Match")
-	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, private")
-	c.Header("Pragma", "no-cache")
-	c.Header("Expires", "0")
+	if opts.private {
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate, private")
+		c.Header("Pragma", "no-cache")
+		c.Header("Expires", "0")
+	} else {
+		c.Header("Cache-Control", "public, max-age=86400")
+	}
+
+	disposition := "inline"
+	if opts.download {
+		disposition = "attachment"
+	}
+	filename := sanitizeDownloadFilename(asset.Filename)
+	if opts.thumbKB > 0 && !opts.download {
+		if data, err := os.ReadFile(asset.StoragePath); err == nil {
+			if thumb, contentType, ok := imageproc.MakeThumbnail(data, opts.thumbKB); ok {
+				c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, thumbnailFilename(filename)))
+				c.Data(http.StatusOK, contentType, thumb)
+				return
+			}
+		}
+	}
+
 	if strings.TrimSpace(asset.MimeType) != "" {
 		c.Header("Content-Type", asset.MimeType)
 	}
-	c.Header("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, sanitizeDownloadFilename(asset.Filename)))
+	c.Header("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, filename))
 	c.File(asset.StoragePath)
+}
+
+func imageAssetPathAllowed(storagePath string) bool {
+	assetPath, err := filepath.Abs(strings.TrimSpace(storagePath))
+	if err != nil {
+		return false
+	}
+	basePath, err := filepath.Abs(imageAssetDir())
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(basePath, assetPath)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func thumbnailFilename(filename string) string {
+	base := strings.TrimSuffix(filename, filepath.Ext(filename))
+	if base == "" {
+		base = "image"
+	}
+	return base + ".thumb.jpg"
+}
+
+func decorateImageJobPage(page *database.ImageJobPage) {
+	if page == nil {
+		return
+	}
+	for idx := range page.Jobs {
+		decorateImageAssets(page.Jobs[idx].Assets)
+	}
+}
+
+func decorateImageJobAssets(job *database.ImageGenerationJob) {
+	if job == nil {
+		return
+	}
+	decorateImageAssets(job.Assets)
+}
+
+func decorateImageAssets(assets []database.ImageAsset) {
+	for idx := range assets {
+		decorateImageAsset(&assets[idx])
+	}
+}
+
+func decorateImageAsset(asset *database.ImageAsset) {
+	if asset == nil || asset.ID <= 0 {
+		return
+	}
+	asset.ProxyURL = signedasset.ImageAssetURL(asset.ID, 0)
+	asset.ThumbnailURL = signedasset.ImageAssetURL(asset.ID, defaultSignedImageThumbKB)
 }
 
 func (h *Handler) DeleteImageAsset(c *gin.Context) {
@@ -428,31 +582,121 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 		logImageJobError(jobID, err)
 		return
 	}
+	log.Printf("[image-studio] job=%d started model=%s size=%s quality=%s format=%s background=%s api_key=%s prompt_chars=%d",
+		jobID,
+		imageLogValue(req.Model),
+		imageLogValue(req.Size),
+		imageLogValue(req.Quality),
+		imageLogValue(req.OutputFormat),
+		imageLogValue(req.Background),
+		imageLogAPIKeyFromRow(apiKey),
+		len([]rune(req.Prompt)),
+	)
 
-	rawBody, _ := buildAdminImageGenerationRequest(req)
+	styledPrompt := proxy.AppendImageStyleToPrompt(req.Prompt, req.Style)
+	rawBody, err := buildAdminImageGenerationRequest(req)
+	if err != nil {
+		durationMs := int(time.Since(start).Milliseconds())
+		log.Printf("[image-studio] job=%d failed duration=%s stage=build_request error=%s", jobID, imageLogDuration(durationMs), security.SanitizeLog(err.Error()))
+		_ = h.db.MarkImageJobFailed(context.Background(), jobID, err.Error(), durationMs)
+		return
+	}
+	log.Printf("[image-studio] job=%d upstream request model=%s size=%s quality=%s format=%s body_bytes=%d prompt_chars=%d prompt=%q",
+		jobID,
+		imageLogValue(gjson.GetBytes(rawBody, "model").String()),
+		imageLogValue(gjson.GetBytes(rawBody, "size").String()),
+		imageLogValue(gjson.GetBytes(rawBody, "quality").String()),
+		imageLogValue(gjson.GetBytes(rawBody, "output_format").String()),
+		len(rawBody),
+		len([]rune(styledPrompt)),
+		imageLogPromptPreview(styledPrompt),
+	)
 	imageProxy := h.imageProxy
 	if imageProxy == nil {
 		imageProxy = proxy.NewHandler(h.store, h.db, nil, nil)
 	}
-	responseJSON, _, err := imageProxy.GenerateImageOnceForAdmin(ctx, rawBody, apiKey)
+	responseJSON, upstreamStatus, err := imageProxy.GenerateImageOnceForAdmin(ctx, rawBody, apiKey)
+	if shouldFallbackImageJobToJPEG(req, upstreamStatus, err) {
+		pngErr := err
+		pngStatus := upstreamStatus
+		fallbackReq := jpegFallbackImageJobRequest(req)
+		fallbackBody, buildErr := buildAdminImageGenerationRequest(fallbackReq)
+		if buildErr != nil {
+			durationMs := int(time.Since(start).Milliseconds())
+			log.Printf("[image-studio] job=%d failed duration=%s stage=build_jpeg_fallback error=%s", jobID, imageLogDuration(durationMs), security.SanitizeLog(buildErr.Error()))
+			_ = h.db.MarkImageJobFailed(context.Background(), jobID, buildErr.Error(), durationMs)
+			return
+		}
+		fallbackStyledPrompt := proxy.AppendImageStyleToPrompt(fallbackReq.Prompt, fallbackReq.Style)
+		log.Printf("[image-studio] job=%d png_failed_retrying_jpeg upstream_status=%d error=%s fallback_size=%s fallback_quality=%s fallback_background=%s fallback_prompt_chars=%d fallback_prompt=%q",
+			jobID,
+			pngStatus,
+			security.SanitizeLog(pngErr.Error()),
+			imageLogValue(fallbackReq.Size),
+			imageLogValue(fallbackReq.Quality),
+			imageLogValue(fallbackReq.Background),
+			len([]rune(fallbackStyledPrompt)),
+			imageLogPromptPreview(fallbackStyledPrompt),
+		)
+		responseJSON, upstreamStatus, err = imageProxy.GenerateImageOnceForAdmin(ctx, fallbackBody, apiKey)
+		if err == nil {
+			req = fallbackReq
+			rawBody = fallbackBody
+			if paramsJSON, marshalErr := json.Marshal(fallbackReq); marshalErr == nil {
+				if updateErr := h.db.UpdateImageGenerationJobParamsJSON(context.Background(), jobID, string(paramsJSON)); updateErr != nil {
+					logImageJobError(jobID, updateErr)
+				}
+			}
+			log.Printf("[image-studio] job=%d jpeg_fallback_succeeded original_status=%d upstream_status=%d body_bytes=%d",
+				jobID,
+				pngStatus,
+				upstreamStatus,
+				len(rawBody),
+			)
+		} else {
+			err = fmt.Errorf("PNG 生成失败: %s；自动改用 JPEG 重试仍失败: %w", pngErr.Error(), err)
+		}
+	}
 	durationMs := int(time.Since(start).Milliseconds())
 	if err != nil {
+		log.Printf("[image-studio] job=%d failed duration=%s upstream_status=%d error=%s",
+			jobID,
+			imageLogDuration(durationMs),
+			upstreamStatus,
+			security.SanitizeLog(err.Error()),
+		)
 		_ = h.db.MarkImageJobFailed(context.Background(), jobID, err.Error(), durationMs)
 		return
 	}
+	log.Printf("[image-studio] job=%d upstream completed duration=%s upstream_status=%d response_bytes=%d",
+		jobID,
+		imageLogDuration(durationMs),
+		upstreamStatus,
+		len(responseJSON),
+	)
 
 	assets, err := h.saveImageJobAssets(context.Background(), jobID, req, responseJSON)
 	if err != nil {
+		log.Printf("[image-studio] job=%d failed duration=%s stage=save_assets error=%s", jobID, imageLogDuration(durationMs), security.SanitizeLog(err.Error()))
 		_ = h.db.MarkImageJobFailed(context.Background(), jobID, err.Error(), durationMs)
 		return
 	}
 	if len(assets) == 0 {
+		log.Printf("[image-studio] job=%d failed duration=%s stage=save_assets error=%s", jobID, imageLogDuration(durationMs), "上游未返回图片")
 		_ = h.db.MarkImageJobFailed(context.Background(), jobID, "上游未返回图片", durationMs)
 		return
 	}
 	if err := h.db.MarkImageJobSucceeded(context.Background(), jobID, durationMs); err != nil {
 		logImageJobError(jobID, err)
 	}
+	log.Printf("[image-studio] job=%d succeeded duration=%s assets=%d total_bytes=%d first_size=%s dir=%s",
+		jobID,
+		imageLogDuration(durationMs),
+		len(assets),
+		imageAssetsTotalBytes(assets),
+		imageLogFirstAssetSize(assets),
+		security.SanitizeLog(imageAssetDir()),
+	)
 }
 
 func buildAdminImageGenerationRequest(req imageGenerationJobPayload) ([]byte, error) {
@@ -476,6 +720,59 @@ func buildAdminImageGenerationRequest(req imageGenerationJobPayload) ([]byte, er
 	return json.Marshal(body)
 }
 
+func shouldFallbackImageJobToJPEG(req imageGenerationJobPayload, upstreamStatus int, err error) bool {
+	if err == nil || !isPNGOutputFormat(req.OutputFormat) {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return false
+	}
+	for _, blocked := range []string{
+		"无可用账号",
+		"no available account",
+		"unauthorized",
+		"forbidden",
+		"rate limit",
+		"rate_limited",
+		"quota",
+		"invalid_request",
+		"bad request",
+		"content_policy",
+		"safety",
+		"unsupported_country_region_territory",
+	} {
+		if strings.Contains(message, blocked) {
+			return false
+		}
+	}
+	for _, marker := range []string{
+		"server_error",
+		"processing your request",
+		"image generation failed with http 5",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return upstreamStatus == http.StatusBadGateway ||
+		upstreamStatus == http.StatusInternalServerError ||
+		upstreamStatus == http.StatusGatewayTimeout
+}
+
+func isPNGOutputFormat(outputFormat string) bool {
+	outputFormat = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(outputFormat)), ".")
+	return outputFormat == "" || outputFormat == "png"
+}
+
+func jpegFallbackImageJobRequest(req imageGenerationJobPayload) imageGenerationJobPayload {
+	req.OutputFormat = "jpeg"
+	if strings.EqualFold(strings.TrimSpace(req.Background), "transparent") {
+		req.Background = "opaque"
+	}
+	return req
+}
+
 func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req imageGenerationJobPayload, responseJSON []byte) ([]database.ImageAsset, error) {
 	dir := imageAssetDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -495,6 +792,17 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 		imageBytes, mimeType, format, err := decodeImageDataItem(item)
 		if err != nil {
 			return saved, err
+		}
+		if req.Upscale != "" {
+			upscaledBytes, upscaledMime, ok := h.upscaleImageJobAsset(ctx, jobID, idx+1, imageBytes, req.Upscale)
+			if ok {
+				imageBytes = upscaledBytes
+				mimeType = upscaledMime
+				format = extensionFromMimeType(upscaledMime)
+				if format == "" {
+					format = "png"
+				}
+			}
 		}
 		width, height := imageDimensions(imageBytes)
 		actualSize := ""
@@ -540,9 +848,78 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 		if err != nil {
 			return saved, err
 		}
+		decorateImageAsset(asset)
 		saved = append(saved, *asset)
+		log.Printf("[image-studio] job=%d asset=%d saved file=%s size=%s requested=%s bytes=%d format=%s mime=%s model=%s",
+			jobID,
+			asset.ID,
+			security.SanitizeLog(filepath.Base(asset.Filename)),
+			imageLogValue(asset.ActualSize),
+			imageLogValue(asset.RequestedSize),
+			asset.Bytes,
+			imageLogValue(asset.OutputFormat),
+			imageLogValue(asset.MimeType),
+			imageLogValue(asset.Model),
+		)
 	}
 	return saved, nil
+}
+
+func (h *Handler) upscaleImageJobAsset(ctx context.Context, jobID int64, assetIndex int, imageBytes []byte, scale string) ([]byte, string, bool) {
+	scale = imageproc.NormalizeUpscale(scale)
+	if scale == "" || len(imageBytes) == 0 {
+		return nil, "", false
+	}
+	cache := imageproc.GlobalUpscaleCache()
+	key := imageproc.ComputeUpscaleCacheKey(imageBytes, scale)
+	if data, contentType, ok := cache.Get(key); ok && contentType != "" {
+		return data, contentType, true
+	}
+
+	upscaleCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	if err := cache.Acquire(upscaleCtx); err != nil {
+		log.Printf("[image-studio] job=%d asset_index=%d local_upscale_skipped scale=%s error=%s",
+			jobID,
+			assetIndex,
+			imageLogValue(scale),
+			security.SanitizeLog(err.Error()),
+		)
+		return nil, "", false
+	}
+	defer cache.Release()
+
+	if data, contentType, ok := cache.Get(key); ok && contentType != "" {
+		return data, contentType, true
+	}
+
+	beforeWidth, beforeHeight := imageDimensions(imageBytes)
+	upscaled, contentType, err := imageproc.DoUpscale(imageBytes, scale)
+	if err != nil {
+		log.Printf("[image-studio] job=%d asset_index=%d local_upscale_failed scale=%s error=%s",
+			jobID,
+			assetIndex,
+			imageLogValue(scale),
+			security.SanitizeLog(err.Error()),
+		)
+		return nil, "", false
+	}
+	if contentType == "" {
+		return nil, "", false
+	}
+
+	cache.Put(key, upscaled, contentType)
+	afterWidth, afterHeight := imageDimensions(upscaled)
+	log.Printf("[image-studio] job=%d asset_index=%d local_upscale=%s from=%s to=%s bytes=%d->%d",
+		jobID,
+		assetIndex,
+		imageLogValue(scale),
+		imageLogDimensions(beforeWidth, beforeHeight),
+		imageLogDimensions(afterWidth, afterHeight),
+		len(imageBytes),
+		len(upscaled),
+	)
+	return upscaled, contentType, true
 }
 
 func (h *Handler) resolveImageJobAPIKey(ctx context.Context, id int64) (*database.APIKeyRow, error) {
@@ -643,6 +1020,14 @@ func parsePositiveIDParam(c *gin.Context, name string) (int64, error) {
 	return id, nil
 }
 
+func queryInt(c *gin.Context, name string) int {
+	value, err := strconv.Atoi(strings.TrimSpace(c.Query(name)))
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
 func paginationParams(c *gin.Context, defaultPageSize int) (int, int) {
 	page := 1
 	if raw := c.Query("page"); raw != "" {
@@ -711,8 +1096,76 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func imageLogValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "auto"
+	}
+	return security.SanitizeLog(value)
+}
+
+func imageLogPromptPreview(prompt string) string {
+	prompt = strings.Join(strings.Fields(prompt), " ")
+	runes := []rune(prompt)
+	if len(runes) > 96 {
+		prompt = string(runes[:96]) + "..."
+	}
+	return security.SanitizeLog(prompt)
+}
+
+func imageLogAPIKeyLabel(id int64, name string, masked string) string {
+	if id <= 0 {
+		return "none"
+	}
+	name = strings.TrimSpace(name)
+	if name != "" {
+		return fmt.Sprintf("%d/%s", id, security.SanitizeLog(name))
+	}
+	masked = strings.TrimSpace(masked)
+	if masked != "" {
+		return fmt.Sprintf("%d/%s", id, security.SanitizeLog(masked))
+	}
+	return fmt.Sprintf("%d", id)
+}
+
+func imageLogAPIKeyFromRow(key *database.APIKeyRow) string {
+	id, name, masked := imageJobAPIKeyMeta(key)
+	return imageLogAPIKeyLabel(id, name, masked)
+}
+
+func imageLogDuration(durationMs int) string {
+	if durationMs <= 0 {
+		return "0s"
+	}
+	return (time.Duration(durationMs) * time.Millisecond).String()
+}
+
+func imageAssetsTotalBytes(assets []database.ImageAsset) int {
+	total := 0
+	for _, asset := range assets {
+		total += asset.Bytes
+	}
+	return total
+}
+
+func imageLogFirstAssetSize(assets []database.ImageAsset) string {
+	for _, asset := range assets {
+		if strings.TrimSpace(asset.ActualSize) != "" {
+			return imageLogValue(asset.ActualSize)
+		}
+	}
+	return "unknown"
+}
+
+func imageLogDimensions(width, height int) string {
+	if width <= 0 || height <= 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%dx%d", width, height)
+}
+
 func logImageJobError(jobID int64, err error) {
 	if err != nil {
-		log.Printf("image generation job %d failed to update state: %v", jobID, err)
+		log.Printf("[image-studio] job=%d state_update_failed error=%s", jobID, security.SanitizeLog(err.Error()))
 	}
 }

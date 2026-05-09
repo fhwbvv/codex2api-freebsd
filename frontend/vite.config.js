@@ -27,7 +27,29 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
-    chunkSizeWarningLimit: 1000
+    chunkSizeWarningLimit: 1000,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return
+          if (/[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom|scheduler|clsx|tailwind-merge|class-variance-authority)[\\/]/.test(id)) {
+            return 'react-vendor'
+          }
+          if (/[\\/]node_modules[\\/](i18next|react-i18next)[\\/]/.test(id)) {
+            return 'i18n-vendor'
+          }
+          if (/[\\/]node_modules[\\/](recharts|d3-[^/\\]+|victory-vendor|internmap)[\\/]/.test(id)) {
+            return 'recharts-vendor'
+          }
+          if (/[\\/]node_modules[\\/](radix-ui|@radix-ui)[\\/]/.test(id)) {
+            return 'radix-vendor'
+          }
+          if (/[\\/]node_modules[\\/]lucide-react[\\/]/.test(id)) {
+            return 'lucide-vendor'
+          }
+        },
+      },
+    },
   },
   server: {
     proxy: {

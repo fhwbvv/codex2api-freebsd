@@ -211,6 +211,24 @@ export default function Settings() {
     { label: t('common.disabled'), value: 'false' },
     { label: t('common.enabled'), value: 'true' },
   ]
+  const clientCompatOptions = [
+    { label: t('settings.clientCompatPreserve'), value: 'preserve' },
+    { label: t('settings.clientCompatAuto'), value: 'auto' },
+    { label: t('settings.clientCompatForce'), value: 'force' },
+  ]
+  const usageLogModeOptions = [
+    { label: t('settings.usageLogFull'), value: 'full' },
+    { label: t('settings.usageLogErrors'), value: 'errors' },
+    { label: t('settings.usageLogOff'), value: 'off' },
+  ]
+  const streamFlushPolicyOptions = [
+    { label: t('settings.streamFlushImmediate'), value: 'immediate' },
+    { label: t('settings.streamFlushCoalesce'), value: 'coalesce' },
+  ]
+  const imageStorageBackendOptions = [
+    { label: t('settings.imageStorageLocal'), value: 'local' },
+    { label: t('settings.imageStorageS3'), value: 's3' },
+  ]
   const [settingsForm, setSettingsForm] = useState<SystemSettings>({
     max_concurrency: 2,
     global_rpm: 0,
@@ -249,8 +267,24 @@ export default function Settings() {
     prompt_filter_sensitive_words: '',
     prompt_filter_custom_patterns: '[]',
     prompt_filter_disabled_patterns: '[]',
+    client_compat_mode: 'preserve',
+    codex_min_cli_version: '0.118.0',
+    usage_log_mode: 'full',
+    usage_log_batch_size: 200,
+    usage_log_flush_interval_seconds: 5,
+    stream_flush_policy: 'immediate',
+    stream_flush_interval_ms: 20,
+    image_storage_backend: 'local',
+    image_s3_endpoint: '',
+    image_s3_region: '',
+    image_s3_bucket: '',
+    image_s3_access_key: '',
+    image_s3_secret_key: '',
+    image_s3_prefix: '',
+    image_s3_force_path_style: false,
   })
   const [savingSettings, setSavingSettings] = useState(false)
+  const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
   const [modelItems, setModelItems] = useState<ModelInfo[]>([])
@@ -304,6 +338,26 @@ export default function Settings() {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
       setSavingSettings(false)
+    }
+  }
+
+  const handleTestImageStorage = async () => {
+    setTestingImageStorage(true)
+    try {
+      const result = await api.testImageStorageConnection({
+        endpoint: settingsForm.image_s3_endpoint,
+        region: settingsForm.image_s3_region,
+        bucket: settingsForm.image_s3_bucket,
+        access_key: settingsForm.image_s3_access_key,
+        secret_key: settingsForm.image_s3_secret_key,
+        prefix: settingsForm.image_s3_prefix,
+        force_path_style: settingsForm.image_s3_force_path_style,
+      })
+      showToast(t('settings.imageS3TestSuccess', { bucket: result.bucket }))
+    } catch (error) {
+      showToast(`${t('settings.imageS3TestFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setTestingImageStorage(false)
     }
   }
 
@@ -499,6 +553,143 @@ export default function Settings() {
               </div>
             </SettingsCard>
           </div>
+
+          <SettingsCard title={t('settings.runtimeOptimization')} description={t('settings.runtimeOptimizationDesc')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
+              <SettingField label={t('settings.clientCompatMode')} description={t('settings.clientCompatModeDesc')}>
+                <Select
+                  value={settingsForm.client_compat_mode}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, client_compat_mode: value }))}
+                  options={clientCompatOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.codexMinCliVersion')} description={t('settings.codexMinCliVersionDesc')}>
+                <Input
+                  value={settingsForm.codex_min_cli_version}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_min_cli_version: e.target.value }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.usageLogMode')} description={t('settings.usageLogModeDesc')}>
+                <Select
+                  value={settingsForm.usage_log_mode}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, usage_log_mode: value }))}
+                  options={usageLogModeOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.usageLogBatchSize')} description={t('settings.usageLogBatchSizeDesc')}>
+                <Input
+                  type="number"
+                  min={1}
+                  max={10000}
+                  value={settingsForm.usage_log_batch_size}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_log_batch_size: parseInt(e.target.value) || 200 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.usageLogFlushInterval')} description={t('settings.usageLogFlushIntervalDesc')}>
+                <Input
+                  type="number"
+                  min={1}
+                  max={300}
+                  value={settingsForm.usage_log_flush_interval_seconds}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_log_flush_interval_seconds: parseInt(e.target.value) || 5 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.streamFlushPolicy')} description={t('settings.streamFlushPolicyDesc')}>
+                <Select
+                  value={settingsForm.stream_flush_policy}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, stream_flush_policy: value }))}
+                  options={streamFlushPolicyOptions}
+                />
+              </SettingField>
+              <SettingField label={t('settings.streamFlushInterval')} description={t('settings.streamFlushIntervalDesc')}>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={settingsForm.stream_flush_interval_ms}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: parseInt(e.target.value) || 20 }))}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.imageStorage')} description={t('settings.imageStorageDesc')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-4">
+              <SettingField label={t('settings.imageStorageBackend')} description={t('settings.imageStorageBackendDesc')}>
+                <Select
+                  value={settingsForm.image_storage_backend}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, image_storage_backend: value }))}
+                  options={imageStorageBackendOptions}
+                />
+              </SettingField>
+              {settingsForm.image_storage_backend === 's3' ? (
+                <>
+                  <SettingField label={t('settings.imageS3Endpoint')} description={t('settings.imageS3EndpointDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_endpoint}
+                      placeholder="https://..."
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_endpoint: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3Region')} description={t('settings.imageS3RegionDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_region}
+                      placeholder="auto"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_region: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3Bucket')} description={t('settings.imageS3BucketDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_bucket}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_bucket: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3AccessKey')} description={t('settings.imageS3AccessKeyDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_access_key}
+                      autoComplete="off"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_access_key: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3SecretKey')} description={t('settings.imageS3SecretKeyDesc')}>
+                    <Input
+                      type="password"
+                      value={settingsForm.image_s3_secret_key}
+                      autoComplete="new-password"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_secret_key: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3Prefix')} description={t('settings.imageS3PrefixDesc')}>
+                    <Input
+                      value={settingsForm.image_s3_prefix}
+                      placeholder="codex/images"
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_prefix: e.target.value }))}
+                    />
+                  </SettingField>
+                  <SettingField label={t('settings.imageS3ForcePathStyle')} description={t('settings.imageS3ForcePathStyleDesc')}>
+                    <Select
+                      value={settingsForm.image_s3_force_path_style ? 'true' : 'false'}
+                      onValueChange={(value) => setSettingsForm((f) => ({ ...f, image_s3_force_path_style: value === 'true' }))}
+                      options={booleanOptions}
+                    />
+                  </SettingField>
+                </>
+              ) : null}
+            </div>
+            {settingsForm.image_storage_backend === 's3' ? (
+              <div className="mt-4">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleTestImageStorage()}
+                  disabled={testingImageStorage || !settingsForm.image_s3_bucket || !settingsForm.image_s3_access_key || !settingsForm.image_s3_secret_key}
+                >
+                  {testingImageStorage ? t('settings.imageS3Testing') : t('settings.imageS3Test')}
+                </Button>
+              </div>
+            ) : null}
+          </SettingsCard>
 
           <SettingsCard title={t('settings.autoCleanup')}>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-4">

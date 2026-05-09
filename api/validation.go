@@ -14,6 +14,15 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// responsesMaxOutputTokensCap is the upper bound enforced by the local
+// validator on the /v1/responses max_output_tokens field. The translator
+// strips the field before forwarding to the Codex upstream (which does not
+// accept it), so this cap only guards against obviously-absurd client values
+// — it does not control the actual output length, which is decided upstream.
+// Aligned to 128000 to match the highest cap OpenAI currently advertises on
+// any Codex-served model, so SDKs that default to 100k+ pass through.
+const responsesMaxOutputTokensCap = 128000
+
 // ValidationRule represents a validation rule function
 type ValidationRule func(value gjson.Result, path string) *ValidationError
 
@@ -419,13 +428,25 @@ func ChatCompletionValidationRules() map[string][]ValidationRule {
 	}
 }
 
+// ResponsesMaxOutputTokensForModel returns the local validation cap for
+// max_output_tokens. The cap is intentionally model-agnostic: the translator
+// drops the field before forwarding to Codex, so the real upstream ceiling is
+// enforced server-side. The model argument is kept for API compatibility.
+func ResponsesMaxOutputTokensForModel(_ string) int {
+	return responsesMaxOutputTokensCap
+}
+
 // ResponsesAPIValidationRules returns validation rules for responses API request
 // Note: input can be either a string or an array of items (validated separately)
 func ResponsesAPIValidationRules() map[string][]ValidationRule {
+	return ResponsesAPIValidationRulesForModel("")
+}
+
+func ResponsesAPIValidationRulesForModel(_ string) map[string][]ValidationRule {
 	return map[string][]ValidationRule{
 		"model": {Required(), TypeString(), MaxLength(64)},
 		// input validation is handled separately to support both string and array formats
-		"max_output_tokens": {TypeNumber(), MinValue(1), MaxValue(65536)},
+		"max_output_tokens": {TypeNumber(), MinValue(1), MaxValue(float64(responsesMaxOutputTokensCap))},
 		"temperature":       {TypeNumber(), Range(0, 2)},
 		"top_p":             {TypeNumber(), Range(0, 1)},
 		"stream":            {TypeBoolean()},
@@ -451,7 +472,7 @@ func ValidateChatCompletionsRequest(body []byte, supportedModels []string) *Vali
 
 // ValidateResponsesAPIRequest validates a responses API request with model validation
 func ValidateResponsesAPIRequest(body []byte, supportedModels []string) *ValidationResult {
-	rules := ResponsesAPIValidationRules()
+	rules := ResponsesAPIValidationRulesForModel(gjson.GetBytes(body, "model").String())
 	rules["model"] = append(rules["model"], ModelValidator(supportedModels))
 	validator := NewValidator(body)
 	return validator.ValidateRequest(rules)

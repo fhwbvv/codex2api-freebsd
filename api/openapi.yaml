@@ -70,6 +70,8 @@ components:
                 - rate_limit_reached
                 - server_error
                 - service_unavailable
+                - no_available_account
+                - account_pool_usage_limit_reached
                 - upstream_error
                 - upstream_timeout
                 - resource_not_found
@@ -339,7 +341,12 @@ components:
         max_output_tokens:
           type: integer
           minimum: 1
-          maximum: 65536
+          maximum: 128000
+          description: |
+            Client-side hint for maximum output tokens. The proxy strips this
+            field before forwarding to the Codex upstream (which does not
+            accept it), so the effective ceiling is enforced upstream, not here.
+            The 128000 cap above is a sanity bound for obviously-absurd values.
         temperature:
           type: number
           minimum: 0

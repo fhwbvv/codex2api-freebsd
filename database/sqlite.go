@@ -71,7 +71,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			image_height INTEGER DEFAULT 0,
 			image_bytes INTEGER DEFAULT 0,
 			image_format TEXT DEFAULT '',
-			image_size TEXT DEFAULT ''
+			image_size TEXT DEFAULT '',
+			error_message TEXT DEFAULT ''
 		);`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,10 +107,18 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				auto_clean_error INTEGER DEFAULT 0,
 				auto_clean_expired INTEGER DEFAULT 0,
 				proxy_pool_enabled INTEGER DEFAULT 0,
-			fast_scheduler_enabled INTEGER DEFAULT 0,
+				fast_scheduler_enabled INTEGER DEFAULT 0,
 				max_retries INTEGER DEFAULT 2,
 				max_rate_limit_retries INTEGER DEFAULT 1,
-				allow_remote_migration INTEGER DEFAULT 0
+				allow_remote_migration INTEGER DEFAULT 0,
+				client_compat_mode TEXT DEFAULT 'preserve',
+				codex_min_cli_version TEXT DEFAULT '0.118.0',
+				usage_log_mode TEXT DEFAULT 'full',
+				usage_log_batch_size INTEGER DEFAULT 200,
+				usage_log_flush_interval_seconds INTEGER DEFAULT 5,
+				stream_flush_policy TEXT DEFAULT 'immediate',
+				stream_flush_interval_ms INTEGER DEFAULT 20,
+				image_storage_config TEXT DEFAULT '{}'
 			);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -252,6 +261,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "is_retry_attempt", "INTEGER DEFAULT 0"},
 		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
+		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
@@ -280,6 +290,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_sensitive_words", "TEXT DEFAULT ''"},
 		{"system_settings", "prompt_filter_custom_patterns", "TEXT DEFAULT '[]'"},
 		{"system_settings", "prompt_filter_disabled_patterns", "TEXT DEFAULT '[]'"},
+		{"system_settings", "client_compat_mode", "TEXT DEFAULT 'preserve'"},
+		{"system_settings", "codex_min_cli_version", "TEXT DEFAULT '0.118.0'"},
+		{"system_settings", "usage_log_mode", "TEXT DEFAULT 'full'"},
+		{"system_settings", "usage_log_batch_size", "INTEGER DEFAULT 200"},
+		{"system_settings", "usage_log_flush_interval_seconds", "INTEGER DEFAULT 5"},
+		{"system_settings", "stream_flush_policy", "TEXT DEFAULT 'immediate'"},
+		{"system_settings", "stream_flush_interval_ms", "INTEGER DEFAULT 20"},
+		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"accounts", "enabled", "INTEGER DEFAULT 1"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
 		{"accounts", "image_quota_remaining", "INTEGER NULL"},
@@ -455,7 +473,8 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		outputTokens    int64
 		reasoningTokens int64
 		cachedTokens    int64
-		errors401       int64
+		errors4xx       int64
+		errors5xx       int64
 	}
 
 	result := &ChartAggregation{}
@@ -491,8 +510,11 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		agg.outputTokens += outputTokens
 		agg.reasoningTokens += reasoningTokens
 		agg.cachedTokens += cachedTokens
-		if statusCode == 401 {
-			agg.errors401++
+		if statusCode >= 400 && statusCode < 500 {
+			agg.errors4xx++
+		}
+		if statusCode >= 500 && statusCode < 600 {
+			agg.errors5xx++
 		}
 
 		modelName := "unknown"
@@ -524,7 +546,8 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 			OutputTokens:    agg.outputTokens,
 			ReasoningTokens: agg.reasoningTokens,
 			CachedTokens:    agg.cachedTokens,
-			Errors401:       agg.errors401,
+			Errors4xx:       agg.errors4xx,
+			Errors5xx:       agg.errors5xx,
 		})
 	}
 	if result.Timeline == nil {

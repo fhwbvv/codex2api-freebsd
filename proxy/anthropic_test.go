@@ -129,3 +129,156 @@ func TestTranslateAnthropicToCodexDoesNotCanonicalizeDisabledModelAlias(t *testi
 		t.Fatalf("translated model = %q, want gpt5-4", out.Model)
 	}
 }
+
+func TestSanitizeToolInputJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "drops empty string optional field",
+			in:   `{"file_path":"/etc/hosts","pages":""}`,
+			want: `{"file_path":"/etc/hosts"}`,
+		},
+		{
+			name: "drops null field",
+			in:   `{"file_path":"/etc/hosts","limit":null}`,
+			want: `{"file_path":"/etc/hosts"}`,
+		},
+		{
+			name: "drops multiple empties",
+			in:   `{"file_path":"/x","pages":"","limit":null,"offset":0}`,
+			want: `{"file_path":"/x","offset":0}`,
+		},
+		{
+			name: "preserves empty object",
+			in:   `{"options":{}}`,
+			want: `{"options":{}}`,
+		},
+		{
+			name: "preserves empty array",
+			in:   `{"items":[]}`,
+			want: `{"items":[]}`,
+		},
+		{
+			name: "preserves whitespace strings",
+			in:   `{"sep":" "}`,
+			want: `{"sep":" "}`,
+		},
+		{
+			name: "no-op when nothing to drop",
+			in:   `{"file_path":"/etc/hosts"}`,
+			want: `{"file_path":"/etc/hosts"}`,
+		},
+		{
+			name: "invalid JSON returned as-is",
+			in:   `{"file_path":`,
+			want: `{"file_path":`,
+		},
+		{
+			name: "empty input returned as-is",
+			in:   ``,
+			want: ``,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeToolInputJSON(tc.in)
+			// Compare as JSON to ignore key ordering.
+			if !jsonEqual(t, got, tc.want) {
+				t.Fatalf("sanitizeToolInputJSON(%q) = %q, want equivalent to %q",
+					tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func jsonEqual(t *testing.T, a, b string) bool {
+	t.Helper()
+	if a == b {
+		return true
+	}
+	var av, bv any
+	if err := json.Unmarshal([]byte(a), &av); err != nil {
+		return a == b
+	}
+	if err := json.Unmarshal([]byte(b), &bv); err != nil {
+		return a == b
+	}
+	ab, _ := json.Marshal(av)
+	bb, _ := json.Marshal(bv)
+	return string(ab) == string(bb)
+}
+
+// TestAnthropicStreamTranslator_ToolInputBufferedAndCleaned 模拟 gpt-5.5 把
+// "pages":"" 拆成多片 SSE 推送：translator 应缓冲到 tool_use 块关闭时再
+// 整段清洗，并以单次 input_json_delta 发出，下游收到的 JSON 不含空 pages。
+func TestAnthropicStreamTranslator_ToolInputBufferedAndCleaned(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+
+	// response.created
+	tr.translateEvent([]byte(`{"type":"response.created"}`))
+	// output_item.added — 启动 tool_use 块
+	tr.translateEvent([]byte(`{
+		"type":"response.output_item.added",
+		"output_index":0,
+		"item":{"type":"function_call","call_id":"call_abc","name":"Read"}
+	}`))
+
+	// 三片 function_call_arguments.delta，分别是开头/中段/结尾
+	deltas := []string{
+		`{"file_path":"/etc/hosts"`,
+		`,"pages":""`,
+		`}`,
+	}
+	var streamed []anthropicStreamEvent
+	for _, d := range deltas {
+		evt := []byte(`{"type":"response.function_call_arguments.delta","delta":` +
+			mustJSONString(d) + `}`)
+		streamed = append(streamed, tr.translateEvent(evt)...)
+	}
+
+	// delta 阶段不应该泄漏任何 input_json_delta
+	for _, evt := range streamed {
+		if evt.Type == "content_block_delta" {
+			t.Fatalf("expected no content_block_delta during streaming, got %+v", evt)
+		}
+	}
+
+	// output_item.done 触发 closeCurrentBlock，整段清洗
+	closing := tr.translateEvent([]byte(`{"type":"response.output_item.done"}`))
+
+	var sawDelta bool
+	var sawStop bool
+	for _, evt := range closing {
+		if evt.Type == "content_block_delta" {
+			sawDelta = true
+			if evt.Delta == nil || evt.Delta.Type != "input_json_delta" {
+				t.Fatalf("expected input_json_delta, got %+v", evt.Delta)
+			}
+			want := `{"file_path":"/etc/hosts"}`
+			if !jsonEqual(t, evt.Delta.PartialJSON, want) {
+				t.Fatalf("cleaned tool input = %q, want equivalent to %q",
+					evt.Delta.PartialJSON, want)
+			}
+		}
+		if evt.Type == "content_block_stop" {
+			sawStop = true
+		}
+	}
+	if !sawDelta {
+		t.Fatalf("expected one content_block_delta with cleaned input on close")
+	}
+	if !sawStop {
+		t.Fatalf("expected content_block_stop on close")
+	}
+}
+
+func mustJSONString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}

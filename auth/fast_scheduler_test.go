@@ -57,6 +57,25 @@ func TestFastSchedulerSkipsDispatchPausedAccount(t *testing.T) {
 	}
 }
 
+func TestFastSchedulerSkipsErrorAccount(t *testing.T) {
+	errored := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 2)
+	errored.Status = StatusError
+	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
+
+	scheduler := NewFastScheduler(2)
+	scheduler.Rebuild([]*Account{errored, fallback})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != fallback.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want %d", got.DBID, fallback.DBID)
+	}
+}
+
 func TestFastSchedulerRespectsConcurrencyLimit(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
 

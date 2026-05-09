@@ -75,6 +75,44 @@ func TestValidateResponsesAPIRequestAllowsCompactionInputType(t *testing.T) {
 	}
 }
 
+func TestValidateResponsesAPIRequestMaxOutputTokensCap(t *testing.T) {
+	tests := []struct {
+		name  string
+		body  []byte
+		valid bool
+	}{
+		{
+			name:  "gpt-5.5 allows 128k output tokens",
+			body:  []byte(`{"model":"gpt-5.5","input":"hello","max_output_tokens":128000}`),
+			valid: true,
+		},
+		{
+			name:  "gpt-5.5 rejects above 128k output tokens",
+			body:  []byte(`{"model":"gpt-5.5","input":"hello","max_output_tokens":128001}`),
+			valid: false,
+		},
+		{
+			name:  "other models also allow up to 128k (aligned cap, upstream decides actual ceiling)",
+			body:  []byte(`{"model":"gpt-5.4","input":"hello","max_output_tokens":100000}`),
+			valid: true,
+		},
+		{
+			name:  "other models reject above 128k",
+			body:  []byte(`{"model":"gpt-5.4","input":"hello","max_output_tokens":128001}`),
+			valid: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := ValidateResponsesAPIRequest(test.body, []string{"gpt-5.5", "gpt-5.4"})
+			if result.Valid != test.valid {
+				t.Fatalf("Valid = %v, want %v; errors=%#v", result.Valid, test.valid, result.Errors)
+			}
+		})
+	}
+}
+
 func TestValidateResponsesAPIRequestRejectsUnknownInputType(t *testing.T) {
 	result := ValidateResponsesAPIRequest(
 		[]byte(`{"model":"gpt-5.4","input":[{"type":"unknown_call","call_id":"call_1"}]}`),

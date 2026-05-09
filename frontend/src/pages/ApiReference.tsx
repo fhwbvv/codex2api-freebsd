@@ -571,6 +571,13 @@ export default function ApiReference() {
     "type": "authentication_error"
   }
 }` },
+          { code: 503, body: `{
+  "error": {
+    "message": "无可用账号，请稍后重试",
+    "type": "server_error",
+    "code": "no_available_account"
+  }
+}` },
           { code: 429, body: `{
   "error": {
     "message": "Rate limit exceeded",

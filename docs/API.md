@@ -1329,6 +1329,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 | invalid_request_error | 请求参数错误 | 检查请求体格式 |
 | server_error | 服务器错误 | 查看日志排查问题 |
 | upstream_error | 上游服务错误 | 检查 Codex 服务状态 |
+| no_available_account | 当前无可调度账号 | 稍后重试、启用账号或补充可用账号 |
 | account_pool_usage_limit_reached | 账号池额度耗尽 | 等待冷却或添加新账号 |
 | rate_limit_exceeded | 限流触发 | 降低请求频率 |
 
@@ -1352,9 +1353,23 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 - **Risky**: 固定 1 并发
 - **Banned**: 0 并发，不参与调度
 
-### 429 限流响应
+### 无可调度账号响应
 
-当账号触发限流时，响应包含 `Retry-After` 头：
+当账号池中没有账号可被调度时，接口返回 `503 Service Unavailable`：
+
+```json
+{
+  "error": {
+    "message": "无可用账号，请稍后重试",
+    "type": "server_error",
+    "code": "no_available_account"
+  }
+}
+```
+
+### 账号池额度耗尽响应
+
+当上游返回账号额度耗尽类 `429` 时，系统会对外改写为 `503 Service Unavailable`，并保留 `Retry-After` 头：
 
 ```http
 HTTP/1.1 503 Service Unavailable

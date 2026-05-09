@@ -121,14 +121,30 @@ func expandPreviousResponse(codexBody []byte) ([]byte, string) {
 		return codexBody, ""
 	}
 
+	currentInput := gjson.GetBytes(codexBody, "input")
+
+	// 客户端已经自带 function_call 等续链项时，跳过注入。
+	// 缓存里只会存 function_call 类项（见 cacheCompletedResponse + isCodexToolCallContextType），
+	// 再注入会让同一 call_id 出现两次，上游会以 "duplicate call_id" 等 400 拒绝。
+	// 仍返回 prevID，让 cacheCompletedResponse 能把这一轮响应链入缓存。
+	if currentInput.IsArray() && inputHasToolCallContext(currentInput) {
+		log.Printf("input 已自带工具续链项，跳过 previous_response_id=%s 的历史注入", prevID)
+		return codexBody, prevID
+	}
+
 	cached := getResponseCache(prevID)
 	if cached == nil {
-		// 缓存未命中（首次请求 / 过期 / 其他实例），无法展开，按原样继续
+		// 缓存未命中（首次请求 / 过期 / 其他实例），无法展开，按原样继续。
+		// 若 input 仅含 function_call_output 又拿不到对应的 function_call，
+		// 上游通常会返回 "No tool call found for function call output" 400，
+		// 这里打日志便于诊断（不阻断，让上游错误透传给客户端）。
+		if currentInput.IsArray() && inputHasFunctionCallOutput(currentInput) {
+			log.Printf("缓存未命中且 input 含 function_call_output，previous_response_id=%s，上游可能返回 400", prevID)
+		}
 		return codexBody, prevID
 	}
 
 	// 构建新 input: 缓存的历史 items + 当前 input items
-	currentInput := gjson.GetBytes(codexBody, "input")
 	var merged []json.RawMessage
 	merged = append(merged, cached...)
 	if currentInput.IsArray() {
@@ -147,6 +163,35 @@ func expandPreviousResponse(codexBody []byte) ([]byte, string) {
 	codexBody, _ = sjson.SetRawBytes(codexBody, "input", mergedJSON)
 	log.Printf("已展开 previous_response_id=%s，注入 %d 条历史 items", prevID, len(cached))
 	return codexBody, prevID
+}
+
+// inputHasToolCallContext 判断 input 数组里是否已包含 function_call 类续链项，
+// 这类项一旦同时出现在缓存里会造成 call_id 冲突。
+func inputHasToolCallContext(input gjson.Result) bool {
+	found := false
+	input.ForEach(func(_, v gjson.Result) bool {
+		if isCodexToolCallContextType(v.Get("type").String()) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// inputHasFunctionCallOutput 判断 input 数组里是否含 *_output 项（缺少配对的 function_call 时上游会 400）。
+func inputHasFunctionCallOutput(input gjson.Result) bool {
+	found := false
+	input.ForEach(func(_, v gjson.Result) bool {
+		switch v.Get("type").String() {
+		case "function_call_output", "tool_call_output", "local_shell_call_output",
+			"tool_search_call_output", "custom_tool_call_output", "mcp_tool_call_output":
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // cacheCompletedResponse 从 response.completed 事件中提取 response.id 和 response.output，

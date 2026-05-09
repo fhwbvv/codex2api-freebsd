@@ -7,6 +7,7 @@
 - [部署模式概览](#部署模式概览)
 - [快速开始](#快速开始)
 - [Docker 部署](#docker-部署)
+- [Render 镜像部署](#render-镜像部署)
 - [本地开发](#本地开发)
 - [生产环境配置](#生产环境配置)
 - [升级指南](#升级指南)
@@ -143,6 +144,90 @@ docker compose -f docker-compose.sqlite.local.yml up -d --build
 ```
 
 **注意:** 本地构建模式使用 `build: .` 而非预构建镜像。
+
+---
+
+## Render 镜像部署
+
+Render 可以直接运行 GHCR 中已经构建好的镜像，适合放一个公开 Demo 或轻量测试环境。
+
+当前公开 Demo：
+
+| 项目 | 地址 |
+|------|------|
+| Demo 首页 | [https://codex2api-latest-vu8j.onrender.com](https://codex2api-latest-vu8j.onrender.com) |
+| Demo 密码 | `codex2api` |
+
+> Demo 环境仅用于体验管理后台界面和基础功能，请勿上传真实 Refresh Token、Access Token、API Key 或其他敏感信息。
+
+### 1. 创建 Image-backed Web Service
+
+在 Render Dashboard 中创建 `Web Service`，选择 `Existing Image`，镜像地址填写：
+
+```text
+ghcr.io/james-6-23/codex2api:latest
+```
+
+如果 GHCR Package 不是公开访问，需要先在 Render 的 Registry Credentials 中配置 GitHub Container Registry 凭据。
+
+### 2. 配置环境变量
+
+免费实例没有持久化磁盘，推荐 Demo 使用 SQLite + 内存缓存，并把可写目录放到 `/tmp`：
+
+```env
+CODEX_PORT=10000
+CODEX_BIND=0.0.0.0
+DATABASE_DRIVER=sqlite
+DATABASE_PATH=/tmp/codex2api.db
+CACHE_DRIVER=memory
+IMAGE_ASSET_DIR=/tmp/images
+LOG_DIR=/tmp/logs
+LOG_DISABLED=true
+ADMIN_SECRET=replace-with-a-strong-secret
+CODEX_ALLOW_ANONYMOUS=false
+GIN_MODE=release
+TZ=Asia/Shanghai
+```
+
+Render Web Service 默认会通过 `PORT=10000` 暴露服务；本项目也会读取 `PORT`，但显式设置 `CODEX_PORT=10000` 更直观。
+
+### 3. 配置自动部署最新镜像
+
+Render 的 image-backed 服务不会在 `latest` 标签更新后自动重新部署。需要使用服务 Settings 中的 Deploy Hook：
+
+1. 打开 Render 服务的 `Settings`。
+2. 找到 `Deploy Hook` 并复制 URL。
+3. 到 GitHub 仓库 `Settings` → `Secrets and variables` → `Actions`。
+4. 新增仓库 Secret：
+
+```text
+RENDER_DEPLOY_HOOK_URL=<Render Deploy Hook URL>
+```
+
+之后 `.github/workflows/render-deploy.yml` 会在 `Build Docker Image` 工作流成功后自动请求该 Hook，让 Render 重新拉取 `ghcr.io/james-6-23/codex2api:latest` 并部署。
+
+也可以手动触发镜像构建工作流，镜像推送成功后会自动进入 Render 部署工作流：
+
+```bash
+gh workflow run docker-image.yml
+```
+
+如果只想让 Render 重新拉取当前 `latest` 镜像，也可以单独触发 Render 部署工作流：
+
+```bash
+gh workflow run render-deploy.yml
+```
+
+### 4. 验证
+
+部署完成后访问：
+
+```text
+https://<your-service>.onrender.com/admin/
+https://<your-service>.onrender.com/health
+```
+
+注意：Render 免费实例适合 Demo，不建议承载真实 Token 或生产流量；实例休眠、重启或重新部署后，`/tmp` 中的 SQLite 数据和图库可能丢失。
 
 ---
 

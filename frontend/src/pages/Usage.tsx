@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
-import { getTimeRangeISO } from '../components/DashboardUsageCharts'
-import type { TimeRangeKey } from '../components/DashboardUsageCharts'
+import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
@@ -232,6 +231,42 @@ function ImageUsageBadge({ log }: { log: UsageLog }) {
   )
 }
 
+function StatusCodeBadge({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const badge = (
+    <Badge
+      variant="outline"
+      className={`${usageTableBadgeClass} ${getStatusBadgeClassName(log.status_code)} ${log.status_code !== 200 ? 'cursor-help ring-1 ring-inset ring-current/10' : ''}`}
+    >
+      {log.status_code}
+    </Badge>
+  )
+
+  if (log.status_code === 200) {
+    return badge
+  }
+
+  const message = log.error_message?.trim() || t('usage.statusErrorEmpty')
+  const title = t('usage.statusErrorDetails')
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span tabIndex={0} aria-label={`${log.status_code} ${message}`} className="inline-flex focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          {badge}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="right" sideOffset={8} className="max-w-[360px] rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-50 shadow-xl">
+        <div className="space-y-1.5">
+          <div className="font-semibold text-slate-300">{title}</div>
+          <div className="font-geist-mono text-[11px] tabular-nums text-slate-400">HTTP {log.status_code}</div>
+          <div className="whitespace-pre-wrap break-words leading-relaxed text-slate-50">{message}</div>
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 const usageTableHeadClass = 'text-[12px] font-semibold'
 const usageTableTextClass = 'text-[14px]'
 const usageTableMonoClass = 'font-geist-mono text-[13px] tabular-nums'
@@ -258,7 +293,7 @@ export default function Usage() {
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
-  const showFastFilter = false
+  const showFastFilter = true
   const pageSizeOptions = [10, 20, 50, 100]
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
 
@@ -696,12 +731,7 @@ export default function Usage() {
                       return (
                       <TableRow key={log.id}>
                         <TableCell>
-                          <Badge
-                            variant="outline"
-                            className={`${usageTableBadgeClass} ${getStatusBadgeClassName(log.status_code)}`}
-                          >
-                            {log.status_code}
-                          </Badge>
+                          <StatusCodeBadge log={log} />
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">
@@ -730,7 +760,7 @@ export default function Usage() {
                             {isImageUsageLog(log) && (
                               <ImageUsageBadge log={log} />
                             )}
-                            {log.service_tier === 'fast' && (
+                            {(log.service_tier === 'fast' || log.service_tier === 'priority') && (
                               <Badge
                                 variant="outline"
                                 className="text-[11px] font-semibold gap-0.5 border-transparent bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400"

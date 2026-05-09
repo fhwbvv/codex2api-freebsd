@@ -10,8 +10,24 @@ import (
 
 const premium5hFallbackWindow = 5 * time.Hour
 
+// NormalizePlanType canonicalizes a plan string for behavior-level comparisons.
+// OpenAI reports the $100 Pro tier as "prolite"; functionally it is a Pro plan
+// with a smaller usage cap, so we fold it into "pro" so that downstream plan
+// gating (premium 5h rate-limit, Spark routing, scheduler bias, 429 cooldown
+// window) treats it identically. The raw value is kept in Account.PlanType so
+// the UI can still render "prolite" for operator visibility.
+func NormalizePlanType(plan string) string {
+	normalized := strings.ToLower(strings.TrimSpace(plan))
+	switch normalized {
+	case "prolite", "pro_lite", "pro-lite":
+		return "pro"
+	default:
+		return normalized
+	}
+}
+
 func normalizePlanType(plan string) string {
-	return strings.ToLower(strings.TrimSpace(plan))
+	return NormalizePlanType(plan)
 }
 
 func isPremium5hPlan(plan string) bool {

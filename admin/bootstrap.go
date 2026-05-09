@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
@@ -26,10 +27,10 @@ var bootstrapState struct {
 }
 
 const (
-	bootstrapWindowSec   = 60
-	bootstrapMaxPerWin   = 20
-	bootstrapMinSecret   = 8
-	bootstrapMaxSecret   = 256
+	bootstrapWindowSec = 60
+	bootstrapMaxPerWin = 20
+	bootstrapMinSecret = 8
+	bootstrapMaxSecret = 256
 )
 
 // bootstrapAllowRate 使用 CAS 实现固定窗口限频：
@@ -198,5 +199,12 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		PromptFilterMaxTextLength:        81920,
 		PromptFilterCustomPatterns:       "[]",
 		PromptFilterDisabledPatterns:     "[]",
+		ClientCompatMode:                 proxy.ClientCompatModePreserve,
+		CodexMinCLIVersion:               "0.118.0",
+		UsageLogMode:                     database.UsageLogModeFull,
+		UsageLogBatchSize:                200,
+		UsageLogFlushIntervalSeconds:     5,
+		StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
+		StreamFlushIntervalMS:            20,
 	}
 }

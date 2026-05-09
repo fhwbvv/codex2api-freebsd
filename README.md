@@ -1,18 +1,79 @@
-# Codex2API
+<p align="center">
+  <img src="assets/banner.svg" alt="Codex2API" width="100%">
+</p>
 
-Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管理后台项目，支持：
+<p align="center">
+  <a href="README.md"><img src="https://img.shields.io/badge/Lang-%E4%B8%AD%E6%96%87-red?style=for-the-badge" alt="中文"></a>
+  <a href="README_EN.md"><img src="https://img.shields.io/badge/Lang-English-blue?style=for-the-badge" alt="English"></a>
+  <img src="https://img.shields.io/badge/Go-1.26-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go">
+  <img src="https://img.shields.io/badge/Gin-1.12-00ACD7?style=for-the-badge" alt="Gin">
+  <img src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=111827" alt="React">
+  <img src="https://img.shields.io/badge/Vite-8-646CFF?style=for-the-badge&logo=vite&logoColor=white" alt="Vite">
+  <img src="https://img.shields.io/badge/DB-PostgreSQL%20%7C%20SQLite-4169E1?style=for-the-badge&logo=postgresql&logoColor=white" alt="Database">
+  <img src="https://img.shields.io/badge/Cache-Redis%20%7C%20Memory-DC382D?style=for-the-badge&logo=redis&logoColor=white" alt="Cache">
+  <img src="https://img.shields.io/badge/API-OpenAI%20%7C%20Anthropic-10A37F?style=for-the-badge" alt="API">
+  <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
+</p>
 
-- 标准模式：**PostgreSQL + Redis**
-- 轻量模式：**SQLite + 内存缓存**
+**把 Codex 账号池变成可观测、可调度、可运维的 OpenAI / Anthropic 兼容网关。** Codex2API 不是一个薄转发层，而是一套面向长期运行的 Codex 接入中枢：对外提供 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`、Images 和 Models 等接口，对内维护 Refresh Token / Access Token 账号池、健康度评分、动态并发、限流恢复、用量统计和后台运维。
 
-它对外提供兼容 OpenAI 风格的接口，并在内部维护一套基于 **Refresh Token 账号池** 的调度、刷新、测试、限流恢复、用量观测与后台管理能力。
+它可以跑在完整的 **PostgreSQL + Redis** 生产形态，也可以用 **SQLite + 内存缓存** 单容器轻量部署。你可以把它接到 Codex CLI、Claude Code、OpenAI SDK 或任何兼容客户端上，用一个统一 Base URL 管理多账号、代理池、API Key、Prompt 检查、生图工作台和运行时配置。
+
+<table>
+<tr><td width="210"><b>统一兼容入口</b></td><td>同时覆盖 OpenAI 风格 Chat Completions / Responses / Images、Anthropic Messages、无前缀兼容路由和 Codex 原生 Responses 转发，客户端侧少改配置即可接入。</td></tr>
+<tr><td><b>账号池调度核心</b></td><td>围绕账号状态、健康层级、调度分、动态并发、冷却恢复和近期用量做选择，自动避开不可用账号，减少单账号打满和反复失败。</td></tr>
+<tr><td><b>可视化管理后台</b></td><td>内置 React / Vite 管理台，提供账号导入测试、API Key、代理池、生图、Prompt 检查、用量统计、运维概览、调度看板和系统设置。</td></tr>
+<tr><td><b>两种部署形态</b></td><td>生产环境用 PostgreSQL + Redis，单机测试用 SQLite + Memory；Docker 镜像、源码构建、本地开发和一键交互部署脚本都已准备好。</td></tr>
+</table>
+
+---
+
+## 在线 Demo
+
+- Demo 地址：[https://codex2api-latest-vu8j.onrender.com](https://codex2api-latest-vu8j.onrender.com)
+- Demo 密码：`codex2api`
+
+> Demo 环境仅用于体验管理后台界面和基础功能，请勿上传真实 Refresh Token、Access Token、API Key 或其他敏感信息。
+
+---
+
+## 界面预览
+
+> 以下截图使用演示数据，实际页面会随账号池、请求日志和运行环境变化。
+
+![CodexProxy 仪表盘](docs/screenshots/dashboard.png)
+
+<details>
+<summary>查看更多后台界面</summary>
+
+| 账号管理 | 仪表盘趋势 |
+| --- | --- |
+| ![账号管理](docs/screenshots/accounts.png) | ![仪表盘趋势](docs/screenshots/dashboard-trends.png) |
+
+| 生图工作台 | Prompt 检查 |
+| --- | --- |
+| ![生图工作台](docs/screenshots/image-studio.png) | ![Prompt 检查](docs/screenshots/prompt-filter.png) |
+
+| 系统运维 | 使用统计 |
+| --- | --- |
+| ![系统运维](docs/screenshots/operations.png) | ![使用统计](docs/screenshots/usage.png) |
+
+| 使用文档 | API 文档 |
+| --- | --- |
+| ![使用文档](docs/screenshots/guide.png) | ![API 文档](docs/screenshots/api-reference.png) |
+
+</details>
 
 ---
 
 ## 目录
 
+- [在线 Demo](#在线-demo)
+- [界面预览](#界面预览)
 - [快速部署](#快速部署)
+  - [一键交互部署 (推荐)](#一键交互部署-推荐)
 - [完整文档](#完整文档)
+- [升级与本地开发](#升级与本地开发)
 - [环境配置](#环境配置)
 - [对外接口](#对外接口)
   - [Token 上传与账号管理](#token-上传与账号管理)
@@ -22,12 +83,50 @@ Codex2API 是一个基于 **Go + Gin + React/Vite** 的 Codex 反向代理与管
 - [常见注意事项](#常见注意事项)
 - [免责声明](#免责声明与开源协议)
 - [Star History](#star-history)
+- [友情链接](#友情链接)
 
 ---
 
 ## 快速部署
 
 > 详细部署指南请参考：[DEPLOYMENT.md](docs/DEPLOYMENT.md)
+
+### 一键交互部署 (推荐)
+
+`deploy.sh` 提供 6 步交互式向导，依次询问 **端口 / 监听范围 / 数据库 / 密钥 / 构建方式 / 确认**，自动生成 `.env` 并拉起容器。
+
+**场景 1：尚未克隆仓库（一行远程拉起）**
+
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/codex2api/main/deploy.sh)
+```
+
+脚本会自动检测当前目录是否是 `codex2api` 仓库，若不是则克隆到 `./codex2api`，进入目录后再执行部署。
+
+**场景 2：已经 `git clone` 到本地**
+
+```bash
+git clone https://github.com/james-6-23/codex2api.git
+cd codex2api
+bash deploy.sh
+```
+
+**监听范围选项**
+
+| 选项 | 绑定地址 | 适用场景 |
+| --- | --- | --- |
+| 1) 仅本机访问 | `127.0.0.1` | 服务放在 nginx / Caddy 等反向代理后端，外网无法直接访问端口 |
+| 2) 全部网络 (默认) | `0.0.0.0` | 直接通过服务器 IP 对外暴露，部署完成后会展示本机 / 内网 / 公网地址 |
+
+绑定地址会写入 `.env` 的 `BIND_HOST`，后续可手动修改后 `docker compose up -d` 重启生效。
+
+**可选环境变量**（用于自定义自举行为）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `CODEX2API_REPO_URL` | `https://github.com/james-6-23/codex2api.git` | 克隆使用的仓库地址 |
+| `CODEX2API_REPO_BRANCH` | `main` | 克隆使用的分支 |
+| `CODEX2API_DIR_NAME` | `codex2api` | 克隆到本地的目录名 |
 
 ### 部署模式总览
 
@@ -112,10 +211,11 @@ docker compose -f docker-compose.sqlite.local.yml logs -f codex2api
 | [架构文档](docs/ARCHITECTURE.md) | 系统架构、调度算法、存储设计 | `docs/ARCHITECTURE.md` |
 | [故障排查](docs/TROUBLESHOOTING.md) | 常见问题排查、诊断脚本、解决方案 | `docs/TROUBLESHOOTING.md` |
 | [贡献指南](docs/CONTRIBUTING.md) | 开发规范、PR 流程、代码标准 | `docs/CONTRIBUTING.md` |
+| [English README](README_EN.md) | 英文项目介绍、部署和后台功能概览 | `README_EN.md` |
 
 ---
 
-## 环境配置
+## 升级与本地开发
 
 ```bash
 git pull && docker compose pull && docker compose up -d && docker compose logs -f codex2api
@@ -289,10 +389,16 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 | --- | --- | --- |
 | Dashboard | `/admin/` | 总览指标、请求趋势、延迟趋势、Token 分布、模型排行 |
 | 账号管理 | `/admin/accounts` | 导入、测试、批量处理、调度信息查看 |
+| API 密钥 | `/admin/api-keys` | API Key 创建、查看、删除与调用凭据管理 |
+| 代理管理 | `/admin/proxies` | 代理池维护、账号代理分配与连通性管理 |
+| 生图工作台 | `/admin/images/studio` | 文生图、提示词模板、任务历史和服务器图库 |
+| Prompt 检查 | `/admin/prompt-filter/overview` | Prompt 规则、触发日志、测试和处理模式配置 |
 | 使用统计 | `/admin/usage` | 请求日志、统计卡片、图表、日志清空 |
 | 运维概览 | `/admin/ops` | 运行态监控与系统概览 |
 | 调度看板 | `/admin/ops/scheduler` | 调度健康度、惩罚项和评分拆解 |
 | 系统设置 | `/admin/settings` | 业务运行参数与后台密钥配置 |
+| 使用文档 | `/admin/docs` | Codex CLI / Claude Code 接入示例 |
+| API 文档 | `/admin/api-reference` | OpenAI 风格接口与管理接口参考 |
 
 ---
 
@@ -383,10 +489,10 @@ codex2api/
 ├─ auth/                        # 账号池、调度与 token 管理
 ├─ cache/                       # Redis 缓存封装
 ├─ config/                      # 环境变量加载
-├─ database/                    # PostgreSQL 访问层
+├─ database/                    # 数据库访问层
 ├─ proxy/                       # 对外代理、转发与限流
 └─ frontend/                    # React + Vite 管理后台
-   ├─ src/pages/                # Dashboard / Accounts / Usage / Ops / Settings
+   ├─ src/pages/                # Dashboard / Accounts / API Keys / Proxies / Images / Prompt Filter / Ops / Usage / Settings / Docs
    ├─ src/components/           # UI 组件
    ├─ src/locales/              # 国际化语言文件 (zh/en)
    └─ vite.config.js            # Vite 配置

@@ -883,7 +883,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"}})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
 				return
 			}
 		}
@@ -941,7 +941,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				Stream:            stream,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
@@ -989,6 +990,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			InboundEndpoint:  inboundEndpoint,
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           stream,
+		}
+		if readErr != nil {
+			logInput.ErrorMessage = usageLogErrorMessage(statusCode, []byte(readErr.Error()))
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -1123,15 +1127,26 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
 	)
+	streamWriter := newStreamFlushWriter(c.Writer, flusher)
 	writeEvent := func(eventName string, payload []byte) {
+		var builder strings.Builder
 		if strings.TrimSpace(eventName) != "" {
-			fmt.Fprintf(c.Writer, "event: %s\n", eventName)
+			builder.WriteString("event: ")
+			builder.WriteString(eventName)
+			builder.WriteString("\n")
 		}
-		fmt.Fprintf(c.Writer, "data: %s\n\n", payload)
-		flusher.Flush()
+		builder.WriteString("data: ")
+		builder.Write(payload)
+		builder.WriteString("\n\n")
+		if err := streamWriter.WriteString(builder.String()); err != nil && readErr == nil {
+			readErr = err
+		}
 	}
 
 	err := ReadSSEStream(body, func(data []byte) bool {
+		if readErr != nil {
+			return false
+		}
 		if firstTokenMs == 0 {
 			firstTokenMs = int(time.Since(start).Milliseconds())
 		}
@@ -1202,6 +1217,9 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 	})
 	if err != nil {
 		return usage, imageCount, firstTokenMs, imageLogInfo, err
+	}
+	if readErr == nil {
+		readErr = streamWriter.Flush()
 	}
 	if imageCount == 0 && len(pendingResults) > 0 && readErr == nil {
 		eventName := streamPrefix + ".completed"

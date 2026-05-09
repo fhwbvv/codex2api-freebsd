@@ -158,7 +158,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 			return false
 		}
 		if isProOnlyModel(model) {
-			return strings.EqualFold(strings.TrimSpace(account.GetPlanType()), "pro")
+			return auth.NormalizePlanType(account.GetPlanType()) == "pro"
 		}
 		return true
 	}
@@ -177,6 +177,82 @@ func noAvailableAccountMessage(model string) string {
 		return "无可用 Pro 账号，gpt-5.3-codex-spark 仅支持 Pro 订阅账号"
 	}
 	return "无可用账号，请稍后重试"
+}
+
+func noAvailableAccountError(model string) gin.H {
+	return gin.H{
+		"error": gin.H{
+			"message": noAvailableAccountMessage(model),
+			"type":    ErrorTypeServerError,
+			"code":    ErrorCodeNoAvailableAccount,
+		},
+	}
+}
+
+func usageLogErrorMessage(statusCode int, body []byte) string {
+	if statusCode < 400 {
+		return ""
+	}
+
+	candidates := []string{
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "response.error.message").String(),
+		gjson.GetBytes(body, "response.status_details.error.message").String(),
+		gjson.GetBytes(body, "message").String(),
+	}
+	message := ""
+	for _, candidate := range candidates {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			message = candidate
+			break
+		}
+	}
+
+	codeCandidates := []string{
+		gjson.GetBytes(body, "error.code").String(),
+		gjson.GetBytes(body, "response.error.code").String(),
+		gjson.GetBytes(body, "response.status_details.error.code").String(),
+		gjson.GetBytes(body, "detail.code").String(),
+		gjson.GetBytes(body, "code").String(),
+	}
+	code := ""
+	for _, candidate := range codeCandidates {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			code = candidate
+			break
+		}
+	}
+
+	typeCandidates := []string{
+		gjson.GetBytes(body, "error.type").String(),
+		gjson.GetBytes(body, "response.error.type").String(),
+		gjson.GetBytes(body, "type").String(),
+	}
+	errType := ""
+	for _, candidate := range typeCandidates {
+		if candidate = strings.TrimSpace(candidate); candidate != "" && candidate != "error" {
+			errType = candidate
+			break
+		}
+	}
+
+	if message == "" {
+		raw := strings.TrimSpace(string(body))
+		if raw == "" {
+			return fmt.Sprintf("HTTP %d", statusCode)
+		}
+		message = raw
+	}
+
+	parts := make([]string, 0, 3)
+	if code != "" {
+		parts = append(parts, code)
+	}
+	if errType != "" && errType != code {
+		parts = append(parts, errType)
+	}
+	parts = append(parts, message)
+	return security.SafeTruncate(security.SanitizeLog(strings.Join(parts, " · ")), 600)
 }
 
 func noAvailableAnthropicAccountMessage(model string) string {
@@ -683,7 +759,37 @@ func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries i
 	return false
 }
 
-func upstreamErrorKind(statusCode int, decision codex429Decision) string {
+func IsDeactivatedWorkspaceError(body []byte) bool {
+	for _, path := range []string{"detail.code", "error.code", "code"} {
+		code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, path).String()))
+		if code == "deactivated_workspace" {
+			return true
+		}
+	}
+	return strings.Contains(strings.ToLower(string(body)), "deactivated_workspace")
+}
+
+func upstreamAccountErrorMessage(statusCode int, body []byte) string {
+	if IsDeactivatedWorkspaceError(body) {
+		return fmt.Sprintf("上游返回 %d: deactivated_workspace", statusCode)
+	}
+	message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+	if message == "" {
+		message = strings.TrimSpace(gjson.GetBytes(body, "detail.message").String())
+	}
+	if message == "" {
+		message = strings.TrimSpace(string(body))
+	}
+	if len(message) > 300 {
+		message = message[:300]
+	}
+	if message == "" {
+		message = http.StatusText(statusCode)
+	}
+	return fmt.Sprintf("上游返回 %d: %s", statusCode, message)
+}
+
+func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) string {
 	switch statusCode {
 	case http.StatusTooManyRequests:
 		if decision.Reason != "" {
@@ -693,6 +799,9 @@ func upstreamErrorKind(statusCode int, decision codex429Decision) string {
 	case http.StatusUnauthorized:
 		return "unauthorized"
 	case http.StatusPaymentRequired, http.StatusForbidden:
+		if IsDeactivatedWorkspaceError(body) {
+			return "deactivated_workspace"
+		}
 		return "payment_required"
 	case http.StatusServiceUnavailable, http.StatusInternalServerError, http.StatusBadGateway, http.StatusGatewayTimeout:
 		return "server"
@@ -730,7 +839,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// Validate request
 	validator := api.NewValidator(rawBody)
-	rules := api.ResponsesAPIValidationRules()
+	rules := api.ResponsesAPIValidationRulesForModel(gjson.GetBytes(rawBody, "model").String())
 	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
@@ -793,6 +902,15 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
+	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
+	// defer 兜底确保函数退出时上游被释放。
+	var lastUpstreamCancel context.CancelFunc
+	defer func() {
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+	}()
+
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
@@ -803,9 +921,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
-				})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
 		}
@@ -831,7 +947,16 @@ func (h *Handler) Responses(c *gin.Context) {
 		downstreamHeaders := c.Request.Header.Clone()
 
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
+		// response.completed 拿到 usage（流式计费的关键）。
+		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
+		// 这里覆盖前先 cancel 上一轮（重试时）。
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		lastUpstreamCancel = upstreamCancel
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -885,7 +1010,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -933,13 +1059,17 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
+			streamWriter := newStreamFlushWriter(c.Writer, flusher)
 
+			// clientGone：客户端写失败后置位，后续事件不再写客户端，
+			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
+			clientGone := false
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
 				// TTFT: 记录第一个 output_text.delta 事件的时间
-				if !ttftRecorded && eventType == "response.output_text.delta" {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -966,14 +1096,19 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
-					writeErr = err
-					return false
+				if !clientGone {
+					if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", data)); err != nil {
+						writeErr = err
+						clientGone = true
+					} else {
+						wroteAnyBody = true
+					}
 				}
-				wroteAnyBody = true
-				flusher.Flush()
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
+			if writeErr == nil {
+				writeErr = streamWriter.Flush()
+			}
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
@@ -985,7 +1120,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
 					imageOutputs = append(imageOutputs, imageOutput)
 				}
-				if !ttftRecorded && eventType == "response.output_text.delta" {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -1078,6 +1213,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			Stream:           isStream,
 			ServiceTier:      resolvedServiceTier,
 		}
+		if logStatusCode != http.StatusOK {
+			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
 			logInput.CompletionTokens = usage.CompletionTokens
@@ -1116,7 +1254,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 	// Validate request
 	validator := api.NewValidator(rawBody)
-	rules := api.ResponsesAPIValidationRules()
+	rules := api.ResponsesAPIValidationRulesForModel(gjson.GetBytes(rawBody, "model").String())
 	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
@@ -1190,9 +1328,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
-				})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
 		}
@@ -1261,7 +1397,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -1392,6 +1529,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
+	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
+	// defer 兜底确保函数退出时上游被释放。
+	var lastUpstreamCancel context.CancelFunc
+	defer func() {
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+	}()
+
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
@@ -1402,9 +1548,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
-				})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
 		}
@@ -1430,7 +1574,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		downstreamHeaders := c.Request.Header.Clone()
 
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		// 上游使用与客户端解耦的 context：客户端中途断开时仍能继续读完
+		// response.completed 拿到 usage（流式计费的关键）。
+		// lastUpstreamCancel 在 attempt loop 顶部声明 + defer 兜底，
+		// 这里覆盖前先 cancel 上一轮（重试时）。
+		if lastUpstreamCancel != nil {
+			lastUpstreamCancel()
+		}
+		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+		lastUpstreamCancel = upstreamCancel
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1484,7 +1637,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, decision),
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
 			if shouldRetry {
@@ -1534,13 +1688,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
+			streamWriter := newStreamFlushWriter(c.Writer, flusher)
 
+			// clientGone：客户端写失败后置位，后续事件不再写客户端，
+			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
+			clientGone := false
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				chunk, done := streamTranslator.Translate(data)
 
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
-				if !ttftRecorded && strings.Contains(eventType, ".delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -1559,25 +1717,37 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if chunk != nil {
-					if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", chunk); err != nil {
+				if !clientGone && chunk != nil {
+					if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", chunk)); err != nil {
 						writeErr = err
-						return false
+						clientGone = true
+					} else {
+						wroteAnyBody = true
 					}
-					wroteAnyBody = true
-					flusher.Flush()
 				}
-				if done {
-					if _, err := fmt.Fprintf(c.Writer, "data: [DONE]\n\n"); err != nil {
+				if !clientGone && done {
+					if err := streamWriter.WriteString("data: [DONE]\n\n"); err != nil {
 						writeErr = err
+						clientGone = true
+					} else if err := streamWriter.Flush(); err != nil {
+						writeErr = err
+						clientGone = true
+					} else {
+						wroteAnyBody = true
+					}
+					if !clientGone {
 						return false
 					}
-					wroteAnyBody = true
-					flusher.Flush()
+				}
+				// 客户端断开后，要等到 terminal 事件才退出，确保拿到 usage。
+				if gotTerminal {
 					return false
 				}
 				return true
 			})
+			if writeErr == nil {
+				writeErr = streamWriter.Flush()
+			}
 		} else {
 			var fullContent strings.Builder
 			var toolCalls []ToolCallResult
@@ -1585,7 +1755,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
-				if !ttftRecorded && strings.Contains(eventType, ".delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -1671,6 +1841,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			Stream:           isStream,
 			ServiceTier:      resolvedServiceTier,
 		}
+		if logStatusCode != http.StatusOK {
+			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
 			logInput.CompletionTokens = usage.CompletionTokens
@@ -1712,19 +1885,24 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 		return
 	}
 
+	streamWriter := newStreamFlushWriter(c.Writer, flusher)
 	err := ReadSSEStream(body, func(data []byte) bool {
 		chunk, done := TranslateStreamChunk(data, model, chunkID, created)
 		if chunk != nil {
-			fmt.Fprintf(c.Writer, "data: %s\n\n", chunk)
-			flusher.Flush()
+			if err := streamWriter.WriteString(fmt.Sprintf("data: %s\n\n", chunk)); err != nil {
+				return false
+			}
 		}
 		if done {
-			fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
-			flusher.Flush()
+			if err := streamWriter.WriteString("data: [DONE]\n\n"); err != nil {
+				return false
+			}
+			_ = streamWriter.Flush()
 			return false
 		}
 		return true
 	})
+	_ = streamWriter.Flush()
 
 	if err != nil {
 		log.Printf("读取上游流失败: %v", err)
@@ -1998,6 +2176,9 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 	if store == nil || account == nil {
 		return decision
 	}
+	if details, ok := parseUsageLimitDetails(body); ok {
+		store.ApplyUsageLimitMetadata(account, details.planType, decision.ResetAt)
+	}
 	if decision.Scope == rateLimitScopeModel {
 		cooldown := store.MarkModelCooldown(account, decision.Model, decision.Cooldown, decision.Reason)
 		decision.ResetAt = cooldown.ResetAt
@@ -2051,6 +2232,13 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
 		}
 	case http.StatusPaymentRequired, http.StatusForbidden:
+		if IsDeactivatedWorkspaceError(body) {
+			log.Printf("账号 %d 工作区已停用，标记为错误", account.ID())
+			if h.store != nil {
+				h.store.MarkError(account, upstreamAccountErrorMessage(statusCode, body))
+			}
+			return codex429Decision{}
+		}
 		h.store.MarkCooldown(account, 30*time.Minute, "payment_required")
 	}
 	return codex429Decision{}
@@ -2072,7 +2260,7 @@ func compute429Cooldown(account *auth.Account, body []byte, resp *http.Response)
 	}
 
 	// 2. 没有精确重置时间，根据套餐类型 + 用量窗口推断
-	planType := strings.ToLower(account.GetPlanType())
+	planType := auth.NormalizePlanType(account.GetPlanType())
 
 	switch planType {
 	case "free":

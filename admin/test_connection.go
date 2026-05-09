@@ -378,11 +378,53 @@ func (h *Handler) connectionTestModel(ctx context.Context) string {
 	return "gpt-5.4"
 }
 
-// BatchTest 批量测试所有账号连接
+type batchTestRequest struct {
+	IDs *[]int64 `json:"ids"`
+}
+
+func resolveBatchTestAccounts(store *auth.Store, ids *[]int64) ([]*auth.Account, int) {
+	if store == nil {
+		return nil, 0
+	}
+	if ids == nil {
+		return store.Accounts(), 0
+	}
+
+	accounts := make([]*auth.Account, 0, len(*ids))
+	missing := 0
+	seen := make(map[int64]struct{}, len(*ids))
+	for _, id := range *ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		acc := store.FindByID(id)
+		if acc == nil {
+			missing++
+			continue
+		}
+		accounts = append(accounts, acc)
+	}
+	return accounts, missing
+}
+
+// BatchTest 批量测试账号连接；未传 ids 时测试所有账号，传 ids 时仅测试指定账号。
 // POST /api/admin/accounts/batch-test
 func (h *Handler) BatchTest(c *gin.Context) {
-	accounts := h.store.Accounts()
-	if len(accounts) == 0 {
+	var req batchTestRequest
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			writeError(c, http.StatusBadRequest, "请求格式错误")
+			return
+		}
+	}
+	if req.IDs != nil && len(*req.IDs) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要测试的账号 ID 列表")
+		return
+	}
+
+	accounts, missingCount := resolveBatchTestAccounts(h.store, req.IDs)
+	if len(accounts) == 0 && missingCount == 0 {
 		c.JSON(http.StatusOK, gin.H{"total": 0, "success": 0, "failed": 0, "banned": 0, "rate_limited": 0})
 		return
 	}
@@ -393,7 +435,7 @@ func (h *Handler) BatchTest(c *gin.Context) {
 
 	var (
 		successCount   int64
-		failedCount    int64
+		failedCount    = int64(missingCount)
 		bannedCount    int64
 		rateLimitCount int64
 		wg             sync.WaitGroup
@@ -457,7 +499,7 @@ func (h *Handler) BatchTest(c *gin.Context) {
 	wg.Wait()
 
 	c.JSON(http.StatusOK, gin.H{
-		"total":        len(accounts),
+		"total":        len(accounts) + missingCount,
 		"success":      successCount,
 		"failed":       failedCount,
 		"banned":       bannedCount,
@@ -467,6 +509,9 @@ func (h *Handler) BatchTest(c *gin.Context) {
 
 func shouldMarkBatchTestAccountError(statusCode int, body []byte) bool {
 	msg := strings.ToLower(string(body))
+	if statusCode == http.StatusPaymentRequired && proxy.IsDeactivatedWorkspaceError(body) {
+		return true
+	}
 	if statusCode == http.StatusForbidden {
 		return true
 	}

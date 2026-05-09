@@ -11,6 +11,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"log"
 	"mime"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imageproc"
+	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/internal/signedasset"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
@@ -33,6 +35,9 @@ import (
 const defaultImageAssetDir = "/data/images"
 const maxInlineImageAssetCacheBytes = 64 * 1024 * 1024
 const defaultSignedImageThumbKB = 32
+
+// thumbCache 跨请求复用缩略图。S3 后端读源图代价高，这里用 LRU 兜一下。
+var thumbCache = imagestore.NewThumbnailCache(0)
 
 type imagePromptTemplatePayload struct {
 	Name         *string  `json:"name"`
@@ -362,12 +367,24 @@ func (h *Handler) attachImageJobAssetCachePayload(job *database.ImageGenerationJ
 		if storagePath == "" {
 			continue
 		}
-		info, err := os.Stat(storagePath)
-		if err != nil || info.Size() <= 0 || info.Size() > maxInlineImageAssetCacheBytes {
+		backend, err := imagestore.Resolve(storagePath)
+		if err != nil {
 			continue
 		}
-		data, err := os.ReadFile(storagePath)
-		if err != nil {
+		// 本地后端走 Stat 快速判断尺寸；S3 后端没有便宜的 Stat，直接尝试 Read 并按字节数过滤。
+		if storedBytes := job.Assets[idx].Bytes; storedBytes > 0 && storedBytes > maxInlineImageAssetCacheBytes {
+			continue
+		}
+		if !imagestore.IsS3Ref(storagePath) {
+			info, statErr := os.Stat(storagePath)
+			if statErr != nil || info.Size() <= 0 || info.Size() > maxInlineImageAssetCacheBytes {
+				continue
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		data, err := backend.Read(ctx, storagePath)
+		cancel()
+		if err != nil || len(data) == 0 || len(data) > maxInlineImageAssetCacheBytes {
 			continue
 		}
 		job.Assets[idx].CacheB64JSON = base64.StdEncoding.EncodeToString(data)
@@ -455,8 +472,8 @@ func (h *Handler) serveImageAssetFile(c *gin.Context, asset *database.ImageAsset
 		writeError(c, http.StatusNotFound, "图片文件不存在")
 		return
 	}
-	info, err := os.Stat(asset.StoragePath)
-	if err != nil || info.IsDir() {
+	backend, err := imagestore.Resolve(asset.StoragePath)
+	if err != nil {
 		writeError(c, http.StatusNotFound, "图片文件不存在")
 		return
 	}
@@ -477,8 +494,15 @@ func (h *Handler) serveImageAssetFile(c *gin.Context, asset *database.ImageAsset
 	}
 	filename := sanitizeDownloadFilename(asset.Filename)
 	if opts.thumbKB > 0 && !opts.download {
-		if data, err := os.ReadFile(asset.StoragePath); err == nil {
+		cacheKey := imagestore.ThumbKey(asset.ID, opts.thumbKB)
+		if data, contentType, ok := thumbCache.Get(cacheKey); ok {
+			c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, thumbnailFilename(filename)))
+			c.Data(http.StatusOK, contentType, data)
+			return
+		}
+		if data, err := backend.Read(c.Request.Context(), asset.StoragePath); err == nil {
 			if thumb, contentType, ok := imageproc.MakeThumbnail(data, opts.thumbKB); ok {
+				thumbCache.Put(cacheKey, contentType, thumb)
 				c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, thumbnailFilename(filename)))
 				c.Data(http.StatusOK, contentType, thumb)
 				return
@@ -490,11 +514,34 @@ func (h *Handler) serveImageAssetFile(c *gin.Context, asset *database.ImageAsset
 		c.Header("Content-Type", asset.MimeType)
 	}
 	c.Header("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, filename))
-	c.File(asset.StoragePath)
+
+	rc, size, err := backend.Open(c.Request.Context(), asset.StoragePath)
+	if err != nil {
+		writeError(c, http.StatusNotFound, "图片文件不存在")
+		return
+	}
+	defer rc.Close()
+	contentType := strings.TrimSpace(asset.MimeType)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	if size < 0 {
+		// S3 偶尔不带 Content-Length，退化为 chunked。
+		c.Status(http.StatusOK)
+		_, _ = c.Writer.Write(nil)
+		_, _ = io.Copy(c.Writer, rc)
+		return
+	}
+	c.DataFromReader(http.StatusOK, size, contentType, rc, nil)
 }
 
 func imageAssetPathAllowed(storagePath string) bool {
-	assetPath, err := filepath.Abs(strings.TrimSpace(storagePath))
+	storagePath = strings.TrimSpace(storagePath)
+	if imagestore.IsS3Ref(storagePath) {
+		// S3 ref 不在本地目录约束内，由后端自身保证作用域。
+		return true
+	}
+	assetPath, err := filepath.Abs(storagePath)
 	if err != nil {
 		return false
 	}
@@ -569,7 +616,10 @@ func (h *Handler) DeleteImageAsset(c *gin.Context) {
 		return
 	}
 	if asset.StoragePath != "" {
-		_ = os.Remove(asset.StoragePath)
+		if backend, err := imagestore.Resolve(asset.StoragePath); err == nil {
+			_ = backend.Delete(ctx, asset.StoragePath)
+		}
+		thumbCache.Invalidate(asset.ID)
 	}
 	writeMessage(c, http.StatusOK, "已删除")
 }
@@ -774,9 +824,15 @@ func jpegFallbackImageJobRequest(req imageGenerationJobPayload) imageGenerationJ
 }
 
 func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req imageGenerationJobPayload, responseJSON []byte) ([]database.ImageAsset, error) {
-	dir := imageAssetDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("创建图库目录失败: %w", err)
+	backend, err := imagestore.Primary()
+	if err != nil {
+		return nil, fmt.Errorf("图片存储未初始化: %w", err)
+	}
+	if backend.Name() == imagestore.BackendLocal {
+		// LocalBackend 已在 Configure 时 mkdir，这里再保险一次以兼容 dir 在运行期被外部清理的情况。
+		if err := os.MkdirAll(imageAssetDir(), 0o755); err != nil {
+			return nil, fmt.Errorf("创建图库目录失败: %w", err)
+		}
 	}
 	data := gjson.GetBytes(responseJSON, "data")
 	if !data.IsArray() {
@@ -819,8 +875,8 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 			mimeType = "application/octet-stream"
 		}
 		filename := fmt.Sprintf("%d-%02d-%s.%s", jobID, idx+1, uuid.NewString()[:8], safeImageExtension(format, mimeType))
-		storagePath := filepath.Join(dir, filename)
-		if err := os.WriteFile(storagePath, imageBytes, 0o644); err != nil {
+		storagePath, err := backend.Save(ctx, filename, imageBytes, mimeType)
+		if err != nil {
 			return saved, fmt.Errorf("保存图片失败: %w", err)
 		}
 		input := database.ImageAssetInput{
@@ -841,7 +897,7 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 		}
 		assetID, err := h.db.InsertImageAsset(ctx, input)
 		if err != nil {
-			_ = os.Remove(storagePath)
+			_ = backend.Delete(ctx, storagePath)
 			return saved, err
 		}
 		asset, err := h.db.GetImageAsset(ctx, assetID)

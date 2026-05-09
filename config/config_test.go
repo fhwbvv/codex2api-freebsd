@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	keys := []string{
@@ -299,5 +302,65 @@ func TestLoadReadsRedisTLSSettings(t *testing.T) {
 	}
 	if !cfg.Cache.Redis.InsecureSkipVerify {
 		t.Fatal("Redis.InsecureSkipVerify = false, want true")
+	}
+}
+
+func TestLoadAcceptsValidDatabaseSchema(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("DATABASE_NAME", "postgres")
+	t.Setenv("DATABASE_SCHEMA", "codex2api")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.Database.Schema; got != "codex2api" {
+		t.Fatalf("Database.Schema = %q, want codex2api", got)
+	}
+	dsn := cfg.Database.DSN()
+	if !strings.Contains(dsn, "options='-c search_path=codex2api,public'") {
+		t.Fatalf("DSN 未包含 search_path 选项: %s", dsn)
+	}
+}
+
+func TestLoadRejectsInvalidDatabaseSchema(t *testing.T) {
+	cases := []string{
+		"public; DROP TABLE users",
+		"with space",
+		"1leading-digit",
+		"with-dash",
+		"中文",
+		strings.Repeat("a", 64),
+	}
+	for _, name := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("DATABASE_DRIVER", "")
+			t.Setenv("DATABASE_HOST", "postgres")
+			t.Setenv("DATABASE_SCHEMA", name)
+			t.Setenv("CACHE_DRIVER", "")
+			t.Setenv("REDIS_ADDR", "redis:6379")
+
+			if _, err := Load("__not_exists__.env"); err == nil {
+				t.Fatalf("非法 schema %q 应当被拒绝，但 Load() 通过了", name)
+			}
+		})
+	}
+}
+
+func TestDSNOmitsSchemaWhenEmpty(t *testing.T) {
+	d := DatabaseConfig{
+		Driver:   "postgres",
+		Host:     "h",
+		Port:     5432,
+		User:     "u",
+		Password: "p",
+		DBName:   "db",
+		SSLMode:  "disable",
+	}
+	if got := d.DSN(); strings.Contains(got, "search_path") {
+		t.Fatalf("空 schema 时 DSN 不应包含 search_path: %s", got)
 	}
 }

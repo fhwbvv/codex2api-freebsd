@@ -32,6 +32,28 @@ func TestResolveServiceTier(t *testing.T) {
 	if got := resolveServiceTier("default", "fast"); got != "fast" {
 		t.Fatalf("expected requested fast to win for logging, got %q", got)
 	}
+	// priority 是 fast 的同义词，入库归一化为 fast，便于 UI 徽章/筛选统一识别
+	if got := resolveServiceTier("priority", ""); got != "fast" {
+		t.Fatalf("expected priority to normalize to fast, got %q", got)
+	}
+	if got := resolveServiceTier("", "priority"); got != "fast" {
+		t.Fatalf("expected requested priority to normalize to fast, got %q", got)
+	}
+	if got := resolveServiceTier("priority", "default"); got != "fast" {
+		t.Fatalf("expected actual priority to normalize to fast, got %q", got)
+	}
+	// codex CLI 0.129+ 直接发 service_tier="priority"；上游配额耗尽降级到 default 时，
+	// 也要锁定为 fast，避免 fast 用户的日志被错误归类成 default。
+	if got := resolveServiceTier("default", "priority"); got != "fast" {
+		t.Fatalf("expected requested priority + downgraded default to be fast, got %q", got)
+	}
+	// flex / default 等其它 tier 保持原值
+	if got := resolveServiceTier("flex", ""); got != "flex" {
+		t.Fatalf("expected flex tier to be preserved, got %q", got)
+	}
+	if got := resolveServiceTier("default", ""); got != "default" {
+		t.Fatalf("expected default tier with no requested intent to stay default, got %q", got)
+	}
 }
 
 func TestSanitizeServiceTierForUpstream_FastToPriority(t *testing.T) {

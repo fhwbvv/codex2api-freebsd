@@ -57,6 +57,7 @@ All API errors follow this structure:
 |------|-------------|
 | `server_error` | Internal server error |
 | `service_unavailable` | Service temporarily unavailable |
+| `no_available_account` | No account is currently available for dispatch |
 | `upstream_error` | Error from upstream service |
 | `upstream_timeout` | Request to upstream timed out |
 

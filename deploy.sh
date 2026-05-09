@@ -36,6 +36,12 @@ EOF
   echo ""
 }
 
+# 输入源：兼容 `bash <(curl ...)` / 管道执行场景，强制从终端读取
+_INPUT_FD="/dev/tty"
+if [[ ! -r "$_INPUT_FD" ]]; then
+  _INPUT_FD="/dev/stdin"
+fi
+
 # 读取用户输入，支持默认值
 ask() {
   local prompt="$1" default="$2" varname="$3"
@@ -44,7 +50,7 @@ ask() {
   else
     printf "${BOLD}%s${NC}: " "$prompt"
   fi
-  read -r input
+  read -r input < "$_INPUT_FD"
   eval "$varname=\"${input:-$default}\""
 }
 
@@ -56,7 +62,7 @@ ask_secret() {
   else
     printf "${BOLD}%s${NC} (留空则自动生成): " "$prompt"
   fi
-  read -rs input
+  read -rs input < "$_INPUT_FD"
   echo ""
   eval "$varname=\"${input:-$default}\""
 }
@@ -70,6 +76,61 @@ gen_secret() {
   else
     date +%s%N | sha256sum | head -c 32
   fi
+}
+
+# ---------- 自举：确保位于 codex2api 仓库目录 ----------
+# 触发条件:
+#   1) 通过 `bash <(curl ...)` 远程拉起 (BASH_SOURCE 不是真实文件)
+#   2) 或当前目录缺少必要的 compose / deploy.sh 文件
+# 行为:
+#   - 若已在仓库目录: 直接返回
+#   - 否则: clone 仓库到 ./codex2api，切入并 exec ./deploy.sh
+REPO_URL="${CODEX2API_REPO_URL:-https://github.com/james-6-23/codex2api.git}"
+REPO_BRANCH="${CODEX2API_REPO_BRANCH:-main}"
+REPO_DIR_NAME="${CODEX2API_DIR_NAME:-codex2api}"
+
+is_codex2api_repo() {
+  [[ -f "docker-compose.yml" ]] && [[ -f "deploy.sh" ]] \
+    && grep -q '^name: codex2api' docker-compose.yml 2>/dev/null
+}
+
+bootstrap_repo() {
+  # 已经在仓库目录里：什么都不做
+  if is_codex2api_repo; then
+    success "检测到当前目录为 codex2api 仓库"
+    return 0
+  fi
+
+  warn "当前目录不是 codex2api 仓库，进入自动拉取流程"
+
+  if ! command -v git >/dev/null 2>&1; then
+    error "未找到 git，请先安装 git 后重试"
+  fi
+
+  # 如果同名目录已存在且是仓库，直接复用
+  if [[ -d "$REPO_DIR_NAME/.git" ]]; then
+    info "发现已有目录 $REPO_DIR_NAME，尝试更新到最新代码..."
+    (cd "$REPO_DIR_NAME" && git fetch --depth=1 origin "$REPO_BRANCH" && git reset --hard "origin/$REPO_BRANCH") \
+      || warn "拉取更新失败，将沿用已有代码继续部署"
+  elif [[ -e "$REPO_DIR_NAME" ]]; then
+    error "目录 $REPO_DIR_NAME 已存在但不是 git 仓库，请手动处理后重试"
+  else
+    info "克隆仓库: $REPO_URL ($REPO_BRANCH) → ./$REPO_DIR_NAME"
+    git clone --depth=1 --branch "$REPO_BRANCH" "$REPO_URL" "$REPO_DIR_NAME" \
+      || error "git clone 失败，请检查网络或仓库地址"
+  fi
+
+  cd "$REPO_DIR_NAME" || error "无法进入 $REPO_DIR_NAME 目录"
+
+  if ! is_codex2api_repo; then
+    error "克隆后仍未识别为 codex2api 仓库，请手动检查"
+  fi
+
+  success "已切换到 $(pwd)"
+  info "重新运行 ./deploy.sh 完成部署..."
+  echo ""
+  # exec 掉本进程，避免远程脚本/旧上下文继续运行
+  exec bash ./deploy.sh "$@"
 }
 
 # ---------- 前置检查 ----------
@@ -94,7 +155,7 @@ preflight() {
 # ---------- 第一步：端口 ----------
 step_port() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 1/5 服务端口 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 1/6 服务端口 ━━━${NC}\n"
   ask "服务监听端口" "8080" PORT
 
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
@@ -103,10 +164,37 @@ step_port() {
   success "端口: $PORT"
 }
 
-# ---------- 第二步：数据库模式 ----------
+# ---------- 第二步：监听范围 ----------
+step_bind() {
+  echo ""
+  printf "${BOLD}${CYAN}━━━ 2/6 监听范围 ━━━${NC}\n"
+  echo ""
+  echo "  1) 仅本机访问  — 绑定 127.0.0.1，外部无法访问 (内网/反向代理后端推荐)"
+  echo "  2) 全部网络    — 绑定 0.0.0.0，可通过内网/公网 IP 访问 (默认)"
+  echo ""
+  ask "请选择 (1 或 2)" "2" BIND_CHOICE
+
+  case "$BIND_CHOICE" in
+    1|local|loopback|127*)
+      BIND_HOST="127.0.0.1"
+      BIND_MODE="loopback"
+      success "监听范围: 仅本机 (127.0.0.1)"
+      ;;
+    2|all|public|0*)
+      BIND_HOST="0.0.0.0"
+      BIND_MODE="all"
+      success "监听范围: 全部网络 (0.0.0.0)"
+      ;;
+    *)
+      error "无效选择: $BIND_CHOICE"
+      ;;
+  esac
+}
+
+# ---------- 第三步：数据库模式 ----------
 step_database() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 2/5 数据库模式 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 3/6 数据库模式 ━━━${NC}\n"
   echo ""
   echo "  1) SQLite   — 轻量单文件，适合个人 / 测试"
   echo "  2) PG+Redis — PostgreSQL + Redis，适合生产 / 多并发"
@@ -151,10 +239,10 @@ step_pg_config() {
   ask_secret "Redis 密码 (留空则无密码)" "" REDIS_PASS
 }
 
-# ---------- 第三步：密钥 ----------
+# ---------- 第四步：密钥 ----------
 step_secrets() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 3/5 安全密钥 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 4/6 安全密钥 ━━━${NC}\n"
   echo ""
 
   ask_secret "管理后台密钥 (ADMIN_SECRET)" "" ADMIN_SECRET
@@ -167,10 +255,10 @@ step_secrets() {
   ask "下游 API 密钥 (CODEX_API_KEYS, 多个用逗号分隔, 留空不启用)" "" API_KEYS
 }
 
-# ---------- 第四步：构建方式 ----------
+# ---------- 第五步：构建方式 ----------
 step_build_mode() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 4/5 构建方式 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 5/6 构建方式 ━━━${NC}\n"
   echo ""
   echo "  1) 拉取镜像 — 使用预构建镜像 (ghcr.io)，部署快"
   echo "  2) 本地构建 — 从源码编译，适合自定义修改"
@@ -192,12 +280,17 @@ step_build_mode() {
   esac
 }
 
-# ---------- 第五步：确认 ----------
+# ---------- 第六步：确认 ----------
 step_confirm() {
   echo ""
-  printf "${BOLD}${CYAN}━━━ 5/5 配置确认 ━━━${NC}\n"
+  printf "${BOLD}${CYAN}━━━ 6/6 配置确认 ━━━${NC}\n"
   echo ""
   echo "  端口:       $PORT"
+  if [[ "$BIND_MODE" == "loopback" ]]; then
+    echo "  监听范围:   127.0.0.1 (仅本机访问)"
+  else
+    echo "  监听范围:   0.0.0.0 (全部网络)"
+  fi
   echo "  数据库:     $DB_MODE"
   if [[ "$DB_MODE" == "sqlite" ]]; then
     echo "  数据路径:   $SQLITE_PATH"
@@ -208,7 +301,7 @@ step_confirm() {
     echo "  Redis:      内置容器"
   fi
   echo "  构建方式:   $( [[ "$BUILD_MODE" == "image" ]] && echo "拉取镜像" || echo "本地构建" )"
-  echo "  管理密钥:   ${ADMIN_SECRET:0:6}******"
+  echo "  管理密钥:   ${ADMIN_SECRET}"
   if [[ -n "${API_KEYS:-}" ]]; then
     echo "  API 密钥:   已设置"
   else
@@ -242,6 +335,9 @@ generate_env() {
 # 服务端口
 CODEX_PORT=${PORT}
 
+# 端口绑定地址 (127.0.0.1=仅本机, 0.0.0.0=全部网络)
+BIND_HOST=${BIND_HOST}
+
 # 管理后台密钥
 ADMIN_SECRET=${ADMIN_SECRET}
 
@@ -264,6 +360,9 @@ EOF
 
 # 服务端口
 CODEX_PORT=${PORT}
+
+# 端口绑定地址 (127.0.0.1=仅本机, 0.0.0.0=全部网络)
+BIND_HOST=${BIND_HOST}
 
 # 管理后台密钥
 ADMIN_SECRET=${ADMIN_SECRET}
@@ -341,24 +440,73 @@ deploy() {
   echo ""
   success "部署完成!"
   echo ""
+
+  local PUBLIC_IP="" LAN_IP=""
+
+  if [[ "$BIND_MODE" == "all" ]]; then
+    # 仅在对外开放时才探测/展示对外 IP
+    PUBLIC_IP=$(curl -fsS4 --max-time 3 https://ifconfig.me 2>/dev/null \
+      || curl -fsS4 --max-time 3 https://api.ipify.org 2>/dev/null \
+      || curl -fsS4 --max-time 3 https://ipinfo.io/ip 2>/dev/null \
+      || true)
+    PUBLIC_IP=$(echo "$PUBLIC_IP" | tr -d '[:space:]')
+
+    if command -v hostname >/dev/null 2>&1; then
+      LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+    fi
+    if [[ -z "$LAN_IP" ]] && command -v ip >/dev/null 2>&1; then
+      LAN_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    fi
+    if [[ -z "$LAN_IP" ]] && command -v ifconfig >/dev/null 2>&1; then
+      LAN_IP=$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.' | head -n1)
+    fi
+  fi
+
   echo "  ┌──────────────────────────────────────────┐"
-  echo "  │                                          │"
-  echo "  │  服务地址: http://localhost:${PORT}          "
-  echo "  │  管理后台: http://localhost:${PORT}/admin    "
-  echo "  │  管理密钥: ${ADMIN_SECRET:0:6}******        "
-  echo "  │                                          │"
-  echo "  │  查看日志: $COMPOSE_CMD -f $COMPOSE_FILE logs -f"
-  echo "  │  停止服务: $COMPOSE_CMD -f $COMPOSE_FILE down"
-  echo "  │                                          │"
+  echo "  │  部署信息                                  │"
   echo "  └──────────────────────────────────────────┘"
+  echo ""
+  if [[ "$BIND_MODE" == "loopback" ]]; then
+    echo "  监听范围 : 127.0.0.1 (仅本机访问)"
+    echo ""
+    echo "  本地访问 : http://127.0.0.1:${PORT}"
+    echo "             http://127.0.0.1:${PORT}/admin"
+  else
+    echo "  监听范围 : 0.0.0.0 (全部网络)"
+    echo ""
+    echo "  本地访问 : http://localhost:${PORT}"
+    echo "             http://localhost:${PORT}/admin"
+    if [[ -n "$LAN_IP" ]]; then
+      echo "  内网访问 : http://${LAN_IP}:${PORT}"
+      echo "             http://${LAN_IP}:${PORT}/admin"
+    fi
+    if [[ -n "$PUBLIC_IP" ]]; then
+      echo "  公网访问 : http://${PUBLIC_IP}:${PORT}"
+      echo "             http://${PUBLIC_IP}:${PORT}/admin"
+    fi
+  fi
+  echo ""
+  echo "  管理密钥 : ${ADMIN_SECRET}"
+  echo ""
+  echo "  查看日志 : $COMPOSE_CMD -f $COMPOSE_FILE logs -f"
+  echo "  停止服务 : $COMPOSE_CMD -f $COMPOSE_FILE down"
+  echo ""
+  if [[ "$BIND_MODE" == "all" && -n "$PUBLIC_IP" ]]; then
+    warn "服务对外开放，请确认防火墙/安全组已放行 ${PORT} 端口"
+  fi
+  if [[ "$BIND_MODE" == "loopback" ]]; then
+    info "如需对外暴露，可重新运行 deploy.sh 选择「全部网络」，或在 .env 中将 BIND_HOST 改为 0.0.0.0"
+  fi
   echo ""
 }
 
 # ---------- 主流程 ----------
 main() {
   banner
+  bootstrap_repo "$@"
   preflight
   step_port
+  step_bind
   step_database
   step_secrets
   step_build_mode

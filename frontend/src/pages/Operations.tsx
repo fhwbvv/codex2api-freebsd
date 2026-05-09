@@ -15,6 +15,7 @@ import {
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
+import OpsTabs from '../components/OpsTabs'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import type { OpsOverviewResponse } from '../types'
@@ -66,6 +67,7 @@ export default function Operations() {
             </div>
           }
         />
+        <OpsTabs />
 
         {overview ? (
           <>

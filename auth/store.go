@@ -308,7 +308,7 @@ func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 }
 
 func defaultScoreBiasForPlan(planType string) int64 {
-	switch strings.ToLower(strings.TrimSpace(planType)) {
+	switch NormalizePlanType(planType) {
 	case "pro", "plus", "team":
 		return 50
 	default:
@@ -792,6 +792,24 @@ func (a *Account) GetPlanType() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.PlanType
+}
+
+// applyRefreshedPlanTypeLocked applies a plan parsed from refreshed tokens.
+// Caller must hold a.mu.
+func (a *Account) applyRefreshedPlanTypeLocked(planType string, now time.Time) (string, bool) {
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	if plan == "" {
+		return "", false
+	}
+	if plan != "free" &&
+		strings.EqualFold(a.PlanType, "free") &&
+		a.UsagePercent7dValid &&
+		a.UsagePercent7d >= 100 &&
+		a.Reset7dAt.After(now) {
+		return plan, false
+	}
+	a.PlanType = plan
+	return plan, true
 }
 
 // GetHealthTier 获取当前健康层级
@@ -2044,13 +2062,60 @@ func (s *Store) WaitForSessionAvailable(ctx context.Context, key string, timeout
 	return s.WaitForSessionAvailableWithFilter(ctx, key, timeout, apiKeyID, exclude, nil)
 }
 
+func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) bool {
+	if s == nil {
+		return false
+	}
+
+	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, acc := range s.accounts {
+		if acc == nil {
+			continue
+		}
+		if exclude != nil && exclude[acc.DBID] {
+			continue
+		}
+		if !acc.IsAvailable() {
+			continue
+		}
+		if !acc.AllowsAPIKey(apiKeyID) {
+			continue
+		}
+		if filter != nil && !filter(acc) {
+			continue
+		}
+
+		_, _, _, limit := acc.schedulerSnapshot(maxConcurrency)
+		if limit > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // WaitForSessionAvailableWithFilter waits for an account that satisfies the request-level filter.
 func (s *Store) WaitForSessionAvailableWithFilter(ctx context.Context, key string, timeout time.Duration, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !s.hasDispatchCandidateWithFilter(apiKeyID, exclude, filter) {
+		return nil, ""
+	}
+
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 
 	backoff := 50 * time.Millisecond
 	backoffTimer := time.NewTimer(backoff)
+	if !backoffTimer.Stop() {
+		select {
+		case <-backoffTimer.C:
+		default:
+		}
+	}
 	defer backoffTimer.Stop()
 
 	for {
@@ -2063,6 +2128,9 @@ func (s *Store) WaitForSessionAvailableWithFilter(ctx context.Context, key strin
 			acc, proxyURL := s.NextForSessionWithFilter(key, apiKeyID, exclude, filter)
 			if acc != nil {
 				return acc, proxyURL
+			}
+			if !s.hasDispatchCandidateWithFilter(apiKeyID, exclude, filter) {
+				return nil, ""
 			}
 			// 等待一下再重试（指数退避，最大 500ms）
 			backoffTimer.Reset(backoff)
@@ -2621,6 +2689,45 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 	}
 }
 
+// ApplyUsageLimitMetadata applies metadata returned by Codex usage_limit_reached errors.
+func (s *Store) ApplyUsageLimitMetadata(acc *Account, planType string, resetAt time.Time) {
+	if acc == nil {
+		return
+	}
+
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	now := time.Now()
+	fields := make(map[string]interface{})
+
+	acc.mu.Lock()
+	if plan != "" {
+		acc.PlanType = plan
+		fields["plan_type"] = plan
+	}
+	if plan == "free" && !resetAt.IsZero() && resetAt.After(now) {
+		acc.UsagePercent7d = 100
+		acc.UsagePercent7dValid = true
+		acc.Reset7dAt = resetAt
+		acc.UsageUpdatedAt = now
+		fields["codex_7d_used_percent"] = float64(100)
+		fields["codex_7d_reset_at"] = resetAt.Format(time.RFC3339)
+		fields["codex_usage_updated_at"] = now.Format(time.RFC3339)
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+
+	if s.db == nil || len(fields) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, fields); err != nil {
+		log.Printf("[账号 %d] 持久化 usage_limit 元数据失败: %v", acc.DBID, err)
+	}
+}
+
 // SetUsageProbeFunc 注册主动探针回调
 func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 	s.usageProbeMu.Lock()
@@ -2988,7 +3095,7 @@ func (s *Store) RefreshSingle(ctx context.Context, dbID int64) error {
 	if target == nil {
 		return fmt.Errorf("账号 %d 不存在", dbID)
 	}
-	return s.refreshAccount(ctx, target)
+	return s.refreshAccountForced(ctx, target)
 }
 
 // AccountCount 返回账号数量
@@ -3069,8 +3176,16 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// refreshAccount 刷新单个账号的 AT（带缓存锁与 token 缓存）
 func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
+	return s.refreshAccountWithOptions(ctx, acc, false)
+}
+
+func (s *Store) refreshAccountForced(ctx context.Context, acc *Account) error {
+	return s.refreshAccountWithOptions(ctx, acc, true)
+}
+
+// refreshAccountWithOptions 刷新单个账号的 AT（带缓存锁与 token 缓存）
+func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, forceRefresh bool) error {
 	acc.mu.RLock()
 	rt := acc.RefreshToken
 	st := acc.SessionToken
@@ -3083,8 +3198,12 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	acc.mu.RUnlock()
 
 	// 1. 尝试从缓存读取 AT
-	cachedToken, err := s.tokenCache.GetAccessToken(ctx, dbID)
-	if err == nil && cachedToken != "" {
+	cachedToken := ""
+	var err error
+	if s.tokenCache != nil && !forceRefresh {
+		cachedToken, err = s.tokenCache.GetAccessToken(ctx, dbID)
+	}
+	if cachedToken != "" {
 		acc.mu.Lock()
 		acc.AccessToken = cachedToken
 		if acc.ExpiresAt.IsZero() || time.Until(acc.ExpiresAt) < 5*time.Minute {
@@ -3111,38 +3230,53 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	}
 
 	// 2. 获取刷新锁
-	acquired, lockErr := s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
-	if lockErr != nil {
-		log.Printf("[账号 %d] 获取刷新锁失败: %v", dbID, lockErr)
-	}
-	if !acquired && lockErr == nil {
-		// 另一个进程在刷新，等待它完成
-		token, waitErr := s.tokenCache.WaitForRefreshComplete(ctx, dbID, 30*time.Second)
-		if waitErr == nil && token != "" {
-			acc.mu.Lock()
-			acc.AccessToken = token
-			acc.ExpiresAt = time.Now().Add(55 * time.Minute)
-			if activeCooldown {
-				acc.Status = StatusCooldown
-				acc.CooldownUtil = cooldownUntil
-				acc.CooldownReason = cooldownReason
-			} else {
-				acc.Status = StatusReady
-				acc.CooldownUtil = time.Time{}
-				acc.CooldownReason = ""
-			}
-			acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-			acc.mu.Unlock()
-			s.fastSchedulerUpdate(acc)
-			if expiredCooldown {
-				_ = s.db.ClearCooldown(ctx, dbID)
-			} else if !activeCooldown && s.db != nil {
-				_ = s.db.ClearError(ctx, dbID)
-			}
-			return nil
+	if s.tokenCache != nil {
+		acquired, lockErr := s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
+		if lockErr != nil {
+			log.Printf("[账号 %d] 获取刷新锁失败: %v", dbID, lockErr)
 		}
-	} else if acquired {
-		defer s.tokenCache.ReleaseRefreshLock(ctx, dbID)
+		if !acquired && lockErr == nil {
+			// 另一个进程在刷新，等待它完成
+			token, waitErr := s.tokenCache.WaitForRefreshComplete(ctx, dbID, 30*time.Second)
+			if !forceRefresh && waitErr == nil && token != "" {
+				acc.mu.Lock()
+				acc.AccessToken = token
+				acc.ExpiresAt = time.Now().Add(55 * time.Minute)
+				if activeCooldown {
+					acc.Status = StatusCooldown
+					acc.CooldownUtil = cooldownUntil
+					acc.CooldownReason = cooldownReason
+				} else {
+					acc.Status = StatusReady
+					acc.CooldownUtil = time.Time{}
+					acc.CooldownReason = ""
+				}
+				acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+				acc.mu.Unlock()
+				s.fastSchedulerUpdate(acc)
+				if expiredCooldown && s.db != nil {
+					_ = s.db.ClearCooldown(ctx, dbID)
+				} else if !activeCooldown && s.db != nil {
+					_ = s.db.ClearError(ctx, dbID)
+				}
+				return nil
+			}
+			if forceRefresh {
+				if waitErr != nil {
+					log.Printf("[账号 %d] 等待已有刷新任务完成失败，继续尝试强制刷新: %v", dbID, waitErr)
+				}
+				acquired, lockErr = s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
+				if lockErr != nil {
+					log.Printf("[账号 %d] 获取强制刷新锁失败: %v", dbID, lockErr)
+				}
+				if !acquired && lockErr == nil {
+					return fmt.Errorf("账号 %d 正在刷新，请稍后重试", dbID)
+				}
+			}
+		}
+		if acquired {
+			defer s.tokenCache.ReleaseRefreshLock(ctx, dbID)
+		}
 	}
 
 	// 3. 执行 RT 刷新（Resin 启用时传入 DBID 用于粘性代理）
@@ -3181,6 +3315,8 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	}
 
 	// 4. 更新内存状态
+	appliedPlanType := ""
+	skippedPlanType := ""
 	acc.mu.Lock()
 	acc.AccessToken = td.AccessToken
 	if td.RefreshToken != "" {
@@ -3198,7 +3334,11 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		}
 		// 不用空值覆盖已有的 PlanType，避免 plus 号被误标为 free
 		if info.PlanType != "" {
-			acc.PlanType = info.PlanType
+			if plan, applied := acc.applyRefreshedPlanTypeLocked(info.PlanType, now); applied {
+				appliedPlanType = plan
+			} else {
+				skippedPlanType = plan
+			}
 		} else if acc.PlanType == "" {
 			log.Printf("[账号 %d] 刷新后 plan_type 为空，无法识别套餐类型", dbID)
 		}
@@ -3215,10 +3355,13 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	if skippedPlanType != "" {
+		log.Printf("[账号 %d] 刷新返回 plan_type=%s，但 Codex free 7d 额度仍处于耗尽窗口，保留 plan_type=free", dbID, skippedPlanType)
+	}
 
 	// 5. 写入缓存
 	ttl := time.Until(td.ExpiresAt) - 5*time.Minute
-	if ttl > 0 {
+	if s.tokenCache != nil && ttl > 0 {
 		_ = s.tokenCache.SetAccessToken(ctx, dbID, td.AccessToken, ttl)
 	}
 
@@ -3241,8 +3384,8 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		if info.Email != "" {
 			credentials["email"] = info.Email
 		}
-		if info.PlanType != "" {
-			credentials["plan_type"] = info.PlanType
+		if appliedPlanType != "" {
+			credentials["plan_type"] = appliedPlanType
 		}
 	}
 	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
@@ -3253,12 +3396,11 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	}
 
 	// 自动锁定 free 以上的账号（pro/plus/team/teamplus 等）
-	if info != nil && atomic.LoadInt32(&acc.Locked) == 0 {
-		plan := strings.ToLower(info.PlanType)
-		if plan != "" && plan != "free" {
+	if appliedPlanType != "" && atomic.LoadInt32(&acc.Locked) == 0 {
+		if appliedPlanType != "free" {
 			atomic.StoreInt32(&acc.Locked, 1)
 			_ = s.db.SetAccountLocked(ctx, dbID, true)
-			log.Printf("[账号 %d] 检测到 %s 套餐，已自动锁定", dbID, info.PlanType)
+			log.Printf("[账号 %d] 检测到 %s 套餐，已自动锁定", dbID, appliedPlanType)
 		}
 	}
 

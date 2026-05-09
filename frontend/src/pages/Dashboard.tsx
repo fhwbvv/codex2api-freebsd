@@ -1,9 +1,8 @@
 import type { ReactNode } from 'react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
-import DashboardUsageCharts, { getTimeRangeISO, getBucketConfig } from '../components/DashboardUsageCharts'
-import type { TimeRangeKey } from '../components/DashboardUsageCharts'
+import { getTimeRangeISO, getBucketConfig, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import StatCard from '../components/StatCard'
@@ -12,7 +11,35 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { Card, CardContent } from '@/components/ui/card'
 import { Users, CheckCircle, XCircle, Activity, Zap, Clock, AlertTriangle, BarChart3, Database } from 'lucide-react'
 
+const DashboardUsageCharts = lazy(() => import('../components/DashboardUsageCharts'))
+
 const DASHBOARD_REFRESH_INTERVAL_MS = 15_000
+
+function ChartsSkeleton() {
+  return (
+    <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+      {[0, 1, 2, 3].map((i) => (
+        <Card key={i} className="py-0">
+          <CardContent className="p-6">
+            <div className="mb-5 space-y-2">
+              <div className="h-4 w-32 rounded-md bg-muted animate-pulse" />
+              <div className="h-3 w-48 rounded-md bg-muted/60 animate-pulse" />
+            </div>
+            <div className="h-[280px] flex items-end gap-2 px-4 pb-4">
+              {[40, 65, 30, 80, 55, 70, 45, 60, 35, 75, 50, 68].map((h, j) => (
+                <div
+                  key={j}
+                  className="flex-1 rounded-t-md bg-muted/50 animate-pulse"
+                  style={{ height: `${h}%`, animationDelay: `${j * 80}ms` }}
+                />
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  )
+}
 
 export default function Dashboard() {
   const { t } = useTranslation()
@@ -146,14 +173,16 @@ export default function Dashboard() {
                 </div>
               </CardContent>
             </Card>
-            <DashboardUsageCharts
-              chartData={chartData}
-              refreshedAt={chartRefreshedAt}
-              refreshIntervalMs={DASHBOARD_REFRESH_INTERVAL_MS}
-              timeRange={timeRange}
-              onTimeRangeChange={setTimeRange}
-              loading={chartLoading}
-            />
+            <Suspense fallback={<ChartsSkeleton />}>
+              <DashboardUsageCharts
+                chartData={chartData}
+                refreshedAt={chartRefreshedAt}
+                refreshIntervalMs={DASHBOARD_REFRESH_INTERVAL_MS}
+                timeRange={timeRange}
+                onTimeRangeChange={setTimeRange}
+                loading={chartLoading}
+              />
+            </Suspense>
           </div>
         )}
       </>

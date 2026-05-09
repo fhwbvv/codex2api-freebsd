@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"strconv"
 	"strings"
 	"time"
 
@@ -130,6 +131,14 @@ func parseCredentialExpiresAt(raw string) time.Time {
 	if raw == "" {
 		return time.Time{}
 	}
+
+	if unixSeconds, err := strconv.ParseFloat(raw, 64); err == nil && unixSeconds > 0 {
+		if unixSeconds >= 1e12 {
+			return time.UnixMilli(int64(unixSeconds))
+		}
+		return time.Unix(int64(unixSeconds), 0)
+	}
+
 	for _, layout := range []string{
 		time.RFC3339Nano,
 		time.RFC3339,

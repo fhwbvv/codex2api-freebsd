@@ -17,6 +17,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imagestore"
 	"github.com/gin-gonic/gin"
 )
 
@@ -84,6 +85,9 @@ func TestSaveImageJobAssetsPersistsFilesAndMetadata(t *testing.T) {
 	db := newTestAdminDB(t)
 	dir := t.TempDir()
 	t.Setenv("IMAGE_ASSET_DIR", dir)
+	if err := imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: dir}); err != nil {
+		t.Fatalf("imagestore.Configure: %v", err)
+	}
 	handler := &Handler{db: db}
 
 	jobID, err := db.InsertImageGenerationJob(context.Background(), database.ImageGenerationJobInput{Prompt: "a blue square"})
@@ -152,6 +156,9 @@ func TestImageAssetFileRouteRequiresAdminAuth(t *testing.T) {
 		t.Fatalf("InsertImageGenerationJob 返回错误: %v", err)
 	}
 	dir := t.TempDir()
+	if err := imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: dir}); err != nil {
+		t.Fatalf("imagestore.Configure: %v", err)
+	}
 	pngBytes := tinyPNG(t)
 	path := filepath.Join(dir, "asset.png")
 	if err := os.WriteFile(path, pngBytes, 0o644); err != nil {

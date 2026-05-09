@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -116,6 +117,41 @@ func TestParseImportJSONTokensSupportsSub2API(t *testing.T) {
 
 	if tokens[2].accessToken != "at-default-name" || tokens[2].name != "" {
 		t.Fatalf("third token = %+v, want access token with empty name for default naming", tokens[2])
+	}
+}
+
+func TestParseImportJSONTokensSupportsSub2APINumericExpiresAt(t *testing.T) {
+	data := []byte(`{
+		"accounts": [
+			{
+				"name": "Numeric Expiry",
+				"credentials": {
+					"refresh_token": "rt-numeric",
+					"access_token": "at-numeric",
+					"expires_at": 1779071020
+				}
+			}
+		]
+	}`)
+
+	tokens, err := parseImportJSONTokens(data)
+	if err != nil {
+		t.Fatalf("parseImportJSONTokens returned error: %v", err)
+	}
+
+	if len(tokens) != 1 {
+		t.Fatalf("tokens len = %d, want 1", len(tokens))
+	}
+	if tokens[0].expiresAt != "1779071020" {
+		t.Fatalf("expiresAt = %q, want numeric value preserved", tokens[0].expiresAt)
+	}
+}
+
+func TestParseCredentialExpiresAtSupportsUnixSeconds(t *testing.T) {
+	got := parseCredentialExpiresAt("1779071020").UTC()
+	want := time.Unix(1779071020, 0).UTC()
+	if !got.Equal(want) {
+		t.Fatalf("parseCredentialExpiresAt = %s, want %s", got, want)
 	}
 }
 

@@ -70,6 +70,38 @@ func TestPremium5hRateLimitedSkipsUsageProbeBeforeReset(t *testing.T) {
 	}
 }
 
+func TestNormalizePlanTypeFoldsProliteIntoPro(t *testing.T) {
+	cases := map[string]string{
+		"prolite":   "pro",
+		"ProLite":   "pro",
+		" prolite ": "pro",
+		"pro_lite":  "pro",
+		"pro-lite":  "pro",
+		"pro":       "pro",
+		"plus":      "plus",
+		"free":      "free",
+		"":          "",
+	}
+	for input, want := range cases {
+		if got := NormalizePlanType(input); got != want {
+			t.Errorf("NormalizePlanType(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestProliteIsTreatedAsPremium5hPlan(t *testing.T) {
+	acc := newPremium5hTestAccount("prolite", time.Now().Add(30*time.Minute))
+	if !acc.IsPremium5hPlan() {
+		t.Fatal("prolite should be recognized as a premium 5h plan")
+	}
+	if !IsPlusOrHigherPlan("prolite") {
+		t.Fatal("prolite should qualify as plus-or-higher for image routing")
+	}
+	if got := defaultScoreBiasForPlan("prolite"); got != 50 {
+		t.Fatalf("defaultScoreBiasForPlan(prolite) = %d, want 50", got)
+	}
+}
+
 func TestCleanByRuntimeStatusSkipsPremium5hRateLimitedAccount(t *testing.T) {
 	acc := newPremium5hTestAccount("plus", time.Now().Add(20*time.Minute))
 	store := &Store{

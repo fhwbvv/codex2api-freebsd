@@ -24,6 +24,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
@@ -138,8 +139,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
 	api.GET("/health", h.GetHealth)
 	api.GET("/ops/overview", h.GetOpsOverview)
+	api.GET("/ops/errors", h.GetOpsErrorLogs)
+	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
@@ -287,6 +291,7 @@ type accountResponse struct {
 	Email                    string                     `json:"email"`
 	PlanType                 string                     `json:"plan_type"`
 	Status                   string                     `json:"status"`
+	ErrorMessage             string                     `json:"error_message,omitempty"`
 	ATOnly                   bool                       `json:"at_only"`
 	HealthTier               string                     `json:"health_tier"`
 	SchedulerScore           float64                    `json:"scheduler_score"`
@@ -388,6 +393,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Email:                    row.GetCredential("email"),
 			PlanType:                 row.GetCredential("plan_type"),
 			Status:                   row.Status,
+			ErrorMessage:             row.ErrorMessage,
 			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			ProxyURL:                 row.ProxyURL,
 			Enabled:                  row.Enabled,
@@ -468,6 +474,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 			// 使用运行时状态（优先于 DB 状态）
 			resp.Status = acc.RuntimeStatus()
+			acc.Mu().RLock()
+			resp.ErrorMessage = acc.ErrorMsg
+			acc.Mu().RUnlock()
 		} else if row.CooldownUntil.Valid && row.CooldownUntil.Time.After(time.Now()) {
 			resp.CooldownReason = row.CooldownReason
 			resp.CooldownUntil = row.CooldownUntil.Time.Format(time.RFC3339)
@@ -1056,17 +1065,17 @@ type importToken struct {
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
-	RefreshToken      string `json:"refresh_token"`
-	SessionToken      string `json:"session_token"`
-	SessionTokenCamel string `json:"sessionToken"`
-	AccessToken       string `json:"access_token"`
-	IDToken           string `json:"id_token"`
-	AccountID         string `json:"account_id"`
-	Email             string `json:"email"`
-	Name              string `json:"name"`
-	PlanType          string `json:"plan_type"`
-	Expired           string `json:"expired"`
-	ExpiresAt         string `json:"expires_at"`
+	RefreshToken      string                 `json:"refresh_token"`
+	SessionToken      string                 `json:"session_token"`
+	SessionTokenCamel string                 `json:"sessionToken"`
+	AccessToken       string                 `json:"access_token"`
+	IDToken           string                 `json:"id_token"`
+	AccountID         string                 `json:"account_id"`
+	Email             string                 `json:"email"`
+	Name              string                 `json:"name"`
+	PlanType          string                 `json:"plan_type"`
+	Expired           importJSONScalarString `json:"expired"`
+	ExpiresAt         importJSONScalarString `json:"expires_at"`
 }
 
 type sub2apiImportPayload struct {
@@ -1079,16 +1088,45 @@ type sub2apiAccountEntry struct {
 }
 
 type sub2apiAccountCredentials struct {
-	RefreshToken      string `json:"refresh_token"`
-	SessionToken      string `json:"session_token"`
-	SessionTokenCamel string `json:"sessionToken"`
-	AccessToken       string `json:"access_token"`
-	IDToken           string `json:"id_token"`
-	AccountID         string `json:"account_id"`
-	Email             string `json:"email"`
-	PlanType          string `json:"plan_type"`
-	ExpiresAt         string `json:"expires_at"`
-	Expired           string `json:"expired"`
+	RefreshToken      string                 `json:"refresh_token"`
+	SessionToken      string                 `json:"session_token"`
+	SessionTokenCamel string                 `json:"sessionToken"`
+	AccessToken       string                 `json:"access_token"`
+	IDToken           string                 `json:"id_token"`
+	AccountID         string                 `json:"account_id"`
+	Email             string                 `json:"email"`
+	PlanType          string                 `json:"plan_type"`
+	ExpiresAt         importJSONScalarString `json:"expires_at"`
+	Expired           importJSONScalarString `json:"expired"`
+}
+
+type importJSONScalarString string
+
+func (v *importJSONScalarString) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+
+	var raw interface{}
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+
+	switch value := raw.(type) {
+	case string:
+		*v = importJSONScalarString(strings.TrimSpace(value))
+	case json.Number:
+		*v = importJSONScalarString(value.String())
+	case bool:
+		*v = importJSONScalarString(strconv.FormatBool(value))
+	default:
+		*v = ""
+	}
+
+	return nil
+}
+
+func (v importJSONScalarString) String() string {
+	return strings.TrimSpace(string(v))
 }
 
 var utf8BOM = []byte{0xef, 0xbb, 0xbf}
@@ -1148,7 +1186,7 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 				idToken:      strings.TrimSpace(entry.IDToken),
 				accountID:    strings.TrimSpace(entry.AccountID),
 				planType:     strings.TrimSpace(entry.PlanType),
-				expiresAt:    firstNonEmpty(entry.ExpiresAt, entry.Expired),
+				expiresAt:    firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
 			})
 		}
 	}
@@ -1183,7 +1221,7 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 				idToken:      strings.TrimSpace(account.Credentials.IDToken),
 				accountID:    strings.TrimSpace(account.Credentials.AccountID),
 				planType:     strings.TrimSpace(account.Credentials.PlanType),
-				expiresAt:    firstNonEmpty(account.Credentials.ExpiresAt, account.Credentials.Expired),
+				expiresAt:    firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
 			})
 		}
 	}
@@ -1934,6 +1972,140 @@ func (h *Handler) GetChartData(c *gin.Context) {
 	c.JSON(http.StatusOK, result)
 }
 
+func parseOpsErrorPositiveInt64(c *gin.Context, name string) (*int64, bool) {
+	raw := strings.TrimSpace(c.Query(name))
+	if raw == "" {
+		return nil, true
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || parsed <= 0 {
+		writeError(c, http.StatusBadRequest, fmt.Sprintf("%s 参数无效，需要正整数", name))
+		return nil, false
+	}
+	return &parsed, true
+}
+
+func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogFilter, bool) {
+	endTime := time.Now()
+	startTime := endTime.Add(-1 * time.Hour)
+	startStr := strings.TrimSpace(c.Query("start"))
+	endStr := strings.TrimSpace(c.Query("end"))
+	if startStr != "" || endStr != "" {
+		if startStr == "" || endStr == "" {
+			writeError(c, http.StatusBadRequest, "start/end 参数需要同时提供")
+			return database.UsageLogFilter{}, false
+		}
+		parsedStart, e1 := time.Parse(time.RFC3339, startStr)
+		parsedEnd, e2 := time.Parse(time.RFC3339, endStr)
+		if e1 != nil || e2 != nil {
+			writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+			return database.UsageLogFilter{}, false
+		}
+		startTime = parsedStart
+		endTime = parsedEnd
+	}
+
+	apiKeyID, ok := parseOpsErrorPositiveInt64(c, "api_key_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+	accountID, ok := parseOpsErrorPositiveInt64(c, "account_id")
+	if !ok {
+		return database.UsageLogFilter{}, false
+	}
+
+	filter := database.UsageLogFilter{
+		Start:           startTime,
+		End:             endTime,
+		Page:            1,
+		PageSize:        20,
+		Email:           strings.TrimSpace(c.Query("email")),
+		Model:           strings.TrimSpace(c.Query("model")),
+		Endpoint:        strings.TrimSpace(c.Query("endpoint")),
+		APIKeyID:        apiKeyID,
+		AccountID:       accountID,
+		ErrorOnly:       true,
+		IncludeCanceled: true,
+		ErrorKind:       strings.TrimSpace(c.Query("error_kind")),
+		Query:           strings.TrimSpace(c.Query("q")),
+	}
+
+	status := strings.TrimSpace(c.Query("status"))
+	if status == "" {
+		status = strings.TrimSpace(c.Query("status_code"))
+	}
+	switch strings.ToLower(status) {
+	case "", "all":
+	case "4xx", "5xx":
+		filter.StatusFamily = strings.ToLower(status)
+	default:
+		statusCode, err := strconv.Atoi(status)
+		if err != nil || statusCode < 100 || statusCode > 599 {
+			writeError(c, http.StatusBadRequest, "status/status_code 参数无效")
+			return database.UsageLogFilter{}, false
+		}
+		filter.StatusCode = statusCode
+	}
+
+	if fastStr := c.Query("fast"); fastStr != "" {
+		v := fastStr == "true"
+		filter.FastOnly = &v
+	}
+	if streamStr := c.Query("stream"); streamStr != "" {
+		v := streamStr == "true"
+		filter.StreamOnly = &v
+	}
+
+	if withPaging {
+		if pageStr := c.Query("page"); pageStr != "" {
+			if page, err := strconv.Atoi(pageStr); err == nil && page > 0 {
+				filter.Page = page
+			}
+		}
+		if ps := c.Query("page_size"); ps != "" {
+			if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 200 {
+				filter.PageSize = n
+			}
+		}
+	}
+
+	return filter, true
+}
+
+// GetOpsErrorLogs 获取运维错误日志
+func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, true)
+	if !ok {
+		return
+	}
+	result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+// GetOpsErrorSummary 获取运维错误日志概览
+func (h *Handler) GetOpsErrorSummary(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, false)
+	if !ok {
+		return
+	}
+	result, err := h.db.GetUsageErrorSummary(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
 // GetUsageLogs 获取使用日志
 func (h *Handler) GetUsageLogs(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
@@ -2190,6 +2362,21 @@ type settingsResponse struct {
 	PromptFilterSensitiveWords       string `json:"prompt_filter_sensitive_words"`
 	PromptFilterCustomPatterns       string `json:"prompt_filter_custom_patterns"`
 	PromptFilterDisabledPatterns     string `json:"prompt_filter_disabled_patterns"`
+	ClientCompatMode                 string `json:"client_compat_mode"`
+	CodexMinCLIVersion               string `json:"codex_min_cli_version"`
+	UsageLogMode                     string `json:"usage_log_mode"`
+	UsageLogBatchSize                int    `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds     int    `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                string `json:"stream_flush_policy"`
+	StreamFlushIntervalMS            int    `json:"stream_flush_interval_ms"`
+	ImageStorageBackend              string `json:"image_storage_backend"`
+	ImageS3Endpoint                  string `json:"image_s3_endpoint"`
+	ImageS3Region                    string `json:"image_s3_region"`
+	ImageS3Bucket                    string `json:"image_s3_bucket"`
+	ImageS3AccessKey                 string `json:"image_s3_access_key"`
+	ImageS3SecretKey                 string `json:"image_s3_secret_key"`
+	ImageS3Prefix                    string `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle            bool   `json:"image_s3_force_path_style"`
 }
 
 type updateSettingsReq struct {
@@ -2226,6 +2413,21 @@ type updateSettingsReq struct {
 	PromptFilterSensitiveWords       *string `json:"prompt_filter_sensitive_words"`
 	PromptFilterCustomPatterns       *string `json:"prompt_filter_custom_patterns"`
 	PromptFilterDisabledPatterns     *string `json:"prompt_filter_disabled_patterns"`
+	ClientCompatMode                 *string `json:"client_compat_mode"`
+	CodexMinCLIVersion               *string `json:"codex_min_cli_version"`
+	UsageLogMode                     *string `json:"usage_log_mode"`
+	UsageLogBatchSize                *int    `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds     *int    `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                *string `json:"stream_flush_policy"`
+	StreamFlushIntervalMS            *int    `json:"stream_flush_interval_ms"`
+	ImageStorageBackend              *string `json:"image_storage_backend"`
+	ImageS3Endpoint                  *string `json:"image_s3_endpoint"`
+	ImageS3Region                    *string `json:"image_s3_region"`
+	ImageS3Bucket                    *string `json:"image_s3_bucket"`
+	ImageS3AccessKey                 *string `json:"image_s3_access_key"`
+	ImageS3SecretKey                 *string `json:"image_s3_secret_key"`
+	ImageS3Prefix                    *string `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle            *bool   `json:"image_s3_force_path_style"`
 }
 
 // GetSettings 获取当前系统设置
@@ -2244,6 +2446,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinPlatformName = dbSettings.ResinPlatformName
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
+	runtimeCfg := proxy.CurrentRuntimeSettings()
+	imgCfg := imagestore.CurrentConfig()
+	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
 	c.JSON(http.StatusOK, settingsResponse{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
@@ -2283,6 +2488,21 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
 		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
 		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		ClientCompatMode:                 runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:               runtimeCfg.CodexMinCLIVersion,
+		UsageLogMode:                     h.db.GetUsageLogMode(),
+		UsageLogBatchSize:                h.db.GetUsageLogBatchSize(),
+		UsageLogFlushIntervalSeconds:     h.db.GetUsageLogFlushIntervalSeconds(),
+		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		ImageStorageBackend:              imgCfg.Backend,
+		ImageS3Endpoint:                  imgCfg.Endpoint,
+		ImageS3Region:                    imgCfg.Region,
+		ImageS3Bucket:                    imgCfg.Bucket,
+		ImageS3AccessKey:                 imgCfg.AccessKey,
+		ImageS3SecretKey:                 imgCfg.SecretKey,
+		ImageS3Prefix:                    imgPrefix,
+		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
 	})
 }
 
@@ -2307,6 +2527,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
+	runtimeCfg := proxy.CurrentRuntimeSettings()
+	usageLogMode := h.db.GetUsageLogMode()
+	usageLogBatchSize := h.db.GetUsageLogBatchSize()
+	usageLogFlushIntervalSeconds := h.db.GetUsageLogFlushIntervalSeconds()
 
 	if req.MaxConcurrency != nil {
 		v := *req.MaxConcurrency
@@ -2496,6 +2720,47 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: model_mapping")
 	}
 
+	if req.ClientCompatMode != nil {
+		runtimeCfg.ClientCompatMode = proxy.NormalizeClientCompatMode(*req.ClientCompatMode)
+		log.Printf("设置已更新: client_compat_mode = %s", runtimeCfg.ClientCompatMode)
+	}
+	if req.CodexMinCLIVersion != nil {
+		runtimeCfg.CodexMinCLIVersion = strings.TrimSpace(*req.CodexMinCLIVersion)
+		log.Printf("设置已更新: codex_min_cli_version = %s", runtimeCfg.CodexMinCLIVersion)
+	}
+	if req.StreamFlushPolicy != nil {
+		runtimeCfg.StreamFlushPolicy = proxy.NormalizeStreamFlushPolicy(*req.StreamFlushPolicy)
+		log.Printf("设置已更新: stream_flush_policy = %s", runtimeCfg.StreamFlushPolicy)
+	}
+	if req.StreamFlushIntervalMS != nil {
+		runtimeCfg.StreamFlushIntervalMS = *req.StreamFlushIntervalMS
+		log.Printf("设置已更新: stream_flush_interval_ms = %d", runtimeCfg.StreamFlushIntervalMS)
+	}
+	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
+
+	usageLogChanged := false
+	if req.UsageLogMode != nil {
+		usageLogMode = database.NormalizeUsageLogMode(*req.UsageLogMode)
+		usageLogChanged = true
+		log.Printf("设置已更新: usage_log_mode = %s", usageLogMode)
+	}
+	if req.UsageLogBatchSize != nil {
+		usageLogBatchSize = database.NormalizeUsageLogBatchSize(*req.UsageLogBatchSize)
+		usageLogChanged = true
+		log.Printf("设置已更新: usage_log_batch_size = %d", usageLogBatchSize)
+	}
+	if req.UsageLogFlushIntervalSeconds != nil {
+		usageLogFlushIntervalSeconds = database.NormalizeUsageLogFlushIntervalSeconds(*req.UsageLogFlushIntervalSeconds)
+		usageLogChanged = true
+		log.Printf("设置已更新: usage_log_flush_interval_seconds = %d", usageLogFlushIntervalSeconds)
+	}
+	if usageLogChanged {
+		h.db.SetUsageLogConfig(usageLogMode, usageLogBatchSize, usageLogFlushIntervalSeconds)
+		usageLogMode = h.db.GetUsageLogMode()
+		usageLogBatchSize = h.db.GetUsageLogBatchSize()
+		usageLogFlushIntervalSeconds = h.db.GetUsageLogFlushIntervalSeconds()
+	}
+
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	promptFilterChanged := false
 	if req.PromptFilterEnabled != nil {
@@ -2583,6 +2848,57 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
+	// 图片存储后端配置
+	imgCfg := imagestore.CurrentConfig()
+	imgChanged := false
+	if req.ImageStorageBackend != nil {
+		imgCfg.Backend = *req.ImageStorageBackend
+		imgChanged = true
+	}
+	if req.ImageS3Endpoint != nil {
+		imgCfg.Endpoint = *req.ImageS3Endpoint
+		imgChanged = true
+	}
+	if req.ImageS3Region != nil {
+		imgCfg.Region = *req.ImageS3Region
+		imgChanged = true
+	}
+	if req.ImageS3Bucket != nil {
+		imgCfg.Bucket = *req.ImageS3Bucket
+		imgChanged = true
+	}
+	if req.ImageS3AccessKey != nil {
+		imgCfg.AccessKey = *req.ImageS3AccessKey
+		imgChanged = true
+	}
+	if req.ImageS3SecretKey != nil {
+		imgCfg.SecretKey = *req.ImageS3SecretKey
+		imgChanged = true
+	}
+	if req.ImageS3Prefix != nil {
+		imgCfg.Prefix = *req.ImageS3Prefix
+		imgChanged = true
+	}
+	if req.ImageS3ForcePathStyle != nil {
+		imgCfg.ForcePathStyle = *req.ImageS3ForcePathStyle
+		imgChanged = true
+	}
+	imgCfg.LocalDir = imageAssetDir()
+	if imgChanged {
+		if err := imagestore.Configure(imgCfg); err != nil {
+			writeError(c, http.StatusBadRequest, "图片存储配置无效: "+err.Error())
+			return
+		}
+		// Configure 内部 Normalize 过，重新读出来用于持久化
+		imgCfg = imagestore.CurrentConfig()
+		log.Printf("设置已更新: image_storage_backend = %s", imgCfg.Backend)
+	}
+	imgConfigJSON, encodeErr := imagestore.EncodeConfigJSON(imgCfg)
+	if encodeErr != nil {
+		log.Printf("图片存储配置序列化失败: %v", encodeErr)
+		imgConfigJSON = "{}"
+	}
+
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
@@ -2618,6 +2934,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
 		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
 		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		ClientCompatMode:                 runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:               runtimeCfg.CodexMinCLIVersion,
+		UsageLogMode:                     usageLogMode,
+		UsageLogBatchSize:                usageLogBatchSize,
+		UsageLogFlushIntervalSeconds:     usageLogFlushIntervalSeconds,
+		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		ImageStorageConfig:               imgConfigJSON,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -2676,7 +3000,68 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterSensitiveWords:       promptFilterCfg.SensitiveWords,
 		PromptFilterCustomPatterns:       promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
 		PromptFilterDisabledPatterns:     promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		ClientCompatMode:                 runtimeCfg.ClientCompatMode,
+		CodexMinCLIVersion:               runtimeCfg.CodexMinCLIVersion,
+		UsageLogMode:                     usageLogMode,
+		UsageLogBatchSize:                usageLogBatchSize,
+		UsageLogFlushIntervalSeconds:     usageLogFlushIntervalSeconds,
+		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
+		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		ImageStorageBackend:              imgCfg.Backend,
+		ImageS3Endpoint:                  imgCfg.Endpoint,
+		ImageS3Region:                    imgCfg.Region,
+		ImageS3Bucket:                    imgCfg.Bucket,
+		ImageS3AccessKey:                 imgCfg.AccessKey,
+		ImageS3SecretKey:                 imgCfg.SecretKey,
+		ImageS3Prefix:                    strings.TrimSuffix(imgCfg.Prefix, "/"),
+		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
 	})
+}
+
+type testImageStorageReq struct {
+	Endpoint       string `json:"endpoint"`
+	Region         string `json:"region"`
+	Bucket         string `json:"bucket"`
+	AccessKey      string `json:"access_key"`
+	SecretKey      string `json:"secret_key"`
+	Prefix         string `json:"prefix"`
+	ForcePathStyle bool   `json:"force_path_style"`
+}
+
+// TestImageStorageConnection 用提交的字段临时构造一次 S3Backend，调用 HeadBucket 验证可达性。
+// 不修改任何持久化状态，便于"保存前先点测试连接"。
+func (h *Handler) TestImageStorageConnection(c *gin.Context) {
+	var req testImageStorageReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	cfg := imagestore.Config{
+		Backend:        imagestore.BackendS3,
+		Endpoint:       req.Endpoint,
+		Region:         req.Region,
+		Bucket:         req.Bucket,
+		AccessKey:      req.AccessKey,
+		SecretKey:      req.SecretKey,
+		Prefix:         req.Prefix,
+		ForcePathStyle: req.ForcePathStyle,
+	}.Normalize()
+	if err := cfg.Validate(); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	backend, err := imagestore.NewS3Backend(cfg)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := backend.HeadBucket(ctx); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "bucket": cfg.Bucket})
 }
 
 // ==================== 导出 & 迁移 ====================

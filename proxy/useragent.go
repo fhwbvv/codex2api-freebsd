@@ -12,9 +12,9 @@ import (
 //   {originator}/{version} ({OS} {OS_version}; {arch}) {terminal}
 //
 // 示例：
-//   codex_cli_rs/0.125.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464
-//   codex_cli_rs/0.125.0 (Mac OS 15.1.0; arm64) Ghostty/1.2.3
-//   codex_cli_rs/0.125.0 (Windows 10.0.26120; x86_64) WindowsTerminal
+//   codex_cli_rs/0.128.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464
+//   codex_cli_rs/0.128.0 (Mac OS 15.1.0; arm64) Ghostty/1.2.3
+//   codex_cli_rs/0.128.0 (Windows 10.0.26120; x86_64) WindowsTerminal
 
 // ClientProfile 表示一个模拟客户端的完整身份
 type ClientProfile struct {
@@ -23,7 +23,7 @@ type ClientProfile struct {
 }
 
 const (
-	latestCodexCLIVersion         = "0.125.0"
+	latestCodexCLIVersion         = "0.128.0"
 	latestCodexCLIUserAgentPrefix = "codex_cli_rs/" + latestCodexCLIVersion
 )
 
@@ -36,11 +36,16 @@ var codexOfficialClientUserAgentPrefixes = []string{
 	"codex_exec/",
 	"codex_sdk_ts/",
 	"codex ",
+	"opencode/",
 }
 
+// Third-party CLIs that ChatGPT-backend Codex accepts as first-party originators.
+// opencode advertises itself via Originator: "opencode" and reaching upstream with
+// that identity is required for features like reasoning_effort=xhigh to take effect.
 var codexOfficialClientOriginatorPrefixes = []string{
 	"codex_",
 	"codex ",
+	"opencode",
 }
 
 func IsCodexOfficialClientByHeaders(userAgent, originator string) bool {

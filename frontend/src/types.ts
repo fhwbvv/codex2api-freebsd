@@ -28,6 +28,7 @@ export interface AccountRow {
   email: string
   plan_type: string
   status: AccountStatus
+  error_message?: string
   at_only?: boolean
   health_tier?: string
   scheduler_score?: number
@@ -242,6 +243,21 @@ export interface SystemSettings {
   prompt_filter_sensitive_words: string
   prompt_filter_custom_patterns: string
   prompt_filter_disabled_patterns: string
+  client_compat_mode: 'preserve' | 'auto' | 'force' | string
+  codex_min_cli_version: string
+  usage_log_mode: 'full' | 'errors' | 'off' | string
+  usage_log_batch_size: number
+  usage_log_flush_interval_seconds: number
+  stream_flush_policy: 'immediate' | 'coalesce' | string
+  stream_flush_interval_ms: number
+  image_storage_backend: 'local' | 's3' | string
+  image_s3_endpoint: string
+  image_s3_region: string
+  image_s3_bucket: string
+  image_s3_access_key: string
+  image_s3_secret_key: string
+  image_s3_prefix: string
+  image_s3_force_path_style: boolean
 }
 
 export interface PromptFilterMatch {
@@ -412,6 +428,10 @@ export interface UsageLog {
   output_price_per_mtoken: number
   cache_read_price_per_mtoken: number
   rate_multiplier: number
+  is_retry_attempt: boolean
+  attempt_index: number
+  upstream_error_kind: string
+  error_message: string
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>
@@ -419,6 +439,18 @@ export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>
 export interface UsageLogsPagedResponse {
   logs: UsageLog[]
   total: number
+}
+
+export interface OpsErrorSummary {
+  total_errors: number
+  status_4xx: number
+  status_5xx: number
+  unauthorized: number
+  rate_limited: number
+  canceled: number
+  timeouts: number
+  retry_attempts: number
+  avg_duration_ms: number
 }
 
 export interface ChartTimelinePoint {
@@ -429,7 +461,8 @@ export interface ChartTimelinePoint {
   output_tokens: number
   reasoning_tokens: number
   cached_tokens: number
-  errors_401: number
+  errors_4xx: number
+  errors_5xx: number
 }
 
 export interface ChartModelPoint {

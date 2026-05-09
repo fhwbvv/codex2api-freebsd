@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Link } from 'react-router-dom'
-import { ArrowLeft, RefreshCw } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 import { api } from '../api'
+import OpsTabs from '../components/OpsTabs'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
@@ -158,12 +158,6 @@ export default function SchedulerBoard() {
           description={t('scheduler.description')}
           actions={
             <div className="flex items-center gap-3 max-sm:w-full max-sm:flex-col max-sm:items-stretch">
-              <Button variant="outline" asChild>
-                <Link to="/ops">
-                  <ArrowLeft className="size-3.5" />
-                  {t('nav.ops')}
-                </Link>
-              </Button>
               <span className="text-sm text-muted-foreground max-sm:text-center">{t('scheduler.lastUpdated', { time: updatedLabel })}</span>
               <Button variant="outline" onClick={() => void reload()}>
                 <RefreshCw className="size-3.5" />
@@ -172,6 +166,7 @@ export default function SchedulerBoard() {
             </div>
           }
         />
+        <OpsTabs />
 
         {overview ? (
           <>

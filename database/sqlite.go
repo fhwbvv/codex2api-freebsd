@@ -78,7 +78,25 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT DEFAULT '',
 			key TEXT NOT NULL UNIQUE,
+			quota_limit REAL DEFAULT 0,
+			quota_used REAL DEFAULT 0,
+			allowed_group_ids TEXT DEFAULT '[]',
+			expires_at TIMESTAMP NULL,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS account_groups (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT UNIQUE NOT NULL,
+			description TEXT DEFAULT '',
+			color TEXT DEFAULT '',
+			sort_order INTEGER DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS account_group_members (
+			account_id INTEGER NOT NULL,
+			group_id INTEGER NOT NULL,
+			PRIMARY KEY (account_id, group_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS account_model_cooldowns (
 			account_id INTEGER NOT NULL,
@@ -90,6 +108,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		);`,
 		`CREATE TABLE IF NOT EXISTS system_settings (
 					id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+					site_name TEXT DEFAULT 'CodexProxy',
+					site_logo TEXT DEFAULT '',
 					max_concurrency INTEGER DEFAULT 2,
 				global_rpm INTEGER DEFAULT 0,
 				test_model TEXT DEFAULT 'gpt-5.4',
@@ -235,6 +255,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "cooldown_until", "TIMESTAMP NULL"},
 		{"accounts", "score_bias_override", "INTEGER NULL"},
 		{"accounts", "base_concurrency_override", "INTEGER NULL"},
+		{"accounts", "tags", "TEXT DEFAULT '[]'"},
 		{"accounts", "deleted_at", "TIMESTAMP NULL"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},
@@ -262,6 +283,17 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
 		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
+		{"api_keys", "quota_limit", "REAL DEFAULT 0"},
+		{"api_keys", "quota_used", "REAL DEFAULT 0"},
+		{"api_keys", "allowed_group_ids", "TEXT DEFAULT '[]'"},
+		{"api_keys", "expires_at", "TIMESTAMP NULL"},
+		{"account_groups", "description", "TEXT DEFAULT ''"},
+		{"account_groups", "color", "TEXT DEFAULT ''"},
+		{"account_groups", "sort_order", "INTEGER DEFAULT 0"},
+		{"account_groups", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
+		{"account_groups", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
+		{"system_settings", "site_name", "TEXT DEFAULT 'CodexProxy'"},
+		{"system_settings", "site_logo", "TEXT DEFAULT ''"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
@@ -323,6 +355,9 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_group_members_group ON account_group_members(group_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_group_members_account ON account_group_members(account_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_events_type_created ON account_events(event_type, created_at);`,
@@ -668,7 +703,7 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 
 	rows, err := db.conn.QueryContext(ctx, `
 			SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
-			       cached_tokens, duration_ms, status_code, account_billed, user_billed
+			       cached_tokens, first_token_ms, duration_ms, status_code, account_billed, user_billed
 			FROM usage_logs
 			WHERE created_at >= $1 AND status_code <> 499
 		`, db.timeArg(todayStart))
@@ -680,15 +715,18 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	stats := &UsageStats{}
 	var todayErrors int64
 	var totalDuration float64
+	var totalFirstTokenMs float64
+	var totalFirstTokenSamples int64
+	var todayCacheHitRequests int64
 
 	for rows.Next() {
 		var createdRaw interface{}
 		var totalTokens, promptTokens, completionTokens, cachedTokens int64
-		var durationMs int
+		var firstTokenMs, durationMs int
 		var statusCode int
 		var accountBilled, userBilled float64
 		if err := rows.Scan(&createdRaw, &totalTokens, &promptTokens, &completionTokens,
-			&cachedTokens, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
+			&cachedTokens, &firstTokenMs, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
 			return nil, err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
@@ -701,9 +739,17 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 		stats.TotalPrompt += promptTokens
 		stats.TotalCompletion += completionTokens
 		stats.TotalCachedTokens += cachedTokens
+		stats.TodayCachedTokens += cachedTokens
 		stats.TodayAccountBilled += accountBilled
 		stats.TodayUserBilled += userBilled
 		totalDuration += float64(durationMs)
+		if firstTokenMs > 0 {
+			totalFirstTokenMs += float64(firstTokenMs)
+			totalFirstTokenSamples++
+		}
+		if cachedTokens > 0 {
+			todayCacheHitRequests++
+		}
 
 		if statusCode >= 400 {
 			todayErrors++
@@ -721,32 +767,66 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context) (*UsageStats, error) {
 	if stats.TodayRequests > 0 {
 		stats.AvgDurationMs = totalDuration / float64(stats.TodayRequests)
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
+		stats.TodayCacheRate = float64(todayCacheHitRequests) / float64(stats.TodayRequests) * 100
+	}
+	if totalFirstTokenSamples > 0 {
+		stats.AvgFirstTokenMs = totalFirstTokenMs / float64(totalFirstTokenSamples)
 	}
 
 	// 可见请求总数（排除 499）
-	var visibleTotal int64
+	var visibleTotal, visibleCacheHitRequests, visibleFirstTokenSamples int64
+	var currentTokens, currentPrompt, currentCompletion, currentCached int64
+	var currentFirstTokenMsSum float64
 	var currentAccountBilled, currentUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(account_billed), 0), COALESCE(SUM(user_billed), 0)
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(prompt_tokens), 0),
+			COALESCE(SUM(completion_tokens), 0),
+			COALESCE(SUM(cached_tokens), 0),
+			COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(account_billed), 0),
+			COALESCE(SUM(user_billed), 0)
 		FROM usage_logs
 		WHERE status_code <> 499
-	`).Scan(&visibleTotal, &currentAccountBilled, &currentUserBilled)
+	`).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
 
 	// 基线值
-	var bReq, bTok, bPrompt, bComp, bCached int64
+	var bReq, bTok, bPrompt, bComp, bCached, bCacheHitRequests, bFirstTokenSamples int64
+	var bFirstTokenMsSum float64
 	var bAccountBilled, bUserBilled float64
 	_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, account_billed, user_billed
+		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
 		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bAccountBilled, &bUserBilled)
+	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bCacheHitRequests, &bFirstTokenMsSum, &bFirstTokenSamples, &bAccountBilled, &bUserBilled)
 
 	stats.TotalRequests = visibleTotal + bReq
-	stats.TotalTokens = stats.TodayTokens + bTok
-	stats.TotalPrompt += bPrompt
-	stats.TotalCompletion += bComp
-	stats.TotalCachedTokens += bCached
+	stats.TotalTokens = currentTokens + bTok
+	stats.TotalPrompt = currentPrompt + bPrompt
+	stats.TotalCompletion = currentCompletion + bComp
+	stats.TotalCachedTokens = currentCached + bCached
 	stats.TotalAccountBilled = currentAccountBilled + bAccountBilled
 	stats.TotalUserBilled = currentUserBilled + bUserBilled
+	if stats.TotalRequests > 0 {
+		stats.TotalCacheRate = float64(visibleCacheHitRequests+bCacheHitRequests) / float64(stats.TotalRequests) * 100
+	}
+	if visibleFirstTokenSamples+bFirstTokenSamples > 0 {
+		stats.AvgFirstTokenMs = (currentFirstTokenMsSum + bFirstTokenMsSum) / float64(visibleFirstTokenSamples+bFirstTokenSamples)
+	}
+	if stats.TotalRequests > 0 {
+		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
+		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
+	}
+	stats.ModelStats, err = db.getUsageModelStats(ctx, 10)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.populateUsageBreakdownStats(ctx, stats); err != nil {
+		return nil, err
+	}
 
 	return stats, nil
 }

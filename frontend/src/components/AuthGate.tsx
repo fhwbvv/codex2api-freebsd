@@ -2,7 +2,7 @@ import type { PropsWithChildren } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { ADMIN_AUTH_REQUIRED_EVENT, getAdminKey, setAdminKey } from '../api'
-import logoImg from '../assets/logo.png'
+import { DEFAULT_SITE_LOGO, useBranding } from '../branding'
 
 type AuthStatus = 'checking' | 'need_bootstrap' | 'need_login' | 'authenticated'
 
@@ -54,6 +54,8 @@ export default function AuthGate({ children }: PropsWithChildren) {
   const { t, i18n } = useTranslation()
   const lang = (i18n.language || 'zh').startsWith('zh') ? 'zh' : 'en'
   const copy = COPY[lang]
+  const { siteName, siteLogo } = useBranding()
+  const logoSrc = siteLogo || DEFAULT_SITE_LOGO
 
   const [status, setStatus] = useState<AuthStatus>('checking')
   const [inputKey, setInputKey] = useState('')
@@ -206,8 +208,8 @@ export default function AuthGate({ children }: PropsWithChildren) {
       <div className="flex items-center justify-center min-h-dvh bg-background">
         <div className="w-full max-w-[460px] mx-4">
           <div className="text-center mb-6">
-            <img src={logoImg} alt="Codex2API" className="size-14 rounded-lg object-cover shadow-sm mx-auto mb-4" />
-            <h1 className="text-[26px] font-bold text-foreground">Codex2API</h1>
+            <img src={logoSrc} alt={siteName} className="size-14 rounded-lg object-cover shadow-sm mx-auto mb-4" />
+            <h1 className="text-[26px] font-bold text-foreground">{siteName}</h1>
             <p className="mt-1 text-sm text-muted-foreground">{copy.bootstrapSubtitle}</p>
           </div>
 
@@ -261,8 +263,8 @@ export default function AuthGate({ children }: PropsWithChildren) {
       <div className="flex items-center justify-center min-h-dvh bg-background">
         <div className="w-full max-w-[400px] mx-4">
           <div className="text-center mb-6">
-            <img src={logoImg} alt="Codex2API" className="size-14 rounded-lg object-cover shadow-sm mx-auto mb-4" />
-            <h1 className="text-[26px] font-bold text-foreground">Codex2API</h1>
+            <img src={logoSrc} alt={siteName} className="size-14 rounded-lg object-cover shadow-sm mx-auto mb-4" />
+            <h1 className="text-[26px] font-bold text-foreground">{siteName}</h1>
             <p className="text-sm text-muted-foreground mt-1">{copy.loginSubtitle}</p>
           </div>
 

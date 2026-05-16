@@ -301,10 +301,10 @@ export default function DashboardUsageCharts({
 
           <ChartCard title={t('dashboard.modelRanking')} description={t('dashboard.modelRankingDesc')}>
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={displayData.modelData} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 0 }}>
+              <BarChart data={displayData.modelData} layout="vertical" margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
                 <CartesianGrid horizontal={false} stroke={gridColor} strokeDasharray="4 4" />
                 <XAxis type="number" tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} allowDecimals={false} />
-                <YAxis dataKey="shortModel" type="category" width={128} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} />
+                <YAxis dataKey="shortModel" type="category" width={80} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} />
                 <Tooltip
                   position={{ y: 10 }}
                   formatter={(value) => formatNumber(value)}

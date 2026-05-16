@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
@@ -142,6 +144,164 @@ func TestRefreshAccountReturnsRefreshFailure(t *testing.T) {
 	}
 	if got := payload["error"]; got != "刷新失败: upstream unavailable" {
 		t.Fatalf("error = %q, want %q", got, "刷新失败: upstream unavailable")
+	}
+}
+
+func TestCreateAPIKeyPersistsQuotaAndExpiration(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	handler := &Handler{db: db}
+	body := `{"name":"Client A","key":"sk-test-client-a-1234567890","quota_limit":0.25,"expires_in_days":7}`
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/keys", strings.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.CreateAPIKey(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload createAPIKeyResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.ID <= 0 || payload.QuotaLimit != 0.25 || payload.ExpiresAt == nil {
+		t.Fatalf("payload = %#v, want quota and expiration", payload)
+	}
+
+	row, err := db.GetAPIKeyByValue(context.Background(), "sk-test-client-a-1234567890")
+	if err != nil {
+		t.Fatalf("GetAPIKeyByValue 返回错误: %v", err)
+	}
+	if row.QuotaLimit != 0.25 || !row.ExpiresAt.Valid {
+		t.Fatalf("row = %#v, want quota and expiration", row)
+	}
+}
+
+func TestUpdateAPIKeyPreservesOmittedFieldsAndUpdatesLimits(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	expiresAt := sql.NullTime{Time: time.Now().AddDate(0, 0, 3), Valid: true}
+	id, err := db.InsertAPIKeyWithOptions(context.Background(), database.APIKeyInput{
+		Name:       "Client A",
+		Key:        "sk-test-update-client-1234567890",
+		QuotaLimit: 0.25,
+		ExpiresAt:  expiresAt,
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions 返回错误: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/api/admin/keys/1", strings.NewReader(`{"name":"Client B"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAPIKey(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAPIKeyByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID 返回错误: %v", err)
+	}
+	if row.Name != "Client B" || row.QuotaLimit != 0.25 || !row.ExpiresAt.Valid {
+		t.Fatalf("row = %#v, want renamed with quota/expiration preserved", row)
+	}
+
+	recorder = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, "/api/admin/keys/1", strings.NewReader(`{"quota_limit":0,"expires_at":null}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAPIKey(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err = db.GetAPIKeyByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetAPIKeyByID 返回错误: %v", err)
+	}
+	if row.Name != "Client B" || row.QuotaLimit != 0 || row.ExpiresAt.Valid {
+		t.Fatalf("row = %#v, want quota/expiration cleared with name preserved", row)
+	}
+}
+
+func TestUpdateAPIKeyRefreshesRuntimeStoreAndCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	groupID, err := db.CreateAccountGroup(ctx, "Team", "", "#2563eb", 0)
+	if err != nil {
+		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
+	}
+	key := "sk-test-runtime-refresh-1234567890"
+	keyID, err := db.InsertAPIKey(ctx, "Client A", key)
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+	store := auth.NewStore(nil, nil, nil)
+	tc := cache.NewMemory(1)
+	handler := &Handler{db: db, store: store, cache: tc}
+	payload, err := json.Marshal(map[string]interface{}{
+		"id":         keyID,
+		"name":       "Client A",
+		"created_at": time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("marshal runtime cache: %v", err)
+	}
+	if err := tc.SetRuntime(ctx, adminAPIKeyCacheNamespace, key, payload, time.Minute); err != nil {
+		t.Fatalf("SetRuntime api key: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", keyID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, "/api/admin/keys/1", strings.NewReader(fmt.Sprintf(`{"allowed_group_ids":[%d]}`, groupID)))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAPIKey(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := store.GetAPIKeyAllowedGroups(keyID); len(got) != 1 || got[0] != groupID {
+		t.Fatalf("runtime store allowed groups = %v, want [%d]", got, groupID)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, adminAPIKeyCacheNamespace, key); err != nil || ok {
+		t.Fatalf("runtime api key cache after update ok=%v err=%v, want miss", ok, err)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, adminAPIKeyCountNamespace, "all"); err != nil || ok {
+		t.Fatalf("runtime api key count cache after update ok=%v err=%v, want miss", ok, err)
 	}
 }
 
@@ -451,7 +611,7 @@ func TestUpdateAccountSchedulerResetsToAutoOnNull(t *testing.T) {
 	db := newTestAdminDB(t)
 	accountID := insertTestAccount(t, db)
 	ctx := context.Background()
-	if err := db.UpdateAccountSchedulerConfig(ctx, accountID, sql.NullInt64{Int64: 20, Valid: true}, sql.NullInt64{Int64: 4, Valid: true}, database.OptionalInt64Slice{}); err != nil {
+	if err := db.UpdateAccountSchedulerConfig(ctx, accountID, database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 20, Valid: true}}, database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 4, Valid: true}}, database.OptionalInt64Slice{}); err != nil {
 		t.Fatalf("seed scheduler config: %v", err)
 	}
 
@@ -480,6 +640,49 @@ func TestUpdateAccountSchedulerResetsToAutoOnNull(t *testing.T) {
 	}
 	if rows[0].BaseConcurrencyOverride.Valid {
 		t.Fatalf("base_concurrency_override = %+v, want null", rows[0].BaseConcurrencyOverride)
+	}
+}
+
+func TestUpdateAccountSchedulerPartialMetadataPatchPreservesSchedulerConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	keyID := insertTestAPIKey(t, db, "Team A")
+	ctx := context.Background()
+	if err := db.UpdateAccountSchedulerConfig(ctx, accountID,
+		database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 20, Valid: true}},
+		database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 4, Valid: true}},
+		database.OptionalInt64Slice{Set: true, Values: []int64{keyID}},
+	); err != nil {
+		t.Fatalf("seed scheduler config: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"tags":["ops"]}`))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if !rows[0].ScoreBiasOverride.Valid || rows[0].ScoreBiasOverride.Int64 != 20 {
+		t.Fatalf("score_bias_override = %+v, want 20", rows[0].ScoreBiasOverride)
+	}
+	if !rows[0].BaseConcurrencyOverride.Valid || rows[0].BaseConcurrencyOverride.Int64 != 4 {
+		t.Fatalf("base_concurrency_override = %+v, want 4", rows[0].BaseConcurrencyOverride)
+	}
+	if got := rows[0].GetCredentialInt64Slice("allowed_api_key_ids"); len(got) != 1 || got[0] != keyID {
+		t.Fatalf("allowed_api_key_ids = %v, want [%d]", got, keyID)
 	}
 }
 
@@ -611,6 +814,112 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	}
 	if got := runtimeAccount.GetAllowedAPIKeyIDs(); len(got) != 2 || got[0] != keyID1 || got[1] != keyID2 {
 		t.Fatalf("runtime allowed_api_key_ids = %v, want [%d %d]", got, keyID1, keyID2)
+	}
+}
+
+// AT-only 账号(没有 refresh_token,只靠 access_token)是规避 Codex Plus "add
+// phone" 流程的常用形态。导出/迁移以前会因为 rt=="" 直接跳过这些账号,导致
+// issue #123 中的迁移丢号。下面两个测试保护已修好的过滤逻辑。
+func TestExportAccountsIncludesATOnly(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+
+	rtID, err := db.InsertAccount(context.Background(), "rt-account", "rt_value", "")
+	if err != nil {
+		t.Fatalf("insert rt account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), rtID, map[string]interface{}{
+		"email":        "rt@example.com",
+		"access_token": "at_for_rt",
+	}); err != nil {
+		t.Fatalf("update rt credentials: %v", err)
+	}
+
+	atID, err := db.InsertAccount(context.Background(), "at-account", "", "")
+	if err != nil {
+		t.Fatalf("insert at-only account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), atID, map[string]interface{}{
+		"email":        "at@example.com",
+		"access_token": "at_only_value",
+	}); err != nil {
+		t.Fatalf("update at-only credentials: %v", err)
+	}
+
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/export?filter=all", nil)
+
+	handler.ExportAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var entries []cpaExportEntry
+	if err := json.Unmarshal(recorder.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("got %d entries, want 2 (rt + at-only)", len(entries))
+	}
+
+	byEmail := make(map[string]cpaExportEntry, len(entries))
+	for _, e := range entries {
+		byEmail[e.Email] = e
+	}
+
+	rt, ok := byEmail["rt@example.com"]
+	if !ok {
+		t.Fatal("rt-based account missing from export")
+	}
+	if rt.RefreshToken != "rt_value" || rt.AccessToken != "at_for_rt" {
+		t.Fatalf("rt entry tokens = (rt=%q, at=%q), want (rt_value, at_for_rt)", rt.RefreshToken, rt.AccessToken)
+	}
+
+	at, ok := byEmail["at@example.com"]
+	if !ok {
+		t.Fatal("AT-only account missing from export")
+	}
+	if at.RefreshToken != "" {
+		t.Fatalf("AT-only RefreshToken = %q, want empty", at.RefreshToken)
+	}
+	if at.AccessToken != "at_only_value" {
+		t.Fatalf("AT-only AccessToken = %q, want at_only_value", at.AccessToken)
+	}
+}
+
+func TestExportAccountsSkipsAccountsWithoutCredentials(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+
+	if _, err := db.InsertAccount(context.Background(), "empty-account", "", ""); err != nil {
+		t.Fatalf("insert empty account: %v", err)
+	}
+
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/export?filter=all", nil)
+
+	handler.ExportAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var entries []cpaExportEntry
+	if err := json.Unmarshal(recorder.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("got %d entries, want 0 (account has no credentials)", len(entries))
 	}
 }
 

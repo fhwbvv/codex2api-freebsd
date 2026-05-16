@@ -35,6 +35,7 @@ Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理
 **Base URL:** `http://localhost:8080` (默认端口)
 
 **请求格式:**
+
 - 请求头: `Content-Type: application/json`
 - 认证头: `Authorization: Bearer <api_key>`
 
@@ -47,11 +48,13 @@ Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理
 公共 API (`/v1/*`) 需要 API Key 进行认证。
 
 **请求头:**
+
 ```http
 Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
 **配置方式:**
+
 1. 通过管理后台 `/admin/settings` 页面配置
 2. 如果没有配置任何 API Key，则 `/v1/*` 接口跳过鉴权（开发模式）
 
@@ -60,6 +63,7 @@ Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxxxxx
 管理 API (`/api/admin/*`) 需要 Admin Secret 进行认证。
 
 **请求头:**
+
 ```http
 X-Admin-Key: your-admin-secret
 ```
@@ -71,6 +75,7 @@ Authorization: Bearer your-admin-secret
 ```
 
 **配置方式:**
+
 - 环境变量: `ADMIN_SECRET`
 - 数据库: 通过管理后台设置
 
@@ -85,12 +90,13 @@ Authorization: Bearer your-admin-secret
 **说明:** OpenAI 风格的 Chat Completions 接口，支持流式和非流式响应。
 
 **请求示例:**
+
 ```json
 {
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "Hello!" }
   ],
   "stream": false,
   "reasoning_effort": "medium",
@@ -100,23 +106,24 @@ Authorization: Bearer your-admin-secret
 
 **参数说明:**
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| model | string | 是 | 模型名称，见 [支持模型](#支持模型) |
-| messages | array | 是 | 消息列表 |
-| stream | boolean | 否 | 是否启用流式响应，默认 false |
-| reasoning_effort | string | 否 | 推理强度: low/medium/high |
-| service_tier | string | 否 | 服务等级: fast/auto |
-| max_tokens | integer | 否 | 最大输出 token 数（Codex 不支持，会被过滤） |
-| temperature | float | 否 | 温度参数（Codex 不支持，会被过滤） |
+| 参数             | 类型    | 必填 | 说明                                        |
+| ---------------- | ------- | ---- | ------------------------------------------- |
+| model            | string  | 是   | 模型名称，见 [支持模型](#支持模型)          |
+| messages         | array   | 是   | 消息列表                                    |
+| stream           | boolean | 否   | 是否启用流式响应，默认 false                |
+| reasoning_effort | string  | 否   | 推理强度: low/medium/high                   |
+| service_tier     | string  | 否   | 服务等级: fast/auto                         |
+| max_tokens       | integer | 否   | 最大输出 token 数（Codex 不支持，会被过滤） |
+| temperature      | float   | 否   | 温度参数（Codex 不支持，会被过滤）          |
 
 **非流式响应示例:**
+
 ```json
 {
   "id": "chatcmpl-xxxxxxxx",
   "object": "chat.completion",
   "created": 1712345678,
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "choices": [
     {
       "index": 0,
@@ -136,14 +143,15 @@ Authorization: Bearer your-admin-secret
 ```
 
 **流式响应示例:**
+
 ```
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-5.5","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-5.5","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-5.4","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+data: {"id":"chatcmpl-xxx","object":"chat.completion.chunk","created":1712345678,"model":"gpt-5.5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 
 data: [DONE]
 ```
@@ -155,12 +163,13 @@ data: [DONE]
 **说明:** Codex 原生 Responses 接口，直接透传，无需协议翻译。
 
 **请求示例:**
+
 ```json
 {
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "input": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Hello!"}
+    { "role": "system", "content": "You are a helpful assistant." },
+    { "role": "user", "content": "Hello!" }
   ],
   "stream": false,
   "reasoning": {
@@ -173,23 +182,24 @@ data: [DONE]
 
 **参数说明:**
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| model | string | 是 | 模型名称 |
-| input | array/string | 是 | 输入内容（支持数组或字符串） |
-| stream | boolean | 否 | 是否启用流式响应，默认 false。仅当显式传 `stream=true` 时返回 SSE（流式响应），否则返回普通 JSON。 |
-| reasoning.effort | string | 否 | 推理强度: low/medium/high |
-| service_tier | string | 否 | 服务等级: fast/auto |
-| include | array | 否 | 包含的额外字段 |
-| previous_response_id | string | 否 | 上一响应 ID，用于上下文连续 |
+| 参数                 | 类型         | 必填 | 说明                                                                                               |
+| -------------------- | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
+| model                | string       | 是   | 模型名称                                                                                           |
+| input                | array/string | 是   | 输入内容（支持数组或字符串）                                                                       |
+| stream               | boolean      | 否   | 是否启用流式响应，默认 false。仅当显式传 `stream=true` 时返回 SSE（流式响应），否则返回普通 JSON。 |
+| reasoning.effort     | string       | 否   | 推理强度: low/medium/high                                                                          |
+| service_tier         | string       | 否   | 服务等级: fast/auto                                                                                |
+| include              | array        | 否   | 包含的额外字段                                                                                     |
+| previous_response_id | string       | 否   | 上一响应 ID，用于上下文连续                                                                        |
 
 **响应示例:**
+
 ```json
 {
   "id": "resp_xxxxxxxx",
   "object": "response",
   "created": 1712345678,
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "output": [
     {
       "type": "message",
@@ -219,6 +229,7 @@ data: [DONE]
 **说明:** OpenAI Images 兼容入口。外部请求使用 `gpt-image-2`，内部按 `CLIProxyAPI/` 与 `sub2api/` 的链路转换为 Codex `/responses`：主模型为 `gpt-5.4-mini`，图像模型写入 `tools[0].model`。
 
 **请求示例:**
+
 ```json
 {
   "model": "gpt-image-2",
@@ -236,18 +247,18 @@ data: [DONE]
 **说明:** 支持 JSON `images[].image_url` 和 multipart `image` / `image[]` 上传。`mask.image_url` 或 multipart `mask` 可用于遮罩编辑。
 
 **JSON 请求示例:**
+
 ```json
 {
   "model": "gpt-image-2",
   "prompt": "Replace the background with aurora lights",
-  "images": [
-    {"image_url": "https://example.com/source.png"}
-  ],
+  "images": [{ "image_url": "https://example.com/source.png" }],
   "output_format": "png"
 }
 ```
 
 **响应示例:**
+
 ```json
 {
   "created": 1710000000,
@@ -270,17 +281,18 @@ data: [DONE]
 **说明:** 获取支持的模型列表。
 
 **响应示例:**
+
 ```json
 {
   "object": "list",
   "data": [
-    {"id": "gpt-5.5", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.4-mini", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.2", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-image-2", "object": "model", "owned_by": "openai"}
+    { "id": "gpt-5.5", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.5", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.4-mini", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.3-codex", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.2", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-image-2", "object": "model", "owned_by": "openai" }
   ]
 }
 ```
@@ -292,6 +304,7 @@ data: [DONE]
 **说明:** 健康检查端点，返回服务状态。
 
 **响应示例:**
+
 ```json
 {
   "status": "ok",
@@ -313,6 +326,7 @@ data: [DONE]
 获取仪表盘统计数据。
 
 **响应:**
+
 ```json
 {
   "total": 10,
@@ -327,6 +341,7 @@ data: [DONE]
 系统健康检查（扩展版）。
 
 **响应:**
+
 ```json
 {
   "status": "ok",
@@ -342,6 +357,7 @@ data: [DONE]
 获取账号列表。
 
 **响应:**
+
 ```json
 {
   "accounts": [
@@ -380,6 +396,7 @@ data: [DONE]
         "failure_penalty": 0,
         "success_bonus": 12,
         "usage_penalty_7d": -5,
+        "usage_urgency_bonus_5h": 0,
         "latency_penalty": 0,
         "success_rate_penalty": 0
       }
@@ -390,21 +407,22 @@ data: [DONE]
 
 字段说明补充：
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| scheduler_score | number | 原始健康分，仅反映动态调度健康状态 |
-| dispatch_score | number | 最终用于调度排序的分数；优先读取运行时快照 |
-| score_bias_override | integer/null | 手工配置的总加权分覆盖值，`null` 表示跟随套餐默认 |
-| score_bias_effective | integer | 当前生效的加权分 |
-| base_concurrency_override | integer/null | 手工配置的基础并发覆盖值，`null` 表示跟随全局 `max_concurrency` |
-| base_concurrency_effective | integer | 当前生效的基础并发值 |
-| allowed_api_key_ids | integer[] | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
+| 字段                       | 类型         | 说明                                                              |
+| -------------------------- | ------------ | ----------------------------------------------------------------- |
+| scheduler_score            | number       | 原始健康分，仅反映动态调度健康状态                                |
+| dispatch_score             | number       | 最终用于调度排序的分数；优先读取运行时快照                        |
+| score_bias_override        | integer/null | 手工配置的总加权分覆盖值，`null` 表示跟随套餐默认                 |
+| score_bias_effective       | integer      | 当前生效的加权分                                                  |
+| base_concurrency_override  | integer/null | 手工配置的基础并发覆盖值，`null` 表示跟随全局 `max_concurrency`   |
+| base_concurrency_effective | integer      | 当前生效的基础并发值                                              |
+| allowed_api_key_ids        | integer[]    | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
 
 #### PATCH /api/admin/accounts/:id/scheduler
 
 更新账号调度配置。
 
 **请求:**
+
 ```json
 {
   "score_bias_override": 80,
@@ -425,13 +443,14 @@ data: [DONE]
 
 **参数说明:**
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| score_bias_override | integer/null | 否 | 总加权分覆盖值，范围 `-200..200`，`null` 表示恢复套餐默认 |
-| base_concurrency_override | integer/null | 否 | 基础并发覆盖值，范围 `1..50`，`null` 表示恢复全局默认 |
-| allowed_api_key_ids | integer[]/null | 否 | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
+| 参数                      | 类型           | 必填 | 说明                                                                                                       |
+| ------------------------- | -------------- | ---- | ---------------------------------------------------------------------------------------------------------- |
+| score_bias_override       | integer/null   | 否   | 总加权分覆盖值，范围 `-200..200`，`null` 表示恢复套餐默认                                                  |
+| base_concurrency_override | integer/null   | 否   | 基础并发覆盖值，范围 `1..50`，`null` 表示恢复全局默认                                                      |
+| allowed_api_key_ids       | integer[]/null | 否   | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
 
 **响应:**
+
 ```json
 {
   "message": "账号调度配置已更新"
@@ -443,6 +462,7 @@ data: [DONE]
 添加 Refresh Token 账号（支持批量）。
 
 **请求:**
+
 ```json
 {
   "name": "my-account",
@@ -453,13 +473,14 @@ data: [DONE]
 
 **参数说明:**
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| name | string | 否 | 账号名称，批量时自动追加序号，默认 `account-{n}` |
-| refresh_token | string | 是 | Refresh Token，多个用 `\n` 换行分隔（单次最多 100 个） |
-| proxy_url | string | 否 | 代理 URL |
+| 参数          | 类型   | 必填 | 说明                                                   |
+| ------------- | ------ | ---- | ------------------------------------------------------ |
+| name          | string | 否   | 账号名称，批量时自动追加序号，默认 `account-{n}`       |
+| refresh_token | string | 是   | Refresh Token，多个用 `\n` 换行分隔（单次最多 100 个） |
+| proxy_url     | string | 否   | 代理 URL                                               |
 
 批量添加（使用换行分隔）:
+
 ```json
 {
   "name": "batch",
@@ -469,6 +490,7 @@ data: [DONE]
 ```
 
 **响应:**
+
 ```json
 {
   "message": "成功添加 3 个账号",
@@ -480,6 +502,7 @@ data: [DONE]
 **curl 示例:**
 
 单个添加:
+
 ```bash
 curl -X POST http://localhost:8080/api/admin/accounts \
   -H "X-Admin-Key: your-admin-secret" \
@@ -488,6 +511,7 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 ```
 
 批量添加（换行分隔）:
+
 ```bash
 curl -X POST http://localhost:8080/api/admin/accounts \
   -H "X-Admin-Key: your-admin-secret" \
@@ -502,6 +526,7 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 添加 Access Token（AT-only）账号（支持批量）。适用于只有 AT 没有 RT 的场景。
 
 **请求:**
+
 ```json
 {
   "name": "my-at-account",
@@ -512,13 +537,14 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 
 **参数说明:**
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| name | string | 否 | 账号名称，批量时自动追加序号，默认 `at-account-{n}` |
-| access_token | string | 是 | Access Token，多个用 `\n` 换行分隔（单次最多 100 个） |
-| proxy_url | string | 否 | 代理 URL |
+| 参数         | 类型   | 必填 | 说明                                                  |
+| ------------ | ------ | ---- | ----------------------------------------------------- |
+| name         | string | 否   | 账号名称，批量时自动追加序号，默认 `at-account-{n}`   |
+| access_token | string | 是   | Access Token，多个用 `\n` 换行分隔（单次最多 100 个） |
+| proxy_url    | string | 否   | 代理 URL                                              |
 
 批量添加:
+
 ```json
 {
   "name": "batch-at",
@@ -528,6 +554,7 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 ```
 
 **响应:**
+
 ```json
 {
   "message": "成功添加 3 个 AT 账号",
@@ -552,6 +579,7 @@ curl -X POST http://localhost:8080/api/admin/accounts/at \
 删除账号（软删除，标记为 deleted）。
 
 **响应:**
+
 ```json
 {
   "message": "账号已删除"
@@ -563,6 +591,7 @@ curl -X POST http://localhost:8080/api/admin/accounts/at \
 手动刷新账号 Access Token。
 
 **响应:**
+
 ```json
 {
   "message": "账号刷新成功"
@@ -574,6 +603,7 @@ curl -X POST http://localhost:8080/api/admin/accounts/at \
 测试账号连接。
 
 **响应:**
+
 ```json
 {
   "success": true,
@@ -587,6 +617,7 @@ curl -X POST http://localhost:8080/api/admin/accounts/at \
 获取单个账号用量统计。
 
 **响应:**
+
 ```json
 {
   "id": 1,
@@ -603,36 +634,39 @@ curl -X POST http://localhost:8080/api/admin/accounts/at \
 批量导入账号（支持 TXT/JSON/AT-TXT 三种格式）。
 
 **请求:**
+
 - Method: POST
 - Content-Type: multipart/form-data
 
 **Form 字段:**
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| file | file | 是 | 上传文件（最大 2MB，JSON 格式支持多文件） |
-| format | string | 否 | 文件格式：`txt`（默认）、`json`、`at_txt` |
-| proxy_url | string | 否 | 代理 URL |
+| 字段      | 类型   | 必填 | 说明                                      |
+| --------- | ------ | ---- | ----------------------------------------- |
+| file      | file   | 是   | 上传文件（最大 20MB，JSON 格式支持多文件） |
+| format    | string | 否   | 文件格式：`txt`（默认）、`json`、`at_txt` |
+| proxy_url | string | 否   | 代理 URL                                  |
 
 **format 格式说明:**
 
 - **`txt`** — 每行一个 Refresh Token:
-  ```
+
+  ```text
   rt_xxxxxx1
   rt_xxxxxx2
   rt_xxxxxx3
   ```
 
 - **`json`** — CLIProxyAPI 凭证 JSON 格式（支持数组或单对象）:
+
   ```json
   [
-    {"refresh_token": "rt_xxx1", "email": "user1@example.com"},
-    {"refresh_token": "rt_xxx2", "email": "user2@example.com"}
+    { "refresh_token": "rt_xxx1", "email": "user1@example.com" },
+    { "refresh_token": "rt_xxx2", "email": "user2@example.com" }
   ]
   ```
 
 - **`at_txt`** — 每行一个 Access Token（AT-only 模式）:
-  ```
+  ```text
   eyJhbGciOiJSUzI1NiIs...token1
   eyJhbGciOiJSUzI1NiIs...token2
   ```
@@ -642,6 +676,7 @@ curl -X POST http://localhost:8080/api/admin/accounts/at \
 **curl 示例:**
 
 导入 RT（TXT 格式）:
+
 ```bash
 curl -X POST http://localhost:8080/api/admin/accounts/import \
   -H "X-Admin-Key: your-admin-secret" \
@@ -651,6 +686,7 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 ```
 
 导入 RT（JSON 格式）:
+
 ```bash
 curl -X POST http://localhost:8080/api/admin/accounts/import \
   -H "X-Admin-Key: your-admin-secret" \
@@ -659,6 +695,7 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 ```
 
 导入 AT（AT-TXT 格式）:
+
 ```bash
 curl -X POST http://localhost:8080/api/admin/accounts/import \
   -H "X-Admin-Key: your-admin-secret" \
@@ -667,13 +704,15 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 ```
 
 **响应:** SSE 流式进度
-```
+
+```text
 data: {"type":"progress","current":5,"total":10,"success":3,"duplicate":1,"failed":1}
 
 data: {"type":"complete","current":10,"total":10,"success":8,"duplicate":1,"failed":1}
 ```
 
 若所有 Token 均已存在，返回普通 JSON（非 SSE）:
+
 ```json
 {
   "message": "所有 10 个 RT 已存在，无需导入",
@@ -689,6 +728,7 @@ data: {"type":"complete","current":10,"total":10,"success":8,"duplicate":1,"fail
 批量测试账号连接。
 
 **请求:**
+
 ```json
 {
   "ids": [1, 2, 3],
@@ -697,6 +737,7 @@ data: {"type":"complete","current":10,"total":10,"success":8,"duplicate":1,"fail
 ```
 
 **响应:** SSE 流式进度
+
 ```
 data: {"type":"progress","current":3,"total":3,"success":2,"failed":1}
 
@@ -708,6 +749,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 清理 Unauthorized（401）账号。
 
 **响应:**
+
 ```json
 {
   "message": "已清理 5 个账号",
@@ -728,11 +770,13 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 导出账号（标准 JSON 格式）。
 
 **查询参数:**
+
 - `filter`: healthy (只导出健康账号)
 - `ids`: 1,2,3 (指定 ID 列表)
 - `remote`: true (远程迁移模式)
 
 **响应:**
+
 ```json
 [
   {
@@ -753,6 +797,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 从远程 codex2api 实例迁移账号。
 
 **请求:**
+
 ```json
 {
   "url": "http://remote-instance:8080",
@@ -767,16 +812,16 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 获取账号增删趋势。
 
 **查询参数:**
+
 - `start`: RFC3339 格式开始时间
 - `end`: RFC3339 格式结束时间
 - `bucket_minutes`: 聚合桶大小（默认 60）
 
 **响应:**
+
 ```json
 {
-  "trend": [
-    {"timestamp": "2024-01-01T00:00:00Z", "added": 5, "deleted": 0}
-  ]
+  "trend": [{ "timestamp": "2024-01-01T00:00:00Z", "added": 5, "deleted": 0 }]
 }
 ```
 
@@ -787,6 +832,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 获取使用统计。
 
 **响应:**
+
 ```json
 {
   "total_requests": 10000,
@@ -804,6 +850,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 获取使用日志。
 
 **查询参数:**
+
 - `start`: RFC3339 开始时间
 - `end`: RFC3339 结束时间
 - `page`: 页码
@@ -816,6 +863,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 - `stream`: true/false (是否流式)
 
 **响应:**
+
 ```json
 {
   "logs": [
@@ -827,7 +875,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
       "api_key_name": "Team A",
       "api_key_masked": "sk-t****...****1234",
       "endpoint": "/v1/chat/completions",
-      "model": "gpt-5.4",
+      "model": "gpt-5.5",
       "status_code": 200,
       "duration_ms": 523,
       "first_token_ms": 150,
@@ -846,11 +894,13 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 获取图表聚合数据。
 
 **查询参数:**
+
 - `start`: RFC3339 开始时间
 - `end`: RFC3339 结束时间
 - `bucket_minutes`: 聚合桶大小（默认 5）
 
 **响应:**
+
 ```json
 {
   "buckets": [
@@ -871,6 +921,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 清空使用日志。
 
 **响应:**
+
 ```json
 {
   "message": "日志已清空"
@@ -881,16 +932,23 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 #### GET /api/admin/keys
 
-获取所有 API 密钥。
+获取所有 API 密钥。管理接口需要 `X-Admin-Key`，这些接口不属于对外 `/v1/*` 客户端 API。该接口会在 `raw_key` 返回完整密钥，只能在受信任后台使用。
 
 **响应:**
+
 ```json
 {
   "keys": [
     {
       "id": 1,
-      "name": "default",
-      "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxx",
+      "name": "Claude Code",
+      "key": "sk-****...abcd",
+      "raw_key": "sk-live-full-key",
+      "quota_limit": 10,
+      "quota_used": 1.25,
+      "expires_at": "2026-06-01T00:00:00Z",
+      "allowed_group_ids": [1],
+      "status": "active",
       "created_at": "2024-01-01T00:00:00Z"
     }
   ]
@@ -902,19 +960,68 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 创建新 API 密钥。
 
 **请求:**
+
 ```json
 {
   "name": "production",
-  "key": "sk-custom-key"  // 可选，不填则自动生成
+  "key": "sk-custom-key",
+  "quota_limit": 10,
+  "expires_in_days": 30,
+  "allowed_group_ids": [1]
 }
 ```
 
+| 字段                | 类型      | 必填 | 说明                                   |
+| ------------------- | --------- | ---- | -------------------------------------- |
+| name                | string    | 是   | 显示名称                               |
+| key                 | string    | 否   | 自定义密钥；省略则自动生成             |
+| quota_limit / quota | number    | 否   | 额度上限，0 或省略表示不限额           |
+| expires_at          | string    | 否   | RFC3339 或本地日期时间                 |
+| expires_in_days     | number    | 否   | N 天后过期；0 表示不过期               |
+| allowed_group_ids   | integer[] | 否   | 允许调度的账号分组；空数组表示全部分组 |
+
 **响应:**
+
 ```json
 {
   "id": 2,
   "key": "sk-xxxxxxxxxxxxxxxxxxxxxxxx",
-  "name": "production"
+  "name": "production",
+  "quota_limit": 10,
+  "quota_used": 0,
+  "expires_at": "2026-06-12T00:00:00Z",
+  "allowed_group_ids": [1]
+}
+```
+
+#### PATCH /api/admin/keys/:id
+
+编辑 API 密钥名称、额度、过期时间和允许账号分组。字段省略时保持原值。
+
+**请求:**
+
+```json
+{
+  "name": "Cherry Studio",
+  "quota_limit": 25,
+  "expires_at": null,
+  "allowed_group_ids": []
+}
+```
+
+| 字段                | 类型        | 说明                                   |
+| ------------------- | ----------- | -------------------------------------- |
+| name                | string      | 新显示名称                             |
+| quota_limit / quota | number/null | 新额度上限；0 或 null 清除额度限制     |
+| expires_at          | string/null | 新过期时间；null 清除过期时间          |
+| expires_in_days     | number      | N 天后过期；0 清除过期时间             |
+| allowed_group_ids   | integer[]   | 允许调度的账号分组；空数组表示全部分组 |
+
+**响应:**
+
+```json
+{
+  "message": "API Key 已更新"
 }
 ```
 
@@ -923,9 +1030,101 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 删除 API 密钥。
 
 **响应:**
+
 ```json
 {
   "message": "已删除"
+}
+```
+
+### 账号分组管理
+
+账号分组用于把账号池划分为多个可调度集合。API Key 的 `allowed_group_ids` 可以限制下游密钥只能使用指定分组；账号自己的 `allowed_api_key_ids` 也可以反向限制哪些 API Key 能调度该账号。
+
+#### GET /api/admin/account-groups
+
+获取账号分组。
+
+**响应:**
+
+```json
+{
+  "groups": [
+    {
+      "id": 1,
+      "name": "Team",
+      "description": "付费团队账号",
+      "color": "#2563eb",
+      "sort_order": 0,
+      "member_count": 8,
+      "created_at": "2026-05-13T00:00:00Z",
+      "updated_at": "2026-05-13T00:00:00Z"
+    }
+  ]
+}
+```
+
+#### POST /api/admin/account-groups
+
+创建账号分组。
+
+**请求:**
+
+```json
+{
+  "name": "Team",
+  "description": "付费团队账号",
+  "color": "#2563eb",
+  "sort_order": 0
+}
+```
+
+**响应:**
+
+```json
+{
+  "id": 1,
+  "message": "分组已创建"
+}
+```
+
+#### PATCH /api/admin/account-groups/:id
+
+编辑账号分组。
+
+**请求:**
+
+```json
+{
+  "name": "Team Plus",
+  "description": "高优先级账号",
+  "color": "#16a34a",
+  "sort_order": 10
+}
+```
+
+**响应:**
+
+```json
+{
+  "message": "分组已更新"
+}
+```
+
+#### DELETE /api/admin/account-groups/:id
+
+删除账号分组。分组仍有成员时需要 `?force=true`；删除后会从账号关系中移除该 ID，并尽量从 API Key 允许分组中清理。若某个 API Key 仅绑定该分组，为避免权限被意外放大，会保留为缺失分组状态。
+
+```bash
+curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
+  -H "X-Admin-Key: your-secret"
+```
+
+**响应:**
+
+```json
+{
+  "message": "分组已删除"
 }
 ```
 
@@ -936,11 +1135,12 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 获取系统设置。
 
 **响应:**
+
 ```json
 {
   "max_concurrency": 2,
   "global_rpm": 0,
-  "test_model": "gpt-5.4",
+  "test_model": "gpt-5.5",
   "test_concurrency": 50,
   "proxy_url": "",
   "pg_max_conns": 50,
@@ -967,11 +1167,12 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 更新系统设置。
 
 **请求:**
+
 ```json
 {
   "max_concurrency": 4,
   "global_rpm": 100,
-  "test_model": "gpt-5.4",
+  "test_model": "gpt-5.5",
   "test_concurrency": 50,
   "proxy_url": "http://proxy.example.com:8080",
   "auto_clean_unauthorized": true,
@@ -989,6 +1190,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 获取代理列表。
 
 **响应:**
+
 ```json
 {
   "proxies": [
@@ -1010,6 +1212,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 添加代理（支持批量）。
 
 **请求:**
+
 ```json
 {
   "urls": ["http://proxy1.example.com:8080", "http://proxy2.example.com:8080"],
@@ -1018,6 +1221,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 ```
 
 或单条:
+
 ```json
 {
   "url": "http://proxy.example.com:8080",
@@ -1034,6 +1238,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 更新代理。
 
 **请求:**
+
 ```json
 {
   "label": "New Label",
@@ -1046,6 +1251,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 批量删除代理。
 
 **请求:**
+
 ```json
 {
   "ids": [1, 2, 3]
@@ -1057,15 +1263,17 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 测试代理连通性。
 
 **请求:**
+
 ```json
 {
   "url": "http://proxy.example.com:8080",
-  "id": 1,  // 可选，用于持久化测试结果
+  "id": 1, // 可选，用于持久化测试结果
   "lang": "zh-CN"
 }
 ```
 
 **响应:**
+
 ```json
 {
   "success": true,
@@ -1086,6 +1294,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 获取系统运维概览。
 
 **响应:**
+
 ```json
 {
   "updated_at": "2024-01-01T12:00:00Z",
@@ -1151,6 +1360,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 获取当前启用的模型列表，并返回模型注册表元数据。
 
 **响应:**
+
 ```json
 {
   "models": [
@@ -1182,6 +1392,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 从 OpenAI 官方 Codex 模型页同步模型注册表。同步只新增或更新模型元数据，不会自动删除本地模型；`gpt-image-2` 始终作为内置图像模型保留。
 
 **响应:**
+
 ```json
 {
   "added": 0,
@@ -1213,6 +1424,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 生成 OAuth 授权 URL（PKCE 模式）。
 
 **请求:**
+
 ```json
 {
   "proxy_url": "http://proxy.example.com:8080",
@@ -1222,12 +1434,13 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 **参数说明:**
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| proxy_url | string | 否 | 账号使用的代理 URL |
-| redirect_uri | string | 否 | 回调地址，默认为系统内置地址 |
+| 参数         | 类型   | 必填 | 说明                         |
+| ------------ | ------ | ---- | ---------------------------- |
+| proxy_url    | string | 否   | 账号使用的代理 URL           |
+| redirect_uri | string | 否   | 回调地址，默认为系统内置地址 |
 
 **响应:**
+
 ```json
 {
   "auth_url": "https://auth.openai.com/authorize?response_type=code&client_id=...&state=...",
@@ -1242,6 +1455,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 用授权码兑换 Token，自动创建新账号并加入号池。
 
 **请求:**
+
 ```json
 {
   "session_id": "a1b2c3d4e5f6...",
@@ -1254,15 +1468,16 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 **参数说明:**
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| session_id | string | 是 | `generate-auth-url` 返回的 session_id |
-| code | string | 是 | 授权回调 URL 中的 `code` 参数 |
-| state | string | 是 | 授权回调 URL 中的 `state` 参数 |
-| name | string | 否 | 账号名称，默认使用邮箱或 `oauth-account` |
-| proxy_url | string | 否 | 代理 URL，覆盖生成 URL 时的设置 |
+| 参数       | 类型   | 必填 | 说明                                     |
+| ---------- | ------ | ---- | ---------------------------------------- |
+| session_id | string | 是   | `generate-auth-url` 返回的 session_id    |
+| code       | string | 是   | 授权回调 URL 中的 `code` 参数            |
+| state      | string | 是   | 授权回调 URL 中的 `state` 参数           |
+| name       | string | 否   | 账号名称，默认使用邮箱或 `oauth-account` |
+| proxy_url  | string | 否   | 代理 URL，覆盖生成 URL 时的设置          |
 
 **响应:**
+
 ```json
 {
   "message": "OAuth 账号 user@example.com 添加成功",
@@ -1276,36 +1491,37 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 ## 支持模型
 
-| 模型 | 说明 |
-|------|------|
-| gpt-5.5 | 最新旗舰模型 |
-| gpt-5.4 | 旗舰模型 |
-| gpt-5.4-mini | 轻量版 |
-| gpt-5.3-codex | 较新版本 |
+| 模型                | 说明                                    |
+| ------------------- | --------------------------------------- |
+| gpt-5.5             | 最新旗舰模型                            |
+| gpt-5.4             | 旗舰模型                                |
+| gpt-5.4-mini        | 轻量版                                  |
+| gpt-5.3-codex       | 较新版本                                |
 | gpt-5.3-codex-spark | Codex Spark 模型，仅 Pro 订阅账号可调用 |
-| gpt-5.2 | 兼容保留模型 |
-| gpt-image-2 | GPT Image 2 图像生成模型 |
+| gpt-5.2             | 兼容保留模型                            |
+| gpt-image-2         | GPT Image 2 图像生成模型                |
 
 > 提示：实际支持的模型以 `/v1/models` 接口返回为准，文档可能未及时更新。
+
 ---
 
 ## 错误码
 
 ### HTTP 状态码
 
-| 状态码 | 说明 |
-|--------|------|
-| 200 | 请求成功 |
-| 400 | 请求参数错误 |
-| 401 | 认证失败 |
-| 403 | 权限不足 |
-| 404 | 资源不存在 |
-| 429 | 请求过于频繁（限流） |
-| 499 | 客户端断开连接 |
-| 500 | 服务器内部错误 |
-| 502 | 网关错误（上游服务异常） |
-| 503 | 服务不可用（账号池耗尽） |
-| 598 | 上游流中断 |
+| 状态码 | 说明                     |
+| ------ | ------------------------ |
+| 200    | 请求成功                 |
+| 400    | 请求参数错误             |
+| 401    | 认证失败                 |
+| 403    | 权限不足                 |
+| 404    | 资源不存在               |
+| 429    | 请求过于频繁（限流）     |
+| 499    | 客户端断开连接           |
+| 500    | 服务器内部错误           |
+| 502    | 网关错误（上游服务异常） |
+| 503    | 服务不可用（账号池耗尽） |
+| 598    | 上游流中断               |
 
 ### 错误响应格式
 
@@ -1321,17 +1537,17 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 ### 常见错误代码
 
-| 代码 | 说明 | 处理建议 |
-|------|------|----------|
-| missing_api_key | 缺少 API Key | 添加 Authorization 请求头 |
-| invalid_api_key | API Key 无效 | 检查密钥是否正确 |
-| authentication_error | 认证错误 | 检查 Admin Secret 或 API Key |
-| invalid_request_error | 请求参数错误 | 检查请求体格式 |
-| server_error | 服务器错误 | 查看日志排查问题 |
-| upstream_error | 上游服务错误 | 检查 Codex 服务状态 |
-| no_available_account | 当前无可调度账号 | 稍后重试、启用账号或补充可用账号 |
-| account_pool_usage_limit_reached | 账号池额度耗尽 | 等待冷却或添加新账号 |
-| rate_limit_exceeded | 限流触发 | 降低请求频率 |
+| 代码                             | 说明             | 处理建议                         |
+| -------------------------------- | ---------------- | -------------------------------- |
+| missing_api_key                  | 缺少 API Key     | 添加 Authorization 请求头        |
+| invalid_api_key                  | API Key 无效     | 检查密钥是否正确                 |
+| authentication_error             | 认证错误         | 检查 Admin Secret 或 API Key     |
+| invalid_request_error            | 请求参数错误     | 检查请求体格式                   |
+| server_error                     | 服务器错误       | 查看日志排查问题                 |
+| upstream_error                   | 上游服务错误     | 检查 Codex 服务状态              |
+| no_available_account             | 当前无可调度账号 | 稍后重试、启用账号或补充可用账号 |
+| account_pool_usage_limit_reached | 账号池额度耗尽   | 等待冷却或添加新账号             |
+| rate_limit_exceeded              | 限流触发         | 降低请求频率                     |
 
 ---
 

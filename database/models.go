@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -134,7 +135,7 @@ func (db *DB) GetModelRegistrySyncState(ctx context.Context) (*ModelRegistrySync
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT source_url, last_synced_at FROM model_registry_sync WHERE id = 1
 	`).Scan(&sourceURL, &syncedRaw)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {

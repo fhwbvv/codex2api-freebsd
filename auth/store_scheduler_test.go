@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -202,6 +203,30 @@ func TestApplyRefreshedPlanTypeKeepsFreeUsageLimitAuthoritative(t *testing.T) {
 	}
 }
 
+func TestApplyRefreshedPlanTypeKeepsActiveFreeUsageWindowAuthoritative(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		PlanType:            "free",
+		UsagePercent7d:      3,
+		UsagePercent7dValid: true,
+		Reset7dAt:           now.Add(24 * time.Hour),
+	}
+
+	acc.mu.Lock()
+	plan, applied := acc.applyRefreshedPlanTypeLocked("pro", now)
+	acc.mu.Unlock()
+
+	if plan != "pro" {
+		t.Fatalf("plan = %q, want pro", plan)
+	}
+	if applied {
+		t.Fatal("refreshed pro plan should not override an active free 7d usage window")
+	}
+	if got := acc.GetPlanType(); got != "free" {
+		t.Fatalf("PlanType = %q, want free", got)
+	}
+}
+
 func TestApplyRefreshedPlanTypeAllowsPlanUpgradeAfterUsageReset(t *testing.T) {
 	now := time.Now()
 	acc := &Account{
@@ -252,5 +277,183 @@ func TestStoreNextPrefersHigherDispatchScoreWithinTier(t *testing.T) {
 
 	if got.DBID != premium.DBID {
 		t.Fatalf("Next() picked dbID=%d, want premium account %d", got.DBID, premium.DBID)
+	}
+}
+
+func TestAccountPremium5hUrgencyBonusOnlyAffectsDispatchScore(t *testing.T) {
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent5h:      20,
+		UsagePercent5hValid: true,
+		Reset5hAt:           time.Now().Add(30 * time.Minute),
+		UsagePercent7d:      45,
+		UsagePercent7dValid: true,
+		Reset7dAt:           time.Now().Add(4 * 24 * time.Hour),
+	}
+
+	snapshot := acc.GetSchedulerDebugSnapshot(4)
+
+	if snapshot.SchedulerScore != 100 {
+		t.Fatalf("SchedulerScore = %v, want 100", snapshot.SchedulerScore)
+	}
+	if snapshot.Breakdown.UsageUrgencyBonus5h <= 20 {
+		t.Fatalf("UsageUrgencyBonus5h = %v, want > 20", snapshot.Breakdown.UsageUrgencyBonus5h)
+	}
+	if snapshot.DispatchScore <= 170 {
+		t.Fatalf("DispatchScore = %v, want plan bias plus urgency bonus", snapshot.DispatchScore)
+	}
+	if snapshot.HealthTier != string(HealthTierHealthy) {
+		t.Fatalf("HealthTier = %q, want %q", snapshot.HealthTier, HealthTierHealthy)
+	}
+}
+
+func TestAccountPremium5hUrgencyBonusSkipsNearlyExhaustedWindow(t *testing.T) {
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent5h:      96,
+		UsagePercent5hValid: true,
+		Reset5hAt:           time.Now().Add(30 * time.Minute),
+	}
+
+	snapshot := acc.GetSchedulerDebugSnapshot(4)
+
+	if snapshot.Breakdown.UsageUrgencyBonus5h != 0 {
+		t.Fatalf("UsageUrgencyBonus5h = %v, want 0", snapshot.Breakdown.UsageUrgencyBonus5h)
+	}
+	if snapshot.DispatchScore != 150 {
+		t.Fatalf("DispatchScore = %v, want only plan bias", snapshot.DispatchScore)
+	}
+}
+
+func TestAccountPremium7dUrgencyBonusOnlyAffectsDispatchScore(t *testing.T) {
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      63,
+		UsagePercent7dValid: true,
+		Reset7dAt:           time.Now().Add(36 * time.Hour),
+	}
+
+	snapshot := acc.GetSchedulerDebugSnapshot(4)
+
+	if snapshot.SchedulerScore != 100 {
+		t.Fatalf("SchedulerScore = %v, want 100", snapshot.SchedulerScore)
+	}
+	if snapshot.Breakdown.UsageUrgencyBonus7d <= 20 {
+		t.Fatalf("UsageUrgencyBonus7d = %v, want > 20", snapshot.Breakdown.UsageUrgencyBonus7d)
+	}
+	if snapshot.DispatchScore <= 170 {
+		t.Fatalf("DispatchScore = %v, want plan bias plus 7d urgency bonus", snapshot.DispatchScore)
+	}
+	if snapshot.HealthTier != string(HealthTierHealthy) {
+		t.Fatalf("HealthTier = %q, want %q", snapshot.HealthTier, HealthTierHealthy)
+	}
+}
+
+func TestAccountPremium7dUrgencyBonusSkipsDistantReset(t *testing.T) {
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      63,
+		UsagePercent7dValid: true,
+		Reset7dAt:           time.Now().Add(5 * 24 * time.Hour),
+	}
+
+	snapshot := acc.GetSchedulerDebugSnapshot(4)
+
+	if snapshot.Breakdown.UsageUrgencyBonus7d != 0 {
+		t.Fatalf("UsageUrgencyBonus7d = %v, want 0", snapshot.Breakdown.UsageUrgencyBonus7d)
+	}
+	if snapshot.DispatchScore != 150 {
+		t.Fatalf("DispatchScore = %v, want only plan bias", snapshot.DispatchScore)
+	}
+}
+
+func TestStoreNextPrefersPremium7dResetSoonOverProvenAccount(t *testing.T) {
+	now := time.Now()
+	soon := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      63,
+		UsagePercent7dValid: true,
+		Reset7dAt:           now.Add(36 * time.Hour),
+	}
+	later := &Account{
+		DBID:                2,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent7d:      68,
+		UsagePercent7dValid: true,
+		Reset7dAt:           now.Add(5 * 24 * time.Hour),
+	}
+	atomic.StoreInt64(&later.TotalRequests, 450)
+	recomputeTestAccount(soon, 2)
+	recomputeTestAccount(later, 2)
+
+	store := &Store{
+		accounts: []*Account{later, soon},
+	}
+	store.SetMaxConcurrency(2)
+
+	got := store.Next()
+	if got == nil {
+		t.Fatal("Next() returned nil")
+	}
+	defer store.Release(got)
+
+	if got.DBID != soon.DBID {
+		t.Fatalf("Next() picked dbID=%d, want 7d reset-soon account %d", got.DBID, soon.DBID)
+	}
+}
+
+func TestStoreNextPrefersPremium5hResetSoonWithinTier(t *testing.T) {
+	now := time.Now()
+	soon := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent5h:      25,
+		UsagePercent5hValid: true,
+		Reset5hAt:           now.Add(30 * time.Minute),
+	}
+	later := &Account{
+		DBID:                2,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		PlanType:            "plus",
+		UsagePercent5h:      25,
+		UsagePercent5hValid: true,
+		Reset5hAt:           now.Add(5 * time.Hour),
+	}
+	recomputeTestAccount(soon, 2)
+	recomputeTestAccount(later, 2)
+
+	store := &Store{
+		accounts: []*Account{later, soon},
+	}
+	store.SetMaxConcurrency(2)
+
+	got := store.Next()
+	if got == nil {
+		t.Fatal("Next() returned nil")
+	}
+	defer store.Release(got)
+
+	if got.DBID != soon.DBID {
+		t.Fatalf("Next() picked dbID=%d, want reset-soon account %d", got.DBID, soon.DBID)
 	}
 }

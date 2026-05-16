@@ -324,6 +324,48 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	return resp, nil
 }
 
+func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, requestBody []byte, proxyOverride string, headers http.Header) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	baseURL, apiKey := account.OpenAIResponsesCredentials()
+	account.Mu().RLock()
+	proxyURL := account.ProxyURL
+	account.Mu().RUnlock()
+	if proxyOverride != "" {
+		proxyURL = proxyOverride
+	}
+	if baseURL == "" || apiKey == "" {
+		return nil, ErrNoAvailableAccount()
+	}
+
+	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
+	if err != nil {
+		return nil, ErrInternalError("创建请求失败", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if headers != nil {
+		for _, key := range []string{"OpenAI-Organization", "OpenAI-Project", "Idempotency-Key"} {
+			if value := strings.TrimSpace(headers.Get(key)); value != "" {
+				req.Header.Set(key, value)
+			}
+		}
+	}
+
+	resp, err := getPooledClient(account, proxyURL).Do(req)
+	if err != nil {
+		if shouldRecyclePooledClient(err) {
+			recyclePooledClient(account, proxyURL)
+		}
+		return nil, ErrUpstream(0, "请求 OpenAI Responses API 失败", err)
+	}
+	return resp, nil
+}
+
 // ExecuteCompactRequest 向 Codex 上游发送 /responses/compact 请求（非流式压缩接口）
 func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
 	if ctx == nil {

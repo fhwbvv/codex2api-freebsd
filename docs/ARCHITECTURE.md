@@ -443,7 +443,7 @@ CREATE TABLE system_settings (
     id INTEGER PRIMARY KEY DEFAULT 1,
     max_concurrency INTEGER DEFAULT 2,
     global_rpm INTEGER DEFAULT 0,
-    test_model VARCHAR(100) DEFAULT 'gpt-5.4',
+    test_model VARCHAR(100) DEFAULT 'gpt-5.5',
     test_concurrency INTEGER DEFAULT 50,
     proxy_url VARCHAR(500),
     pg_max_conns INTEGER DEFAULT 50,

@@ -75,6 +75,26 @@ func TestValidateResponsesAPIRequestAllowsCompactionInputType(t *testing.T) {
 	}
 }
 
+func TestValidateResponsesAPIRequestAllowsOfficialContentInputTypes(t *testing.T) {
+	result := ValidateResponsesAPIRequest(
+		[]byte(`{
+			"model":"gpt-5.4",
+			"input":[
+				{"type":"input_text","text":"hello"},
+				{"type":"input_image","image_url":"https://example.com/cat.png"},
+				{"type":"input_file","file_id":"file_abc"},
+				{"type":"computer_screenshot","image_url":"https://example.com/screen.png"},
+				{"type":"summary_text","text":"summary"}
+			]
+		}`),
+		[]string{"gpt-5.4"},
+	)
+
+	if !result.Valid {
+		t.Fatalf("expected official Responses content input types to be valid, got %#v", result.Errors)
+	}
+}
+
 func TestValidateResponsesAPIRequestMaxOutputTokensCap(t *testing.T) {
 	tests := []struct {
 		name  string

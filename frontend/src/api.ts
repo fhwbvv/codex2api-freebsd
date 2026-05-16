@@ -3,12 +3,16 @@ import type {
   AccountUsageDetail,
   AddAccountRequest,
   AddATAccountRequest,
+  AddOpenAIResponsesAccountRequest,
   AdminErrorResponse,
   APIKeysResponse,
   AccountsResponse,
   ChartAggregation,
   CreateAccountResponse,
   CreateAPIKeyResponse,
+  CreateAPIKeyRequest,
+  FetchOpenAIResponsesModelsRequest,
+  FetchOpenAIResponsesModelsResponse,
   CreateImageJobPayload,
   HealthResponse,
   ImageAssetsResponse,
@@ -27,13 +31,20 @@ import type {
   PromptFilterLogsResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
+  SiteBranding,
   StatsResponse,
   CPAExportEntry,
   SystemSettings,
   UpdateAccountSchedulerRequest,
+  UpdateAPIKeyRequest,
+  UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
   UsageStats,
+  AccountGroup,
+  AccountGroupsResponse,
+  CreateAccountGroupRequest,
+  UpdateAccountGroupRequest,
 } from './types'
 
 const BASE = '/api/admin'
@@ -92,6 +103,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
   const res = await fetch(BASE + path, {
     ...options,
+    cache: options.cache ?? 'no-store',
     headers,
   })
 
@@ -100,6 +112,20 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     if (res.status === 401) {
       resetAdminAuthState()
     }
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return (await res.json()) as T
+}
+
+async function requestPublic<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const res = await fetch(path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
     throw new Error(extractAdminErrorMessage(body, res.status))
   }
 
@@ -141,6 +167,8 @@ function buildOpsErrorSearchParams(params: {
   stream?: string
   fast?: string
   q?: string
+  dedupe?: boolean
+  excludeStatus?: string
 }) {
   const search = new URLSearchParams()
   search.set('start', params.start)
@@ -152,22 +180,38 @@ function buildOpsErrorSearchParams(params: {
   if (params.stream) search.set('stream', params.stream)
   if (params.fast) search.set('fast', params.fast)
   if (params.q) search.set('q', params.q)
+  if (typeof params.dedupe === 'boolean') search.set('dedupe', String(params.dedupe))
+  if (params.excludeStatus) search.set('exclude_status', params.excludeStatus)
   return search
 }
 
 export const api = {
+  getBranding: () => requestPublic<SiteBranding>('/api/branding'),
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
     request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
+  addOpenAIResponsesAccount: (data: AddOpenAIResponsesAccountRequest) =>
+    request<CreateAccountResponse>('/accounts/openai-responses', { method: 'POST', body: JSON.stringify(data) }),
+  fetchOpenAIResponsesModels: (data: FetchOpenAIResponsesModelsRequest) =>
+    request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
+  updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
+    request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
+  listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
+  createAccountGroup: (data: CreateAccountGroupRequest) =>
+    request<{ id: number; message: string }>('/account-groups', { method: 'POST', body: JSON.stringify(data) }),
+  updateAccountGroup: (id: number, data: UpdateAccountGroupRequest) =>
+    request<MessageResponse>(`/account-groups/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteAccountGroup: (id: number, force = false) =>
+    request<MessageResponse>(`/account-groups/${id}${force ? '?force=true' : ''}`, { method: 'DELETE' }),
   toggleAccountEnabled: (id: number, enabled: boolean) =>
     request<MessageResponse>(`/accounts/${id}/enable`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   toggleAccountLock: (id: number, locked: boolean) =>
@@ -212,6 +256,22 @@ export const api = {
     if (params.pageSize) search.set('page_size', String(params.pageSize))
     return request<UsageLogsPagedResponse>(`/ops/errors?${search.toString()}`)
   },
+  downloadOpsErrors: (params: {
+    start: string
+    end: string
+    status?: string
+    errorKind?: string
+    endpoint?: string
+    apiKeyId?: string
+    stream?: string
+    fast?: string
+    q?: string
+    dedupe?: boolean
+    excludeStatus?: string
+  }) => {
+    const search = buildOpsErrorSearchParams(params)
+    return requestBlob(`/ops/errors/export?${search.toString()}`)
+  },
   getUsageStats: () => request<UsageStats>('/usage/stats'),
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()
@@ -252,13 +312,15 @@ export const api = {
     return request<{ trend: AccountEventTrendPoint[] }>(`/accounts/event-trend?${sp.toString()}`)
   },
   getAPIKeys: () => request<APIKeysResponse>('/keys'),
-  createAPIKey: (name: string, key?: string) =>
+  createAPIKey: (data: CreateAPIKeyRequest) =>
     request<CreateAPIKeyResponse>('/keys', {
       method: 'POST',
-      body: JSON.stringify({ name, ...(key ? { key } : {}) }),
+      body: JSON.stringify(data),
     }),
   deleteAPIKey: (id: number) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
+  updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
+    request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   getImagePromptTemplates: (params: { q?: string; tag?: string } = {}) => {
     const sp = new URLSearchParams()
     if (params.q) sp.set('q', params.q)
@@ -286,6 +348,8 @@ export const api = {
     const query = sp.toString()
     return request<ImageJobResponse>(`/images/jobs/${id}${query ? `?${query}` : ''}`)
   },
+  deleteImageJob: (id: number) =>
+    request<MessageResponse>(`/images/jobs/${id}`, { method: 'DELETE' }),
   getImageAssets: (params: { page?: number; pageSize?: number } = {}) => {
     const sp = new URLSearchParams()
     if (params.page) sp.set('page', String(params.page))
@@ -372,7 +436,7 @@ export const api = {
     request<{ message: string; inserted: number; total: number }>('/proxies', { method: 'POST', body: JSON.stringify(data) }),
   deleteProxy: (id: number) =>
     request<MessageResponse>(`/proxies/${id}`, { method: 'DELETE' }),
-  updateProxy: (id: number, data: { label?: string; enabled?: boolean }) =>
+  updateProxy: (id: number, data: { url?: string; label?: string; enabled?: boolean }) =>
     request<MessageResponse>(`/proxies/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   batchDeleteProxies: (ids: number[]) =>
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),

@@ -46,21 +46,15 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		return
 	}
 
-	// 检查 access_token 是否可用
-	account.Mu().RLock()
-	hasToken := account.AccessToken != ""
-	account.Mu().RUnlock()
-
-	if !hasToken {
+	isOpenAIResponsesAccount := account.IsOpenAIResponsesAPI()
+	if !isOpenAIResponsesAccount && account.GetAccessToken() == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "账号没有可用的 Access Token，请先刷新"})
 		return
 	}
 
-	testModel := strings.TrimSpace(c.Query("model"))
-	if testModel == "" {
-		testModel = h.connectionTestModel(c.Request.Context())
-	} else if !proxy.IsTextTestModelID(c.Request.Context(), h.db, testModel) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的测试模型: " + testModel})
+	testModel, err := h.connectionTestModelForAccount(c.Request.Context(), account, strings.TrimSpace(c.Query("model")))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -79,7 +73,13 @@ func (h *Handler) TestConnection(c *gin.Context) {
 
 	// 发送请求
 	start := time.Now()
-	resp, reqErr := proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
+	var resp *http.Response
+	var reqErr error
+	if isOpenAIResponsesAccount {
+		resp, reqErr = proxy.ExecuteOpenAIResponsesRequest(c.Request.Context(), account, payload, h.store.ResolveProxyForAccount(account), nil)
+	} else {
+		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
+	}
 	if reqErr != nil {
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("请求失败: %s", reqErr.Error())})
 		return
@@ -87,19 +87,32 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		proxy.SyncCodexUsageState(h.store, account, resp)
+		if !isOpenAIResponsesAccount {
+			proxy.SyncCodexUsageState(h.store, account, resp)
+		}
 		errBody, _ := io.ReadAll(resp.Body)
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
 			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
 		case http.StatusTooManyRequests:
-			proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
+			if isOpenAIResponsesAccount {
+				h.store.MarkCooldown(account, time.Minute, "rate_limited")
+			} else {
+				proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
+			}
 		}
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
 		return
 	}
 
-	usageState := proxy.SyncCodexUsageState(h.store, account, resp)
+	var usageState proxy.CodexUsageSyncResult
+	if !isOpenAIResponsesAccount {
+		usageState = proxy.SyncCodexUsageState(h.store, account, resp)
+		if msg, limited := formatUsageLimitedTestError(usageState); limited {
+			sendTestEvent(c, testEvent{Type: "error", Error: msg})
+			return
+		}
+	}
 
 	// 解析 SSE 流
 	hasContent := false
@@ -161,11 +174,11 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				return false
 			}
 			// 测试成功即重置冷却状态，用量限制由调度器自行判断
-			if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
+			if isOpenAIResponsesAccount || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100)) {
 				h.store.ClearCooldown(account)
 			}
 			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
-			if !usageState.HasUsage7d && !usageState.HasUsage5h {
+			if !isOpenAIResponsesAccount && !usageState.HasUsage7d && !usageState.HasUsage5h {
 				account.ClearUsageCache()
 			}
 			duration := time.Since(start).Milliseconds()
@@ -218,6 +231,20 @@ func buildTestPayload(model string) []byte {
 	payload, _ = sjson.SetBytes(payload, "store", false)
 	payload, _ = sjson.SetBytes(payload, "instructions", "You are a helpful assistant. Reply briefly.")
 	return payload
+}
+
+func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool) {
+	if state.Premium5hRateLimited {
+		remaining := time.Until(state.Reset5hAt).Round(time.Second)
+		if remaining < 0 {
+			remaining = 0
+		}
+		return fmt.Sprintf("上游探针返回 200，但 Codex 5h 用量头已达 %.0f%%，账号已保持限流状态，预计 %s 后恢复。", state.UsagePct5h, remaining), true
+	}
+	if state.HasUsage7d && state.UsagePct7d >= 100 {
+		return fmt.Sprintf("上游探针返回 200，但 Codex 7d 用量头已达 %.0f%%，账号已保持用量耗尽状态。", state.UsagePct7d), true
+	}
+	return "", false
 }
 
 // sendTestEvent 发送 SSE 事件
@@ -378,6 +405,51 @@ func (h *Handler) connectionTestModel(ctx context.Context) string {
 	return "gpt-5.4"
 }
 
+func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *auth.Account, requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	if account == nil || !account.IsOpenAIResponsesAPI() {
+		if requested == "" {
+			return h.connectionTestModel(ctx), nil
+		}
+		if !proxy.IsTextTestModelID(ctx, h.db, requested) {
+			return "", fmt.Errorf("不支持的测试模型: %s", requested)
+		}
+		return requested, nil
+	}
+
+	models := account.OpenAIResponsesModels()
+	textModels := make([]string, 0, len(models))
+	for _, model := range models {
+		if isTextConnectionModel(model) {
+			textModels = append(textModels, strings.TrimSpace(model))
+		}
+	}
+	if len(textModels) == 0 {
+		return "", fmt.Errorf("该 Responses API 账号没有可用于测试的文本模型")
+	}
+	if requested != "" {
+		for _, model := range textModels {
+			if strings.EqualFold(model, requested) {
+				return model, nil
+			}
+		}
+		return "", fmt.Errorf("该账号不支持测试模型: %s", requested)
+	}
+
+	defaultModel := strings.TrimSpace(h.store.GetTestModel())
+	for _, model := range textModels {
+		if strings.EqualFold(model, defaultModel) {
+			return model, nil
+		}
+	}
+	return textModels[0], nil
+}
+
+func isTextConnectionModel(model string) bool {
+	model = strings.TrimSpace(strings.ToLower(model))
+	return model != "" && !strings.Contains(model, "image")
+}
+
 type batchTestRequest struct {
 	IDs *[]int64 `json:"ids"`
 }
@@ -429,8 +501,6 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		return
 	}
 
-	testModel := h.connectionTestModel(c.Request.Context())
-	payload := buildTestPayload(testModel)
 	concurrency := h.store.GetTestConcurrency()
 
 	var (
@@ -443,12 +513,10 @@ func (h *Handler) BatchTest(c *gin.Context) {
 	)
 
 	for _, account := range accounts {
-		// 跳过没有 token 的账号
-		account.Mu().RLock()
-		hasToken := account.AccessToken != ""
-		hasRefreshToken := account.RefreshToken != ""
-		account.Mu().RUnlock()
-		if !hasToken {
+		if !account.IsOpenAIResponsesAPI() && account.GetAccessToken() == "" {
+			account.Mu().RLock()
+			hasRefreshToken := account.RefreshToken != ""
+			account.Mu().RUnlock()
 			if !hasRefreshToken {
 				h.store.MarkError(account, "批量测试失败: 账号缺少 access_token 和 refresh_token")
 			}
@@ -462,7 +530,21 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+			testModel, modelErr := h.connectionTestModelForAccount(context.Background(), acc, "")
+			if modelErr != nil {
+				h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+				atomic.AddInt64(&failedCount, 1)
+				return
+			}
+			payload := buildTestPayload(testModel)
+
+			var resp *http.Response
+			var err error
+			if acc.IsOpenAIResponsesAPI() {
+				resp, err = proxy.ExecuteOpenAIResponsesRequest(context.Background(), acc, payload, h.store.ResolveProxyForAccount(acc), nil)
+			} else {
+				resp, err = proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+			}
 			if err != nil {
 				h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
 				atomic.AddInt64(&failedCount, 1)
@@ -473,19 +555,29 @@ func (h *Handler) BatchTest(c *gin.Context) {
 
 			switch resp.StatusCode {
 			case http.StatusOK:
-				usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
-				// 测试成功即重置冷却状态，用量限制由调度器自行判断
-				if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
-					h.store.ClearCooldown(acc)
+				if !acc.IsOpenAIResponsesAPI() {
+					usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
+					if _, limited := formatUsageLimitedTestError(usageState); limited {
+						atomic.AddInt64(&rateLimitCount, 1)
+						return
+					}
 				}
+				// 测试成功即重置冷却状态，用量限制由调度器自行判断
+				h.store.ClearCooldown(acc)
 				atomic.AddInt64(&successCount, 1)
 			case http.StatusUnauthorized:
-				proxy.SyncCodexUsageState(h.store, acc, resp)
+				if !acc.IsOpenAIResponsesAPI() {
+					proxy.SyncCodexUsageState(h.store, acc, resp)
+				}
 				h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
 				atomic.AddInt64(&bannedCount, 1)
 			case http.StatusTooManyRequests:
-				proxy.SyncCodexUsageState(h.store, acc, resp)
-				proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
+				if acc.IsOpenAIResponsesAPI() {
+					h.store.MarkCooldown(acc, time.Minute, "rate_limited")
+				} else {
+					proxy.SyncCodexUsageState(h.store, acc, resp)
+					proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
+				}
 				atomic.AddInt64(&rateLimitCount, 1)
 			default:
 				if shouldMarkBatchTestAccountError(resp.StatusCode, body) {

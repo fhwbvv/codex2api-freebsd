@@ -159,6 +159,12 @@ func TestParseImportJSONTokensPreservesCPAFields(t *testing.T) {
 	data := []byte(`{
 		"type": "codex",
 		"email": "cpa@example.com",
+		"plan_type": "free",
+		"codex_7d_used_percent": 3,
+		"codex_7d_reset_at": "2026-05-15T20:33:11+08:00",
+		"codex_5h_used_percent": 0,
+		"codex_5h_reset_at": "2026-05-11T11:39:07+08:00",
+		"codex_usage_updated_at": "2026-05-11T11:39:07+08:00",
 		"expired": "2026-04-25T12:00:00Z",
 		"id_token": "id-cpa",
 		"account_id": "acc-cpa",
@@ -181,8 +187,49 @@ func TestParseImportJSONTokensPreservesCPAFields(t *testing.T) {
 	if token.email != "cpa@example.com" || token.name != "cpa@example.com" {
 		t.Fatalf("identity = name:%q email:%q, want cpa@example.com", token.name, token.email)
 	}
+	if token.planType != "free" {
+		t.Fatalf("planType = %q, want free", token.planType)
+	}
+	if token.codex7DUsedPercent != "3" || token.codex7DResetAt != "2026-05-15T20:33:11+08:00" {
+		t.Fatalf("7d usage = %q/%q, want 3/reset", token.codex7DUsedPercent, token.codex7DResetAt)
+	}
+	if token.codex5HUsedPercent != "0" || token.codex5HResetAt != "2026-05-11T11:39:07+08:00" {
+		t.Fatalf("5h usage = %q/%q, want 0/reset", token.codex5HUsedPercent, token.codex5HResetAt)
+	}
+	if token.codexUsageUpdatedAt != "2026-05-11T11:39:07+08:00" {
+		t.Fatalf("usageUpdatedAt = %q, want timestamp", token.codexUsageUpdatedAt)
+	}
 	if token.idToken != "id-cpa" || token.accountID != "acc-cpa" || token.expiresAt != "2026-04-25T12:00:00Z" {
 		t.Fatalf("metadata = %+v, want CPA token metadata preserved", token)
+	}
+}
+
+func TestAccountFromCredentialSeedRestoresUsageSnapshots(t *testing.T) {
+	account := accountFromCredentialSeed(42, "", tokenCredentialSeed{
+		planType:            "free",
+		codex7DUsedPercent:  "3",
+		codex7DResetAt:      "2026-05-15T20:33:11+08:00",
+		codex5HUsedPercent:  "0",
+		codex5HResetAt:      "2026-05-11T11:39:07+08:00",
+		codexUsageUpdatedAt: "2026-05-11T11:39:07+08:00",
+	})
+
+	if got := account.GetPlanType(); got != "free" {
+		t.Fatalf("PlanType = %q, want free", got)
+	}
+	pct7d, ok := account.GetUsagePercent7d()
+	if !ok || pct7d != 3 {
+		t.Fatalf("7d usage = %v/%t, want 3/true", pct7d, ok)
+	}
+	if account.GetReset7dAt().IsZero() {
+		t.Fatal("Reset7dAt is zero")
+	}
+	pct5h, ok := account.GetUsagePercent5h()
+	if !ok || pct5h != 0 {
+		t.Fatalf("5h usage = %v/%t, want 0/true", pct5h, ok)
+	}
+	if account.GetReset5hAt().IsZero() {
+		t.Fatal("Reset5hAt is zero")
 	}
 }
 
@@ -248,6 +295,20 @@ func TestReadUploadedImportFilesReadsRepeatedFileFields(t *testing.T) {
 	}
 	if !got["rt-1"] || !got["rt-2"] {
 		t.Fatalf("files = %+v, want both uploaded files", files)
+	}
+}
+
+func TestValidateImportFileSize(t *testing.T) {
+	if err := validateImportFileSize(&multipart.FileHeader{Filename: "ok.txt", Size: importFileSizeLimitBytes}); err != nil {
+		t.Fatalf("validateImportFileSize returned error for boundary size: %v", err)
+	}
+
+	err := validateImportFileSize(&multipart.FileHeader{Filename: "too-big.txt", Size: importFileSizeLimitBytes + 1})
+	if err == nil {
+		t.Fatal("expected oversized file error, got nil")
+	}
+	if got, want := err.Error(), "文件 too-big.txt 大小超过 20MB"; got != want {
+		t.Fatalf("error = %q, want %q", got, want)
 	}
 }
 

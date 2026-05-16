@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"testing"
 	"time"
@@ -121,6 +122,32 @@ func TestMemoryTokenCache_SetAndGetAccessToken(t *testing.T) {
 	}
 	if token != "test-token" {
 		t.Fatalf("GetAccessToken() = %s, want test-token", token)
+	}
+}
+
+func TestMemoryTokenCache_RuntimeCacheRoundTrip(t *testing.T) {
+	tc := NewMemory(10)
+	ctx := context.Background()
+	value := json.RawMessage(`{"ok":true}`)
+
+	if err := tc.SetRuntime(ctx, "test-runtime", "key-1", value, time.Minute); err != nil {
+		t.Fatalf("SetRuntime() error = %v", err)
+	}
+	got, ok, err := tc.GetRuntime(ctx, "test-runtime", "key-1")
+	if err != nil {
+		t.Fatalf("GetRuntime() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("GetRuntime() cache miss, want hit")
+	}
+	if string(got) != string(value) {
+		t.Fatalf("GetRuntime() = %s, want %s", got, value)
+	}
+	if err := tc.DeleteRuntime(ctx, "test-runtime", "key-1"); err != nil {
+		t.Fatalf("DeleteRuntime() error = %v", err)
+	}
+	if _, ok, err := tc.GetRuntime(ctx, "test-runtime", "key-1"); err != nil || ok {
+		t.Fatalf("GetRuntime() after delete ok=%v err=%v, want miss without error", ok, err)
 	}
 }
 

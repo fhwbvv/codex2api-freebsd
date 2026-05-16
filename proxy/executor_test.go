@@ -85,6 +85,41 @@ func TestClassifyStreamOutcome(t *testing.T) {
 	}
 }
 
+func TestClassifyResponseFailedOutcome(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"server_error","message":"An error occurred while processing your request. Please include the request ID req-123."}}}`)
+
+	outcome := classifyResponseFailedOutcome(payload)
+
+	if outcome.logStatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", outcome.logStatusCode, http.StatusInternalServerError)
+	}
+	if outcome.failureKind != "server" {
+		t.Fatalf("failure kind = %q, want server", outcome.failureKind)
+	}
+	if !outcome.penalize {
+		t.Fatal("response.failed server error should be penalized")
+	}
+	if !strings.Contains(outcome.failureMessage, "server_error") || !strings.Contains(outcome.failureMessage, "req-123") {
+		t.Fatalf("failure message = %q, want upstream code and request id", outcome.failureMessage)
+	}
+}
+
+func TestClassifyResponseFailedOutcomeInvalidRequest(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_value","type":"invalid_request_error","message":"Invalid input"}}}`)
+
+	outcome := classifyResponseFailedOutcome(payload)
+
+	if outcome.logStatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", outcome.logStatusCode, http.StatusBadRequest)
+	}
+	if outcome.failureKind != "client" {
+		t.Fatalf("failure kind = %q, want client", outcome.failureKind)
+	}
+	if outcome.penalize {
+		t.Fatal("client-side response.failed should not penalize account")
+	}
+}
+
 func TestShouldRecyclePooledClient(t *testing.T) {
 	tests := []struct {
 		name string

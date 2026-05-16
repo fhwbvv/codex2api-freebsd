@@ -32,14 +32,14 @@ var (
 	defaultModelPricing = &ModelPricing{InputPricePerMToken: 1.0, OutputPricePerMToken: 2.0}
 
 	modelPricingRules = []modelPricingRule{
-		// Codex/GPT-5 系列，参考 sub2api 的本地 fallback 定价。
+		// Codex/GPT-5 系列，参考 sub2api 的动态定价优先、fallback 兜底策略。
 		{model: "gpt-5.5", pricing: ModelPricing{
-			InputPricePerMToken:             5.0,
-			InputPricePerMTokenPriority:     10.0,
-			OutputPricePerMToken:            30.0,
-			OutputPricePerMTokenPriority:    60.0,
-			CacheReadPricePerMToken:         0.5,
-			CacheReadPricePerMTokenPriority: 1.0,
+			InputPricePerMToken:             2.5,
+			InputPricePerMTokenPriority:     5.0,
+			OutputPricePerMToken:            15.0,
+			OutputPricePerMTokenPriority:    30.0,
+			CacheReadPricePerMToken:         0.25,
+			CacheReadPricePerMTokenPriority: 0.5,
 		}},
 		{model: "gpt-5.4-mini", pricing: ModelPricing{InputPricePerMToken: 0.75, OutputPricePerMToken: 4.5, CacheReadPricePerMToken: 0.075}},
 		{model: "gpt-5.4-nano", pricing: ModelPricing{InputPricePerMToken: 0.2, OutputPricePerMToken: 1.25, CacheReadPricePerMToken: 0.02}},
@@ -52,20 +52,20 @@ var (
 			CacheReadPricePerMTokenPriority: 0.5,
 		}},
 		{model: "gpt-5.3-codex-spark", pricing: ModelPricing{
-			InputPricePerMToken:             1.5,
-			InputPricePerMTokenPriority:     3.0,
-			OutputPricePerMToken:            12.0,
-			OutputPricePerMTokenPriority:    24.0,
-			CacheReadPricePerMToken:         0.15,
-			CacheReadPricePerMTokenPriority: 0.3,
+			InputPricePerMToken:             1.25,
+			InputPricePerMTokenPriority:     2.5,
+			OutputPricePerMToken:            10.0,
+			OutputPricePerMTokenPriority:    20.0,
+			CacheReadPricePerMToken:         0.125,
+			CacheReadPricePerMTokenPriority: 0.25,
 		}},
 		{model: "gpt-5.3-codex", pricing: ModelPricing{
-			InputPricePerMToken:             1.5,
-			InputPricePerMTokenPriority:     3.0,
-			OutputPricePerMToken:            12.0,
-			OutputPricePerMTokenPriority:    24.0,
-			CacheReadPricePerMToken:         0.15,
-			CacheReadPricePerMTokenPriority: 0.3,
+			InputPricePerMToken:             1.75,
+			InputPricePerMTokenPriority:     3.5,
+			OutputPricePerMToken:            14.0,
+			OutputPricePerMTokenPriority:    28.0,
+			CacheReadPricePerMToken:         0.175,
+			CacheReadPricePerMTokenPriority: 0.35,
 		}},
 		{model: "gpt-5.2", pricing: ModelPricing{
 			InputPricePerMToken:             1.75,

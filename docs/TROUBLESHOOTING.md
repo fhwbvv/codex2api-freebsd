@@ -419,7 +419,7 @@ docker compose logs codex2api | awk '{for(i=1;i<=NF;i++){if($i ~ /@/){gsub(/[\[\
 ### 日志字段说明
 
 ```
-2024/01/01 12:00:00 api/server.go:123: POST /v1/chat/completions 200 523ms gpt-5.4 effort=medium [user@example.com] [proxy1]
+2024/01/01 12:00:00 api/server.go:123: POST /v1/chat/completions 200 523ms gpt-5.5 effort=medium [user@example.com] [proxy1]
 │                 │                │    │                        │   │     │          │          │                │
 │                 │                │    │                        │   │     │          │          │                └── 使用的代理
 │                 │                │    │                        │   │     │          │          └── 账号邮箱

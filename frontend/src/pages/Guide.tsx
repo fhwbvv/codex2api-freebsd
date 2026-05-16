@@ -1,21 +1,111 @@
-import { useMemo, useState } from 'react'
-import { useTranslation } from 'react-i18next'
-import { Copy, Check } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Check, Copy, ExternalLink } from 'lucide-react'
+import { api } from '../api'
 import PageHeader from '../components/PageHeader'
-import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Card, CardContent } from '@/components/ui/card'
+import { Select } from '@/components/ui/select'
 
-// 带复制按钮的代码块
-function CodeBlock({ path, content }: { path: string; content: string }) {
-  const { t } = useTranslation()
+type TabOption<T extends string> = {
+  id: T
+  label: string
+}
+
+type ApiKeyOption = {
+  name: string
+  key: string
+}
+
+type ClientTool = {
+  id: string
+  name: string
+  badge: string
+  blurb: string
+  glyph: string
+  tone: string
+}
+
+const CLIENT_TOOLS: ClientTool[] = [
+  {
+    id: 'codex',
+    name: 'Codex CLI',
+    badge: 'Responses',
+    blurb: 'Write config.toml and auth.json for the OpenAI Responses wire API.',
+    glyph: 'CX',
+    tone: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
+  },
+  {
+    id: 'claude',
+    name: 'Claude Code',
+    badge: 'Anthropic',
+    blurb: 'Use environment variables or settings.json for the Messages endpoint.',
+    glyph: 'CC',
+    tone: 'bg-orange-500/10 text-orange-600 dark:text-orange-400',
+  },
+  {
+    id: 'cc-switch',
+    name: 'CC Switch',
+    badge: 'Deeplink',
+    blurb: 'Launch the desktop switcher and import this server as a provider.',
+    glyph: 'CS',
+    tone: 'bg-fuchsia-500/10 text-fuchsia-600 dark:text-fuchsia-400',
+  },
+]
+
+const FALLBACK_MODELS = ['gpt-5.5', 'gpt-5.4-mini', 'gpt-5.3-codex', 'claude-sonnet-4-5-20250514']
+
+function encodeBase64(text: string): string {
+  return btoa(unescape(encodeURIComponent(text)))
+}
+
+function buildCcSwitchUrl(baseUrl: string, apiKey: string): string {
+  const config = encodeURIComponent(encodeBase64(JSON.stringify({
+    name: 'codex2api',
+    baseURL: baseUrl,
+    apiKey,
+    anthropicVersion: '2023-06-01',
+  })))
+  return `cc-switch://import?data=${config}`
+}
+
+function keyLabel(item: ApiKeyOption): string {
+  if (!item.key) return item.name || 'API Key'
+  const masked = item.key.length > 14 ? `${item.key.slice(0, 7)}...${item.key.slice(-4)}` : item.key
+  return item.name ? `${item.name} - ${masked}` : masked
+}
+
+function Tabs<T extends string>({ tabs, active, onChange }: {
+  tabs: TabOption<T>[]
+  active: T
+  onChange: (value: T) => void
+}) {
+  return (
+    <div className="mb-4 flex flex-wrap gap-1.5 border-b border-border">
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          onClick={() => onChange(tab.id)}
+          className={`-mb-px border-b-2 px-3 py-2 text-sm font-semibold transition-colors ${
+            active === tab.id
+              ? 'border-primary text-primary'
+              : 'border-transparent text-muted-foreground hover:text-foreground'
+          }`}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function CodeBlock({ label, content }: { label: string; content: string }) {
   const [copied, setCopied] = useState(false)
 
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(content)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
     } catch {
       const textarea = document.createElement('textarea')
       textarea.value = content
@@ -24,80 +114,46 @@ function CodeBlock({ path, content }: { path: string; content: string }) {
       textarea.select()
       document.execCommand('copy')
       document.body.removeChild(textarea)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
     }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1600)
   }
 
   return (
-    <div className="bg-zinc-900 dark:bg-zinc-950 rounded-xl overflow-hidden">
-      <div className="flex items-center justify-between px-4 py-2 bg-zinc-800 dark:bg-zinc-900 border-b border-zinc-700">
-        <span className="text-xs text-zinc-400 font-mono">{path}</span>
+    <div className="overflow-hidden rounded-lg bg-zinc-900 dark:bg-zinc-950">
+      <div className="flex items-center justify-between gap-3 border-b border-zinc-700 bg-zinc-800 px-4 py-2 dark:bg-zinc-900">
+        <span className="truncate font-mono text-xs text-zinc-400">{label}</span>
         <button
+          type="button"
           onClick={() => void handleCopy()}
-          className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg transition-colors ${
-            copied
-              ? 'bg-emerald-500/20 text-emerald-400'
-              : 'bg-zinc-700 hover:bg-zinc-600 text-zinc-300 hover:text-white'
+          className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-semibold transition-colors ${
+            copied ? 'bg-emerald-500/20 text-emerald-300' : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600 hover:text-white'
           }`}
         >
           {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-          {copied ? t('guide.copied') : t('guide.copy')}
+          {copied ? 'Copied' : 'Copy'}
         </button>
       </div>
-      <pre className="p-4 text-sm font-mono text-zinc-100 overflow-x-auto leading-relaxed">
+      <pre className="overflow-x-auto p-4 font-mono text-[13px] leading-relaxed text-zinc-100">
         <code>{content}</code>
       </pre>
     </div>
   )
 }
 
-// macOS/Linux 和 Windows 的 Tab 切换
-function OsTabs({ active, onChange }: { active: 'unix' | 'windows'; onChange: (v: 'unix' | 'windows') => void }) {
-  return (
-    <div className="border-b border-border mb-4">
-      <nav className="-mb-px flex space-x-4">
-        <button
-          onClick={() => onChange('unix')}
-          className={`whitespace-nowrap py-2.5 px-1 border-b-2 font-medium text-sm transition-colors flex items-center gap-2 ${
-            active === 'unix'
-              ? 'border-primary text-primary'
-              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-          }`}
-        >
-          <svg fill="currentColor" viewBox="0 0 24 24" className="size-4"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
-          macOS / Linux
-        </button>
-        <button
-          onClick={() => onChange('windows')}
-          className={`whitespace-nowrap py-2.5 px-1 border-b-2 font-medium text-sm transition-colors flex items-center gap-2 ${
-            active === 'windows'
-              ? 'border-primary text-primary'
-              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-          }`}
-        >
-          <svg fill="currentColor" viewBox="0 0 24 24" className="size-4"><path d="M3 12V6.75l6-1.32v6.48L3 12zm17-9v8.75l-10 .15V5.21L20 3zM3 13l6 .09v6.81l-6-1.15V13zm7 .25l10 .15V21l-10-1.91v-5.84z"/></svg>
-          Windows
-        </button>
-      </nav>
-    </div>
-  )
-}
+function ClientCard({ tool, activeKey, baseUrl }: {
+  tool: ClientTool
+  activeKey: string
+  baseUrl: string
+}) {
+  const [codexTab, setCodexTab] = useState<'unix' | 'windows'>('unix')
+  const [claudeTab, setClaudeTab] = useState<'env-unix' | 'env-windows' | 'settings'>('env-unix')
+  const key = activeKey || 'YOUR_API_KEY'
+  const codexDir = codexTab === 'windows' ? '%userprofile%\\.codex' : '~/.codex'
 
-export default function Guide() {
-  const { t } = useTranslation()
-  const [codexOs, setCodexOs] = useState<'unix' | 'windows'>('unix')
-  const [claudeOs, setClaudeOs] = useState<'unix' | 'windows'>('unix')
-
-  // 动态获取当前服务地址
-  const baseUrl = useMemo(() => window.location.origin, [])
-
-  const codexConfigDir = codexOs === 'windows' ? '%userprofile%\\.codex' : '~/.codex'
-  const claudeConfigDir = claudeOs === 'windows' ? '%userprofile%\\.claude' : '~/.claude'
-
-  const codexConfigToml = `model_provider = "OpenAI"
-model = "gpt-5.4"
-review_model = "gpt-5.4"
+  const codexConfig = `model_provider = "OpenAI"
+model = "gpt-5.5"
+review_model = "gpt-5.5"
 model_reasoning_effort = "xhigh"
 disable_response_storage = true
 network_access = "enabled"
@@ -110,189 +166,273 @@ base_url = "${baseUrl}"
 wire_api = "responses"
 requires_openai_auth = true`
 
-  const codexAuthJson = `{
-  "OPENAI_API_KEY": "YOUR_API_KEY"
+  const codexAuth = `{
+  "OPENAI_API_KEY": "${key}"
 }`
 
-  const claudeSettingsJson = `{
+  const claudeEnvUnix = `export ANTHROPIC_BASE_URL="${baseUrl}"
+export ANTHROPIC_AUTH_TOKEN="${key}"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+
+  const claudeEnvWindows = `set ANTHROPIC_BASE_URL=${baseUrl}
+set ANTHROPIC_AUTH_TOKEN=${key}
+set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+
+  const claudeSettings = `{
   "env": {
     "ANTHROPIC_BASE_URL": "${baseUrl}",
-    "ANTHROPIC_AUTH_TOKEN": "YOUR_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN": "${key}",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
   }
 }`
 
-  const claudeEnvUnix = `export ANTHROPIC_BASE_URL="${baseUrl}"
-export ANTHROPIC_AUTH_TOKEN="YOUR_API_KEY"
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+  const ccSwitchUrl = buildCcSwitchUrl(baseUrl, key)
 
-  const claudeEnvWindows = `set ANTHROPIC_BASE_URL=${baseUrl}
-set ANTHROPIC_AUTH_TOKEN=YOUR_API_KEY
-set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+  return (
+    <Card id={`client-${tool.id}`} className="scroll-mt-20">
+      <CardContent className="p-5">
+        <div className="mb-4 flex items-start gap-3">
+          <div className={`flex size-10 shrink-0 items-center justify-center rounded-lg text-sm font-bold ${tool.tone}`}>
+            {tool.glyph}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-base font-semibold text-foreground">{tool.name}</h3>
+              <Badge variant="outline" className="text-[10px] font-bold">{tool.badge}</Badge>
+            </div>
+            <p className="mt-1 text-sm text-muted-foreground">{tool.blurb}</p>
+          </div>
+        </div>
+
+        {tool.id === 'codex' && (
+          <>
+            <Tabs
+              tabs={[{ id: 'unix', label: 'macOS / Linux' }, { id: 'windows', label: 'Windows' }]}
+              active={codexTab}
+              onChange={setCodexTab}
+            />
+            <div className="space-y-4">
+              <CodeBlock label={`${codexDir}/config.toml`} content={codexConfig} />
+              <CodeBlock label={`${codexDir}/auth.json`} content={codexAuth} />
+            </div>
+          </>
+        )}
+
+        {tool.id === 'claude' && (
+          <>
+            <Tabs
+              tabs={[
+                { id: 'env-unix', label: 'macOS / Linux env' },
+                { id: 'env-windows', label: 'Windows env' },
+                { id: 'settings', label: 'settings.json' },
+              ]}
+              active={claudeTab}
+              onChange={setClaudeTab}
+            />
+            {claudeTab === 'env-unix' && <CodeBlock label="Terminal" content={claudeEnvUnix} />}
+            {claudeTab === 'env-windows' && <CodeBlock label="Command Prompt" content={claudeEnvWindows} />}
+            {claudeTab === 'settings' && <CodeBlock label="~/.claude/settings.json" content={claudeSettings} />}
+          </>
+        )}
+
+        {tool.id === 'cc-switch' && (
+          <div className="space-y-4">
+            <CodeBlock label="cc-switch deeplink" content={ccSwitchUrl} />
+            <Button
+              asChild
+              disabled={!activeKey}
+              className="gap-2"
+            >
+              <a href={ccSwitchUrl}>
+                <ExternalLink className="size-4" />
+                Import to CC Switch
+              </a>
+            </Button>
+            {!activeKey && <p className="text-xs text-amber-600 dark:text-amber-400">Create or select an API key before launching the deeplink.</p>}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+export default function Guide() {
+  const baseUrl = useMemo(() => window.location.origin, [])
+  const [apiKeys, setApiKeys] = useState<ApiKeyOption[]>([])
+  const [selectedKey, setSelectedKey] = useState('')
+  const [models, setModels] = useState(FALLBACK_MODELS)
+  const [selectedModel, setSelectedModel] = useState('gpt-5.5')
+  const [curlTab, setCurlTab] = useState<'responses' | 'chat' | 'messages'>('responses')
+
+  useEffect(() => {
+    api.getAPIKeys().then((res) => {
+      const keys = (res.keys ?? []).map((item) => ({ name: item.name, key: item.raw_key || item.key }))
+      setApiKeys(keys)
+      if (keys[0]) setSelectedKey(keys[0].key)
+    }).catch(() => {})
+
+    api.getModels().then((res) => {
+      const next = (res.models?.length ? res.models : res.items?.map((item) => item.id) ?? [])
+        .filter((model): model is string => Boolean(model))
+      if (next.length > 0) {
+        setModels(next)
+        setSelectedModel(next.includes('gpt-5.5') ? 'gpt-5.5' : next[0])
+      }
+    }).catch(() => {})
+  }, [])
+
+  const activeKey = selectedKey || apiKeys[0]?.key || ''
+  const keyForSnippet = activeKey || 'YOUR_API_KEY'
+  const messagesModel = selectedModel.startsWith('claude-') ? selectedModel : 'claude-sonnet-4-5-20250514'
+
+  const curlExamples = {
+    responses: `curl -X POST ${baseUrl}/v1/responses \\
+  -H "Authorization: Bearer ${keyForSnippet}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${selectedModel}",
+    "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+    "stream": true
+  }'`,
+    chat: `curl -X POST ${baseUrl}/v1/chat/completions \\
+  -H "Authorization: Bearer ${keyForSnippet}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${selectedModel}",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'`,
+    messages: `curl -X POST ${baseUrl}/v1/messages \\
+  -H "x-api-key: ${keyForSnippet}" \\
+  -H "Content-Type: application/json" \\
+  -H "anthropic-version: 2023-06-01" \\
+  -d '{
+    "model": "${messagesModel}",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'`,
+  }
+
+  const tocItems = [
+    ['quick-start', 'Quick Start'],
+    ['client-codex', 'Codex CLI'],
+    ['client-claude', 'Claude Code'],
+    ['client-cc-switch', 'CC Switch'],
+    ['curl-examples', 'cURL Examples'],
+    ['auth', 'Authentication'],
+  ]
 
   return (
     <>
       <PageHeader
-        title={t('guide.title')}
-        description={t('guide.description')}
+        title="Usage Guide"
+        description="Configure clients and test the OpenAI / Anthropic compatible endpoints."
       />
 
-      {/* API 端点总览 */}
-      <Card className="mb-4">
-        <CardContent className="p-6">
-          <h3 className="text-base font-semibold text-foreground mb-2">{t('guide.endpoints')}</h3>
-          <p className="text-sm text-muted-foreground mb-4">{t('guide.endpointsDesc')}</p>
-
-          <div className="space-y-4">
-            <div className="p-4 rounded-xl border border-border bg-white/40 dark:bg-white/5">
-              <div className="flex items-center gap-2 mb-2">
-                <Badge variant="default" className="text-[13px]">POST</Badge>
-                <code className="font-mono text-sm font-semibold">/v1/responses</code>
+      <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_240px]">
+        <div className="min-w-0 space-y-4">
+          <Card id="quick-start" className="scroll-mt-20">
+            <CardContent className="p-5">
+              <div className="flex flex-wrap items-end justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-bold text-foreground">Quick Start</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">Choose a key once; client cards and cURL examples update together.</p>
+                </div>
+                <div className="min-w-[240px]">
+                  <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">API Key</label>
+                  {apiKeys.length > 0 ? (
+                    <Select
+                      value={selectedKey}
+                      onValueChange={setSelectedKey}
+                      options={apiKeys.map((item) => ({ label: keyLabel(item), value: item.key }))}
+                    />
+                  ) : (
+                    <a
+                      href="/admin/api-keys"
+                      className="inline-flex h-10 items-center rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 text-sm font-semibold text-amber-700 dark:text-amber-300"
+                    >
+                      Create an API key first
+                    </a>
+                  )}
+                </div>
               </div>
-              <p className="text-sm text-muted-foreground">{t('guide.responsesDesc')}</p>
-            </div>
+            </CardContent>
+          </Card>
 
-            <div className="p-4 rounded-xl border border-border bg-white/40 dark:bg-white/5">
-              <div className="flex items-center gap-2 mb-2">
-                <Badge variant="default" className="text-[13px]">POST</Badge>
-                <code className="font-mono text-sm font-semibold">/v1/chat/completions</code>
+          <div className="grid gap-4 lg:grid-cols-3">
+            {CLIENT_TOOLS.map((tool) => (
+              <ClientCard key={tool.id} tool={tool} activeKey={activeKey} baseUrl={baseUrl} />
+            ))}
+          </div>
+
+          <Card id="curl-examples" className="scroll-mt-20">
+            <CardContent className="p-5">
+              <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-bold text-foreground">cURL Examples</h2>
+                  <p className="mt-1 text-sm text-muted-foreground">Switch endpoint format and model without editing the snippet manually.</p>
+                </div>
+                <div className="min-w-[220px]">
+                  <label className="mb-1.5 block text-xs font-semibold uppercase tracking-wide text-muted-foreground">Model</label>
+                  <Select
+                    value={selectedModel}
+                    onValueChange={setSelectedModel}
+                    options={models.map((model) => ({ label: model, value: model }))}
+                  />
+                </div>
               </div>
-              <p className="text-sm text-muted-foreground">{t('guide.chatDesc')}</p>
-            </div>
+              <Tabs
+                tabs={[
+                  { id: 'responses', label: '/v1/responses' },
+                  { id: 'chat', label: '/v1/chat/completions' },
+                  { id: 'messages', label: '/v1/messages' },
+                ]}
+                active={curlTab}
+                onChange={setCurlTab}
+              />
+              <CodeBlock label="cURL" content={curlExamples[curlTab]} />
+            </CardContent>
+          </Card>
 
-            <div className="p-4 rounded-xl border border-border bg-white/40 dark:bg-white/5">
-              <div className="flex items-center gap-2 mb-2">
-                <Badge variant="default" className="text-[13px]">POST</Badge>
-                <code className="font-mono text-sm font-semibold">/v1/messages</code>
+          <Card id="auth" className="scroll-mt-20">
+            <CardContent className="p-5">
+              <h2 className="text-lg font-bold text-foreground">Authentication</h2>
+              <p className="mt-1 text-sm text-muted-foreground">Downstream API requests accept standard OpenAI and Anthropic header styles.</p>
+              <div className="mt-4 grid gap-2">
+                <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
+                  <Badge variant="outline">Header</Badge>
+                  <code className="font-mono text-sm">Authorization: Bearer &lt;key&gt;</code>
+                </div>
+                <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
+                  <Badge variant="outline">Header</Badge>
+                  <code className="font-mono text-sm">x-api-key: &lt;key&gt;</code>
+                </div>
+                <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
+                  <Badge variant="outline">Header</Badge>
+                  <code className="font-mono text-sm">anthropic-auth-token: &lt;key&gt;</code>
+                </div>
               </div>
-              <p className="text-sm text-muted-foreground">{t('guide.messagesDesc')}</p>
-            </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        <aside className="sticky top-4 hidden xl:block">
+          <div className="rounded-lg border border-border bg-card p-4">
+            <div className="mb-3 text-xs font-bold uppercase tracking-wide text-muted-foreground">On this page</div>
+            <nav className="space-y-1">
+              {tocItems.map(([id, label]) => (
+                <a
+                  key={id}
+                  href={`#${id}`}
+                  className="block rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                >
+                  {label}
+                </a>
+              ))}
+            </nav>
           </div>
-        </CardContent>
-      </Card>
-
-      {/* Codex CLI 配置 */}
-      <Card className="mb-4">
-        <CardContent className="p-6">
-          <h3 className="text-base font-semibold text-foreground mb-2">{t('guide.codexTitle')}</h3>
-          <p className="text-sm text-muted-foreground mb-4">{t('guide.codexDesc')}</p>
-
-          <OsTabs active={codexOs} onChange={setCodexOs} />
-
-          <p className="text-xs text-amber-600 dark:text-amber-400 mb-3 flex items-center gap-1">
-            ⓘ {t('guide.codexConfigHint')}
-          </p>
-
-          <div className="space-y-4">
-            <CodeBlock path={`${codexConfigDir}/config.toml`} content={codexConfigToml} />
-            <CodeBlock path={`${codexConfigDir}/auth.json`} content={codexAuthJson} />
-          </div>
-
-          <p className="text-xs text-muted-foreground mt-3">
-            {codexOs === 'windows' ? t('guide.codexNoteWindows') : t('guide.codexNoteUnix')}
-          </p>
-        </CardContent>
-      </Card>
-
-      {/* Claude Code 配置 */}
-      <Card className="mb-4">
-        <CardContent className="p-6">
-          <h3 className="text-base font-semibold text-foreground mb-2">{t('guide.claudeCodeTitle')}</h3>
-          <p className="text-sm text-muted-foreground mb-4">{t('guide.claudeCodeDesc')}</p>
-
-          <OsTabs active={claudeOs} onChange={setClaudeOs} />
-
-          <div className="space-y-4">
-            <CodeBlock
-              path={claudeOs === 'unix' ? 'Terminal' : 'Command Prompt'}
-              content={claudeOs === 'unix' ? claudeEnvUnix : claudeEnvWindows}
-            />
-            <p className="text-xs text-muted-foreground">{t('guide.claudeEnvNote')}</p>
-
-            <CodeBlock
-              path={`${claudeConfigDir}/settings.json`}
-              content={claudeSettingsJson}
-            />
-            <p className="text-xs text-muted-foreground">{t('guide.claudeSettingsNote')}</p>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* 认证方式 */}
-      <Card className="mb-4">
-        <CardContent className="p-6">
-          <h3 className="text-base font-semibold text-foreground mb-2">{t('guide.authTitle')}</h3>
-          <p className="text-sm text-muted-foreground mb-3">{t('guide.authDesc')}</p>
-          <ul className="space-y-2 text-sm">
-            <li className="flex items-start gap-2">
-              <span className="text-primary font-bold mt-0.5">1.</span>
-              <code className="font-mono text-[13px] bg-muted px-2 py-0.5 rounded">{t('guide.authBearer')}</code>
-            </li>
-            <li className="flex items-start gap-2">
-              <span className="text-primary font-bold mt-0.5">2.</span>
-              <code className="font-mono text-[13px] bg-muted px-2 py-0.5 rounded">{t('guide.authXApiKey')}</code>
-            </li>
-            <li className="flex items-start gap-2">
-              <span className="text-primary font-bold mt-0.5">3.</span>
-              <code className="font-mono text-[13px] bg-muted px-2 py-0.5 rounded">{t('guide.authAnthropicToken')}</code>
-            </li>
-          </ul>
-        </CardContent>
-      </Card>
-
-      {/* 模型映射说明 */}
-      <Card className="mb-4">
-        <CardContent className="p-6">
-          <h3 className="text-base font-semibold text-foreground mb-2">{t('guide.modelMappingTitle')}</h3>
-          <p className="text-sm text-muted-foreground">{t('guide.modelMappingDesc')}</p>
-        </CardContent>
-      </Card>
-
-      {/* 请求示例 */}
-      <Card>
-        <CardContent className="p-6">
-          <h3 className="text-base font-semibold text-foreground mb-4">{t('guide.exampleTitle')}</h3>
-
-          <div className="space-y-6">
-            <div>
-              <h4 className="text-sm font-semibold text-muted-foreground mb-2">{t('guide.responsesExample')}</h4>
-              <CodeBlock path="curl" content={`curl -X POST http://your-server:8080/v1/responses \\
-  -H "Authorization: Bearer YOUR_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "model": "gpt-5.4",
-    "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
-    "stream": true
-  }'`} />
-            </div>
-
-            <div>
-              <h4 className="text-sm font-semibold text-muted-foreground mb-2">{t('guide.chatExample')}</h4>
-              <CodeBlock path="curl" content={`curl -X POST http://your-server:8080/v1/chat/completions \\
-  -H "Authorization: Bearer YOUR_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "model": "gpt-5.4",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": true
-  }'`} />
-            </div>
-
-            <div>
-              <h4 className="text-sm font-semibold text-muted-foreground mb-2">{t('guide.messagesExample')}</h4>
-              <CodeBlock path="curl" content={`curl -X POST http://your-server:8080/v1/messages \\
-  -H "x-api-key: YOUR_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -H "anthropic-version: 2023-06-01" \\
-  -d '{
-    "model": "claude-sonnet-4-5-20250514",
-    "max_tokens": 1024,
-    "messages": [{"role": "user", "content": "Hello"}]
-  }'`} />
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+        </aside>
+      </div>
     </>
   )
 }

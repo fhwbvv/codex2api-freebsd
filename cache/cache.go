@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -13,7 +14,12 @@ type PoolStats struct {
 	StaleConns uint32
 }
 
-// TokenCache 统一的 token 缓存与刷新锁接口。
+type SessionAffinityBinding struct {
+	AccountID int64  `json:"account_id"`
+	ProxyURL  string `json:"proxy_url,omitempty"`
+}
+
+// TokenCache 统一的 token 缓存、刷新锁与短期运行态缓存接口。
 type TokenCache interface {
 	Driver() string
 	Label() string
@@ -28,4 +34,12 @@ type TokenCache interface {
 	AcquireRefreshLock(ctx context.Context, accountID int64, ttl time.Duration) (bool, error)
 	ReleaseRefreshLock(ctx context.Context, accountID int64) error
 	WaitForRefreshComplete(ctx context.Context, accountID int64, timeout time.Duration) (string, error)
+	SetSessionAffinity(ctx context.Context, key string, binding SessionAffinityBinding, ttl time.Duration) error
+	GetSessionAffinity(ctx context.Context, key string) (SessionAffinityBinding, bool, error)
+	DeleteSessionAffinity(ctx context.Context, key string, accountID int64) error
+	SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error
+	GetResponseContext(ctx context.Context, responseID string) ([]json.RawMessage, error)
+	SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error
+	GetRuntime(ctx context.Context, namespace string, key string) (json.RawMessage, bool, error)
+	DeleteRuntime(ctx context.Context, namespace string, key string) error
 }

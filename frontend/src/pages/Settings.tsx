@@ -11,6 +11,7 @@ import { useToast } from '../hooks/useToast'
 import type { HealthResponse, ModelInfo, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
+import { DEFAULT_SITE_LOGO, sanitizeBrandingLogo, useBranding } from '../branding'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -26,7 +27,7 @@ import {
 } from '@/components/ui/table'
 import { cn } from '@/lib/utils'
 
-import { ExternalLink, RefreshCw, Save, Trash2 } from 'lucide-react'
+import { ExternalLink, RefreshCw, Save, Trash2, Upload, X } from 'lucide-react'
 
 type ModelMappingEntry = [string, string]
 
@@ -114,7 +115,7 @@ function ModelMappingEditor({ value, onChange }: { value: string; onChange: (v: 
             />
             <Input
               className="h-8 px-2 font-mono text-xs"
-              placeholder="gpt-5.4"
+              placeholder="gpt-5.5"
               value={v}
               onChange={(e: ChangeEvent<HTMLInputElement>) => handleChange(i, 1, e.target.value)}
             />
@@ -205,8 +206,142 @@ function StatusTile({
   )
 }
 
+const SITE_LOGO_MAX_BYTES = 600 * 1024
+const SITE_LOGO_CANVAS_SIZE = 80
+
+function formatBytesKB(bytes: number) {
+  return Math.max(1, Math.round(bytes / 1024))
+}
+
+function getSiteLogoMimeType(file: File) {
+  const type = file.type.toLowerCase()
+  const name = file.name.toLowerCase()
+  if (type === 'image/png' || name.endsWith('.png')) return 'image/png'
+  if (type === 'image/jpeg' || name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg'
+  if (type === 'image/svg+xml' || name.endsWith('.svg')) return 'image/svg+xml'
+  return ''
+}
+
+function dataURLByteLength(dataURL: string) {
+  const commaIndex = dataURL.indexOf(',')
+  if (commaIndex === -1) return new Blob([dataURL]).size
+  const meta = dataURL.slice(0, commaIndex)
+  const data = dataURL.slice(commaIndex + 1)
+  if (meta.endsWith(';base64')) {
+    const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0
+    return Math.floor((data.length * 3) / 4) - padding
+  }
+  return new Blob([decodeURIComponent(data)]).size
+}
+
+function readFileAsDataURL(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '')
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+
+function textToBase64(value: string) {
+  const bytes = new TextEncoder().encode(value)
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.slice(i, i + 0x8000))
+  }
+  return btoa(binary)
+}
+
+function minifySVG(value: string) {
+  return value
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/>\s+</g, '><')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+function loadImage(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve(image)
+    image.onerror = reject
+    image.src = src
+  })
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality?: number) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob)
+      else reject(new Error('canvas-to-blob-failed'))
+    }, type, quality)
+  })
+}
+
+async function blobToDataURL(blob: Blob) {
+  return readFileAsDataURL(new File([blob], 'site-logo', { type: blob.type }))
+}
+
+async function compressImageSourceToDataURL(src: string, mimeType: string) {
+  const image = await loadImage(src)
+  const canvas = document.createElement('canvas')
+  canvas.width = SITE_LOGO_CANVAS_SIZE
+  canvas.height = SITE_LOGO_CANVAS_SIZE
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('canvas-context-unavailable')
+
+  const outputType = mimeType === 'image/jpeg' ? 'image/jpeg' : 'image/png'
+  if (outputType === 'image/jpeg') {
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
+  } else {
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+  }
+
+  const sourceWidth = image.naturalWidth || image.width || SITE_LOGO_CANVAS_SIZE
+  const sourceHeight = image.naturalHeight || image.height || SITE_LOGO_CANVAS_SIZE
+  const scale = Math.min(canvas.width / sourceWidth, canvas.height / sourceHeight)
+  const drawWidth = Math.max(1, Math.round(sourceWidth * scale))
+  const drawHeight = Math.max(1, Math.round(sourceHeight * scale))
+  const dx = Math.round((canvas.width - drawWidth) / 2)
+  const dy = Math.round((canvas.height - drawHeight) / 2)
+  ctx.drawImage(image, dx, dy, drawWidth, drawHeight)
+
+  if (outputType === 'image/png') {
+    const blob = await canvasToBlob(canvas, outputType)
+    return blobToDataURL(blob)
+  }
+
+  const qualities = [0.86, 0.72, 0.6, 0.48, 0.36]
+  let bestDataURL = ''
+  for (const quality of qualities) {
+    const blob = await canvasToBlob(canvas, outputType, quality)
+    const dataURL = await blobToDataURL(blob)
+    bestDataURL = dataURL
+    if (dataURLByteLength(dataURL) <= SITE_LOGO_MAX_BYTES) return dataURL
+  }
+  return bestDataURL
+}
+
+async function compressSiteLogoFile(file: File, mimeType: string) {
+  if (mimeType === 'image/svg+xml') {
+    const minified = minifySVG(await file.text())
+    const svgDataURL = `data:image/svg+xml;base64,${textToBase64(minified)}`
+    if (dataURLByteLength(svgDataURL) <= SITE_LOGO_MAX_BYTES) return svgDataURL
+    return compressImageSourceToDataURL(svgDataURL, mimeType)
+  }
+
+  const objectURL = URL.createObjectURL(file)
+  try {
+    return await compressImageSourceToDataURL(objectURL, mimeType)
+  } finally {
+    URL.revokeObjectURL(objectURL)
+  }
+}
+
 export default function Settings() {
   const { t } = useTranslation()
+  const { applyBranding } = useBranding()
   const booleanOptions = [
     { label: t('common.disabled'), value: 'false' },
     { label: t('common.enabled'), value: 'true' },
@@ -230,6 +365,8 @@ export default function Settings() {
     { label: t('settings.imageStorageS3'), value: 's3' },
   ]
   const [settingsForm, setSettingsForm] = useState<SystemSettings>({
+    site_name: 'CodexProxy',
+    site_logo: '',
     max_concurrency: 2,
     global_rpm: 0,
     test_model: '',
@@ -291,11 +428,13 @@ export default function Settings() {
   const [modelsLastSyncedAt, setModelsLastSyncedAt] = useState<string | undefined>()
   const [modelsSourceURL, setModelsSourceURL] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
+  const logoFileInputRef = useRef<HTMLInputElement>(null)
   const { toast, showToast } = useToast()
 
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
     setSettingsForm(settings)
+    applyBranding({ site_name: settings.site_name, site_logo: settings.site_logo })
     setLoadedAdminSecret(settings.admin_secret ?? '')
     setModelList(modelsResp.models ?? [])
     setModelItems(modelsResp.items ?? [])
@@ -304,7 +443,7 @@ export default function Settings() {
     return {
       health,
     }
-  }, [])
+  }, [applyBranding])
 
   const { data, loading, error, reload } = useDataLoader<{
     health: HealthResponse | null
@@ -321,6 +460,7 @@ export default function Settings() {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
       const updated = await api.updateSettings(settingsForm)
       setSettingsForm(updated)
+      applyBranding({ site_name: updated.site_name, site_logo: updated.site_logo })
       setLoadedAdminSecret(updated.admin_secret ?? '')
       if (updated.admin_auth_source !== 'env') {
         setAdminKey(updated.admin_secret ?? '')
@@ -338,6 +478,33 @@ export default function Settings() {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
       setSavingSettings(false)
+    }
+  }
+
+  const handleSiteLogoUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    const mimeType = getSiteLogoMimeType(file)
+    if (!mimeType) {
+      showToast(t('settings.siteLogoInvalidType'), 'error')
+      return
+    }
+
+    try {
+      const result = file.size <= SITE_LOGO_MAX_BYTES
+        ? await readFileAsDataURL(file)
+        : await compressSiteLogoFile(file, mimeType)
+      if (dataURLByteLength(result) > SITE_LOGO_MAX_BYTES) {
+        showToast(t('settings.siteLogoTooLarge'), 'error')
+        return
+      }
+      setSettingsForm((f) => ({ ...f, site_logo: result }))
+      if (file.size > SITE_LOGO_MAX_BYTES) {
+        showToast(t('settings.siteLogoCompressed', { size: formatBytesKB(dataURLByteLength(result)) }))
+      }
+    } catch {
+      showToast(t('settings.siteLogoCompressionFailed'), 'error')
     }
   }
 
@@ -387,6 +554,7 @@ export default function Settings() {
   const showConnectionPool = isExternalDatabase || isExternalCache
   const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
   const saveButtonLabel = savingSettings ? t('common.saving') : t('settings.saveSettings')
+  const siteLogoPreview = sanitizeBrandingLogo(settingsForm.site_logo) || DEFAULT_SITE_LOGO
   const visibleModelItems = useMemo(() => {
     if (modelItems.length > 0) {
       return modelItems
@@ -788,40 +956,81 @@ export default function Settings() {
             </SettingsCard>
 
             <SettingsCard title={t('settings.display')}>
-              <SettingField label={t('settings.timezone')} description={t('settings.timezoneDesc')}>
-                <Select
-                  value={getTimezone()}
-                  onValueChange={(value) => {
-                    setTimezone(value)
-                    window.location.reload()
-                  }}
-                  options={[
-                    { label: t('settings.timezoneAuto'), value: Intl.DateTimeFormat().resolvedOptions().timeZone },
-                    { label: '(UTC) UTC', value: 'UTC' },
-                    { label: '(GMT+08:00) Asia/Shanghai', value: 'Asia/Shanghai' },
-                    { label: '(GMT+09:00) Asia/Tokyo', value: 'Asia/Tokyo' },
-                    { label: '(GMT+09:00) Asia/Seoul', value: 'Asia/Seoul' },
-                    { label: '(GMT+08:00) Asia/Singapore', value: 'Asia/Singapore' },
-                    { label: '(GMT+08:00) Asia/Hong_Kong', value: 'Asia/Hong_Kong' },
-                    { label: '(GMT+08:00) Asia/Taipei', value: 'Asia/Taipei' },
-                    { label: '(GMT+07:00) Asia/Bangkok', value: 'Asia/Bangkok' },
-                    { label: '(GMT+04:00) Asia/Dubai', value: 'Asia/Dubai' },
-                    { label: '(GMT+05:30) Asia/Kolkata', value: 'Asia/Kolkata' },
-                    { label: '(GMT+01:00) Europe/London', value: 'Europe/London' },
-                    { label: '(GMT+02:00) Europe/Paris', value: 'Europe/Paris' },
-                    { label: '(GMT+02:00) Europe/Berlin', value: 'Europe/Berlin' },
-                    { label: '(GMT+03:00) Europe/Moscow', value: 'Europe/Moscow' },
-                    { label: '(GMT+02:00) Europe/Amsterdam', value: 'Europe/Amsterdam' },
-                    { label: '(GMT+02:00) Europe/Rome', value: 'Europe/Rome' },
-                    { label: '(GMT-04:00) America/New_York', value: 'America/New_York' },
-                    { label: '(GMT-07:00) America/Los_Angeles', value: 'America/Los_Angeles' },
-                    { label: '(GMT-05:00) America/Chicago', value: 'America/Chicago' },
-                    { label: '(GMT-03:00) America/Sao_Paulo', value: 'America/Sao_Paulo' },
-                    { label: '(GMT+10:00) Australia/Sydney', value: 'Australia/Sydney' },
-                    { label: '(GMT+12:00) Pacific/Auckland', value: 'Pacific/Auckland' },
-                  ]}
-                />
-              </SettingField>
+              <div className="space-y-4">
+                <SettingField label={t('settings.siteName')} description={t('settings.siteNameDesc')}>
+                  <Input
+                    value={settingsForm.site_name}
+                    maxLength={80}
+                    placeholder="CodexProxy"
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, site_name: e.target.value }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.siteLogo')} description={t('settings.siteLogoDesc')}>
+                  <div className="flex items-start gap-3">
+                    <div className="flex size-12 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-background shadow-sm">
+                      <img src={siteLogoPreview} alt={settingsForm.site_name || 'CodexProxy'} className="size-full object-cover" />
+                    </div>
+                    <div className="min-w-0 flex-1 space-y-2">
+                      <Input
+                        value={settingsForm.site_logo}
+                        placeholder="/favicon.png or https://..."
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, site_logo: e.target.value }))}
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        <Button type="button" variant="outline" size="sm" onClick={() => logoFileInputRef.current?.click()}>
+                          <Upload className="size-4" />
+                          {t('settings.siteLogoUpload')}
+                        </Button>
+                        <Button type="button" variant="ghost" size="sm" onClick={() => setSettingsForm(f => ({ ...f, site_logo: '' }))}>
+                          <X className="size-4" />
+                          {t('settings.siteLogoReset')}
+                        </Button>
+                      </div>
+                      <input
+                        ref={logoFileInputRef}
+                        type="file"
+                        accept="image/png,image/jpeg,image/svg+xml,.png,.jpg,.jpeg,.svg"
+                        className="hidden"
+                        onChange={handleSiteLogoUpload}
+                      />
+                    </div>
+                  </div>
+                </SettingField>
+                <SettingField label={t('settings.timezone')} description={t('settings.timezoneDesc')}>
+                  <Select
+                    value={getTimezone()}
+                    onValueChange={(value) => {
+                      setTimezone(value)
+                      window.location.reload()
+                    }}
+                    options={[
+                      { label: t('settings.timezoneAuto'), value: Intl.DateTimeFormat().resolvedOptions().timeZone },
+                      { label: '(UTC) UTC', value: 'UTC' },
+                      { label: '(GMT+08:00) Asia/Shanghai', value: 'Asia/Shanghai' },
+                      { label: '(GMT+09:00) Asia/Tokyo', value: 'Asia/Tokyo' },
+                      { label: '(GMT+09:00) Asia/Seoul', value: 'Asia/Seoul' },
+                      { label: '(GMT+08:00) Asia/Singapore', value: 'Asia/Singapore' },
+                      { label: '(GMT+08:00) Asia/Hong_Kong', value: 'Asia/Hong_Kong' },
+                      { label: '(GMT+08:00) Asia/Taipei', value: 'Asia/Taipei' },
+                      { label: '(GMT+07:00) Asia/Bangkok', value: 'Asia/Bangkok' },
+                      { label: '(GMT+04:00) Asia/Dubai', value: 'Asia/Dubai' },
+                      { label: '(GMT+05:30) Asia/Kolkata', value: 'Asia/Kolkata' },
+                      { label: '(GMT+01:00) Europe/London', value: 'Europe/London' },
+                      { label: '(GMT+02:00) Europe/Paris', value: 'Europe/Paris' },
+                      { label: '(GMT+02:00) Europe/Berlin', value: 'Europe/Berlin' },
+                      { label: '(GMT+03:00) Europe/Moscow', value: 'Europe/Moscow' },
+                      { label: '(GMT+02:00) Europe/Amsterdam', value: 'Europe/Amsterdam' },
+                      { label: '(GMT+02:00) Europe/Rome', value: 'Europe/Rome' },
+                      { label: '(GMT-04:00) America/New_York', value: 'America/New_York' },
+                      { label: '(GMT-07:00) America/Los_Angeles', value: 'America/Los_Angeles' },
+                      { label: '(GMT-05:00) America/Chicago', value: 'America/Chicago' },
+                      { label: '(GMT-03:00) America/Sao_Paulo', value: 'America/Sao_Paulo' },
+                      { label: '(GMT+10:00) Australia/Sydney', value: 'Australia/Sydney' },
+                      { label: '(GMT+12:00) Pacific/Auckland', value: 'Pacific/Auckland' },
+                    ]}
+                  />
+                </SettingField>
+              </div>
             </SettingsCard>
           </div>
 

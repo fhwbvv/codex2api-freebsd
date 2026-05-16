@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -122,12 +121,12 @@ func IsVersionSupported(version Version) bool {
 
 // RequestContext holds request-scoped information
 type RequestContext struct {
-	RequestID   string
-	Version     Version
-	StartTime   time.Time
-	APIKey      string
-	Model       string
-	Stream      bool
+	RequestID string
+	Version   Version
+	StartTime time.Time
+	APIKey    string
+	Model     string
+	Stream    bool
 }
 
 // GetRequestContext retrieves the request context from gin context
@@ -234,14 +233,14 @@ func LoggingMiddleware() gin.HandlerFunc {
 
 		// Build log entry
 		logEntry := map[string]interface{}{
-			"timestamp":    start.Format(time.RFC3339),
-			"method":       c.Request.Method,
-			"path":         path,
-			"status":       status,
-			"latency_ms":   float64(latency.Nanoseconds()) / 1e6,
-			"client_ip":    c.ClientIP(),
-			"request_id":   requestID,
-			"api_version":  extractVersionFromPath(c.Request.URL.Path).String(),
+			"timestamp":   start.Format(time.RFC3339),
+			"method":      c.Request.Method,
+			"path":        path,
+			"status":      status,
+			"latency_ms":  float64(latency.Nanoseconds()) / 1e6,
+			"client_ip":   c.ClientIP(),
+			"request_id":  requestID,
+			"api_version": extractVersionFromPath(c.Request.URL.Path).String(),
 		}
 
 		// Add error if present
@@ -342,42 +341,10 @@ func ContentTypeMiddleware() gin.HandlerFunc {
 // For a more robust solution, use http.TimeoutHandler at the server level.
 func TimeoutMiddleware(timeout time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Wrap the request context with a timeout
 		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
 		defer cancel()
-
-		// Replace the request with one using the timeout context
 		c.Request = c.Request.WithContext(ctx)
-
-		// Use a channel to track completion
-		done := make(chan struct{})
-		var once sync.Once
-
-		// Run the next handlers
-		go func() {
-			c.Next()
-			once.Do(func() { close(done) })
-		}()
-
-		select {
-		case <-done:
-			// Request completed normally
-		case <-ctx.Done():
-			// Timeout occurred - abort and return error
-			// Only abort if not already written
-			if !c.IsAborted() && c.Writer.Status() == 0 {
-				c.Abort()
-				c.Writer.WriteHeader(http.StatusGatewayTimeout)
-				json.NewEncoder(c.Writer).Encode(ErrorResponse{
-					Error: APIError{
-						Code:    ErrCodeUpstreamTimeout,
-						Message: "Request timeout",
-						Type:    ErrorTypeServer,
-					},
-				})
-			}
-			once.Do(func() { close(done) })
-		}
+		c.Next()
 	}
 }
 

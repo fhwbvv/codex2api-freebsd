@@ -49,7 +49,7 @@ func TestNextImageAccountPrefersPlusOrHigherPlan(t *testing.T) {
 	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "plus-token", PlanType: "plus"})
 	handler := &Handler{store: store}
 
-	account, _ := handler.nextImageAccount(0, nil)
+	account, _ := handler.nextImageAccount(0, nil, "")
 	if account == nil {
 		t.Fatal("nextImageAccount returned nil")
 	}
@@ -65,7 +65,7 @@ func TestNextImageAccountFallsBackToFreeWhenNoPaidAccountAvailable(t *testing.T)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "free-token", PlanType: "free"})
 	handler := &Handler{store: store}
 
-	account, _ := handler.nextImageAccount(0, nil)
+	account, _ := handler.nextImageAccount(0, nil, "")
 	if account == nil {
 		t.Fatal("nextImageAccount returned nil")
 	}

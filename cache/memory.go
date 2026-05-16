@@ -2,7 +2,9 @@ package cache
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,13 +14,31 @@ type memoryTokenEntry struct {
 	expiresAt time.Time
 }
 
+type memorySessionAffinityEntry struct {
+	binding   SessionAffinityBinding
+	expiresAt time.Time
+}
+
+type memoryResponseContextEntry struct {
+	items     []json.RawMessage
+	expiresAt time.Time
+}
+
+type memoryRuntimeEntry struct {
+	value     json.RawMessage
+	expiresAt time.Time
+}
+
 // MemoryTokenCache 为单机轻量部署提供进程内 token 缓存和刷新锁。
 // 重启后缓存丢失属于预期行为。
 type MemoryTokenCache struct {
-	mu       sync.RWMutex
-	tokens   map[int64]memoryTokenEntry
-	locks    map[int64]time.Time
-	poolSize int
+	mu        sync.RWMutex
+	tokens    map[int64]memoryTokenEntry
+	locks     map[int64]time.Time
+	sessions  map[string]memorySessionAffinityEntry
+	responses map[string]memoryResponseContextEntry
+	runtime   map[string]memoryRuntimeEntry
+	poolSize  int
 }
 
 // NewMemory 创建内存缓存实现。
@@ -27,9 +47,12 @@ func NewMemory(poolSize int) TokenCache {
 		poolSize = 1
 	}
 	tc := &MemoryTokenCache{
-		tokens:   make(map[int64]memoryTokenEntry),
-		locks:    make(map[int64]time.Time),
-		poolSize: poolSize,
+		tokens:    make(map[int64]memoryTokenEntry),
+		locks:     make(map[int64]time.Time),
+		sessions:  make(map[string]memorySessionAffinityEntry),
+		responses: make(map[string]memoryResponseContextEntry),
+		runtime:   make(map[string]memoryRuntimeEntry),
+		poolSize:  poolSize,
 	}
 	// 启动后台定时清理过期 token 和过期锁，防止已删除账号的条目永驻内存
 	go tc.cleanupLoop()
@@ -51,6 +74,21 @@ func (tc *MemoryTokenCache) cleanupLoop() {
 		for id, until := range tc.locks {
 			if now.After(until) {
 				delete(tc.locks, id)
+			}
+		}
+		for key, entry := range tc.sessions {
+			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+				delete(tc.sessions, key)
+			}
+		}
+		for key, entry := range tc.responses {
+			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+				delete(tc.responses, key)
+			}
+		}
+		for key, entry := range tc.runtime {
+			if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+				delete(tc.runtime, key)
 			}
 		}
 		tc.mu.Unlock()
@@ -200,4 +238,163 @@ func (tc *MemoryTokenCache) WaitForRefreshComplete(ctx context.Context, accountI
 	}
 
 	return "", fmt.Errorf("等待刷新超时")
+}
+
+func (tc *MemoryTokenCache) SetSessionAffinity(ctx context.Context, key string, binding SessionAffinityBinding, ttl time.Duration) error {
+	key = strings.TrimSpace(key)
+	if key == "" || binding.AccountID == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	tc.mu.Lock()
+	tc.sessions[key] = memorySessionAffinityEntry{
+		binding:   binding,
+		expiresAt: time.Now().Add(ttl),
+	}
+	tc.mu.Unlock()
+	return nil
+}
+
+func (tc *MemoryTokenCache) GetSessionAffinity(ctx context.Context, key string) (SessionAffinityBinding, bool, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return SessionAffinityBinding{}, false, nil
+	}
+	tc.mu.RLock()
+	entry, ok := tc.sessions[key]
+	tc.mu.RUnlock()
+	if !ok {
+		return SessionAffinityBinding{}, false, nil
+	}
+	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
+		tc.mu.Lock()
+		if current, exists := tc.sessions[key]; exists && current.expiresAt.Equal(entry.expiresAt) {
+			delete(tc.sessions, key)
+		}
+		tc.mu.Unlock()
+		return SessionAffinityBinding{}, false, nil
+	}
+	return entry.binding, true, nil
+}
+
+func (tc *MemoryTokenCache) DeleteSessionAffinity(ctx context.Context, key string, accountID int64) error {
+	key = strings.TrimSpace(key)
+	if key == "" || accountID == 0 {
+		return nil
+	}
+	tc.mu.Lock()
+	if entry, ok := tc.sessions[key]; ok && entry.binding.AccountID == accountID {
+		delete(tc.sessions, key)
+	}
+	tc.mu.Unlock()
+	return nil
+}
+
+func (tc *MemoryTokenCache) SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	itemsCopy := make([]json.RawMessage, len(items))
+	for i, item := range items {
+		itemsCopy[i] = append(json.RawMessage(nil), item...)
+	}
+	tc.mu.Lock()
+	tc.responses[responseID] = memoryResponseContextEntry{
+		items:     itemsCopy,
+		expiresAt: time.Now().Add(ttl),
+	}
+	tc.mu.Unlock()
+	return nil
+}
+
+func (tc *MemoryTokenCache) GetResponseContext(ctx context.Context, responseID string) ([]json.RawMessage, error) {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil, nil
+	}
+	tc.mu.RLock()
+	entry, ok := tc.responses[responseID]
+	tc.mu.RUnlock()
+	if !ok {
+		return nil, nil
+	}
+	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
+		tc.mu.Lock()
+		if current, exists := tc.responses[responseID]; exists && current.expiresAt.Equal(entry.expiresAt) {
+			delete(tc.responses, responseID)
+		}
+		tc.mu.Unlock()
+		return nil, nil
+	}
+	itemsCopy := make([]json.RawMessage, len(entry.items))
+	for i, item := range entry.items {
+		itemsCopy[i] = append(json.RawMessage(nil), item...)
+	}
+	return itemsCopy, nil
+}
+
+func runtimeMapKey(namespace, key string) string {
+	namespace = strings.TrimSpace(namespace)
+	key = strings.TrimSpace(key)
+	if namespace == "" || key == "" {
+		return ""
+	}
+	return namespace + "\x00" + key
+}
+
+func (tc *MemoryTokenCache) SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error {
+	mapKey := runtimeMapKey(namespace, key)
+	if mapKey == "" || len(value) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	valueCopy := append(json.RawMessage(nil), value...)
+	tc.mu.Lock()
+	tc.runtime[mapKey] = memoryRuntimeEntry{
+		value:     valueCopy,
+		expiresAt: time.Now().Add(ttl),
+	}
+	tc.mu.Unlock()
+	return nil
+}
+
+func (tc *MemoryTokenCache) GetRuntime(ctx context.Context, namespace string, key string) (json.RawMessage, bool, error) {
+	mapKey := runtimeMapKey(namespace, key)
+	if mapKey == "" {
+		return nil, false, nil
+	}
+	tc.mu.RLock()
+	entry, ok := tc.runtime[mapKey]
+	tc.mu.RUnlock()
+	if !ok {
+		return nil, false, nil
+	}
+	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
+		tc.mu.Lock()
+		if current, exists := tc.runtime[mapKey]; exists && current.expiresAt.Equal(entry.expiresAt) {
+			delete(tc.runtime, mapKey)
+		}
+		tc.mu.Unlock()
+		return nil, false, nil
+	}
+	return append(json.RawMessage(nil), entry.value...), true, nil
+}
+
+func (tc *MemoryTokenCache) DeleteRuntime(ctx context.Context, namespace string, key string) error {
+	mapKey := runtimeMapKey(namespace, key)
+	if mapKey == "" {
+		return nil
+	}
+	tc.mu.Lock()
+	delete(tc.runtime, mapKey)
+	tc.mu.Unlock()
+	return nil
 }

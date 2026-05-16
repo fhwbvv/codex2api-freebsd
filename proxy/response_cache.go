@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"sync"
 	"time"
 
+	"github.com/codex2api/cache"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -29,13 +31,20 @@ type responseCacheEntry struct {
 }
 
 var respCache struct {
-	mu    sync.RWMutex
-	store map[string]*responseCacheEntry
+	mu           sync.RWMutex
+	store        map[string]*responseCacheEntry
+	runtimeCache cache.TokenCache
 }
 
 func init() {
 	respCache.store = make(map[string]*responseCacheEntry)
 	go respCacheCleanupLoop()
+}
+
+func SetResponseContextCache(tc cache.TokenCache) {
+	respCache.mu.Lock()
+	respCache.runtimeCache = tc
+	respCache.mu.Unlock()
 }
 
 // setResponseCache 存储响应上下文
@@ -66,29 +75,67 @@ func setResponseCache(responseID string, items []json.RawMessage) {
 		items:     itemsCopy,
 		createdAt: time.Now(),
 	}
+	runtimeCache := respCache.runtimeCache
 	respCache.mu.Unlock()
+
+	if runtimeCache != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		if err := runtimeCache.SetResponseContext(ctx, responseID, itemsCopy, responseCacheTTL); err != nil {
+			log.Printf("写入 Redis response context 失败: response_id=%s err=%v", responseID, err)
+		}
+	}
 }
 
 // getResponseCache 查找缓存的响应上下文
 func getResponseCache(responseID string) []json.RawMessage {
 	respCache.mu.RLock()
 	entry, ok := respCache.store[responseID]
+	runtimeCache := respCache.runtimeCache
 	respCache.mu.RUnlock()
-	if !ok {
-		return nil
-	}
-	// entry.createdAt 在创建后不可变，无锁访问安全
-	if time.Since(entry.createdAt) > responseCacheTTL {
-		// 同步删除过期条目，避免goroutine爆炸
-		respCache.mu.Lock()
-		// 双重检查：确认条目仍然存在且已过期
-		if e, exists := respCache.store[responseID]; exists && time.Since(e.createdAt) > responseCacheTTL {
-			delete(respCache.store, responseID)
+	if ok {
+		// entry.createdAt 在创建后不可变，无锁访问安全
+		if time.Since(entry.createdAt) > responseCacheTTL {
+			// 同步删除过期条目，避免goroutine爆炸
+			respCache.mu.Lock()
+			// 双重检查：确认条目仍然存在且已过期
+			if e, exists := respCache.store[responseID]; exists && time.Since(e.createdAt) > responseCacheTTL {
+				delete(respCache.store, responseID)
+			}
+			respCache.mu.Unlock()
+		} else {
+			return entry.items
 		}
-		respCache.mu.Unlock()
+	}
+
+	if runtimeCache == nil {
 		return nil
 	}
-	return entry.items
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	items, err := runtimeCache.GetResponseContext(ctx, responseID)
+	if err != nil {
+		log.Printf("读取 Redis response context 失败: response_id=%s err=%v", responseID, err)
+		return nil
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	setResponseCacheLocal(responseID, items)
+	return items
+}
+
+func setResponseCacheLocal(responseID string, items []json.RawMessage) {
+	itemsCopy := make([]json.RawMessage, len(items))
+	for i, item := range items {
+		itemsCopy[i] = append(json.RawMessage(nil), item...)
+	}
+	respCache.mu.Lock()
+	respCache.store[responseID] = &responseCacheEntry{
+		items:     itemsCopy,
+		createdAt: time.Now(),
+	}
+	respCache.mu.Unlock()
 }
 
 // respCacheCleanupLoop 后台清理过期条目
@@ -227,20 +274,55 @@ func cacheCompletedResponse(expandedInputRaw []byte, completedData []byte) {
 	inputItems := gjson.ParseBytes(expandedInputRaw)
 	if inputItems.IsArray() {
 		inputItems.ForEach(func(_, v gjson.Result) bool {
-			items = append(items, json.RawMessage(v.Raw))
+			if item, ok := replayableCachedInputItem(v); ok {
+				items = append(items, item)
+			}
 			return true
 		})
 	}
 
-	// 添加响应 output items
+	// 添加响应 output 中真正需要续链的工具上下文；reasoning/message 等
+	// 服务端输出 item 带有 rs_/msg_ id，store=false 时回灌会触发 item not found。
 	output.ForEach(func(_, v gjson.Result) bool {
-		items = append(items, json.RawMessage(v.Raw))
+		if item, ok := replayableCachedOutputItem(v); ok {
+			items = append(items, item)
+		}
 		return true
 	})
 
 	if len(items) > 0 {
 		setResponseCache(respID, items)
 	}
+}
+
+func replayableCachedInputItem(item gjson.Result) (json.RawMessage, bool) {
+	if item.Get("type").String() == "reasoning" && item.Get("encrypted_content").Exists() {
+		return nil, false
+	}
+	return stripResponseItemID(json.RawMessage(item.Raw))
+}
+
+func replayableCachedOutputItem(item gjson.Result) (json.RawMessage, bool) {
+	if !isCodexToolCallContextType(item.Get("type").String()) {
+		return nil, false
+	}
+	return stripResponseItemID(json.RawMessage(item.Raw))
+}
+
+func stripResponseItemID(raw json.RawMessage) (json.RawMessage, bool) {
+	var item map[string]any
+	if err := json.Unmarshal(raw, &item); err != nil || item == nil {
+		return raw, true
+	}
+	if _, exists := item["id"]; !exists {
+		return raw, true
+	}
+	delete(item, "id")
+	stripped, err := json.Marshal(item)
+	if err != nil {
+		return nil, false
+	}
+	return stripped, true
 }
 
 func isCodexToolCallContextType(typ string) bool {

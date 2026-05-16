@@ -2,7 +2,10 @@ package cache
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -27,6 +30,10 @@ type RedisOptions struct {
 // redisTokenCache Redis Token 缓存（参考 sub2api OpenAITokenCache 接口）
 type redisTokenCache struct {
 	client *redis.Client
+}
+
+type redisResponseContextRecord struct {
+	Items []json.RawMessage `json:"items"`
 }
 
 // NewRedis 创建 Redis Token 缓存（poolSize <= 0 时使用默认值）。
@@ -271,4 +278,176 @@ func (tc *redisTokenCache) WaitForRefreshComplete(ctx context.Context, accountID
 		}
 	}
 	return "", fmt.Errorf("等待刷新超时")
+}
+
+// ==================== 运行态缓存 ====================
+
+func runtimeHashKey(prefix, raw string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(raw)))
+	return prefix + hex.EncodeToString(sum[:])
+}
+
+func sessionAffinityKey(raw string) string {
+	return runtimeHashKey("codex:session:", raw)
+}
+
+func responseContextKey(responseID string) string {
+	return runtimeHashKey("codex:response:", responseID)
+}
+
+func runtimeNamespace(namespace string) string {
+	namespace = strings.ToLower(strings.TrimSpace(namespace))
+	if namespace == "" {
+		return "default"
+	}
+	var b strings.Builder
+	for _, r := range namespace {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == ':':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "default"
+	}
+	return b.String()
+}
+
+func runtimeValueKey(namespace, raw string) string {
+	return runtimeHashKey("codex:runtime:"+runtimeNamespace(namespace)+":", raw)
+}
+
+func (tc *redisTokenCache) SetSessionAffinity(ctx context.Context, key string, binding SessionAffinityBinding, ttl time.Duration) error {
+	key = strings.TrimSpace(key)
+	if key == "" || binding.AccountID == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	payload, err := json.Marshal(binding)
+	if err != nil {
+		return err
+	}
+	return tc.client.Set(ctx, sessionAffinityKey(key), payload, ttl).Err()
+}
+
+func (tc *redisTokenCache) GetSessionAffinity(ctx context.Context, key string) (SessionAffinityBinding, bool, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return SessionAffinityBinding{}, false, nil
+	}
+	val, err := tc.client.Get(ctx, sessionAffinityKey(key)).Result()
+	if err == redis.Nil {
+		return SessionAffinityBinding{}, false, nil
+	}
+	if err != nil {
+		return SessionAffinityBinding{}, false, err
+	}
+	var binding SessionAffinityBinding
+	if err := json.Unmarshal([]byte(val), &binding); err != nil {
+		return SessionAffinityBinding{}, false, err
+	}
+	if binding.AccountID == 0 {
+		return SessionAffinityBinding{}, false, nil
+	}
+	return binding, true, nil
+}
+
+func (tc *redisTokenCache) DeleteSessionAffinity(ctx context.Context, key string, accountID int64) error {
+	key = strings.TrimSpace(key)
+	if key == "" || accountID == 0 {
+		return nil
+	}
+	const script = `
+local value = redis.call("GET", KEYS[1])
+if not value then
+  return 0
+end
+local ok, data = pcall(cjson.decode, value)
+if ok and tonumber(data["account_id"]) == tonumber(ARGV[1]) then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`
+	return tc.client.Eval(ctx, script, []string{sessionAffinityKey(key)}, accountID).Err()
+}
+
+func (tc *redisTokenCache) SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Minute
+	}
+	record := redisResponseContextRecord{Items: items}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	return tc.client.Set(ctx, responseContextKey(responseID), payload, ttl).Err()
+}
+
+func (tc *redisTokenCache) GetResponseContext(ctx context.Context, responseID string) ([]json.RawMessage, error) {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return nil, nil
+	}
+	val, err := tc.client.Get(ctx, responseContextKey(responseID)).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var record redisResponseContextRecord
+	if err := json.Unmarshal([]byte(val), &record); err != nil {
+		return nil, err
+	}
+	items := make([]json.RawMessage, len(record.Items))
+	for i, item := range record.Items {
+		items[i] = append(json.RawMessage(nil), item...)
+	}
+	return items, nil
+}
+
+func (tc *redisTokenCache) SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error {
+	key = strings.TrimSpace(key)
+	if key == "" || len(value) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	return tc.client.Set(ctx, runtimeValueKey(namespace, key), []byte(value), ttl).Err()
+}
+
+func (tc *redisTokenCache) GetRuntime(ctx context.Context, namespace string, key string) (json.RawMessage, bool, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, false, nil
+	}
+	val, err := tc.client.Get(ctx, runtimeValueKey(namespace, key)).Bytes()
+	if err == redis.Nil {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return append(json.RawMessage(nil), val...), true, nil
+}
+
+func (tc *redisTokenCache) DeleteRuntime(ctx context.Context, namespace string, key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	return tc.client.Del(ctx, runtimeValueKey(namespace, key)).Err()
 }

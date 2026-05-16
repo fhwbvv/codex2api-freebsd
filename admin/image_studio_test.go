@@ -2,8 +2,10 @@ package admin
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -203,6 +205,61 @@ func TestImageAssetFileRouteRequiresAdminAuth(t *testing.T) {
 	}
 	if got := recorder.Body.Bytes(); string(got) != string(pngBytes) {
 		t.Fatalf("file bytes = %v, want %v", got, pngBytes)
+	}
+}
+
+func TestDeleteImageGenerationJobRouteDeletesAssetsAndFiles(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	router := gin.New()
+	handler.RegisterRoutes(router)
+
+	dir := t.TempDir()
+	if err := imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: dir}); err != nil {
+		t.Fatalf("imagestore.Configure: %v", err)
+	}
+	jobID, err := db.InsertImageGenerationJob(context.Background(), database.ImageGenerationJobInput{Prompt: "delete job"})
+	if err != nil {
+		t.Fatalf("InsertImageGenerationJob 返回错误: %v", err)
+	}
+	if err := db.MarkImageJobSucceeded(context.Background(), jobID, 123); err != nil {
+		t.Fatalf("MarkImageJobSucceeded 返回错误: %v", err)
+	}
+	path := filepath.Join(dir, "job-asset.png")
+	if err := os.WriteFile(path, tinyPNG(t), 0o644); err != nil {
+		t.Fatalf("write asset file: %v", err)
+	}
+	assetID, err := db.InsertImageAsset(context.Background(), database.ImageAssetInput{
+		JobID:       jobID,
+		Filename:    "job-asset.png",
+		StoragePath: path,
+		MimeType:    "image/png",
+		Bytes:       len(tinyPNG(t)),
+	})
+	if err != nil {
+		t.Fatalf("InsertImageAsset 返回错误: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/images/jobs/"+strconv.FormatInt(jobID, 10), nil)
+	req.Header.Set("X-Admin-Key", "admin-secret")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := db.GetImageGenerationJob(context.Background(), jobID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetImageGenerationJob after delete err = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := db.GetImageAsset(context.Background(), assetID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetImageAsset after delete err = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("asset file stat err = %v, want not exist", err)
 	}
 }
 

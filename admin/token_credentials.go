@@ -9,16 +9,21 @@ import (
 )
 
 type tokenCredentialSeed struct {
-	refreshToken string
-	sessionToken string
-	accessToken  string
-	idToken      string
-	accountID    string
-	email        string
-	planType     string
-	expiresAt    time.Time
-	expiresAtRaw string
-	expiresIn    int64
+	refreshToken        string
+	sessionToken        string
+	accessToken         string
+	idToken             string
+	accountID           string
+	email               string
+	planType            string
+	expiresAt           time.Time
+	expiresAtRaw        string
+	expiresIn           int64
+	codex7DUsedPercent  string
+	codex7DResetAt      string
+	codex5HUsedPercent  string
+	codex5HResetAt      string
+	codexUsageUpdatedAt string
 }
 
 func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed {
@@ -30,6 +35,11 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	seed.email = strings.TrimSpace(seed.email)
 	seed.planType = strings.TrimSpace(seed.planType)
 	seed.expiresAtRaw = strings.TrimSpace(seed.expiresAtRaw)
+	seed.codex7DUsedPercent = strings.TrimSpace(seed.codex7DUsedPercent)
+	seed.codex7DResetAt = strings.TrimSpace(seed.codex7DResetAt)
+	seed.codex5HUsedPercent = strings.TrimSpace(seed.codex5HUsedPercent)
+	seed.codex5HResetAt = strings.TrimSpace(seed.codex5HResetAt)
+	seed.codexUsageUpdatedAt = strings.TrimSpace(seed.codexUsageUpdatedAt)
 
 	if info := accountInfoFromTokens(seed.idToken, seed.accessToken); info != nil {
 		if seed.accountID == "" {
@@ -107,12 +117,27 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	if seed.planType != "" {
 		credentials["plan_type"] = seed.planType
 	}
+	if seed.codex7DUsedPercent != "" {
+		credentials["codex_7d_used_percent"] = seed.codex7DUsedPercent
+	}
+	if seed.codex7DResetAt != "" {
+		credentials["codex_7d_reset_at"] = seed.codex7DResetAt
+	}
+	if seed.codex5HUsedPercent != "" {
+		credentials["codex_5h_used_percent"] = seed.codex5HUsedPercent
+	}
+	if seed.codex5HResetAt != "" {
+		credentials["codex_5h_reset_at"] = seed.codex5HResetAt
+	}
+	if seed.codexUsageUpdatedAt != "" {
+		credentials["codex_usage_updated_at"] = seed.codexUsageUpdatedAt
+	}
 	return credentials
 }
 
 func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSeed) *auth.Account {
 	seed = normalizeTokenCredentialSeed(seed)
-	return &auth.Account{
+	account := &auth.Account{
 		DBID:         id,
 		RefreshToken: seed.refreshToken,
 		SessionToken: seed.sessionToken,
@@ -124,6 +149,41 @@ func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSe
 		ProxyURL:     proxyURL,
 		Status:       auth.StatusReady,
 	}
+	if pct, ok := parseSeedUsagePercent(seed.codex7DUsedPercent); ok {
+		updatedAt := parseSeedRFC3339(seed.codexUsageUpdatedAt)
+		account.SetUsageSnapshot(pct, updatedAt)
+		if resetAt := parseSeedRFC3339(seed.codex7DResetAt); !resetAt.IsZero() {
+			account.SetReset7dAt(resetAt)
+		}
+	}
+	if pct, ok := parseSeedUsagePercent(seed.codex5HUsedPercent); ok {
+		account.SetUsageSnapshot5h(pct, parseSeedRFC3339(seed.codex5HResetAt))
+	}
+	return account
+}
+
+func parseSeedUsagePercent(raw string) (float64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func parseSeedRFC3339(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }
 
 func parseCredentialExpiresAt(raw string) time.Time {

@@ -31,8 +31,9 @@ func TestGetModelPricingUsesSub2APICodexFallbacks(t *testing.T) {
 		wantOutput float64
 	}{
 		{model: "gpt-5.4-mini-20260401", wantInput: 0.75, wantOutput: 4.5},
-		{model: "gpt-5.3-codex-spark", wantInput: 1.5, wantOutput: 12.0},
-		{model: "gpt-5.5", wantInput: 5.0, wantOutput: 30.0},
+		{model: "gpt-5.3-codex-spark", wantInput: 1.25, wantOutput: 10.0},
+		{model: "gpt-5.3-codex", wantInput: 1.75, wantOutput: 14.0},
+		{model: "gpt-5.5", wantInput: 2.5, wantOutput: 15.0},
 	}
 
 	for _, tt := range tests {
@@ -133,16 +134,39 @@ func TestCalculateCostBreakdownExposesDisplayFields(t *testing.T) {
 	assertFloatEqual(t, got.ServiceTierCostMultiplier, 0.5)
 }
 
-func TestGPT55PricingIsDoubleGPT54(t *testing.T) {
+func TestGPT55PricingMatchesGPT54Fallback(t *testing.T) {
 	gpt54 := getModelPricing("gpt-5.4")
 	gpt55 := getModelPricing("gpt-5.5")
 
-	assertFloatEqual(t, gpt55.InputPricePerMToken, gpt54.InputPricePerMToken*2)
-	assertFloatEqual(t, gpt55.OutputPricePerMToken, gpt54.OutputPricePerMToken*2)
-	assertFloatEqual(t, gpt55.CacheReadPricePerMToken, gpt54.CacheReadPricePerMToken*2)
-	assertFloatEqual(t, gpt55.InputPricePerMTokenPriority, gpt54.InputPricePerMTokenPriority*2)
-	assertFloatEqual(t, gpt55.OutputPricePerMTokenPriority, gpt54.OutputPricePerMTokenPriority*2)
-	assertFloatEqual(t, gpt55.CacheReadPricePerMTokenPriority, gpt54.CacheReadPricePerMTokenPriority*2)
+	assertFloatEqual(t, gpt55.InputPricePerMToken, gpt54.InputPricePerMToken)
+	assertFloatEqual(t, gpt55.OutputPricePerMToken, gpt54.OutputPricePerMToken)
+	assertFloatEqual(t, gpt55.CacheReadPricePerMToken, gpt54.CacheReadPricePerMToken)
+	assertFloatEqual(t, gpt55.InputPricePerMTokenPriority, gpt54.InputPricePerMTokenPriority)
+	assertFloatEqual(t, gpt55.OutputPricePerMTokenPriority, gpt54.OutputPricePerMTokenPriority)
+	assertFloatEqual(t, gpt55.CacheReadPricePerMTokenPriority, gpt54.CacheReadPricePerMTokenPriority)
+}
+
+func TestSparkPricingUsesGpt51CodexFallback(t *testing.T) {
+	spark := getModelPricing("gpt-5.3-codex-spark-high")
+
+	assertFloatEqual(t, spark.InputPricePerMToken, 1.25)
+	assertFloatEqual(t, spark.OutputPricePerMToken, 10.0)
+	assertFloatEqual(t, spark.CacheReadPricePerMToken, 0.125)
+	assertFloatEqual(t, spark.InputPricePerMTokenPriority, 2.5)
+	assertFloatEqual(t, spark.OutputPricePerMTokenPriority, 20.0)
+	assertFloatEqual(t, spark.CacheReadPricePerMTokenPriority, 0.25)
+}
+
+func TestGPT53CodexPricingUsesGPT52CodexFallback(t *testing.T) {
+	codex := getModelPricing("gpt-5.3-codex-xhigh")
+	gpt52 := getModelPricing("gpt-5.2")
+
+	assertFloatEqual(t, codex.InputPricePerMToken, gpt52.InputPricePerMToken)
+	assertFloatEqual(t, codex.OutputPricePerMToken, gpt52.OutputPricePerMToken)
+	assertFloatEqual(t, codex.CacheReadPricePerMToken, gpt52.CacheReadPricePerMToken)
+	assertFloatEqual(t, codex.InputPricePerMTokenPriority, gpt52.InputPricePerMTokenPriority)
+	assertFloatEqual(t, codex.OutputPricePerMTokenPriority, gpt52.OutputPricePerMTokenPriority)
+	assertFloatEqual(t, codex.CacheReadPricePerMTokenPriority, gpt52.CacheReadPricePerMTokenPriority)
 }
 
 func TestUsageLogBreakdownScalesToStoredBilledTotal(t *testing.T) {

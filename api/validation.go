@@ -676,6 +676,13 @@ func ValidateInput() ValidationRule {
 			"image_generation_call":   true,
 			"web_search_call":         true,
 			"compaction":              true,
+			"input_text":              true,
+			"input_image":             true,
+			"output_text":             true,
+			"refusal":                 true,
+			"input_file":              true,
+			"computer_screenshot":     true,
+			"summary_text":            true,
 			"file":                    true,
 			"image":                   true,
 		}

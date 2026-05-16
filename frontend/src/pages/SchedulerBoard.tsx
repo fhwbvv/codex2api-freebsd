@@ -425,6 +425,12 @@ function buildScoreReasonTags(account: AccountRow, t: any) {
   if (breakdown.usage_penalty_7d > 0) {
     tags.push({ label: `7d -${Math.round(breakdown.usage_penalty_7d)}`, className: 'border-transparent bg-fuchsia-500/10 text-fuchsia-600 dark:bg-fuchsia-500/20 dark:text-fuchsia-300' })
   }
+  if ((breakdown.usage_urgency_bonus_5h ?? 0) > 0) {
+    tags.push({ label: `${t('scheduler.reason5hUrgency')} +${Math.round(breakdown.usage_urgency_bonus_5h ?? 0)}`, className: 'border-transparent bg-teal-500/10 text-teal-700 dark:bg-teal-500/20 dark:text-teal-300' })
+  }
+  if ((breakdown.usage_urgency_bonus_7d ?? 0) > 0) {
+    tags.push({ label: `${t('scheduler.reason7dUrgency')} +${Math.round(breakdown.usage_urgency_bonus_7d ?? 0)}`, className: 'border-transparent bg-lime-500/10 text-lime-700 dark:bg-lime-500/20 dark:text-lime-300' })
+  }
   if (breakdown.latency_penalty > 0) {
     tags.push({ label: `${t('scheduler.reasonLatency')} -${Math.round(breakdown.latency_penalty)}`, className: 'border-transparent bg-cyan-500/10 text-cyan-700 dark:bg-cyan-500/20 dark:text-cyan-300' })
   }

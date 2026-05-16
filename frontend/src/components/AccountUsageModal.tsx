@@ -34,7 +34,10 @@ export default function AccountUsageModal({ account, onClose }: Props) {
 
   useEffect(() => { void load() }, [load])
 
-  const title = t('accounts.usageDetailTitle') + ' — ' + (account.email || account.name || `#${account.id}`)
+  const accountLabel = account.openai_responses_api
+    ? (account.name?.trim() || `#${account.id}`)
+    : (account.email || account.name || `#${account.id}`)
+  const title = t('accounts.usageDetailTitle') + ' — ' + accountLabel
 
   return (
     <Modal show title={title} onClose={onClose} contentClassName="sm:max-w-[720px]">

@@ -238,6 +238,10 @@ function jobStatusClass(status: string): string {
   }
 }
 
+function isImageJobBusy(job: ImageGenerationJob): boolean {
+  return job.status === 'queued' || job.status === 'running'
+}
+
 function jobModel(job: ImageGenerationJob): string {
   const params = jobParams(job)
   return params.model || job.assets?.[0]?.model || '-'
@@ -925,6 +929,44 @@ export default function ImageStudio() {
     }
   }
 
+  const deleteJob = async (job: ImageGenerationJob) => {
+    const ok = await confirm({
+      title: t('images.deleteJobTitle'),
+      description: t('images.deleteJobDesc', { id: job.id }),
+      confirmText: t('common.delete'),
+      tone: 'destructive',
+    })
+    if (!ok) return
+    try {
+      await api.deleteImageJob(job.id)
+      const jobAssets = job.assets ?? []
+      const deletedAssetIds = new Set(jobAssets.map(asset => asset.id))
+      for (const asset of jobAssets) {
+        const url = assetURLs[asset.id]
+        if (url) URL.revokeObjectURL(url)
+        assetURLRequestsRef.current.delete(asset.id)
+      }
+      await Promise.all(jobAssets.map(asset => deleteCachedImageAsset(asset.id)))
+      setAssetURLs(prev => {
+        const next = { ...prev }
+        deletedAssetIds.forEach(id => {
+          delete next[id]
+        })
+        return next
+      })
+      setAssets(prev => prev.filter(asset => !deletedAssetIds.has(asset.id)))
+      setJobs(prev => prev.filter(item => item.id !== job.id))
+      setHistoryJobs(prev => prev.filter(item => item.id !== job.id))
+      setHistoryTotal(total => Math.max(0, total - 1))
+      setPreviewAsset(prev => prev && deletedAssetIds.has(prev.id) ? null : prev)
+      setCurrentJob(prev => prev?.id === job.id ? null : prev)
+      await Promise.all([loadJobs(), loadAssets(), loadHistoryJobs()])
+      showToast(t('images.jobDeleted'), 'success')
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : t('images.deleteFailed'), 'error')
+    }
+  }
+
   const latestAsset = currentJob?.assets?.[0]
   const recentJobs = jobs.slice(0, 3)
   const maxAssetPage = Math.max(1, Math.ceil(assetTotal / IMAGE_ASSET_PAGE_SIZE))
@@ -1114,7 +1156,16 @@ export default function ImageStudio() {
       <CardContent className="space-y-3">
         <div className="flex items-center justify-between">
           <h2 className="font-semibold">{t('images.currentJob')}</h2>
-          {currentJob && <Badge className={jobStatusClass(currentJob.status)}>{t(`images.status.${currentJob.status}`, { defaultValue: currentJob.status })}</Badge>}
+          {currentJob && (
+            <div className="flex items-center gap-1.5">
+              <Badge className={jobStatusClass(currentJob.status)}>{t(`images.status.${currentJob.status}`, { defaultValue: currentJob.status })}</Badge>
+              {!isImageJobBusy(currentJob) && (
+                <Button size="icon-xs" variant="ghost" onClick={() => void deleteJob(currentJob)} aria-label={t('images.deleteJob')} title={t('images.deleteJob')}>
+                  <Trash2 className="size-3" />
+                </Button>
+              )}
+            </div>
+          )}
         </div>
         {currentJob ? (
           <>
@@ -1241,6 +1292,7 @@ export default function ImageStudio() {
             onCopyPrompt={() => void copyPrompt(job.prompt)}
             onRerun={() => rerunFromJob(job)}
             onSaveTemplate={asset => void saveAssetPromptAsTemplate(asset)}
+            onDeleteJob={() => void deleteJob(job)}
             onDelete={asset => void deleteAsset(asset)}
           />
         ))}
@@ -1667,6 +1719,7 @@ function HistoryJobCard({
   onCopyPrompt,
   onRerun,
   onSaveTemplate,
+  onDeleteJob,
   onDelete,
 }: {
   job: ImageGenerationJob
@@ -1677,6 +1730,7 @@ function HistoryJobCard({
   onCopyPrompt: () => void
   onRerun: () => void
   onSaveTemplate: (asset: ImageAsset) => void
+  onDeleteJob: () => void
   onDelete: (asset: ImageAsset) => void
 }) {
   const { t } = useTranslation()
@@ -1700,6 +1754,9 @@ function HistoryJobCard({
               <Button size="xs" variant="outline" onClick={onSelect}>{t('images.selectJob')}</Button>
               <Button size="icon-xs" variant="ghost" onClick={onCopyPrompt} aria-label={t('images.copyPrompt')} title={t('images.copyPrompt')}><Copy className="size-3" /></Button>
               <Button size="icon-xs" variant="ghost" onClick={onRerun} aria-label={t('images.rerun')} title={t('images.rerun')}><RefreshCcw className="size-3" /></Button>
+              {!isImageJobBusy(job) && (
+                <Button size="icon-xs" variant="ghost" onClick={onDeleteJob} aria-label={t('images.deleteJob')} title={t('images.deleteJob')}><Trash2 className="size-3" /></Button>
+              )}
             </div>
           </div>
 

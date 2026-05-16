@@ -384,31 +384,31 @@ func TestAccountsResponse(t *testing.T) {
 
 func TestAccountResponseFields(t *testing.T) {
 	resp := accountResponse{
-		ID:                      1,
-		Name:                    "Test Account",
-		Email:                   "test@example.com",
-		PlanType:                "plus",
-		Status:                  "active",
-		HealthTier:              "healthy",
-		SchedulerScore:          95.5,
-		ConcurrencyCap:          4,
-		ProxyURL:                "http://proxy:8080",
-		CreatedAt:               time.Now().Format(time.RFC3339),
-		UpdatedAt:               time.Now().Format(time.RFC3339),
-		ActiveRequests:          2,
-		TotalRequests:           100,
-		LastUsedAt:              time.Now().Format(time.RFC3339),
-		SuccessRequests:         95,
-		ErrorRequests:           5,
-		UsagePercent7d:          floatPtr(75.5),
-		UsagePercent5h:          floatPtr(50.0),
-		Reset5hAt:               time.Now().Format(time.RFC3339),
-		Reset7dAt:               time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
-		ScoreBreakdown:          schedulerBreakdownResponse{},
-		LastUnauthorizedAt:      time.Now().Format(time.RFC3339),
-		LastRateLimitedAt:       time.Now().Format(time.RFC3339),
-		LastTimeoutAt:           time.Now().Format(time.RFC3339),
-		LastServerErrorAt:       time.Now().Format(time.RFC3339),
+		ID:                 1,
+		Name:               "Test Account",
+		Email:              "test@example.com",
+		PlanType:           "plus",
+		Status:             "active",
+		HealthTier:         "healthy",
+		SchedulerScore:     95.5,
+		ConcurrencyCap:     4,
+		ProxyURL:           "http://proxy:8080",
+		CreatedAt:          time.Now().Format(time.RFC3339),
+		UpdatedAt:          time.Now().Format(time.RFC3339),
+		ActiveRequests:     2,
+		TotalRequests:      100,
+		LastUsedAt:         time.Now().Format(time.RFC3339),
+		SuccessRequests:    95,
+		ErrorRequests:      5,
+		UsagePercent7d:     floatPtr(75.5),
+		UsagePercent5h:     floatPtr(50.0),
+		Reset5hAt:          time.Now().Format(time.RFC3339),
+		Reset7dAt:          time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+		ScoreBreakdown:     schedulerBreakdownResponse{},
+		LastUnauthorizedAt: time.Now().Format(time.RFC3339),
+		LastRateLimitedAt:  time.Now().Format(time.RFC3339),
+		LastTimeoutAt:      time.Now().Format(time.RFC3339),
+		LastServerErrorAt:  time.Now().Format(time.RFC3339),
 	}
 
 	if resp.Name != "Test Account" {
@@ -435,6 +435,8 @@ func TestSchedulerBreakdownResponse(t *testing.T) {
 		FailurePenalty:      1.0,
 		SuccessBonus:        4.0,
 		UsagePenalty7d:      8.0,
+		UsageUrgencyBonus5h: 6.0,
+		UsageUrgencyBonus7d: 7.0,
 		LatencyPenalty:      2.5,
 		SuccessRatePenalty:  1.5,
 	}
@@ -444,6 +446,12 @@ func TestSchedulerBreakdownResponse(t *testing.T) {
 	}
 	if resp.SuccessBonus != 4.0 {
 		t.Errorf("SuccessBonus = %v, want 4.0", resp.SuccessBonus)
+	}
+	if resp.UsageUrgencyBonus5h != 6.0 {
+		t.Errorf("UsageUrgencyBonus5h = %v, want 6.0", resp.UsageUrgencyBonus5h)
+	}
+	if resp.UsageUrgencyBonus7d != 7.0 {
+		t.Errorf("UsageUrgencyBonus7d = %v, want 7.0", resp.UsageUrgencyBonus7d)
 	}
 }
 

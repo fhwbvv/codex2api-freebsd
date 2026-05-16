@@ -9,6 +9,7 @@ interface PageHeaderProps {
   onRefresh?: () => void
   refreshLabel?: string
   actions?: ReactNode
+  actionMeta?: ReactNode
 }
 
 export default function PageHeader({
@@ -17,9 +18,10 @@ export default function PageHeader({
   onRefresh,
   refreshLabel,
   actions,
+  actionMeta,
 }: PageHeaderProps) {
   const { t } = useTranslation()
-  const hasActions = Boolean(onRefresh) || Boolean(actions)
+  const hasActions = Boolean(onRefresh) || Boolean(actions) || Boolean(actionMeta)
   const resolvedRefreshLabel = refreshLabel ?? t('common.refresh')
 
   return (
@@ -35,14 +37,21 @@ export default function PageHeader({
         ) : null}
       </div>
       {hasActions ? (
-        <div className="flex flex-wrap justify-end gap-2 items-center max-sm:w-full max-sm:justify-start">
-          {onRefresh ? (
-            <Button variant="outline" onClick={onRefresh} className="max-sm:w-full">
-              <RefreshCw className="size-3.5" />
-              {resolvedRefreshLabel}
-            </Button>
+        <div className="flex min-w-0 flex-col items-end gap-2 max-sm:w-full max-sm:items-stretch">
+          {actionMeta ? (
+            <div className="text-right text-xs text-muted-foreground max-sm:text-left">
+              {actionMeta}
+            </div>
           ) : null}
-          {actions}
+          <div className="flex flex-wrap items-center justify-end gap-2 max-sm:w-full max-sm:justify-start">
+            {actions}
+            {onRefresh ? (
+              <Button variant="outline" onClick={onRefresh} className="max-sm:w-full">
+                <RefreshCw className="size-3.5" />
+                {resolvedRefreshLabel}
+              </Button>
+            ) : null}
+          </div>
         </div>
       ) : null}
     </div>

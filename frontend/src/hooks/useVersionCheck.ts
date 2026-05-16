@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 const GITHUB_API = 'https://api.github.com/repos/james-6-23/codex2api/releases/latest'
 const CACHE_KEY = 'codex2api_latest_version'
@@ -8,6 +8,19 @@ const POLL_INTERVAL = 30 * 60 * 1000 // 30 分钟轮询
 interface CachedVersion {
   version: string
   checkedAt: number
+}
+
+function readCachedVersion(ignoreTTL = false): string | null {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY)
+    if (!raw) return null
+    const cached: CachedVersion = JSON.parse(raw)
+    if (!cached.version) return null
+    if (!ignoreTTL && Date.now() - cached.checkedAt >= CACHE_TTL) return null
+    return cached.version
+  } catch {
+    return null
+  }
 }
 
 /** 解析版本号字符串为数字数组，如 "v1.0.5" → [1, 0, 5] */
@@ -26,17 +39,12 @@ function isNewer(remote: number[], local: number[]): boolean {
   return false
 }
 
-async function fetchLatestVersion(): Promise<string | null> {
+async function fetchLatestVersion(forceNetwork = false): Promise<string | null> {
   // 优先读取未过期的缓存
-  try {
-    const raw = localStorage.getItem(CACHE_KEY)
-    if (raw) {
-      const cached: CachedVersion = JSON.parse(raw)
-      if (Date.now() - cached.checkedAt < CACHE_TTL) {
-        return cached.version
-      }
-    }
-  } catch { /* 缓存损坏忽略 */ }
+  if (!forceNetwork) {
+    const cached = readCachedVersion()
+    if (cached) return cached
+  }
 
   try {
     const res = await fetch(GITHUB_API, {
@@ -51,15 +59,16 @@ async function fetchLatestVersion(): Promise<string | null> {
     }
     return version || null
   } catch {
-    return null
+    return readCachedVersion(true)
   }
 }
 
-export function useVersionCheck() {
+export function useVersionCheck(triggerKey?: string) {
   const [latestVersion, setLatestVersion] = useState<string | null>(null)
   const [hasUpdate, setHasUpdate] = useState(false)
+  const lastTriggerRef = useRef<string | undefined>(undefined)
 
-  useEffect(() => {
+  const check = useCallback(async (forceNetwork = false) => {
     const currentVersion = __APP_VERSION__
     // 开发模式不检查
     if (currentVersion === 'dev') return
@@ -67,20 +76,31 @@ export function useVersionCheck() {
     const localParsed = parseVersion(currentVersion)
     if (!localParsed) return
 
-    const check = async () => {
-      const remote = await fetchLatestVersion()
-      if (!remote) return
-      const remoteParsed = parseVersion(remote)
-      if (!remoteParsed) return
+    const remote = await fetchLatestVersion(forceNetwork)
+    if (!remote) return
+    const remoteParsed = parseVersion(remote)
+    if (!remoteParsed) return
 
-      setLatestVersion(remote)
-      setHasUpdate(isNewer(remoteParsed, localParsed))
-    }
+    setLatestVersion(remote)
+    setHasUpdate(isNewer(remoteParsed, localParsed))
+  }, [])
 
+  useEffect(() => {
     void check()
     const timer = setInterval(() => void check(), POLL_INTERVAL)
     return () => clearInterval(timer)
-  }, [])
+  }, [check])
+
+  useEffect(() => {
+    if (triggerKey === undefined) return
+    if (lastTriggerRef.current === undefined) {
+      lastTriggerRef.current = triggerKey
+      return
+    }
+    if (lastTriggerRef.current === triggerKey) return
+    lastTriggerRef.current = triggerKey
+    void check(true)
+  }, [check, triggerKey])
 
   return { hasUpdate, latestVersion }
 }

@@ -31,7 +31,7 @@ banner() {
 
 EOF
   printf "${NC}"
-  echo "  交互式部署脚本 v1.0"
+  echo "  交互式部署脚本 v1.1"
   echo "  ────────────────────────────────────────"
   echo ""
 }
@@ -51,7 +51,7 @@ ask() {
     printf "${BOLD}%s${NC}: " "$prompt"
   fi
   read -r input < "$_INPUT_FD"
-  eval "$varname=\"${input:-$default}\""
+  printf -v "$varname" "%s" "${input:-$default}"
 }
 
 # 读取密码（不回显）
@@ -64,7 +64,7 @@ ask_secret() {
   fi
   read -rs input < "$_INPUT_FD"
   echo ""
-  eval "$varname=\"${input:-$default}\""
+  printf -v "$varname" "%s" "${input:-$default}"
 }
 
 # 生成随机密钥
@@ -88,6 +88,96 @@ gen_secret() {
 REPO_URL="${CODEX2API_REPO_URL:-https://github.com/james-6-23/codex2api.git}"
 REPO_BRANCH="${CODEX2API_REPO_BRANCH:-main}"
 REPO_DIR_NAME="${CODEX2API_DIR_NAME:-codex2api}"
+EXISTING_ENV_FILE=".env"
+
+env_default() {
+  local key="$1" fallback="${2:-}" value=""
+
+  if [[ -f "$EXISTING_ENV_FILE" ]]; then
+    value="$(awk -v target="$key" '
+      /^[[:space:]]*($|#)/ { next }
+      {
+        line=$0
+        sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+        pos=index(line, "=")
+        if (pos == 0) next
+
+        key=substr(line, 1, pos - 1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+        if (key != target) next
+
+        value=substr(line, pos + 1)
+        sub(/\r$/, "", value)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+
+        first=substr(value, 1, 1)
+        last=substr(value, length(value), 1)
+        quote=sprintf("%c", 39)
+        if ((first == "\"" && last == "\"") || (first == quote && last == quote)) {
+          value=substr(value, 2, length(value) - 2)
+        }
+
+        print value
+        exit
+      }
+    ' "$EXISTING_ENV_FILE")"
+  fi
+
+  printf "%s" "${value:-$fallback}"
+}
+
+known_compose_service_exists() {
+  local compose_file
+  for compose_file in docker-compose.yml docker-compose.sqlite.yml docker-compose.local.yml docker-compose.sqlite.local.yml; do
+    [[ -f "$compose_file" ]] || continue
+    if [[ -n "$($COMPOSE_CMD -f "$compose_file" ps -q codex2api 2>/dev/null || true)" ]]; then
+      EXISTING_COMPOSE_FILE="$compose_file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_deployment_state() {
+  DEPLOYMENT_STATE="first"
+  DEPLOYMENT_REASON="未检测到 .env 或已创建的 compose 服务"
+  EXISTING_COMPOSE_FILE=""
+
+  if [[ -f "$EXISTING_ENV_FILE" ]]; then
+    DEPLOYMENT_STATE="existing"
+    DEPLOYMENT_REASON="检测到已有 .env"
+  fi
+
+  if known_compose_service_exists; then
+    DEPLOYMENT_STATE="existing"
+    if [[ -f "$EXISTING_ENV_FILE" ]]; then
+      DEPLOYMENT_REASON="检测到已有 .env 和 compose 服务 ($EXISTING_COMPOSE_FILE)"
+    else
+      DEPLOYMENT_REASON="检测到已有 compose 服务 ($EXISTING_COMPOSE_FILE)"
+    fi
+  fi
+}
+
+step_deployment_route() {
+  detect_deployment_state
+
+  echo ""
+  printf "${BOLD}${CYAN}━━━ 部署状态检查 ━━━${NC}\n"
+  echo ""
+  if [[ "$DEPLOYMENT_STATE" == "first" ]]; then
+    success "检测结果: 首次部署"
+    info "$DEPLOYMENT_REASON"
+    success "部署线路: 完整部署向导"
+    return 0
+  fi
+
+  success "检测结果: 已有部署"
+  info "$DEPLOYMENT_REASON"
+  if [[ -f "$EXISTING_ENV_FILE" ]]; then
+    success "已有 .env 将作为交互默认值"
+  fi
+  success "部署线路: 完整部署向导"
+}
 
 is_codex2api_repo() {
   [[ -f "docker-compose.yml" ]] && [[ -f "deploy.sh" ]] \
@@ -133,6 +223,39 @@ bootstrap_repo() {
   exec bash ./deploy.sh "$@"
 }
 
+update_repo_code() {
+  if [[ "${CODEX2API_SKIP_GIT_PULL:-}" == "1" || "${CODEX2API_SKIP_GIT_PULL:-}" == "true" ]]; then
+    warn "已跳过自动拉取最新代码 (CODEX2API_SKIP_GIT_PULL=${CODEX2API_SKIP_GIT_PULL})"
+    return 0
+  fi
+
+  if ! command -v git >/dev/null 2>&1 || ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    warn "当前目录不是 git 仓库，跳过自动拉取最新代码"
+    return 0
+  fi
+
+  if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+    warn "检测到本地已跟踪文件存在未提交更改，跳过自动拉取最新代码，避免覆盖本地修改"
+    return 0
+  fi
+
+  local branch="${REPO_BRANCH:-main}"
+  if [[ -z "$branch" ]]; then
+    branch="$(git branch --show-current 2>/dev/null || true)"
+  fi
+  if [[ -z "$branch" ]]; then
+    warn "无法识别当前分支，跳过自动拉取最新代码"
+    return 0
+  fi
+
+  info "拉取最新代码: origin/$branch"
+  if git fetch origin "$branch" && git pull --ff-only origin "$branch"; then
+    success "代码已更新到最新可快进版本"
+  else
+    warn "自动拉取最新代码失败，将沿用当前代码继续部署"
+  fi
+}
+
 # ---------- 前置检查 ----------
 preflight() {
   info "检查运行环境..."
@@ -156,7 +279,7 @@ preflight() {
 step_port() {
   echo ""
   printf "${BOLD}${CYAN}━━━ 1/6 服务端口 ━━━${NC}\n"
-  ask "服务监听端口" "8080" PORT
+  ask "服务监听端口" "$(env_default CODEX_PORT "$(env_default PORT "8080")")" PORT
 
   if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     error "无效端口号: $PORT"
@@ -172,7 +295,17 @@ step_bind() {
   echo "  1) 仅本机访问  — 绑定 127.0.0.1，外部无法访问 (内网/反向代理后端推荐)"
   echo "  2) 全部网络    — 绑定 0.0.0.0，可通过内网/公网 IP 访问 (默认)"
   echo ""
-  ask "请选择 (1 或 2)" "2" BIND_CHOICE
+  local bind_default bind_choice_default
+  bind_default="$(env_default BIND_HOST "0.0.0.0")"
+  case "$bind_default" in
+    127.*|localhost)
+      bind_choice_default="1"
+      ;;
+    *)
+      bind_choice_default="2"
+      ;;
+  esac
+  ask "请选择 (1 或 2)" "$bind_choice_default" BIND_CHOICE
 
   case "$BIND_CHOICE" in
     1|local|loopback|127*)
@@ -199,7 +332,18 @@ step_database() {
   echo "  1) SQLite   — 轻量单文件，适合个人 / 测试"
   echo "  2) PG+Redis — PostgreSQL + Redis，适合生产 / 多并发"
   echo ""
-  ask "请选择 (1 或 2)" "1" DB_CHOICE
+  local db_default db_choice_default
+  db_default="$(env_default DATABASE_DRIVER "sqlite")"
+  db_default="$(printf "%s" "$db_default" | tr '[:upper:]' '[:lower:]')"
+  case "$db_default" in
+    postgres|postgresql|pg)
+      db_choice_default="2"
+      ;;
+    *)
+      db_choice_default="1"
+      ;;
+  esac
+  ask "请选择 (1 或 2)" "$db_choice_default" DB_CHOICE
 
   case "$DB_CHOICE" in
     1|sqlite|SQLite)
@@ -220,23 +364,23 @@ step_database() {
 
 step_sqlite_config() {
   echo ""
-  ask "SQLite 数据文件路径 (容器内)" "/data/codex2api.db" SQLITE_PATH
+  ask "SQLite 数据文件路径 (容器内)" "$(env_default DATABASE_PATH "/data/codex2api.db")" SQLITE_PATH
 }
 
 step_pg_config() {
   echo ""
   info "PostgreSQL 配置 (Docker 内置，通常保持默认即可)"
-  ask "数据库用户名" "codex2api" PG_USER
-  ask "数据库名称"   "codex2api" PG_DB
+  ask "数据库用户名" "$(env_default DATABASE_USER "$(env_default POSTGRES_USER "codex2api")")" PG_USER
+  ask "数据库名称"   "$(env_default DATABASE_NAME "$(env_default POSTGRES_DB "codex2api")")" PG_DB
   echo ""
-  ask_secret "数据库密码" "" PG_PASS
+  ask_secret "数据库密码" "$(env_default DATABASE_PASSWORD "$(env_default POSTGRES_PASSWORD "")")" PG_PASS
   if [[ -z "$PG_PASS" ]]; then
     PG_PASS=$(gen_secret)
     success "已自动生成数据库密码"
   fi
   echo ""
   info "Redis 配置"
-  ask_secret "Redis 密码 (留空则无密码)" "" REDIS_PASS
+  ask_secret "Redis 密码 (留空则无密码)" "$(env_default REDIS_PASSWORD "")" REDIS_PASS
 }
 
 # ---------- 第四步：密钥 ----------
@@ -245,14 +389,14 @@ step_secrets() {
   printf "${BOLD}${CYAN}━━━ 4/6 安全密钥 ━━━${NC}\n"
   echo ""
 
-  ask_secret "管理后台密钥 (ADMIN_SECRET)" "" ADMIN_SECRET
+  ask_secret "管理后台密钥 (ADMIN_SECRET)" "$(env_default ADMIN_SECRET "")" ADMIN_SECRET
   if [[ -z "$ADMIN_SECRET" ]]; then
     ADMIN_SECRET=$(gen_secret)
     success "已自动生成管理密钥"
   fi
 
   echo ""
-  ask "下游 API 密钥 (CODEX_API_KEYS, 多个用逗号分隔, 留空不启用)" "" API_KEYS
+  ask "下游 API 密钥 (CODEX_API_KEYS, 多个用逗号分隔, 留空不启用)" "$(env_default CODEX_API_KEYS "")" API_KEYS
 }
 
 # ---------- 第五步：构建方式 ----------
@@ -420,6 +564,17 @@ resolve_compose_file() {
   fi
 
   success "Compose 文件: $COMPOSE_FILE"
+
+  COMPOSE_FILE_ARGS=(-f "$COMPOSE_FILE")
+}
+
+compose_cmd_display() {
+  local display="$COMPOSE_CMD"
+  local arg
+  for arg in "${COMPOSE_FILE_ARGS[@]}"; do
+    display+=" $arg"
+  done
+  printf "%s" "$display"
 }
 
 # ---------- 部署 ----------
@@ -429,12 +584,12 @@ deploy() {
 
   if [[ "$BUILD_MODE" == "local" ]]; then
     info "本地构建并启动..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --build
+    $COMPOSE_CMD "${COMPOSE_FILE_ARGS[@]}" up -d --build
   else
     info "拉取最新镜像..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" pull
+    $COMPOSE_CMD "${COMPOSE_FILE_ARGS[@]}" pull
     info "启动服务..."
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d
+    $COMPOSE_CMD "${COMPOSE_FILE_ARGS[@]}" up -d
   fi
 
   echo ""
@@ -487,9 +642,8 @@ deploy() {
   fi
   echo ""
   echo "  管理密钥 : ${ADMIN_SECRET}"
-  echo ""
-  echo "  查看日志 : $COMPOSE_CMD -f $COMPOSE_FILE logs -f"
-  echo "  停止服务 : $COMPOSE_CMD -f $COMPOSE_FILE down"
+  echo "  查看日志 : $(compose_cmd_display) logs -f"
+  echo "  停止服务 : $(compose_cmd_display) down"
   echo ""
   if [[ "$BIND_MODE" == "all" && -n "$PUBLIC_IP" ]]; then
     warn "服务对外开放，请确认防火墙/安全组已放行 ${PORT} 端口"
@@ -505,6 +659,8 @@ main() {
   banner
   bootstrap_repo "$@"
   preflight
+  update_repo_code
+  step_deployment_route
   step_port
   step_bind
   step_database

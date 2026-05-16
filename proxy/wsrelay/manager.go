@@ -218,18 +218,13 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
-// evictExpired 清理过期连接、会话和对应的 keyLocks
+// evictExpired 清理过期连接和会话
 func (m *Manager) evictExpired() {
-	// 收集仍存活的 pool key
-	activeKeys := make(map[string]struct{})
-
 	m.connections.Range(func(key, value any) bool {
 		wc := value.(*WsConnection)
 		if wc.IsExpired() || !wc.IsConnected() {
 			m.connections.Delete(key)
 			wc.Close()
-		} else {
-			activeKeys[key.(string)] = struct{}{}
 		}
 		return true
 	})
@@ -239,16 +234,6 @@ func (m *Manager) evictExpired() {
 		if s.IsExpired() || !s.IsConnected() {
 			m.sessions.Delete(key)
 			s.Close()
-		} else {
-			activeKeys[key.(string)] = struct{}{}
-		}
-		return true
-	})
-
-	// 清理不再关联任何存活连接/会话的 keyLocks，防止 sync.Map 无限膨胀
-	m.keyLocks.Range(func(key, _ any) bool {
-		if _, alive := activeKeys[key.(string)]; !alive {
-			m.keyLocks.Delete(key)
 		}
 		return true
 	})
@@ -345,11 +330,8 @@ func (m *Manager) AcquireConnection(
 				// 探活失败，清理死连接
 				m.connections.Delete(key)
 				m.sessions.Delete(key)
-				m.keyLocks.Delete(key)
 				wc.Close()
 				lock.Unlock()
-				// 直接重新获取锁创建新连接，不等待
-				lock = m.keyLock(key)
 				continue
 			}
 			if wc.IsConnected() && !wc.IsExpired() && wc.session != nil {
@@ -503,7 +485,6 @@ func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey str
 		wc.Close()
 	}
 	m.sessions.Delete(key)
-	m.keyLocks.Delete(key)
 }
 
 // poolKey 生成连接池键

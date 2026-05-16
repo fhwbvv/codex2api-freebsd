@@ -512,7 +512,7 @@ export default function ApiReference() {
         baseUrl={baseUrl}
         allKeys={allKeys}
         defaultBody={`{
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
   "stream": false
 }`}
@@ -521,7 +521,7 @@ export default function ApiReference() {
   --header 'Authorization: Bearer <token>' \\
   --header 'Content-Type: application/json' \\
   --data '{
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "input": [
     {
       "role": "user",
@@ -537,7 +537,7 @@ export default function ApiReference() {
           { code: 200, body: `{
   "id": "resp_abc123",
   "object": "response",
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "status": "completed",
   "output": [
     {
@@ -600,7 +600,7 @@ export default function ApiReference() {
         baseUrl={baseUrl}
         allKeys={allKeys}
         defaultBody={`{
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "messages": [{"role": "user", "content": "Hello"}],
   "stream": false
 }`}
@@ -609,7 +609,7 @@ export default function ApiReference() {
   --header 'Authorization: Bearer <token>' \\
   --header 'Content-Type: application/json' \\
   --data '{
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant."},
     {"role": "user", "content": "Hello!"}
@@ -621,7 +621,7 @@ export default function ApiReference() {
           { code: 200, body: `{
   "id": "chatcmpl-abc123",
   "object": "chat.completion",
-  "model": "gpt-5.4",
+  "model": "gpt-5.5",
   "choices": [
     {
       "index": 0,
@@ -826,7 +826,7 @@ export default function ApiReference() {
   "object": "list",
   "data": [
     {"id": "gpt-5.5", "object": "model", "owned_by": "openai"},
-    {"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
+    {"id": "gpt-5.5", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.4-mini", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
     {"id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai"},

@@ -3,7 +3,9 @@ package admin
 import (
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/codex2api/proxy"
 	"github.com/tidwall/gjson"
 )
 
@@ -26,6 +28,23 @@ func TestBuildTestPayloadUsesSelectedModel(t *testing.T) {
 	}
 	if !gjson.GetBytes(payload, "stream").Bool() {
 		t.Fatal("stream should be true")
+	}
+}
+
+func TestFormatUsageLimitedTestErrorReportsSuccessfulProbeAsLimited(t *testing.T) {
+	msg, limited := formatUsageLimitedTestError(proxy.CodexUsageSyncResult{
+		Premium5hRateLimited: true,
+		UsagePct5h:           100,
+		Reset5hAt:            time.Now().Add(time.Hour),
+	})
+
+	if !limited {
+		t.Fatal("limited = false, want true")
+	}
+	for _, want := range []string{"返回 200", "5h 用量头", "限流状态"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message %q does not contain %q", msg, want)
+		}
 	}
 }
 

@@ -851,12 +851,13 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 	return auth.IsPlusOrHigherPlan(account.GetPlanType())
 }
 
-func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
-	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, imagePreferredAccountFilter)
+func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
+	preferredFilter := h.withModelCooldownFilter(model, imagePreferredAccountFilter)
+	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, preferredFilter)
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	return h.nextAccountForSession("", apiKeyID, exclude)
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
 }
 
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
@@ -875,9 +876,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts)
+		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts, requestModel)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, nil))
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)

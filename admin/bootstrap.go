@@ -2,7 +2,9 @@ package admin
 
 import (
 	"context"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +57,27 @@ func bootstrapAllowRate() bool {
 	return newCount <= bootstrapMaxPerWin
 }
 
+func bootstrapAllowClientIP(clientIP string) bool {
+	ip := net.ParseIP(strings.TrimSpace(clientIP))
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	for _, cidr := range strings.Split(os.Getenv("BOOTSTRAP_ALLOWED_CIDR"), ",") {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(cidr)
+		if err == nil && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // GetBootstrapStatus 返回当前是否需要执行初始化（GET /api/admin/bootstrap-status）。
 //
 // 该端点不要求鉴权，前端 AuthGate 在拿到登录界面前会先轮询此端点：
@@ -105,6 +128,12 @@ func (h *Handler) GetBootstrapStatus(c *gin.Context) {
 //  4. 校验最小长度（8 个 rune），避免过弱密钥；
 //  5. 全程审计日志。
 func (h *Handler) PostBootstrap(c *gin.Context) {
+	if !bootstrapAllowClientIP(c.ClientIP()) {
+		security.SecurityAuditLog("BOOTSTRAP_REJECTED_IP", "ip="+c.ClientIP())
+		c.JSON(http.StatusForbidden, gin.H{"error": "当前来源不允许执行初始化"})
+		return
+	}
+
 	if !bootstrapAllowRate() {
 		security.SecurityAuditLog("BOOTSTRAP_RATE_LIMITED", "ip="+c.ClientIP())
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁，请稍后再试"})
@@ -183,6 +212,7 @@ func (h *Handler) PostBootstrap(c *gin.Context) {
 // 写入空值导致后续业务设置缺失。
 func defaultBootstrapSettings() *database.SystemSettings {
 	return &database.SystemSettings{
+		SiteName:                         database.DefaultSiteName,
 		MaxConcurrency:                   2,
 		GlobalRPM:                        0,
 		TestModel:                        "gpt-5.4",

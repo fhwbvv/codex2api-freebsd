@@ -182,6 +182,35 @@ func TestSQLiteImageStudioTablesAndPersistence(t *testing.T) {
 	if _, err := db.GetImageAsset(ctx, assetID); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("GetImageAsset after delete err = %v, want sql.ErrNoRows", err)
 	}
+	jobID2, err := db.InsertImageGenerationJob(ctx, ImageGenerationJobInput{
+		Prompt:     "delete this job",
+		ParamsJSON: `{"model":"gpt-image-2"}`,
+	})
+	if err != nil {
+		t.Fatalf("InsertImageGenerationJob job2 返回错误: %v", err)
+	}
+	if err := db.MarkImageJobFailed(ctx, jobID2, "upstream failed", 456); err != nil {
+		t.Fatalf("MarkImageJobFailed 返回错误: %v", err)
+	}
+	assetID2, err := db.InsertImageAsset(ctx, ImageAssetInput{
+		JobID:       jobID2,
+		Filename:    "delete-me.png",
+		StoragePath: filepath.Join(t.TempDir(), "delete-me.png"),
+		MimeType:    "image/png",
+		Bytes:       1024,
+	})
+	if err != nil {
+		t.Fatalf("InsertImageAsset job2 返回错误: %v", err)
+	}
+	if err := db.DeleteImageGenerationJob(ctx, jobID2); err != nil {
+		t.Fatalf("DeleteImageGenerationJob 返回错误: %v", err)
+	}
+	if _, err := db.GetImageGenerationJob(ctx, jobID2); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetImageGenerationJob after delete err = %v, want sql.ErrNoRows", err)
+	}
+	if _, err := db.GetImageAsset(ctx, assetID2); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetImageAsset after job delete err = %v, want sql.ErrNoRows", err)
+	}
 	if err := db.DeleteImagePromptTemplate(ctx, templateID); err != nil {
 		t.Fatalf("DeleteImagePromptTemplate 返回错误: %v", err)
 	}

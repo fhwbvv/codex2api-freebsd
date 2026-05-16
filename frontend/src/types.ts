@@ -30,6 +30,10 @@ export interface AccountRow {
   status: AccountStatus
   error_message?: string
   at_only?: boolean
+  account_type?: string
+  openai_responses_api?: boolean
+  base_url?: string
+  models?: string[]
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -39,6 +43,8 @@ export interface AccountRow {
   base_concurrency_effective?: number
   dynamic_concurrency_limit?: number
   allowed_api_key_ids?: number[]
+  tags?: string[]
+  group_ids?: number[]
   scheduler_breakdown?: {
     unauthorized_penalty: number
     rate_limit_penalty: number
@@ -47,7 +53,10 @@ export interface AccountRow {
     failure_penalty: number
     success_bonus: number
     usage_penalty_7d: number
+    usage_urgency_bonus_5h?: number
+    usage_urgency_bonus_7d?: number
     latency_penalty: number
+    success_rate_penalty?: number
   }
   last_unauthorized_at?: ISODateString
   last_rate_limited_at?: ISODateString
@@ -100,10 +109,70 @@ export interface AddATAccountRequest {
   proxy_url: string
 }
 
+export interface AddOpenAIResponsesAccountRequest {
+  name?: string
+  base_url: string
+  api_key: string
+  models: string[]
+  proxy_url: string
+}
+
+export interface UpdateOpenAIResponsesAccountRequest {
+  name?: string
+  base_url: string
+  api_key?: string
+  models: string[]
+  proxy_url: string
+}
+
+export interface FetchOpenAIResponsesModelsRequest {
+  account_id?: number
+  base_url: string
+  api_key: string
+  proxy_url?: string
+}
+
+export interface FetchOpenAIResponsesModelsResponse {
+  base_url: string
+  models: string[]
+}
+
 export interface UpdateAccountSchedulerRequest {
-  score_bias_override: number | null
-  base_concurrency_override: number | null
+  score_bias_override?: number | null
+  base_concurrency_override?: number | null
   allowed_api_key_ids?: number[] | null
+  proxy_url?: string | null
+  tags?: string[] | null
+  group_ids?: number[] | null
+}
+
+export interface AccountGroup {
+  id: number
+  name: string
+  description: string
+  color: string
+  sort_order: number
+  member_count: number
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface AccountGroupsResponse {
+  groups: AccountGroup[]
+}
+
+export interface CreateAccountGroupRequest {
+  name: string
+  description?: string
+  color?: string
+  sort_order?: number
+}
+
+export interface UpdateAccountGroupRequest {
+  name?: string
+  description?: string
+  color?: string
+  sort_order?: number
 }
 
 export interface AccountModelStat {
@@ -119,6 +188,7 @@ export interface AccountUsageDetail {
   output_tokens: number
   reasoning_tokens: number
   cached_tokens: number
+  cache_hit_rate: number
   models: AccountModelStat[]
 }
 
@@ -138,6 +208,11 @@ export interface HealthResponse {
   status: 'ok' | string
   available: number
   total: number
+}
+
+export interface SiteBranding {
+  site_name: string
+  site_logo: string
 }
 
 export interface AccountEventTrendPoint {
@@ -200,10 +275,13 @@ export interface OpsOverviewResponse {
     today_requests: number
     today_tokens: number
     rpm_limit: number
+    avg_duration_ms: number
   }
 }
 
 export interface SystemSettings {
+  site_name: string
+  site_logo: string
   max_concurrency: number
   global_rpm: number
   test_model: string
@@ -217,6 +295,7 @@ export interface SystemSettings {
   auto_clean_unauthorized: boolean
   auto_clean_rate_limited: boolean
   admin_secret: string
+  admin_secret_configured?: boolean
   admin_auth_source: 'env' | 'database' | 'disabled' | string
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
@@ -256,6 +335,7 @@ export interface SystemSettings {
   image_s3_bucket: string
   image_s3_access_key: string
   image_s3_secret_key: string
+  image_s3_secret_key_configured?: boolean
   image_s3_prefix: string
   image_s3_force_path_style: boolean
 }
@@ -373,17 +453,69 @@ export interface UsageStats {
   total_tokens: number
   total_prompt_tokens: number
   total_completion_tokens: number
+  total_input_tokens?: number
   total_cached_tokens: number
+  total_cache_rate?: number
   total_account_billed: number
   total_user_billed: number
+  avg_account_billed_per_request: number
+  avg_user_billed_per_request: number
   today_requests: number
   today_tokens: number
+  today_input_tokens?: number
+  today_cached_tokens?: number
+  today_cache_rate?: number
   today_account_billed: number
   today_user_billed: number
   rpm: number
   tpm: number
   avg_duration_ms: number
+  avg_first_token_ms?: number
   error_rate: number
+  feature_stats: UsageFeatureStats
+  model_stats: UsageModelStat[]
+  endpoint_stats: UsageEndpointStat[]
+  api_key_stats: UsageAPIKeyStat[]
+}
+
+export interface UsageModelStat {
+  model: string
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  account_billed: number
+  user_billed: number
+  error_count: number
+}
+
+export interface UsageFeatureStats {
+  stream_requests: number
+  sync_requests: number
+  fast_requests: number
+  cache_hit_requests: number
+  reasoning_requests: number
+  image_requests: number
+  retry_requests: number
+  error_requests: number
+}
+
+export interface UsageEndpointStat {
+  endpoint: string
+  requests: number
+  tokens: number
+  error_count: number
+  user_billed: number
+}
+
+export interface UsageAPIKeyStat {
+  api_key_id: number
+  label: string
+  requests: number
+  tokens: number
+  error_count: number
+  user_billed: number
 }
 
 export interface UsageLog {
@@ -480,15 +612,43 @@ export interface APIKeyRow {
   name: string
   key: string
   raw_key: string
+  quota_limit: number
+  quota_used: number
+  expires_at?: ISODateString | null
+  status?: 'active' | 'expired' | 'quota_exhausted'
+  allowed_group_ids?: number[]
   created_at: ISODateString
 }
 
 export type APIKeysResponse = ApiListResponse<'keys', APIKeyRow>
 
+export interface CreateAPIKeyRequest {
+  name: string
+  key?: string
+  quota_limit?: number
+  quota?: number
+  expires_at?: string
+  expires_in_days?: number
+  allowed_group_ids?: number[]
+}
+
+export interface UpdateAPIKeyRequest {
+  name?: string
+  quota_limit?: number | null
+  quota?: number | null
+  expires_at?: string | null
+  expires_in_days?: number
+  allowed_group_ids?: number[]
+}
+
 export interface CreateAPIKeyResponse {
   id: number
   key: string
   name: string
+  quota_limit: number
+  quota_used: number
+  expires_at?: ISODateString | null
+  allowed_group_ids?: number[]
 }
 
 export interface ImagePromptTemplate {

@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"reflect"
@@ -65,6 +69,86 @@ type chartCacheEntry struct {
 	expiresAt time.Time
 }
 
+const (
+	adminUsageStatsCacheNamespace = "admin:usage-stats"
+	adminChartCacheNamespace      = "admin:chart-data"
+	adminAPIKeyCacheNamespace     = "api-key"
+	adminAPIKeyCountNamespace     = "api-key-count"
+	adminUsageStatsCacheTTL       = 5 * time.Second
+	adminChartCacheTTL            = 10 * time.Second
+	importFileSizeLimitBytes      = 20 * 1024 * 1024
+	importFileSizeLimitLabel      = "20MB"
+)
+
+func (h *Handler) getRuntimeJSON(ctx context.Context, namespace, key string, dest interface{}) bool {
+	if h == nil || h.cache == nil || dest == nil {
+		return false
+	}
+	raw, ok, err := h.cache.GetRuntime(ctx, namespace, key)
+	if err != nil {
+		log.Printf("读取运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return false
+	}
+	if !ok || len(raw) == 0 {
+		return false
+	}
+	if err := json.Unmarshal(raw, dest); err != nil {
+		log.Printf("解析运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) setRuntimeJSON(ctx context.Context, namespace, key string, value interface{}, ttl time.Duration) {
+	if h == nil || h.cache == nil || value == nil {
+		return
+	}
+	payload, err := json.Marshal(value)
+	if err != nil {
+		log.Printf("编码运行态缓存失败: namespace=%s err=%v", namespace, err)
+		return
+	}
+	if err := h.cache.SetRuntime(ctx, namespace, key, payload, ttl); err != nil {
+		log.Printf("写入运行态缓存失败: namespace=%s err=%v", namespace, err)
+	}
+}
+
+func validateImportFileSize(fh *multipart.FileHeader) error {
+	if fh.Size > importFileSizeLimitBytes {
+		return fmt.Errorf("文件 %s 大小超过 %s", fh.Filename, importFileSizeLimitLabel)
+	}
+	return nil
+}
+
+func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
+	if h == nil || h.cache == nil {
+		return
+	}
+	if err := h.cache.DeleteRuntime(ctx, namespace, key); err != nil {
+		log.Printf("删除运行态缓存失败: namespace=%s err=%v", namespace, err)
+	}
+}
+
+func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey string) {
+	h.deleteRuntimeCache(ctx, adminAPIKeyCountNamespace, "all")
+	if strings.TrimSpace(apiKey) != "" {
+		h.deleteRuntimeCache(ctx, adminAPIKeyCacheNamespace, apiKey)
+	}
+}
+
+func (h *Handler) getUsageStatsCached(ctx context.Context) (*database.UsageStats, error) {
+	var cached database.UsageStats
+	if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", &cached) {
+		return &cached, nil
+	}
+	stats, err := h.db.GetUsageStats(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", stats, adminUsageStatsCacheTTL)
+	return stats, nil
+}
+
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
@@ -81,6 +165,9 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		adminSecretEnv: adminSecretEnv,
 		imageProxy:     proxy.NewHandler(store, db, nil, nil),
 		chartCacheData: make(map[string]*chartCacheEntry),
+	}
+	if handler.imageProxy != nil {
+		handler.imageProxy.SetRuntimeCache(tc)
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
 	if db != nil {
@@ -100,6 +187,7 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/p/img/:id", h.GetSignedImageAssetFile)
+	r.GET("/api/branding", h.GetBranding)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
@@ -112,6 +200,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts", h.ListAccounts)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
+	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
+	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
+	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
@@ -136,10 +227,16 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
+	api.PATCH("/keys/:id", h.UpdateAPIKey)
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
+	api.GET("/account-groups", h.ListAccountGroups)
+	api.POST("/account-groups", h.CreateAccountGroup)
+	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
+	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
 	api.GET("/health", h.GetHealth)
 	api.GET("/ops/overview", h.GetOpsOverview)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
+	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
@@ -157,6 +254,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/images/jobs", h.CreateImageGenerationJob)
 	api.GET("/images/jobs", h.ListImageGenerationJobs)
 	api.GET("/images/jobs/:id", h.GetImageGenerationJob)
+	api.DELETE("/images/jobs/:id", h.DeleteImageGenerationJob)
 	api.GET("/images/assets", h.ListImageAssets)
 	api.GET("/images/assets/:id/file", h.GetImageAssetFile)
 	api.DELETE("/images/assets/:id", h.DeleteImageAsset)
@@ -269,7 +367,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 		}
 	}
 
-	usageStats, _ := h.db.GetUsageStats(ctx)
+	usageStats, _ := h.getUsageStatsCached(ctx)
 	todayReqs := int64(0)
 	if usageStats != nil {
 		todayReqs = usageStats.TodayRequests
@@ -293,6 +391,10 @@ type accountResponse struct {
 	Status                   string                     `json:"status"`
 	ErrorMessage             string                     `json:"error_message,omitempty"`
 	ATOnly                   bool                       `json:"at_only"`
+	AccountType              string                     `json:"account_type,omitempty"`
+	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
+	BaseURL                  string                     `json:"base_url,omitempty"`
+	Models                   []string                   `json:"models,omitempty"`
 	HealthTier               string                     `json:"health_tier"`
 	SchedulerScore           float64                    `json:"scheduler_score"`
 	DispatchScore            float64                    `json:"dispatch_score"`
@@ -328,6 +430,8 @@ type accountResponse struct {
 	Enabled                  bool                       `json:"enabled"`
 	Locked                   bool                       `json:"locked"`
 	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
+	Tags                     []string                   `json:"tags"`
+	GroupIDs                 []int64                    `json:"group_ids"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -357,6 +461,8 @@ type schedulerBreakdownResponse struct {
 	FailurePenalty      float64 `json:"failure_penalty"`
 	SuccessBonus        float64 `json:"success_bonus"`
 	UsagePenalty7d      float64 `json:"usage_penalty_7d"`
+	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
+	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
@@ -387,26 +493,44 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
+		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
+		email := row.GetCredential("email")
+		baseURL := row.GetCredential("base_url")
+		if isOpenAIResponsesAccount && email == "" {
+			email = baseURL
+		}
+		planType := row.GetCredential("plan_type")
+		if isOpenAIResponsesAccount && planType == "" {
+			planType = "api"
+		}
 		resp := accountResponse{
 			ID:                       row.ID,
 			Name:                     row.Name,
-			Email:                    row.GetCredential("email"),
-			PlanType:                 row.GetCredential("plan_type"),
+			Email:                    email,
+			PlanType:                 planType,
 			Status:                   row.Status,
 			ErrorMessage:             row.ErrorMessage,
-			ATOnly:                   row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:                   !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			AccountType:              row.Type,
+			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
+			BaseURL:                  baseURL,
+			Models:                   row.GetCredentialStringSlice("models"),
 			ProxyURL:                 row.ProxyURL,
 			Enabled:                  row.Enabled,
 			Locked:                   row.Locked,
 			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
+			Tags:                     append([]string(nil), row.Tags...),
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
-			ScoreBiasEffective:       effectiveScoreBias(row.GetCredential("plan_type"), row.ScoreBiasOverride),
+			ScoreBiasEffective:       effectiveScoreBias(planType, row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
 			BaseConcurrencyEffective: effectiveBaseConcurrency(row.BaseConcurrencyOverride, int64(h.store.GetMaxConcurrency())),
 			CreatedAt:                row.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:                row.UpdatedAt.Format(time.RFC3339),
 		}
 		if acc, ok := accountMap[row.ID]; ok {
+			acc.Mu().RLock()
+			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
+			acc.Mu().RUnlock()
 			resp.ActiveRequests = acc.GetActiveRequests()
 			resp.TotalRequests = acc.GetTotalRequests()
 			debug := acc.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))
@@ -430,6 +554,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				FailurePenalty:      debug.Breakdown.FailurePenalty,
 				SuccessBonus:        debug.Breakdown.SuccessBonus,
 				UsagePenalty7d:      debug.Breakdown.UsagePenalty7d,
+				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
+				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}
@@ -516,6 +642,9 @@ type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
+	Tags                    json.RawMessage `json:"tags"`
+	GroupIDs                json.RawMessage `json:"group_ids"`
+	ProxyURL                *string         `json:"proxy_url"`
 }
 
 // UpdateAccountScheduler 更新账号调度配置。
@@ -549,6 +678,16 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	tags, err := parseOptionalStringSliceField(req.Tags, "tags")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	groupIDs, err := parseOptionalIntegerSliceField(req.GroupIDs, "group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -568,9 +707,28 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			return
 		}
 	}
+	if groupIDs.Set {
+		missingGroupIDs, err := h.db.VerifyAccountGroupIDs(ctx, groupIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验账号分组失败: "+err.Error())
+			return
+		}
+		if len(missingGroupIDs) > 0 {
+			values := make([]string, 0, len(missingGroupIDs))
+			for _, value := range missingGroupIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
 
-	if err := h.db.UpdateAccountSchedulerConfig(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs); err != nil {
-		if err == sql.ErrNoRows {
+	proxyURL := database.OptionalString{}
+	if req.ProxyURL != nil {
+		proxyURL = database.OptionalString{Set: true, Value: *req.ProxyURL}
+	}
+	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
 		}
@@ -578,32 +736,106 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		h.store.ApplyAccountSchedulerOverrides(id, nullableInt64Pointer(scoreBiasOverride), nullableInt64Pointer(baseConcurrencyOverride))
+		if scoreBiasOverride.Set || baseConcurrencyOverride.Set {
+			current := h.store.FindByID(id)
+			var score *int64
+			var concurrency *int64
+			if current != nil {
+				current.Mu().RLock()
+				if current.ScoreBiasOverride != nil {
+					value := *current.ScoreBiasOverride
+					score = &value
+				}
+				if current.BaseConcurrencyOverride != nil {
+					value := *current.BaseConcurrencyOverride
+					concurrency = &value
+				}
+				current.Mu().RUnlock()
+			}
+			if scoreBiasOverride.Set {
+				score = nullableInt64Pointer(scoreBiasOverride.Value)
+			}
+			if baseConcurrencyOverride.Set {
+				concurrency = nullableInt64Pointer(baseConcurrencyOverride.Value)
+			}
+			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency)
+		}
 		if allowedAPIKeyIDs.Set {
 			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
 		}
+	}
+	if h.store != nil && tags.Set {
+		h.store.ApplyAccountTags(id, tags.Values)
+	}
+	if h.store != nil && groupIDs.Set {
+		h.store.ApplyAccountGroups(id, groupIDs.Values)
+	}
+	if h.store != nil && req.ProxyURL != nil {
+		h.store.ApplyAccountProxyURL(id, *req.ProxyURL)
 	}
 
 	writeMessage(c, http.StatusOK, "账号调度配置已更新")
 }
 
-func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxValue int64) (sql.NullInt64, error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return sql.NullInt64{}, nil
+type optionalStringSlice struct {
+	Set    bool
+	Values []string
+}
+
+func parseOptionalStringSliceField(raw json.RawMessage, field string) (optionalStringSlice, error) {
+	if len(raw) == 0 {
+		return optionalStringSlice{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalStringSlice{Set: true, Values: []string{}}, nil
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return optionalStringSlice{}, fmt.Errorf("%s 必须是字符串数组或 null", field)
+	}
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		clean := strings.TrimSpace(value)
+		if clean == "" {
+			continue
+		}
+		if utf8.RuneCountInString(clean) > 40 {
+			return optionalStringSlice{}, fmt.Errorf("%s 单个标签不能超过 40 字符", field)
+		}
+		key := strings.ToLower(clean)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, clean)
+	}
+	if len(out) > 32 {
+		return optionalStringSlice{}, fmt.Errorf("%s 最多 32 个标签", field)
+	}
+	return optionalStringSlice{Set: true, Values: out}, nil
+}
+
+func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxValue int64) (database.OptionalNullInt64, error) {
+	if len(raw) == 0 {
+		return database.OptionalNullInt64{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalNullInt64{Set: true}, nil
 	}
 
 	var number json.Number
 	if err := json.Unmarshal(raw, &number); err != nil {
-		return sql.NullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
 	}
 	value, err := number.Int64()
 	if err != nil {
-		return sql.NullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 必须是整数或 null", field)
 	}
 	if value < minValue || value > maxValue {
-		return sql.NullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
+		return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
-	return sql.NullInt64{Int64: value, Valid: true}, nil
+	return database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: value, Valid: true}}, nil
 }
 
 func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
@@ -1050,32 +1282,366 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 	})
 }
 
+type addOpenAIResponsesAccountReq struct {
+	Name     string   `json:"name"`
+	BaseURL  string   `json:"base_url"`
+	APIKey   string   `json:"api_key"`
+	Models   []string `json:"models"`
+	ProxyURL string   `json:"proxy_url"`
+}
+
+type fetchOpenAIResponsesModelsReq struct {
+	AccountID int64  `json:"account_id"`
+	BaseURL   string `json:"base_url"`
+	APIKey    string `json:"api_key"`
+	ProxyURL  string `json:"proxy_url"`
+}
+
+func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
+	var req addOpenAIResponsesAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	models := auth.NormalizeOpenAIResponsesModels(req.Models)
+
+	if req.APIKey == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+	if len(models) == 0 {
+		writeError(c, http.StatusBadRequest, "至少需要添加一个模型")
+		return
+	}
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	existing, err := h.db.GetAllOpenAIAPIKeys(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if existing[req.APIKey] {
+		writeError(c, http.StatusConflict, "该 API Key 已存在")
+		return
+	}
+
+	name := req.Name
+	if name == "" {
+		name = "openai-responses"
+	}
+	credentials := map[string]interface{}{
+		"upstream_type": auth.UpstreamOpenAIResponses,
+		"base_url":      baseURL,
+		"api_key":       req.APIKey,
+		"models":        models,
+		"plan_type":     "api",
+		"email":         baseURL,
+	}
+	id, err := h.db.InsertOpenAIResponsesAccount(ctx, name, credentials, req.ProxyURL)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.db.InsertAccountEventAsync(id, "added", "manual_openai_responses")
+
+	h.store.AddAccount(&auth.Account{
+		DBID:         id,
+		ProxyURL:     req.ProxyURL,
+		HealthTier:   auth.HealthTierHealthy,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      baseURL,
+		APIKey:       req.APIKey,
+		Models:       models,
+		Email:        baseURL,
+		PlanType:     "api",
+	})
+
+	security.SecurityAuditLog("OPENAI_RESPONSES_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{
+		"message": "成功添加 OpenAI Responses API 账号",
+		"id":      id,
+	})
+}
+
+func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
+	var req fetchOpenAIResponsesModelsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	if req.AccountID > 0 && req.APIKey == "" {
+		row, err := h.db.GetAccountByID(c.Request.Context(), req.AccountID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusNotFound, "账号不存在")
+				return
+			}
+			writeInternalError(c, err)
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses) {
+			writeError(c, http.StatusBadRequest, "仅 OpenAI Responses API 账号支持使用已保存的 API Key 获取模型")
+			return
+		}
+		req.APIKey = row.GetCredential("api_key")
+		if strings.TrimSpace(req.BaseURL) == "" {
+			req.BaseURL = row.GetCredential("base_url")
+		}
+		if strings.TrimSpace(req.ProxyURL) == "" {
+			req.ProxyURL = row.ProxyURL
+		}
+	}
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.APIKey == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"models":   models,
+		"base_url": baseURL,
+	})
+}
+
+func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req addOpenAIResponsesAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	req.Name = security.SanitizeInput(req.Name)
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	row, err := h.db.GetAccountByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses) {
+		writeError(c, http.StatusBadRequest, "仅 OpenAI Responses API 账号支持账号设置")
+		return
+	}
+
+	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	models := auth.NormalizeOpenAIResponsesModels(req.Models)
+	if len(models) == 0 {
+		writeError(c, http.StatusBadRequest, "至少需要添加一个模型")
+		return
+	}
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+
+	name := req.Name
+	if name == "" {
+		name = row.Name
+	}
+	if name == "" {
+		name = "openai-responses"
+	}
+
+	credentials := map[string]interface{}{
+		"upstream_type": auth.UpstreamOpenAIResponses,
+		"base_url":      baseURL,
+		"models":        models,
+		"plan_type":     "api",
+		"email":         baseURL,
+	}
+	if req.APIKey != "" {
+		credentials["api_key"] = req.APIKey
+	}
+	if req.APIKey == "" && strings.TrimSpace(row.GetCredential("api_key")) == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+
+	if err := h.db.UpdateOpenAIResponsesAccount(ctx, id, name, credentials, req.ProxyURL); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if h.store != nil {
+		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, req.ProxyURL)
+	}
+	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
+
+	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
+}
+
+func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
+	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	transport.DialContext = baseDialer.DialContext
+	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
+		return nil, fmt.Errorf("代理URL无效: %w", err)
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   20 * time.Second,
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建模型列表请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("请求 /v1/models 失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+		if message == "" {
+			message = strings.TrimSpace(string(body))
+		}
+		if message == "" {
+			message = http.StatusText(resp.StatusCode)
+		}
+		return nil, fmt.Errorf("/v1/models 返回 %d: %s", resp.StatusCode, message)
+	}
+
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("解析 /v1/models 响应失败: %w", err)
+	}
+	models := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		models = append(models, item.ID)
+	}
+	models = auth.NormalizeOpenAIResponsesModels(models)
+	if len(models) == 0 {
+		return nil, fmt.Errorf("/v1/models 未返回可用模型")
+	}
+	return models, nil
+}
+
 // importToken 导入时的统一 token 载体
 type importToken struct {
-	refreshToken string
-	sessionToken string
-	accessToken  string // AT-only 兼容路径
-	name         string
-	email        string
-	idToken      string
-	accountID    string
-	planType     string
-	expiresAt    string
+	refreshToken        string
+	sessionToken        string
+	accessToken         string // AT-only 兼容路径
+	name                string
+	email               string
+	idToken             string
+	accountID           string
+	planType            string
+	expiresAt           string
+	codex7DUsedPercent  string
+	codex7DResetAt      string
+	codex5HUsedPercent  string
+	codex5HResetAt      string
+	codexUsageUpdatedAt string
 }
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
-	RefreshToken      string                 `json:"refresh_token"`
-	SessionToken      string                 `json:"session_token"`
-	SessionTokenCamel string                 `json:"sessionToken"`
-	AccessToken       string                 `json:"access_token"`
-	IDToken           string                 `json:"id_token"`
-	AccountID         string                 `json:"account_id"`
-	Email             string                 `json:"email"`
-	Name              string                 `json:"name"`
-	PlanType          string                 `json:"plan_type"`
-	Expired           importJSONScalarString `json:"expired"`
-	ExpiresAt         importJSONScalarString `json:"expires_at"`
+	RefreshToken        string                 `json:"refresh_token"`
+	SessionToken        string                 `json:"session_token"`
+	SessionTokenCamel   string                 `json:"sessionToken"`
+	AccessToken         string                 `json:"access_token"`
+	IDToken             string                 `json:"id_token"`
+	AccountID           string                 `json:"account_id"`
+	Email               string                 `json:"email"`
+	Name                string                 `json:"name"`
+	PlanType            string                 `json:"plan_type"`
+	Codex7DUsedPercent  importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt      string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent  importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt      string                 `json:"codex_5h_reset_at"`
+	CodexUsageUpdatedAt string                 `json:"codex_usage_updated_at"`
+	Expired             importJSONScalarString `json:"expired"`
+	ExpiresAt           importJSONScalarString `json:"expires_at"`
 }
 
 type sub2apiImportPayload struct {
@@ -1088,16 +1654,21 @@ type sub2apiAccountEntry struct {
 }
 
 type sub2apiAccountCredentials struct {
-	RefreshToken      string                 `json:"refresh_token"`
-	SessionToken      string                 `json:"session_token"`
-	SessionTokenCamel string                 `json:"sessionToken"`
-	AccessToken       string                 `json:"access_token"`
-	IDToken           string                 `json:"id_token"`
-	AccountID         string                 `json:"account_id"`
-	Email             string                 `json:"email"`
-	PlanType          string                 `json:"plan_type"`
-	ExpiresAt         importJSONScalarString `json:"expires_at"`
-	Expired           importJSONScalarString `json:"expired"`
+	RefreshToken        string                 `json:"refresh_token"`
+	SessionToken        string                 `json:"session_token"`
+	SessionTokenCamel   string                 `json:"sessionToken"`
+	AccessToken         string                 `json:"access_token"`
+	IDToken             string                 `json:"id_token"`
+	AccountID           string                 `json:"account_id"`
+	Email               string                 `json:"email"`
+	PlanType            string                 `json:"plan_type"`
+	Codex7DUsedPercent  importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt      string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent  importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt      string                 `json:"codex_5h_reset_at"`
+	CodexUsageUpdatedAt string                 `json:"codex_usage_updated_at"`
+	ExpiresAt           importJSONScalarString `json:"expires_at"`
+	Expired             importJSONScalarString `json:"expired"`
 }
 
 type importJSONScalarString string
@@ -1178,15 +1749,20 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
-				refreshToken: rt,
-				sessionToken: st,
-				accessToken:  at,
-				name:         name,
-				email:        email,
-				idToken:      strings.TrimSpace(entry.IDToken),
-				accountID:    strings.TrimSpace(entry.AccountID),
-				planType:     strings.TrimSpace(entry.PlanType),
-				expiresAt:    firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
+				refreshToken:        rt,
+				sessionToken:        st,
+				accessToken:         at,
+				name:                name,
+				email:               email,
+				idToken:             strings.TrimSpace(entry.IDToken),
+				accountID:           strings.TrimSpace(entry.AccountID),
+				planType:            strings.TrimSpace(entry.PlanType),
+				expiresAt:           firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
+				codex7DUsedPercent:  strings.TrimSpace(entry.Codex7DUsedPercent.String()),
+				codex7DResetAt:      strings.TrimSpace(entry.Codex7DResetAt),
+				codex5HUsedPercent:  strings.TrimSpace(entry.Codex5HUsedPercent.String()),
+				codex5HResetAt:      strings.TrimSpace(entry.Codex5HResetAt),
+				codexUsageUpdatedAt: strings.TrimSpace(entry.CodexUsageUpdatedAt),
 			})
 		}
 	}
@@ -1213,15 +1789,20 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
-				refreshToken: rt,
-				sessionToken: st,
-				accessToken:  at,
-				name:         name,
-				email:        email,
-				idToken:      strings.TrimSpace(account.Credentials.IDToken),
-				accountID:    strings.TrimSpace(account.Credentials.AccountID),
-				planType:     strings.TrimSpace(account.Credentials.PlanType),
-				expiresAt:    firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
+				refreshToken:        rt,
+				sessionToken:        st,
+				accessToken:         at,
+				name:                name,
+				email:               email,
+				idToken:             strings.TrimSpace(account.Credentials.IDToken),
+				accountID:           strings.TrimSpace(account.Credentials.AccountID),
+				planType:            strings.TrimSpace(account.Credentials.PlanType),
+				expiresAt:           firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
+				codex7DUsedPercent:  strings.TrimSpace(account.Credentials.Codex7DUsedPercent.String()),
+				codex7DResetAt:      strings.TrimSpace(account.Credentials.Codex7DResetAt),
+				codex5HUsedPercent:  strings.TrimSpace(account.Credentials.Codex5HUsedPercent.String()),
+				codex5HResetAt:      strings.TrimSpace(account.Credentials.Codex5HResetAt),
+				codexUsageUpdatedAt: strings.TrimSpace(account.Credentials.CodexUsageUpdatedAt),
 			})
 		}
 	}
@@ -1261,8 +1842,8 @@ func readUploadedImportFiles(c *gin.Context) ([]uploadedImportFile, error) {
 
 	result := make([]uploadedImportFile, 0, len(files))
 	for _, fh := range files {
-		if fh.Size > 2*1024*1024 {
-			return nil, fmt.Errorf("文件 %s 大小超过 2MB", fh.Filename)
+		if err := validateImportFileSize(fh); err != nil {
+			return nil, err
 		}
 
 		f, err := fh.Open()
@@ -1334,8 +1915,8 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 	var allTokens []importToken
 
 	for _, fh := range files {
-		if fh.Size > 2*1024*1024 {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 大小超过 2MB", fh.Filename))
+		if err := validateImportFileSize(fh); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
 			return
 		}
 
@@ -1566,13 +2147,18 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-					sessionToken: tok.sessionToken,
-					accessToken:  tok.accessToken,
-					idToken:      tok.idToken,
-					accountID:    tok.accountID,
-					email:        tok.email,
-					planType:     tok.planType,
-					expiresAtRaw: tok.expiresAt,
+					sessionToken:        tok.sessionToken,
+					accessToken:         tok.accessToken,
+					idToken:             tok.idToken,
+					accountID:           tok.accountID,
+					email:               tok.email,
+					planType:            tok.planType,
+					expiresAtRaw:        tok.expiresAt,
+					codex7DUsedPercent:  tok.codex7DUsedPercent,
+					codex7DResetAt:      tok.codex7DResetAt,
+					codex5HUsedPercent:  tok.codex5HUsedPercent,
+					codex5HResetAt:      tok.codex5HResetAt,
+					codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
 				})
 				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 				if len(tokenCredentialMap(seed)) > 0 {
@@ -1594,13 +2180,18 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					id, err = h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
 				} else {
 					seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-						sessionToken: tok.sessionToken,
-						accessToken:  tok.accessToken,
-						idToken:      tok.idToken,
-						accountID:    tok.accountID,
-						email:        tok.email,
-						planType:     tok.planType,
-						expiresAtRaw: tok.expiresAt,
+						sessionToken:        tok.sessionToken,
+						accessToken:         tok.accessToken,
+						idToken:             tok.idToken,
+						accountID:           tok.accountID,
+						email:               tok.email,
+						planType:            tok.planType,
+						expiresAtRaw:        tok.expiresAt,
+						codex7DUsedPercent:  tok.codex7DUsedPercent,
+						codex7DResetAt:      tok.codex7DResetAt,
+						codex5HUsedPercent:  tok.codex5HUsedPercent,
+						codex5HResetAt:      tok.codex5HResetAt,
+						codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
 					})
 					id, err = h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
 				}
@@ -1618,14 +2209,19 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				h.db.InsertAccountEventAsync(id, "added", "import")
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-					refreshToken: tok.refreshToken,
-					sessionToken: tok.sessionToken,
-					accessToken:  tok.accessToken,
-					idToken:      tok.idToken,
-					accountID:    tok.accountID,
-					email:        tok.email,
-					planType:     tok.planType,
-					expiresAtRaw: tok.expiresAt,
+					refreshToken:        tok.refreshToken,
+					sessionToken:        tok.sessionToken,
+					accessToken:         tok.accessToken,
+					idToken:             tok.idToken,
+					accountID:           tok.accountID,
+					email:               tok.email,
+					planType:            tok.planType,
+					expiresAtRaw:        tok.expiresAt,
+					codex7DUsedPercent:  tok.codex7DUsedPercent,
+					codex7DResetAt:      tok.codex7DResetAt,
+					codex5HUsedPercent:  tok.codex5HUsedPercent,
+					codex5HResetAt:      tok.codex5HResetAt,
+					codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
 				})
 				if len(tokenCredentialMap(seed)) > 0 {
 					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1719,6 +2315,10 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 
 	// 软删除：保留账号数据与事件记录，但从运行时池和 active 列表中移除。
 	if err := h.db.SoftDeleteAccount(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
@@ -1779,7 +2379,7 @@ func (h *Handler) ToggleAccountEnabled(c *gin.Context) {
 	defer cancel()
 
 	if err := h.db.SetAccountEnabled(ctx, id, *req.Enabled); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
 		}
@@ -1911,7 +2511,7 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	stats, err := h.db.GetUsageStats(ctx)
+	stats, err := h.getUsageStatsCached(ctx)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -1949,17 +2549,31 @@ func (h *Handler) GetChartData(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
+	var cached database.ChartAggregation
+	if h.getRuntimeJSON(ctx, adminChartCacheNamespace, cacheKey, &cached) {
+		result := &cached
+		h.chartCacheMu.Lock()
+		h.chartCacheData[cacheKey] = &chartCacheEntry{
+			data:      result,
+			expiresAt: time.Now().Add(adminChartCacheTTL),
+		}
+		h.chartCacheMu.Unlock()
+		c.JSON(http.StatusOK, result)
+		return
+	}
+
 	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes)
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
+	h.setRuntimeJSON(ctx, adminChartCacheNamespace, cacheKey, result, adminChartCacheTTL)
 
 	// 写入缓存
 	h.chartCacheMu.Lock()
 	h.chartCacheData[cacheKey] = &chartCacheEntry{
 		data:      result,
-		expiresAt: time.Now().Add(10 * time.Second),
+		expiresAt: time.Now().Add(adminChartCacheTTL),
 	}
 	// 清理过期条目（延迟清理，避免内存泄漏）
 	for k, v := range h.chartCacheData {
@@ -2072,6 +2686,72 @@ func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogF
 	return filter, true
 }
 
+type opsErrorExportFile struct {
+	Version           int                   `json:"version"`
+	GeneratedAt       time.Time             `json:"generated_at"`
+	Range             opsErrorExportRange   `json:"range"`
+	Filters           opsErrorExportFilters `json:"filters"`
+	Options           opsErrorExportOptions `json:"options"`
+	TotalMatched      int                   `json:"total_matched"`
+	ExcludedCount     int                   `json:"excluded_count"`
+	ExportedCount     int                   `json:"exported_count"`
+	DuplicatesRemoved int                   `json:"duplicates_removed"`
+	Errors            []opsErrorExportEntry `json:"errors"`
+}
+
+type opsErrorExportRange struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+type opsErrorExportFilters struct {
+	Email        string `json:"email,omitempty"`
+	Model        string `json:"model,omitempty"`
+	Endpoint     string `json:"endpoint,omitempty"`
+	APIKeyID     *int64 `json:"api_key_id,omitempty"`
+	AccountID    *int64 `json:"account_id,omitempty"`
+	FastOnly     *bool  `json:"fast_only,omitempty"`
+	StreamOnly   *bool  `json:"stream_only,omitempty"`
+	StatusCode   int    `json:"status_code,omitempty"`
+	StatusFamily string `json:"status_family,omitempty"`
+	ErrorKind    string `json:"error_kind,omitempty"`
+	Query        string `json:"query,omitempty"`
+}
+
+type opsErrorExportOptions struct {
+	Dedupe              bool  `json:"dedupe"`
+	ExcludedStatusCodes []int `json:"excluded_status_codes,omitempty"`
+}
+
+type opsErrorExportEntry struct {
+	Signature          string    `json:"signature"`
+	Occurrences        int       `json:"occurrences"`
+	FirstSeen          time.Time `json:"first_seen"`
+	LastSeen           time.Time `json:"last_seen"`
+	SampleIDs          []int64   `json:"sample_ids"`
+	AffectedAccountIDs []int64   `json:"affected_account_ids,omitempty"`
+	AffectedAPIKeyIDs  []int64   `json:"affected_api_key_ids,omitempty"`
+	ID                 int64     `json:"id"`
+	CreatedAt          time.Time `json:"created_at"`
+	StatusCode         int       `json:"status_code"`
+	ErrorKind          string    `json:"error_kind"`
+	ErrorMessage       string    `json:"error_message"`
+	AccountID          int64     `json:"account_id"`
+	AccountEmail       string    `json:"account_email"`
+	APIKeyID           int64     `json:"api_key_id"`
+	APIKeyName         string    `json:"api_key_name"`
+	APIKeyMasked       string    `json:"api_key_masked"`
+	Endpoint           string    `json:"endpoint"`
+	UpstreamEndpoint   string    `json:"upstream_endpoint"`
+	Model              string    `json:"model"`
+	EffectiveModel     string    `json:"effective_model"`
+	Stream             bool      `json:"stream"`
+	DurationMs         int       `json:"duration_ms"`
+	FirstTokenMs       int       `json:"first_token_ms"`
+	IsRetryAttempt     bool      `json:"is_retry_attempt"`
+	AttemptIndex       int       `json:"attempt_index"`
+}
+
 // GetOpsErrorLogs 获取运维错误日志
 func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
@@ -2087,6 +2767,219 @@ func (h *Handler) GetOpsErrorLogs(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// ExportOpsErrorLogs 导出运维错误日志 JSON。
+func (h *Handler) ExportOpsErrorLogs(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	filter, ok := parseOpsErrorLogFilter(c, false)
+	if !ok {
+		return
+	}
+	dedupe := parseBoolQueryDefault(c, "dedupe", true)
+	excludedStatusCodes, excludedStatusSet, ok := parseExcludedStatusCodes(c.Query("exclude_status"))
+	if !ok {
+		writeError(c, http.StatusBadRequest, "exclude_status 参数无效")
+		return
+	}
+
+	logs, err := h.db.ListUsageLogsByFilter(ctx, filter)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	exportFile := buildOpsErrorExportFile(logs, filter, dedupe, excludedStatusCodes, excludedStatusSet)
+	body, err := json.MarshalIndent(exportFile, "", "  ")
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	body = append(body, '\n')
+
+	filename := fmt.Sprintf("ops-errors-%s.json", time.Now().Format("20060102-150405"))
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	c.Data(http.StatusOK, "application/json; charset=utf-8", body)
+}
+
+func parseBoolQueryDefault(c *gin.Context, name string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(c.Query(name)))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func parseExcludedStatusCodes(raw string) ([]int, map[int]bool, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, map[int]bool{}, true
+	}
+	seen := map[int]bool{}
+	var statuses []int
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		code, err := strconv.Atoi(part)
+		if err != nil || code < 100 || code > 599 {
+			return nil, nil, false
+		}
+		if !seen[code] {
+			seen[code] = true
+			statuses = append(statuses, code)
+		}
+	}
+	sort.Ints(statuses)
+	return statuses, seen, true
+}
+
+func buildOpsErrorExportFile(logs []*database.UsageLog, filter database.UsageLogFilter, dedupe bool, excludedStatusCodes []int, excludedStatusSet map[int]bool) opsErrorExportFile {
+	exportFile := opsErrorExportFile{
+		Version:      1,
+		GeneratedAt:  time.Now(),
+		Range:        opsErrorExportRange{Start: filter.Start, End: filter.End},
+		Filters:      opsErrorExportFiltersFromUsageFilter(filter),
+		Options:      opsErrorExportOptions{Dedupe: dedupe, ExcludedStatusCodes: excludedStatusCodes},
+		TotalMatched: len(logs),
+		Errors:       []opsErrorExportEntry{},
+	}
+
+	filteredLogs := make([]*database.UsageLog, 0, len(logs))
+	for _, logRow := range logs {
+		if logRow == nil {
+			continue
+		}
+		if excludedStatusSet[logRow.StatusCode] {
+			exportFile.ExcludedCount++
+			continue
+		}
+		filteredLogs = append(filteredLogs, logRow)
+	}
+
+	if !dedupe {
+		for _, logRow := range filteredLogs {
+			entry := newOpsErrorExportEntry(logRow)
+			exportFile.Errors = append(exportFile.Errors, entry)
+		}
+		exportFile.ExportedCount = len(exportFile.Errors)
+		return exportFile
+	}
+
+	entryBySignature := make(map[string]int)
+	for _, logRow := range filteredLogs {
+		entry := newOpsErrorExportEntry(logRow)
+		if idx, exists := entryBySignature[entry.Signature]; exists {
+			exportFile.Errors[idx].merge(logRow)
+			continue
+		}
+		entryBySignature[entry.Signature] = len(exportFile.Errors)
+		exportFile.Errors = append(exportFile.Errors, entry)
+	}
+	sort.SliceStable(exportFile.Errors, func(i, j int) bool {
+		if exportFile.Errors[i].Occurrences != exportFile.Errors[j].Occurrences {
+			return exportFile.Errors[i].Occurrences > exportFile.Errors[j].Occurrences
+		}
+		return exportFile.Errors[i].LastSeen.After(exportFile.Errors[j].LastSeen)
+	})
+	exportFile.ExportedCount = len(exportFile.Errors)
+	exportFile.DuplicatesRemoved = len(filteredLogs) - len(exportFile.Errors)
+	return exportFile
+}
+
+func opsErrorExportFiltersFromUsageFilter(filter database.UsageLogFilter) opsErrorExportFilters {
+	return opsErrorExportFilters{
+		Email:        filter.Email,
+		Model:        filter.Model,
+		Endpoint:     filter.Endpoint,
+		APIKeyID:     filter.APIKeyID,
+		AccountID:    filter.AccountID,
+		FastOnly:     filter.FastOnly,
+		StreamOnly:   filter.StreamOnly,
+		StatusCode:   filter.StatusCode,
+		StatusFamily: filter.StatusFamily,
+		ErrorKind:    filter.ErrorKind,
+		Query:        filter.Query,
+	}
+}
+
+func newOpsErrorExportEntry(logRow *database.UsageLog) opsErrorExportEntry {
+	entry := opsErrorExportEntry{
+		Signature:          opsErrorSignature(logRow),
+		Occurrences:        1,
+		FirstSeen:          logRow.CreatedAt,
+		LastSeen:           logRow.CreatedAt,
+		SampleIDs:          []int64{logRow.ID},
+		AffectedAccountIDs: appendUniqueInt64(nil, logRow.AccountID, 50),
+		AffectedAPIKeyIDs:  appendUniqueInt64(nil, logRow.APIKeyID, 50),
+		ID:                 logRow.ID,
+		CreatedAt:          logRow.CreatedAt,
+		StatusCode:         logRow.StatusCode,
+		ErrorKind:          logRow.UpstreamErrorKind,
+		ErrorMessage:       logRow.ErrorMessage,
+		AccountID:          logRow.AccountID,
+		AccountEmail:       logRow.AccountEmail,
+		APIKeyID:           logRow.APIKeyID,
+		APIKeyName:         logRow.APIKeyName,
+		APIKeyMasked:       logRow.APIKeyMasked,
+		Endpoint:           firstNonEmpty(logRow.InboundEndpoint, logRow.Endpoint),
+		UpstreamEndpoint:   logRow.UpstreamEndpoint,
+		Model:              logRow.Model,
+		EffectiveModel:     logRow.EffectiveModel,
+		Stream:             logRow.Stream,
+		DurationMs:         logRow.DurationMs,
+		FirstTokenMs:       logRow.FirstTokenMs,
+		IsRetryAttempt:     logRow.IsRetryAttempt,
+		AttemptIndex:       logRow.AttemptIndex,
+	}
+	return entry
+}
+
+func (entry *opsErrorExportEntry) merge(logRow *database.UsageLog) {
+	entry.Occurrences++
+	if logRow.CreatedAt.Before(entry.FirstSeen) {
+		entry.FirstSeen = logRow.CreatedAt
+	}
+	if logRow.CreatedAt.After(entry.LastSeen) {
+		entry.LastSeen = logRow.CreatedAt
+	}
+	entry.SampleIDs = appendUniqueInt64(entry.SampleIDs, logRow.ID, 20)
+	entry.AffectedAccountIDs = appendUniqueInt64(entry.AffectedAccountIDs, logRow.AccountID, 50)
+	entry.AffectedAPIKeyIDs = appendUniqueInt64(entry.AffectedAPIKeyIDs, logRow.APIKeyID, 50)
+}
+
+func opsErrorSignature(logRow *database.UsageLog) string {
+	parts := []string{
+		strconv.Itoa(logRow.StatusCode),
+		strings.TrimSpace(logRow.UpstreamErrorKind),
+		strings.Join(strings.Fields(logRow.ErrorMessage), " "),
+		firstNonEmpty(logRow.InboundEndpoint, logRow.Endpoint),
+		strings.TrimSpace(logRow.UpstreamEndpoint),
+		strings.TrimSpace(logRow.Model),
+		strings.TrimSpace(logRow.EffectiveModel),
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x1f")))
+	return hex.EncodeToString(sum[:12])
+}
+
+func appendUniqueInt64(values []int64, value int64, limit int) []int64 {
+	if value <= 0 || (limit > 0 && len(values) >= limit) {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 // GetOpsErrorSummary 获取运维错误日志概览
@@ -2209,6 +3102,10 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	h.deleteRuntimeCache(ctx, adminUsageStatsCacheNamespace, "global")
+	h.chartCacheMu.Lock()
+	h.chartCacheData = make(map[string]*chartCacheEntry)
+	h.chartCacheMu.Unlock()
 	c.JSON(http.StatusOK, gin.H{"message": "日志已清空"})
 }
 
@@ -2235,8 +3132,13 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 }
 
 type createKeyReq struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
+	Name            string          `json:"name"`
+	Key             string          `json:"key"`
+	QuotaLimit      *float64        `json:"quota_limit"`
+	Quota           *float64        `json:"quota"`
+	ExpiresAt       string          `json:"expires_at"`
+	ExpiresInDays   *int            `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage `json:"allowed_group_ids"`
 }
 
 // generateKey 生成随机 API Key
@@ -2271,6 +3173,33 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		return
 	}
 
+	quotaLimit := 0.0
+	if req.Quota != nil {
+		quotaLimit = *req.Quota
+	}
+	if req.QuotaLimit != nil {
+		quotaLimit = *req.QuotaLimit
+	}
+	if quotaLimit < 0 {
+		writeError(c, http.StatusBadRequest, "额度限制不能小于 0")
+		return
+	}
+	if quotaLimit > 1000000000 {
+		writeError(c, http.StatusBadRequest, "额度限制过大")
+		return
+	}
+
+	expiresAt, err := parseAPIKeyExpiresAt(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	allowedGroupIDs, err := parseOptionalIntegerSliceField(req.AllowedGroupIDs, "allowed_group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	key := req.Key
 	if key == "" {
 		key = generateKey()
@@ -2285,21 +3214,246 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
+	if allowedGroupIDs.Set {
+		missing, err := h.db.VerifyAccountGroupIDs(ctx, allowedGroupIDs.Values)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if len(missing) > 0 {
+			values := make([]string, 0, len(missing))
+			for _, value := range missing {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
 
-	id, err := h.db.InsertAPIKey(ctx, req.Name, key)
+	id, err := h.db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name:            req.Name,
+		Key:             key,
+		QuotaLimit:      quotaLimit,
+		ExpiresAt:       expiresAt,
+		AllowedGroupIDs: allowedGroupIDs.Values,
+	})
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "创建失败: "+err.Error())
 		return
 	}
+	if allowedGroupIDs.Set {
+		values := dedupeInt64(allowedGroupIDs.Values)
+		if h.store != nil {
+			h.store.SetAPIKeyAllowedGroups(id, values)
+		}
+	}
+	h.invalidateAPIKeyRuntimeCaches(ctx, key)
 
 	// 记录安全审计日志
 	security.SecurityAuditLog("API_KEY_CREATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(req.Name), c.ClientIP()))
 
+	var expiresAtResponse *string
+	if expiresAt.Valid {
+		formatted := expiresAt.Time.Format(time.RFC3339)
+		expiresAtResponse = &formatted
+	}
 	c.JSON(http.StatusOK, createAPIKeyResponse{
-		ID:   id,
-		Key:  key,
-		Name: req.Name,
+		ID:              id,
+		Key:             key,
+		Name:            req.Name,
+		QuotaLimit:      quotaLimit,
+		QuotaUsed:       0,
+		ExpiresAt:       expiresAtResponse,
+		AllowedGroupIDs: dedupeInt64(allowedGroupIDs.Values),
 	})
+}
+
+type updateAPIKeyReq struct {
+	Name            *string         `json:"name"`
+	QuotaLimit      json.RawMessage `json:"quota_limit"`
+	Quota           json.RawMessage `json:"quota"`
+	ExpiresAt       json.RawMessage `json:"expires_at"`
+	ExpiresInDays   *int            `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage `json:"allowed_group_ids"`
+}
+
+func (h *Handler) UpdateAPIKey(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效 ID")
+		return
+	}
+	var req updateAPIKeyReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	allowedGroupIDs, err := parseOptionalIntegerSliceField(req.AllowedGroupIDs, "allowed_group_ids")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	quotaLimit, quotaLimitSet, err := parseOptionalAPIKeyQuota(req.QuotaLimit, req.Quota)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	expiresAt, expiresAtSet, err := parseOptionalAPIKeyExpiration(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	row, err := h.db.GetAPIKeyByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "API Key 不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	if req.Name != nil {
+		name := security.SanitizeInput(*req.Name)
+		if strings.TrimSpace(name) == "" {
+			writeError(c, http.StatusBadRequest, "名称不能为空")
+			return
+		}
+		if utf8.RuneCountInString(name) > 100 {
+			writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+			return
+		}
+		if security.ContainsXSS(name) {
+			writeError(c, http.StatusBadRequest, "名称包含非法字符")
+			return
+		}
+		req.Name = &name
+	}
+	if quotaLimitSet {
+		if quotaLimit > 1000000000 {
+			writeError(c, http.StatusBadRequest, "额度限制不能超过 1000000000")
+			return
+		}
+	}
+	var allowedGroupValues []int64
+	if allowedGroupIDs.Set {
+		missing, err := h.db.VerifyAccountGroupIDs(ctx, allowedGroupIDs.Values)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		if len(missing) > 0 {
+			values := make([]string, 0, len(missing))
+			for _, value := range missing {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+		allowedGroupValues = dedupeInt64(allowedGroupIDs.Values)
+	}
+	update := database.APIKeyUpdate{
+		QuotaLimit:         quotaLimit,
+		QuotaLimitSet:      quotaLimitSet,
+		ExpiresAt:          expiresAt,
+		ExpiresAtSet:       expiresAtSet,
+		AllowedGroupIDs:    allowedGroupValues,
+		AllowedGroupIDsSet: allowedGroupIDs.Set,
+	}
+	if req.Name != nil {
+		update.Name = *req.Name
+		update.NameSet = true
+	}
+	if err := h.db.UpdateAPIKey(ctx, id, update); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if allowedGroupIDs.Set && h.store != nil {
+		h.store.SetAPIKeyAllowedGroups(id, allowedGroupValues)
+	}
+	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
+	writeMessage(c, http.StatusOK, "API Key 已更新")
+}
+
+func parseOptionalAPIKeyQuota(quotaLimitRaw, quotaRaw json.RawMessage) (float64, bool, error) {
+	raw := quotaLimitRaw
+	if len(raw) == 0 {
+		raw = quotaRaw
+	}
+	if len(raw) == 0 {
+		return 0, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return 0, true, nil
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, true, fmt.Errorf("额度限制必须是数字")
+	}
+	if value < 0 {
+		return 0, true, fmt.Errorf("额度限制不能小于 0")
+	}
+	return value, true, nil
+}
+
+func parseOptionalAPIKeyExpiration(raw json.RawMessage, expiresInDays *int) (sql.NullTime, bool, error) {
+	if expiresInDays != nil {
+		expiresAt, err := parseAPIKeyExpiresAt("", expiresInDays)
+		return expiresAt, true, err
+	}
+	if len(raw) == 0 {
+		return sql.NullTime{}, false, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return sql.NullTime{}, true, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return sql.NullTime{}, true, fmt.Errorf("过期时间格式无效")
+	}
+	expiresAt, err := parseAPIKeyExpiresAt(value, nil)
+	return expiresAt, true, err
+}
+
+func parseAPIKeyExpiresAt(raw string, expiresInDays *int) (sql.NullTime, error) {
+	if expiresInDays != nil {
+		if *expiresInDays < 0 {
+			return sql.NullTime{}, fmt.Errorf("过期天数不能小于 0")
+		}
+		if *expiresInDays > 0 {
+			if *expiresInDays > 3650 {
+				return sql.NullTime{}, fmt.Errorf("过期天数不能超过 3650 天")
+			}
+			return sql.NullTime{Time: time.Now().AddDate(0, 0, *expiresInDays), Valid: true}, nil
+		}
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return sql.NullTime{}, nil
+	}
+	layouts := []string{time.RFC3339, "2006-01-02T15:04", "2006-01-02 15:04", "2006-01-02"}
+	var parsed time.Time
+	var err error
+	for _, layout := range layouts {
+		if layout == time.RFC3339 {
+			parsed, err = time.Parse(layout, raw)
+		} else {
+			parsed, err = time.ParseInLocation(layout, raw, time.Local)
+		}
+		if err == nil {
+			if layout == "2006-01-02" {
+				parsed = parsed.Add(24*time.Hour - time.Nanosecond)
+			}
+			if !parsed.After(time.Now()) {
+				return sql.NullTime{}, fmt.Errorf("过期时间必须晚于当前时间")
+			}
+			return sql.NullTime{Time: parsed, Valid: true}, nil
+		}
+	}
+	return sql.NullTime{}, fmt.Errorf("过期时间格式无效")
 }
 
 // DeleteAPIKey 删除 API 密钥
@@ -2313,16 +3467,26 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	keyToInvalidate := ""
+	if row, err := h.db.GetAPIKeyByID(ctx, id); err == nil && row != nil {
+		keyToInvalidate = row.Key
+	}
 	if err := h.db.DeleteAPIKey(ctx, id); err != nil {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+	if h.store != nil {
+		h.store.SetAPIKeyAllowedGroups(id, nil)
+	}
+	h.invalidateAPIKeyRuntimeCaches(ctx, keyToInvalidate)
 	writeMessage(c, http.StatusOK, "已删除")
 }
 
 // ==================== Settings ====================
 
 type settingsResponse struct {
+	SiteName                         string `json:"site_name"`
+	SiteLogo                         string `json:"site_logo"`
 	MaxConcurrency                   int    `json:"max_concurrency"`
 	GlobalRPM                        int    `json:"global_rpm"`
 	TestModel                        string `json:"test_model"`
@@ -2380,6 +3544,8 @@ type settingsResponse struct {
 }
 
 type updateSettingsReq struct {
+	SiteName                         *string `json:"site_name"`
+	SiteLogo                         *string `json:"site_logo"`
 	MaxConcurrency                   *int    `json:"max_concurrency"`
 	GlobalRPM                        *int    `json:"global_rpm"`
 	TestModel                        *string `json:"test_model"`
@@ -2430,6 +3596,72 @@ type updateSettingsReq struct {
 	ImageS3ForcePathStyle            *bool   `json:"image_s3_force_path_style"`
 }
 
+type brandingResponse struct {
+	SiteName string `json:"site_name"`
+	SiteLogo string `json:"site_logo"`
+}
+
+const maxSiteLogoBytes = 600 * 1024
+const maxSiteLogoURLChars = 4096
+
+func normalizeSiteLogo(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "data:image/") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("网站图标 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("网站图标 base64 数据无效")
+		}
+		if len(decoded) > maxSiteLogoBytes {
+			return "", fmt.Errorf("网站图标不能超过 600KB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://"):
+		if len(value) > maxSiteLogoURLChars {
+			return "", fmt.Errorf("网站图标 URL 过长")
+		}
+		return value, nil
+	case strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "//"):
+		if len(value) > maxSiteLogoURLChars {
+			return "", fmt.Errorf("网站图标路径过长")
+		}
+		return value, nil
+	default:
+		return "", fmt.Errorf("网站图标仅支持 http(s) URL、站内路径或 data:image base64")
+	}
+}
+
+func brandingFromSettings(settings *database.SystemSettings) brandingResponse {
+	resp := brandingResponse{SiteName: database.DefaultSiteName}
+	if settings == nil {
+		return resp
+	}
+	resp.SiteName = database.NormalizeSiteName(settings.SiteName)
+	resp.SiteLogo = strings.TrimSpace(settings.SiteLogo)
+	return resp
+}
+
+// GetBranding 获取公开站点品牌配置（无需管理密钥）。
+func (h *Handler) GetBranding(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	settings, err := h.db.GetSystemSettings(ctx)
+	if err != nil {
+		log.Printf("读取站点品牌配置失败: %v", err)
+		c.JSON(http.StatusOK, brandingFromSettings(nil))
+		return
+	}
+	c.JSON(http.StatusOK, brandingFromSettings(settings))
+}
+
 // GetSettings 获取当前系统设置
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
@@ -2438,6 +3670,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
 	var resinURL, resinPlatformName string
+	branding := brandingFromSettings(dbSettings)
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -2450,6 +3683,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	imgCfg := imagestore.CurrentConfig()
 	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
 	c.JSON(http.StatusOK, settingsResponse{
+		SiteName:                         branding.SiteName,
+		SiteLogo:                         branding.SiteLogo,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -2515,8 +3750,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	currentAdminSecret := ""
-	if dbSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && dbSettings != nil {
-		currentAdminSecret = dbSettings.AdminSecret
+	siteName := database.DefaultSiteName
+	siteLogo := ""
+	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
+	if existingSettings != nil {
+		currentAdminSecret = existingSettings.AdminSecret
+		siteName = database.NormalizeSiteName(existingSettings.SiteName)
+		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -2525,6 +3765,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		} else {
 			log.Printf("检测到环境变量 ADMIN_SECRET，忽略前端提交的 admin_secret")
 		}
+	}
+	if req.SiteName != nil {
+		siteName = database.NormalizeSiteName(*req.SiteName)
+		log.Printf("设置已更新: site_name = %s", siteName)
+	}
+	if req.SiteLogo != nil {
+		normalized, err := normalizeSiteLogo(*req.SiteLogo)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		siteLogo = normalized
+		log.Printf("设置已更新: site_logo (长度=%d)", len(siteLogo))
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -2668,10 +3921,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	if req.ProxyPoolEnabled != nil {
-		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
 		if *req.ProxyPoolEnabled {
-			_ = h.store.ReloadProxyPool()
+			if err := h.store.ReloadProxyPool(); err != nil {
+				writeError(c, http.StatusInternalServerError, "代理池刷新失败: "+err.Error())
+				return
+			}
 		}
+		h.store.SetProxyPoolEnabled(*req.ProxyPoolEnabled)
 		log.Printf("设置已更新: proxy_pool_enabled = %t", *req.ProxyPoolEnabled)
 	}
 
@@ -2822,9 +4078,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	// Resin 粘性代理池配置
 	resinURL := ""
 	resinPlatformName := ""
-	if existSettings, err := h.db.GetSystemSettings(c.Request.Context()); err == nil && existSettings != nil {
-		resinURL = existSettings.ResinURL
-		resinPlatformName = existSettings.ResinPlatformName
+	if existingSettings != nil {
+		resinURL = existingSettings.ResinURL
+		resinPlatformName = existingSettings.ResinPlatformName
 	}
 	if req.ResinURL != nil {
 		resinURL = *req.ResinURL
@@ -2901,6 +4157,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
+		SiteName:                         siteName,
+		SiteLogo:                         siteLogo,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -2961,6 +4219,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, settingsResponse{
+		SiteName:                         siteName,
+		SiteLogo:                         siteLogo,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
@@ -3067,14 +4327,20 @@ func (h *Handler) TestImageStorageConnection(c *gin.Context) {
 // ==================== 导出 & 迁移 ====================
 
 type cpaExportEntry struct {
-	Type         string `json:"type"`
-	Email        string `json:"email"`
-	Expired      string `json:"expired"`
-	IDToken      string `json:"id_token"`
-	AccountID    string `json:"account_id"`
-	AccessToken  string `json:"access_token"`
-	LastRefresh  string `json:"last_refresh"`
-	RefreshToken string `json:"refresh_token"`
+	Type                string `json:"type"`
+	Email               string `json:"email"`
+	PlanType            string `json:"plan_type,omitempty"`
+	Codex7DUsedPercent  string `json:"codex_7d_used_percent,omitempty"`
+	Codex7DResetAt      string `json:"codex_7d_reset_at,omitempty"`
+	Codex5HUsedPercent  string `json:"codex_5h_used_percent,omitempty"`
+	Codex5HResetAt      string `json:"codex_5h_reset_at,omitempty"`
+	CodexUsageUpdatedAt string `json:"codex_usage_updated_at,omitempty"`
+	Expired             string `json:"expired"`
+	IDToken             string `json:"id_token"`
+	AccountID           string `json:"account_id"`
+	AccessToken         string `json:"access_token"`
+	LastRefresh         string `json:"last_refresh"`
+	RefreshToken        string `json:"refresh_token"`
 }
 
 type accountAuthJSONTokens struct {
@@ -3104,7 +4370,7 @@ func (h *Handler) GetAccountAuthJSON(c *gin.Context) {
 
 	row, err := h.db.GetAccountByID(ctx, id)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
 		}
@@ -3211,18 +4477,27 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 			}
 		}
 		rt := row.GetCredential("refresh_token")
-		if rt == "" {
+		at := row.GetCredential("access_token")
+		// AT-only accounts (没有 refresh_token,只靠 access_token,常用于规避
+		// add-phone 的 Plus 号) 也需要可导出与可迁移。仅当两个凭证都缺失才跳过。
+		if rt == "" && at == "" {
 			continue
 		}
 		entries = append(entries, cpaExportEntry{
-			Type:         "codex",
-			Email:        row.GetCredential("email"),
-			Expired:      row.GetCredential("expires_at"),
-			IDToken:      row.GetCredential("id_token"),
-			AccountID:    row.GetCredential("account_id"),
-			AccessToken:  row.GetCredential("access_token"),
-			LastRefresh:  row.UpdatedAt.Format(time.RFC3339),
-			RefreshToken: rt,
+			Type:                "codex",
+			Email:               row.GetCredential("email"),
+			PlanType:            row.GetCredential("plan_type"),
+			Codex7DUsedPercent:  row.GetCredential("codex_7d_used_percent"),
+			Codex7DResetAt:      row.GetCredential("codex_7d_reset_at"),
+			Codex5HUsedPercent:  row.GetCredential("codex_5h_used_percent"),
+			Codex5HResetAt:      row.GetCredential("codex_5h_reset_at"),
+			CodexUsageUpdatedAt: row.GetCredential("codex_usage_updated_at"),
+			Expired:             row.GetCredential("expires_at"),
+			IDToken:             row.GetCredential("id_token"),
+			AccountID:           row.GetCredential("account_id"),
+			AccessToken:         at,
+			LastRefresh:         row.UpdatedAt.Format(time.RFC3339),
+			RefreshToken:        rt,
 		})
 	}
 
@@ -3291,11 +4566,13 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 		return
 	}
 
-	// 转换为 importToken 格式，复用 importAccountsCommon
+	// 转换为 importToken 格式，复用 importAccountsCommon (原生支持 AT-only 混合导入)
 	var tokens []importToken
 	for _, entry := range remoteAccounts {
 		rt := strings.TrimSpace(entry.RefreshToken)
-		if rt == "" {
+		at := strings.TrimSpace(entry.AccessToken)
+		// 至少需要一种凭证;两者都为空表示账号根本没有可用凭证。
+		if rt == "" && at == "" {
 			continue
 		}
 		name := entry.Email
@@ -3303,13 +4580,19 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 			name = "migrate"
 		}
 		tokens = append(tokens, importToken{
-			refreshToken: rt,
-			accessToken:  strings.TrimSpace(entry.AccessToken),
-			name:         name,
-			email:        strings.TrimSpace(entry.Email),
-			idToken:      strings.TrimSpace(entry.IDToken),
-			accountID:    strings.TrimSpace(entry.AccountID),
-			expiresAt:    strings.TrimSpace(entry.Expired),
+			refreshToken:        rt,
+			accessToken:         at,
+			name:                name,
+			email:               strings.TrimSpace(entry.Email),
+			idToken:             strings.TrimSpace(entry.IDToken),
+			accountID:           strings.TrimSpace(entry.AccountID),
+			planType:            strings.TrimSpace(entry.PlanType),
+			expiresAt:           strings.TrimSpace(entry.Expired),
+			codex7DUsedPercent:  strings.TrimSpace(entry.Codex7DUsedPercent),
+			codex7DResetAt:      strings.TrimSpace(entry.Codex7DResetAt),
+			codex5HUsedPercent:  strings.TrimSpace(entry.Codex5HUsedPercent),
+			codex5HResetAt:      strings.TrimSpace(entry.Codex5HResetAt),
+			codexUsageUpdatedAt: strings.TrimSpace(entry.CodexUsageUpdatedAt),
 		})
 	}
 
@@ -3460,12 +4743,13 @@ func (h *Handler) AddProxies(c *gin.Context) {
 
 	inserted, err := h.db.InsertProxies(ctx, cleaned, req.Label)
 	if err != nil {
-		writeError(c, http.StatusInternalServerError, "添加代理失败")
+		writeError(c, http.StatusInternalServerError, "添加代理失败: "+err.Error())
 		return
 	}
 
-	// 刷新代理池
-	_ = h.store.ReloadProxyPool()
+	if err := h.store.ReloadProxyPool(); err != nil {
+		log.Printf("代理已添加，但代理池刷新失败: %v", err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":  fmt.Sprintf("成功添加 %d 个代理", inserted),
@@ -3486,11 +4770,17 @@ func (h *Handler) DeleteProxy(c *gin.Context) {
 	defer cancel()
 
 	if err := h.db.DeleteProxy(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "删除代理失败")
 		return
 	}
 
-	_ = h.store.ReloadProxyPool()
+	if err := h.store.ReloadProxyPool(); err != nil {
+		log.Printf("代理已删除，但代理池刷新失败: %v", err)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "代理已删除"})
 }
 
@@ -3503,6 +4793,7 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	}
 
 	var req struct {
+		URL     *string `json:"url"`
 		Label   *string `json:"label"`
 		Enabled *bool   `json:"enabled"`
 	}
@@ -3514,12 +4805,18 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if err := h.db.UpdateProxy(ctx, id, req.Label, req.Enabled); err != nil {
+	if err := h.db.UpdateProxy(ctx, id, req.URL, req.Label, req.Enabled); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "代理不存在")
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "更新代理失败")
 		return
 	}
 
-	_ = h.store.ReloadProxyPool()
+	if err := h.store.ReloadProxyPool(); err != nil {
+		log.Printf("代理已更新，但代理池刷新失败: %v", err)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "代理已更新"})
 }
 
@@ -3601,7 +4898,10 @@ func (h *Handler) TestProxy(c *gin.Context) {
 	if req.ID > 0 {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 		defer cancel()
-		_ = h.db.UpdateProxyTestResult(ctx, req.ID, ip, location, latencyMs)
+		if err := h.db.UpdateProxyTestResult(ctx, req.ID, ip, location, latencyMs); err != nil {
+			c.JSON(http.StatusOK, gin.H{"success": false, "error": "代理测试结果保存失败: " + err.Error(), "latency_ms": latencyMs})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

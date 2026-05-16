@@ -1,8 +1,8 @@
-import { type PropsWithChildren, type ReactNode, useState } from 'react'
+import { type PropsWithChildren, type ReactNode, useEffect, useRef, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Sun, Moon, Languages, Globe, BookOpen, FileCode2, KeyRound, Image as ImageIcon, ShieldAlert } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Sun, Moon, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import logoImg from '../assets/logo.png'
+import { DEFAULT_SITE_LOGO, useBranding } from '../branding'
 import { useTheme } from '../hooks/useTheme'
 import { useVersionCheck } from '../hooks/useVersionCheck'
 import SecurityBanner from './SecurityBanner'
@@ -26,15 +26,41 @@ const navDefs: NavDef[] = [
   { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
   { to: '/settings', labelKey: 'nav.settings', icon: <Settings className="size-[18px]" /> },
   { to: '/docs', labelKey: 'nav2.docs', icon: <BookOpen className="size-[18px]" /> },
-  { to: '/api-reference', labelKey: 'nav2.apiRef', icon: <FileCode2 className="size-[18px]" /> },
 ]
 
 export default function Layout({ children }: PropsWithChildren) {
   const location = useLocation()
   const { theme, toggle } = useTheme()
   const { t, i18n } = useTranslation()
-  const { hasUpdate, latestVersion } = useVersionCheck()
+  const { hasUpdate, latestVersion } = useVersionCheck(location.pathname)
+  const { siteName, siteLogo } = useBranding()
+  const logoSrc = siteLogo || DEFAULT_SITE_LOGO
   const [spinning, setSpinning] = useState(false)
+  const [showVersionPopover, setShowVersionPopover] = useState(false)
+  const versionPopoverRef = useRef<HTMLDivElement | null>(null)
+  const releaseURL = latestVersion
+    ? `https://github.com/james-6-23/codex2api/releases/tag/${encodeURIComponent(latestVersion)}`
+    : undefined
+
+  useEffect(() => {
+    if (!showVersionPopover) return
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target instanceof Node ? event.target : null
+      if (target && versionPopoverRef.current?.contains(target)) return
+      setShowVersionPopover(false)
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowVersionPopover(false)
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [showVersionPopover])
 
   const handleThemeToggle = (e: React.MouseEvent) => {
     setSpinning(true)
@@ -67,20 +93,50 @@ export default function Layout({ children }: PropsWithChildren) {
             {/* Brand */}
             <div className="pb-4 border-b border-border">
               <div className="flex items-center gap-3">
-                <img src={logoImg} alt="CodexProxy" className="size-10 rounded-lg object-cover shadow-sm shrink-0" />
+                <img src={logoSrc} alt={siteName} className="size-10 rounded-lg object-cover shadow-sm shrink-0" />
                 <div className="flex flex-col gap-1">
-                  <h1 className="text-[20px] leading-tight font-bold text-foreground">
-                    CodexProxy
+                  <h1 className="max-w-[160px] truncate text-[20px] leading-tight font-bold text-foreground" title={siteName}>
+                    {siteName}
                   </h1>
-                  <span
-                    className="relative inline-flex items-center rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-primary w-fit"
-                    title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
-                  >
-                    {__APP_VERSION__}
-                    {hasUpdate && (
-                      <span className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-red-500 animate-pulse" />
+                  <div ref={versionPopoverRef} className="relative w-fit">
+                    <button
+                      type="button"
+                      className={`relative inline-flex items-center rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-bold text-primary ring-1 ring-primary/10 transition-colors ${releaseURL ? 'cursor-pointer hover:bg-primary/15' : 'cursor-default'}`}
+                      title={hasUpdate && latestVersion ? t('common.newVersionAvailable', { version: latestVersion }) : undefined}
+                      onClick={() => {
+                        if (!releaseURL) return
+                        setShowVersionPopover((current) => !current)
+                      }}
+                    >
+                      {__APP_VERSION__}
+                      {hasUpdate && (
+                        <span className="absolute -top-1.5 left-1/2 size-2.5 -translate-x-1/2 rounded-full bg-red-500 shadow-sm ring-2 ring-[hsl(var(--sidebar-background))] animate-pulse" />
+                      )}
+                    </button>
+                    {showVersionPopover && releaseURL && latestVersion && (
+                      <div className="absolute left-0 top-[calc(100%+8px)] z-50 w-[240px] rounded-lg border border-border bg-popover p-3 text-left shadow-xl">
+                        <div className="text-[13px] font-semibold text-foreground">
+                          {hasUpdate ? t('common.newVersionAvailable', { version: latestVersion }) : t('common.versionLatest')}
+                        </div>
+                        <div className="mt-1 text-[11px] text-muted-foreground">
+                          {t('common.currentVersion', { version: __APP_VERSION__ })}
+                        </div>
+                        <div className="mt-1 text-[11px] text-muted-foreground">
+                          {t('common.latestVersion', { version: latestVersion })}
+                        </div>
+                        <a
+                          href={releaseURL}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-primary/20 bg-primary/10 px-2.5 py-1.5 text-[12px] font-semibold text-primary transition-colors hover:bg-primary/15"
+                          onClick={() => setShowVersionPopover(false)}
+                        >
+                          {t('common.viewReleaseNotes')}
+                          <ExternalLink className="size-3.5" />
+                        </a>
+                      </div>
                     )}
-                  </span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -152,8 +208,8 @@ export default function Layout({ children }: PropsWithChildren) {
           {/* Mobile topbar */}
           <header className="hidden max-lg:flex items-center justify-between gap-4 mb-4 p-3 border border-border rounded-lg bg-card/95 shadow-sm">
             <div className="flex items-center gap-3">
-              <img src={logoImg} alt="CodexProxy" className="w-8 h-8 rounded-[10px] object-cover" />
-              <strong className="text-lg">CodexProxy</strong>
+              <img src={logoSrc} alt={siteName} className="w-8 h-8 rounded-[10px] object-cover" />
+              <strong className="max-w-[150px] truncate text-lg" title={siteName}>{siteName}</strong>
             </div>
             <div className="flex items-center gap-2">
               <button

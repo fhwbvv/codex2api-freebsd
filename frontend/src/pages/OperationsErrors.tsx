@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Clock3,
   Copy,
+  Download,
   RefreshCw,
   RotateCcw,
   Search,
@@ -65,6 +66,9 @@ export default function OperationsErrors() {
   const [streamFilter, setStreamFilter] = useState<'' | 'true' | 'false'>('')
   const [searchInput, setSearchInput] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
+  const [exportDedupe, setExportDedupe] = useState(true)
+  const [exportExcludeAuthRateLimit, setExportExcludeAuthRateLimit] = useState(true)
+  const [exporting, setExporting] = useState(false)
   const [selectedLog, setSelectedLog] = useState<UsageLog | null>(null)
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
 
@@ -85,9 +89,9 @@ export default function OperationsErrors() {
     }
   }, [])
 
-  const loadErrorData = useCallback(async () => {
+  const buildBaseParams = useCallback(() => {
     const range = getTimeRangeISO(timeRange)
-    const baseParams = {
+    return {
       start: range.start,
       end: range.end,
       status: statusFilter,
@@ -97,6 +101,10 @@ export default function OperationsErrors() {
       stream: streamFilter,
       q: searchQuery,
     }
+  }, [apiKeyFilter, endpointFilter, errorKindFilter, searchQuery, statusFilter, streamFilter, timeRange])
+
+  const loadErrorData = useCallback(async () => {
+    const baseParams = buildBaseParams()
     const [summary, pageResult, apiKeysResult] = await Promise.all([
       api.getOpsErrorSummary(baseParams),
       api.getOpsErrors({
@@ -113,7 +121,7 @@ export default function OperationsErrors() {
       total: pageResult.total ?? 0,
       apiKeys: apiKeysResult.keys ?? [],
     }
-  }, [apiKeyFilter, endpointFilter, errorKindFilter, page, pageSize, searchQuery, statusFilter, streamFilter, timeRange])
+  }, [buildBaseParams, page, pageSize])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     summary: OpsErrorSummary | null
@@ -166,6 +174,23 @@ export default function OperationsErrors() {
     setPage(1)
   }
 
+  const handleExport = async () => {
+    setExporting(true)
+    try {
+      const blob = await api.downloadOpsErrors({
+        ...buildBaseParams(),
+        dedupe: exportDedupe,
+        excludeStatus: exportExcludeAuthRateLimit ? '401,429' : '',
+      })
+      downloadBlob(blob, buildOpsErrorExportFilename(timeRange, exportDedupe, exportExcludeAuthRateLimit))
+      showToast(t('opsErrors.exportSuccess'))
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : t('opsErrors.exportFailed'), 'error')
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const copyLog = async (log: UsageLog) => {
     const text = JSON.stringify({
       id: log.id,
@@ -188,7 +213,7 @@ export default function OperationsErrors() {
       attempt_index: log.attempt_index,
     }, null, 2)
     try {
-      await navigator.clipboard.writeText(text)
+      await copyTextToClipboard(text)
       showToast(t('opsErrors.copySuccess'))
     } catch {
       showToast(t('opsErrors.copyFailed'), 'error')
@@ -358,6 +383,28 @@ export default function OperationsErrors() {
                   { label: 'Sync', value: 'false' },
                 ]}
               />
+              <label className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 text-[13px] text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={exportDedupe}
+                  onChange={(event) => setExportDedupe(event.target.checked)}
+                  className="size-3.5 rounded border-border"
+                />
+                {t('opsErrors.exportDedupe')}
+              </label>
+              <label className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 text-[13px] text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={exportExcludeAuthRateLimit}
+                  onChange={(event) => setExportExcludeAuthRateLimit(event.target.checked)}
+                  className="size-3.5 rounded border-border"
+                />
+                {t('opsErrors.exclude401429')}
+              </label>
+              <Button variant="outline" size="sm" onClick={() => void handleExport()} disabled={exporting}>
+                <Download className="size-3.5" />
+                {exporting ? t('opsErrors.exporting') : t('opsErrors.exportJson')}
+              </Button>
               {hasActiveFilters && (
                 <button
                   type="button"
@@ -599,6 +646,53 @@ function formatEndpoint(log: UsageLog): string {
     return `${inbound} → ${log.upstream_endpoint}`
   }
   return inbound
+}
+
+async function copyTextToClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {
+      // Fall back for non-secure contexts or browsers that block clipboard writes.
+    }
+  }
+
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', 'true')
+  textarea.style.position = 'fixed'
+  textarea.style.top = '-1000px'
+  textarea.style.opacity = '0'
+  textarea.style.pointerEvents = 'none'
+  document.body.appendChild(textarea)
+  textarea.select()
+  textarea.setSelectionRange(0, text.length)
+  const copied = document.execCommand('copy')
+  document.body.removeChild(textarea)
+  if (!copied) {
+    throw new Error('copy failed')
+  }
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function buildOpsErrorExportFilename(timeRange: TimeRangeKey, dedupe: boolean, excludeAuthRateLimit: boolean) {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const options = [
+    dedupe ? 'deduped' : 'raw',
+    excludeAuthRateLimit ? 'no-401-429' : 'all-status',
+  ].join('-')
+  return `ops-errors-${timeRange}-${options}-${timestamp}.json`
 }
 
 function classifyStatus(statusCode: number): string {

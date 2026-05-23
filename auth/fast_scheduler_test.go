@@ -24,7 +24,7 @@ func TestFastSchedulerAcquirePrefersHealthyTier(t *testing.T) {
 	warm := newFastSchedulerTestAccount(1, HealthTierWarm, 90, 2)
 	healthy := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
 
-	scheduler := NewFastScheduler(2)
+	scheduler := NewFastScheduler(2, "round_robin")
 	scheduler.Rebuild([]*Account{warm, healthy})
 
 	got := scheduler.Acquire()
@@ -43,7 +43,7 @@ func TestFastSchedulerSkipsDispatchPausedAccount(t *testing.T) {
 	atomic.StoreInt32(&paused.DispatchPaused, 1)
 	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
 
-	scheduler := NewFastScheduler(2)
+	scheduler := NewFastScheduler(2, "round_robin")
 	scheduler.Rebuild([]*Account{paused, fallback})
 
 	got := scheduler.Acquire()
@@ -62,7 +62,7 @@ func TestFastSchedulerSkipsErrorAccount(t *testing.T) {
 	errored.Status = StatusError
 	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 2)
 
-	scheduler := NewFastScheduler(2)
+	scheduler := NewFastScheduler(2, "round_robin")
 	scheduler.Rebuild([]*Account{errored, fallback})
 
 	got := scheduler.Acquire()
@@ -79,7 +79,7 @@ func TestFastSchedulerSkipsErrorAccount(t *testing.T) {
 func TestFastSchedulerRespectsConcurrencyLimit(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
 
-	scheduler := NewFastScheduler(1)
+	scheduler := NewFastScheduler(1, "round_robin")
 	scheduler.Rebuild([]*Account{acc})
 
 	first := scheduler.Acquire()
@@ -105,7 +105,7 @@ func TestFastSchedulerRoundRobinWithinTier(t *testing.T) {
 	a2 := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 4)
 	a3 := newFastSchedulerTestAccount(3, HealthTierHealthy, 100, 4)
 
-	scheduler := NewFastScheduler(4)
+	scheduler := NewFastScheduler(4, "round_robin")
 	scheduler.Rebuild([]*Account{a1, a2, a3})
 
 	var got []int64
@@ -287,7 +287,7 @@ func TestFastSchedulerAcquireExcludingRespectsAPIKeyWhitelist(t *testing.T) {
 	restricted.SetAllowedAPIKeyIDs([]int64{2})
 	fallback := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
 
-	scheduler := NewFastScheduler(1)
+	scheduler := NewFastScheduler(1, "round_robin")
 	scheduler.Rebuild([]*Account{restricted, fallback})
 
 	got := scheduler.AcquireExcluding(1, nil)
@@ -307,7 +307,7 @@ func TestFastSchedulerAcquireExcludingWithFilterRespectsPlanFilter(t *testing.T)
 	pro := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
 	pro.PlanType = "pro"
 
-	scheduler := NewFastScheduler(1)
+	scheduler := NewFastScheduler(1, "round_robin")
 	scheduler.Rebuild([]*Account{plus, pro})
 
 	got := scheduler.AcquireExcludingWithFilter(0, nil, func(acc *Account) bool {
@@ -325,7 +325,7 @@ func TestFastSchedulerAcquireExcludingWithFilterRespectsPlanFilter(t *testing.T)
 
 func TestFastSchedulerUpdateMovesAccountBetweenBuckets(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 2)
-	scheduler := NewFastScheduler(2)
+	scheduler := NewFastScheduler(2, "round_robin")
 	scheduler.Rebuild([]*Account{acc})
 
 	sizes := scheduler.BucketSizes()
@@ -358,7 +358,7 @@ func TestFastSchedulerUpdateMovesAccountBetweenBuckets(t *testing.T) {
 
 func TestFastSchedulerSkipsStaleBucketEntryWithoutUpdate(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
-	scheduler := NewFastScheduler(1)
+	scheduler := NewFastScheduler(1, "round_robin")
 	scheduler.Rebuild([]*Account{acc})
 
 	acc.SetCooldownUntil(time.Now().Add(5*time.Minute), "rate_limited")
@@ -392,7 +392,7 @@ func TestFastSchedulerDispatchScoreOutranksProvenHistory(t *testing.T) {
 	proven := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 1)
 	atomic.StoreInt64(&proven.TotalRequests, 11)
 
-	scheduler := NewFastScheduler(1)
+	scheduler := NewFastScheduler(1, "round_robin")
 	scheduler.Rebuild([]*Account{highScore, proven})
 
 	got := scheduler.Acquire()
@@ -413,7 +413,7 @@ func TestFastSchedulerProvenHistoryBreaksDispatchScoreTies(t *testing.T) {
 	proven := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 1)
 	atomic.StoreInt64(&proven.TotalRequests, 11)
 
-	scheduler := NewFastScheduler(1)
+	scheduler := NewFastScheduler(1, "round_robin")
 	scheduler.Rebuild([]*Account{unproven, proven})
 
 	got := scheduler.Acquire()
@@ -442,7 +442,7 @@ func TestFastSchedulerPrefersPremium7dResetSoonOverProvenAccount(t *testing.T) {
 	soon.UsagePercent7dValid = true
 	soon.Reset7dAt = now.Add(36 * time.Hour)
 
-	scheduler := NewFastScheduler(1)
+	scheduler := NewFastScheduler(1, "round_robin")
 	scheduler.Rebuild([]*Account{later, soon})
 
 	got := scheduler.Acquire()
@@ -470,7 +470,7 @@ func TestFastSchedulerPrefersPremium5hResetSoonWithinTier(t *testing.T) {
 	soon.UsagePercent5hValid = true
 	soon.Reset5hAt = now.Add(30 * time.Minute)
 
-	scheduler := NewFastScheduler(1)
+	scheduler := NewFastScheduler(1, "round_robin")
 	scheduler.Rebuild([]*Account{later, soon})
 
 	got := scheduler.Acquire()
@@ -600,7 +600,7 @@ func TestFastSchedulerPremium5hRateLimitIsFencedAndRecoversAfterReset(t *testing
 		Reset5hAt:           time.Now().Add(30 * time.Minute),
 	}
 
-	scheduler := NewFastScheduler(4)
+	scheduler := NewFastScheduler(4, "round_robin")
 	scheduler.Rebuild([]*Account{acc})
 
 	sizes := scheduler.BucketSizes()
@@ -784,10 +784,189 @@ func TestFastSchedulerRelease(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 2)
 	atomic.StoreInt64(&acc.ActiveRequests, 1)
 
-	scheduler := NewFastScheduler(2)
+	scheduler := NewFastScheduler(2, "round_robin")
 	scheduler.Release(acc)
 
 	if got := atomic.LoadInt64(&acc.ActiveRequests); got != 0 {
 		t.Fatalf("ActiveRequests after Release() = %d, want 0", got)
 	}
+}
+
+func TestFastSchedulerRemainingQuotaPicksLowestUsage(t *testing.T) {
+	highUsage := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      90,
+		UsagePercent7dValid: true,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+	lowUsage := &Account{
+		DBID:                2,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      10,
+		UsagePercent7dValid: true,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+	midUsage := &Account{
+		DBID:                3,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      50,
+		UsagePercent7dValid: true,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+
+	scheduler := NewFastScheduler(4, "remaining_quota")
+	scheduler.Rebuild([]*Account{highUsage, lowUsage, midUsage})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != lowUsage.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want lowest-usage account %d", got.DBID, lowUsage.DBID)
+	}
+}
+
+func TestFastSchedulerRemainingQuotaSortOrder(t *testing.T) {
+	a1 := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      70,
+		UsagePercent7dValid: true,
+		BaseConcurrencyEffective: 1,
+		DynamicConcurrencyLimit:  1,
+	}
+	a2 := &Account{
+		DBID:                2,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      30,
+		UsagePercent7dValid: true,
+		BaseConcurrencyEffective: 1,
+		DynamicConcurrencyLimit:  1,
+	}
+	a3 := &Account{
+		DBID:                3,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      90,
+		UsagePercent7dValid: true,
+		BaseConcurrencyEffective: 1,
+		DynamicConcurrencyLimit:  1,
+	}
+
+	scheduler := NewFastScheduler(1, "remaining_quota")
+	scheduler.Rebuild([]*Account{a1, a2, a3})
+
+	// Acquire all without releasing; concurrency limit 1 forces
+	// iteration through the usage-ascending sorted order.
+	var got []int64
+	for i := 0; i < 3; i++ {
+		acc := scheduler.Acquire()
+		if acc == nil {
+			t.Fatalf("Acquire() returned nil at iteration %d", i)
+		}
+		got = append(got, acc.DBID)
+	}
+
+	// Expect ascending usage: a2 (30%), a1 (70%), a3 (90%)
+	want := []int64{2, 1, 3}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("remaining_quota sort order mismatch: got=%v want=%v", got, want)
+		}
+	}
+}
+
+func TestFastSchedulerRemainingQuotaTieBreakProvenThenDBID(t *testing.T) {
+	unproven := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      50,
+		UsagePercent7dValid: true,
+		BaseConcurrencyEffective: 2,
+		DynamicConcurrencyLimit:  2,
+	}
+	unproven.TotalRequests = 0 // not proven
+
+	proven := &Account{
+		DBID:                2,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      50,
+		UsagePercent7dValid: true,
+		BaseConcurrencyEffective: 2,
+		DynamicConcurrencyLimit:  2,
+	}
+	proven.TotalRequests = 11 // proven (>10)
+
+	scheduler := NewFastScheduler(4, "remaining_quota")
+	scheduler.Rebuild([]*Account{unproven, proven})
+
+	// Both same usage; proven account should sort first.
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != proven.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want proven tie-breaker account %d", got.DBID, proven.DBID)
+	}
+}
+
+func TestFastSchedulerSetSchedulerModeEmptyDefaultsToRoundRobin(t *testing.T) {
+	s := NewFastScheduler(4, "remaining_quota")
+	if s.SchedulerMode() != "remaining_quota" {
+		t.Fatalf("initial mode = %q, want remaining_quota", s.SchedulerMode())
+	}
+	s.SetSchedulerMode("")
+	if s.SchedulerMode() != "round_robin" {
+		t.Fatalf("after empty mode: got %q, want round_robin", s.SchedulerMode())
+	}
+}
+
+func TestFastSchedulerSetSchedulerModeResortsBuckets(t *testing.T) {
+	highUsage := newFastSchedulerTestAccount(1, HealthTierHealthy, 90, 2)
+	highUsage.UsagePercent7d = 90
+	highUsage.UsagePercent7dValid = true
+	lowUsage := newFastSchedulerTestAccount(2, HealthTierHealthy, 10, 2)
+	lowUsage.UsagePercent7d = 10
+	lowUsage.UsagePercent7dValid = true
+
+	s := NewFastScheduler(4, "round_robin")
+	s.Rebuild([]*Account{highUsage, lowUsage})
+
+	// In round_robin mode, acquires are cursor-based, not usage-based
+	first := s.Acquire()
+	s.Release(first)
+
+	s.SetSchedulerMode("remaining_quota")
+	// After re-sort + zero cursor, should pick lowest usage first
+	first = s.Acquire()
+	if first == nil {
+		t.Fatal("Acquire() returned nil after mode switch")
+	}
+	if first.DBID != lowUsage.DBID {
+		t.Fatalf("after remaining_quota switch, Acquire() picked dbID=%d, want lowest-usage account %d", first.DBID, lowUsage.DBID)
+	}
+	s.Release(first)
 }

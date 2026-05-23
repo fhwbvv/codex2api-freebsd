@@ -19,6 +19,11 @@ export default function AccountUsageModal({ account, onClose }: Props) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
+  const [creditEnabled, setCreditEnabled] = useState(account.credit_enabled ?? false)
+  const [creditSkipWindow, setCreditSkipWindow] = useState(account.credit_skip_usage_window ?? false)
+  const [savingCredit, setSavingCredit] = useState(false)
+  const [creditError, setCreditError] = useState<string | null>(null)
+
   const load = useCallback(async () => {
     setLoading(true)
     setError(null)
@@ -38,6 +43,25 @@ export default function AccountUsageModal({ account, onClose }: Props) {
     ? (account.name?.trim() || `#${account.id}`)
     : (account.email || account.name || `#${account.id}`)
   const title = t('accounts.usageDetailTitle') + ' — ' + accountLabel
+
+  const handleCreditToggle = async (field: 'credit_enabled' | 'credit_skip_usage_window', value: boolean) => {
+    setCreditError(null)
+    const newEnabled = field === 'credit_enabled' ? value : creditEnabled
+    const newSkip = field === 'credit_skip_usage_window' ? value : creditSkipWindow
+    setSavingCredit(true)
+    try {
+      await api.updateAccountCredit(account.id, {
+        credit_enabled: newEnabled,
+        credit_skip_usage_window: newSkip,
+      })
+      if (field === 'credit_enabled') setCreditEnabled(value)
+      if (field === 'credit_skip_usage_window') setCreditSkipWindow(value)
+    } catch (err) {
+      setCreditError(getErrorMessage(err))
+    } finally {
+      setSavingCredit(false)
+    }
+  }
 
   return (
     <Modal show title={title} onClose={onClose} contentClassName="sm:max-w-[720px]">
@@ -101,6 +125,50 @@ export default function AccountUsageModal({ account, onClose }: Props) {
           </div>
         </div>
       )}
+
+      {/* 信用设置 */}
+      <div className="mt-6 border-t border-border pt-4 space-y-3">
+        <h4 className="text-sm font-semibold">{t('accounts.creditSettings')}</h4>
+        {creditError && (
+          <div className="text-xs text-red-500">{creditError}</div>
+        )}
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium">{t('accounts.creditEnabled')}</p>
+            <p className="text-xs text-muted-foreground">{t('accounts.creditEnabledHint')}</p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-label={t("accounts.creditEnabled")}
+            aria-checked={creditEnabled}
+            disabled={savingCredit}
+            onClick={() => handleCreditToggle('credit_enabled', !creditEnabled)}
+            className={`relative inline-flex h-5 w-9 shrink-0 ${savingCredit ? "cursor-not-allowed opacity-60" : "cursor-pointer"} items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${creditEnabled ? 'bg-primary' : 'bg-muted'}`}
+          >
+            <span className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${creditEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
+          </button>
+        </div>
+        {creditEnabled && (
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium">{t('accounts.creditSkipWindow')}</p>
+              <p className="text-xs text-muted-foreground">{t('accounts.creditSkipWindowHint')}</p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-label={t("accounts.creditSkipWindow")}
+              aria-checked={creditSkipWindow}
+              disabled={savingCredit}
+              onClick={() => handleCreditToggle('credit_skip_usage_window', !creditSkipWindow)}
+              className={`relative inline-flex h-5 w-9 shrink-0 ${savingCredit ? "cursor-not-allowed opacity-60" : "cursor-pointer"} items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${creditSkipWindow ? 'bg-primary' : 'bg-muted'}`}
+            >
+              <span className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${creditSkipWindow ? 'translate-x-4' : 'translate-x-0'}`} />
+            </button>
+          </div>
+        )}
+      </div>
     </Modal>
   )
 }

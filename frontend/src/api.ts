@@ -222,6 +222,8 @@ export const api = {
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number) =>
     request<AccountUsageDetail>(`/accounts/${id}/usage`),
+  updateAccountCredit: (id: number, data: { credit_enabled: boolean; credit_skip_usage_window: boolean }) =>
+    request<MessageResponse>(`/accounts/${id}/credit`, { method: 'PATCH', body: JSON.stringify(data) }),
   getHealth: () => request<HealthResponse>('/health'),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getOpsErrorSummary: (params: {
@@ -336,6 +338,8 @@ export const api = {
     request<MessageResponse>(`/image-prompts/${id}`, { method: 'DELETE' }),
   createImageJob: (data: CreateImageJobPayload) =>
     request<ImageJobResponse>('/images/jobs', { method: 'POST', body: JSON.stringify(data) }),
+  createImageEditJob: (data: CreateImageJobPayload) =>
+    request<ImageJobResponse>('/images/edit-jobs', { method: 'POST', body: JSON.stringify(data) }),
   getImageJobs: (params: { page?: number; pageSize?: number } = {}) => {
     const sp = new URLSearchParams()
     if (params.page) sp.set('page', String(params.page))

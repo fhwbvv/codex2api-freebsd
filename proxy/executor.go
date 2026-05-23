@@ -201,7 +201,7 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 	entry := &poolEntry{
 		client: &http.Client{
 			Transport: transport,
-			Timeout:   0,
+			Timeout:   10 * time.Minute,
 		},
 	}
 	entry.touch()
@@ -224,6 +224,7 @@ var codexAllowedForwardHeaders = []string{
 	"X-Codex-Turn-State",
 	"X-Codex-Turn-Metadata",
 	"X-Client-Request-Id",
+	"X-Codex-Beta-Features",
 }
 
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）

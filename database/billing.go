@@ -2,14 +2,22 @@ package database
 
 import "strings"
 
-// ModelPricing 模型价格配置（每百万 token 的价格，单位：美元）
+const longContextThreshold = 272000
+
 type ModelPricing struct {
-	InputPricePerMToken             float64 // 输入价格（美元/百万token）
-	InputPricePerMTokenPriority     float64 // priority service tier 输入价格
-	OutputPricePerMToken            float64 // 输出价格（美元/百万token）
-	OutputPricePerMTokenPriority    float64 // priority service tier 输出价格
-	CacheReadPricePerMToken         float64 // 缓存命中输入价格
-	CacheReadPricePerMTokenPriority float64 // priority service tier 缓存命中输入价格
+	InputPricePerMToken             float64
+	InputPricePerMTokenPriority     float64
+	OutputPricePerMToken            float64
+	OutputPricePerMTokenPriority    float64
+	CacheReadPricePerMToken         float64
+	CacheReadPricePerMTokenPriority float64
+
+	LongInputPricePerMToken             float64
+	LongInputPricePerMTokenPriority     float64
+	LongOutputPricePerMToken            float64
+	LongOutputPricePerMTokenPriority    float64
+	LongCacheReadPricePerMToken         float64
+	LongCacheReadPricePerMTokenPriority float64
 }
 
 type modelPricingRule struct {
@@ -17,39 +25,70 @@ type modelPricingRule struct {
 	pricing ModelPricing
 }
 
-type costBreakdown struct {
-	InputCost                 float64
-	OutputCost                float64
-	CacheReadCost             float64
-	TotalCost                 float64
-	InputPricePerMToken       float64
-	OutputPricePerMToken      float64
-	CacheReadPricePerMToken   float64
-	ServiceTierCostMultiplier float64
+type CostBreakdown struct {
+	InputCost                 float64 `json:"input_cost"`
+	OutputCost                float64 `json:"output_cost"`
+	CacheReadCost             float64 `json:"cache_read_cost"`
+	TotalCost                 float64 `json:"total_cost"`
+	InputPricePerMToken       float64 `json:"input_price_per_mtoken"`
+	OutputPricePerMToken      float64 `json:"output_price_per_mtoken"`
+	CacheReadPricePerMToken   float64 `json:"cache_read_price_per_mtoken"`
+	ServiceTierCostMultiplier float64 `json:"service_tier_cost_multiplier"`
 }
 
 var (
 	defaultModelPricing = &ModelPricing{InputPricePerMToken: 1.0, OutputPricePerMToken: 2.0}
 
 	modelPricingRules = []modelPricingRule{
-		// Codex/GPT-5 系列，参考 sub2api 的动态定价优先、fallback 兜底策略。
 		{model: "gpt-5.5", pricing: ModelPricing{
-			InputPricePerMToken:             2.5,
-			InputPricePerMTokenPriority:     5.0,
-			OutputPricePerMToken:            15.0,
-			OutputPricePerMTokenPriority:    30.0,
-			CacheReadPricePerMToken:         0.25,
-			CacheReadPricePerMTokenPriority: 0.5,
+			InputPricePerMToken:                 5.0,
+			InputPricePerMTokenPriority:         12.5,
+			OutputPricePerMToken:                30.0,
+			OutputPricePerMTokenPriority:        75.0,
+			CacheReadPricePerMToken:             0.5,
+			CacheReadPricePerMTokenPriority:     1.25,
+			LongInputPricePerMToken:             10.0,
+			LongInputPricePerMTokenPriority:     25.0,
+			LongOutputPricePerMToken:            45.0,
+			LongOutputPricePerMTokenPriority:    112.5,
+			LongCacheReadPricePerMToken:         1.0,
+			LongCacheReadPricePerMTokenPriority: 2.5,
+		}},
+		{model: "gpt-5.5-pro", pricing: ModelPricing{
+			InputPricePerMToken:              30.0,
+			InputPricePerMTokenPriority:      75.0,
+			OutputPricePerMToken:             180.0,
+			OutputPricePerMTokenPriority:     450.0,
+			LongInputPricePerMToken:          60.0,
+			LongInputPricePerMTokenPriority:  150.0,
+			LongOutputPricePerMToken:         270.0,
+			LongOutputPricePerMTokenPriority: 675.0,
 		}},
 		{model: "gpt-5.4-mini", pricing: ModelPricing{InputPricePerMToken: 0.75, OutputPricePerMToken: 4.5, CacheReadPricePerMToken: 0.075}},
 		{model: "gpt-5.4-nano", pricing: ModelPricing{InputPricePerMToken: 0.2, OutputPricePerMToken: 1.25, CacheReadPricePerMToken: 0.02}},
 		{model: "gpt-5.4", pricing: ModelPricing{
-			InputPricePerMToken:             2.5,
-			InputPricePerMTokenPriority:     5.0,
-			OutputPricePerMToken:            15.0,
-			OutputPricePerMTokenPriority:    30.0,
-			CacheReadPricePerMToken:         0.25,
-			CacheReadPricePerMTokenPriority: 0.5,
+			InputPricePerMToken:                 2.5,
+			InputPricePerMTokenPriority:         5.0,
+			OutputPricePerMToken:                15.0,
+			OutputPricePerMTokenPriority:        30.0,
+			CacheReadPricePerMToken:             0.25,
+			CacheReadPricePerMTokenPriority:     0.5,
+			LongInputPricePerMToken:             5.0,
+			LongInputPricePerMTokenPriority:     10.0,
+			LongOutputPricePerMToken:            22.5,
+			LongOutputPricePerMTokenPriority:    45.0,
+			LongCacheReadPricePerMToken:         0.5,
+			LongCacheReadPricePerMTokenPriority: 1.0,
+		}},
+		{model: "gpt-5.4-pro", pricing: ModelPricing{
+			InputPricePerMToken:              30.0,
+			InputPricePerMTokenPriority:      75.0,
+			OutputPricePerMToken:             180.0,
+			OutputPricePerMTokenPriority:     450.0,
+			LongInputPricePerMToken:          60.0,
+			LongInputPricePerMTokenPriority:  150.0,
+			LongOutputPricePerMToken:         270.0,
+			LongOutputPricePerMTokenPriority: 675.0,
 		}},
 		{model: "gpt-5.3-codex-spark", pricing: ModelPricing{
 			InputPricePerMToken:             1.25,
@@ -75,8 +114,6 @@ var (
 			CacheReadPricePerMToken:         0.175,
 			CacheReadPricePerMTokenPriority: 0.35,
 		}},
-
-		// GPT-4 系列。保持最具体模型优先，避免 gpt-4o-mini 被 gpt-4o/gpt-4 抢先匹配。
 		{model: "gpt-4o-mini", pricing: ModelPricing{InputPricePerMToken: 0.15, OutputPricePerMToken: 0.6}},
 		{model: "gpt-4o", pricing: ModelPricing{InputPricePerMToken: 2.5, OutputPricePerMToken: 10.0}},
 		{model: "gpt-4-turbo", pricing: ModelPricing{InputPricePerMToken: 10.0, OutputPricePerMToken: 30.0}},
@@ -85,9 +122,7 @@ var (
 	}
 )
 
-// getModelPricing 获取模型价格配置
-// 优先使用确定性的模型族匹配，避免 Go map 迭代顺序导致重叠前缀随机命中。
-func getModelPricing(model string) *ModelPricing {
+func GetModelPricing(model string) *ModelPricing {
 	normalized := normalizeBillingModelName(model)
 	if pricing := claudeFamilyPricing(normalized); pricing != nil {
 		return pricing
@@ -104,31 +139,42 @@ func getModelPricing(model string) *ModelPricing {
 	return defaultModelPricing
 }
 
-// calculateCost 计算使用费用
-// inputTokens: 输入 token 数量
-// outputTokens: 输出 token 数量
-// model: 模型名称
-// 返回：账号计费金额（美元）
-func calculateCost(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) float64 {
-	return calculateCostBreakdown(inputTokens, outputTokens, cachedTokens, model, serviceTier).TotalCost
+func CalculateCost(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) float64 {
+	return CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens, model, serviceTier).TotalCost
 }
 
-func calculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) costBreakdown {
-	pricing := getModelPricing(model)
+func CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) CostBreakdown {
+	pricing := GetModelPricing(model)
+	isLong := inputTokens > longContextThreshold
+
 	inputPrice := pricing.InputPricePerMToken
 	outputPrice := pricing.OutputPricePerMToken
 	cacheReadPrice := pricing.CacheReadPricePerMToken
 
+	if isLong && pricing.LongInputPricePerMToken > 0 {
+		inputPrice = pricing.LongInputPricePerMToken
+		outputPrice = pricing.LongOutputPricePerMToken
+		if pricing.LongCacheReadPricePerMToken > 0 {
+			cacheReadPrice = pricing.LongCacheReadPricePerMToken
+		}
+	}
+
 	tierMultiplier := serviceTierCostMultiplier(serviceTier)
 	if usePriorityPricing(serviceTier, pricing) {
 		tierMultiplier = 1
-		if pricing.InputPricePerMTokenPriority > 0 {
+		if isLong && pricing.LongInputPricePerMTokenPriority > 0 {
+			inputPrice = pricing.LongInputPricePerMTokenPriority
+		} else if pricing.InputPricePerMTokenPriority > 0 {
 			inputPrice = pricing.InputPricePerMTokenPriority
 		}
-		if pricing.OutputPricePerMTokenPriority > 0 {
+		if isLong && pricing.LongOutputPricePerMTokenPriority > 0 {
+			outputPrice = pricing.LongOutputPricePerMTokenPriority
+		} else if pricing.OutputPricePerMTokenPriority > 0 {
 			outputPrice = pricing.OutputPricePerMTokenPriority
 		}
-		if pricing.CacheReadPricePerMTokenPriority > 0 {
+		if isLong && pricing.LongCacheReadPricePerMTokenPriority > 0 {
+			cacheReadPrice = pricing.LongCacheReadPricePerMTokenPriority
+		} else if pricing.CacheReadPricePerMTokenPriority > 0 {
 			cacheReadPrice = pricing.CacheReadPricePerMTokenPriority
 		}
 	}
@@ -149,7 +195,7 @@ func calculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model s
 	cacheReadCost := float64(cachedTokens) / 1000000.0 * cacheReadPrice
 	outputCost := float64(outputTokens) / 1000000.0 * outputPrice
 
-	return costBreakdown{
+	return CostBreakdown{
 		InputCost:                 inputCost * tierMultiplier,
 		OutputCost:                outputCost * tierMultiplier,
 		CacheReadCost:             cacheReadCost * tierMultiplier,
@@ -178,14 +224,18 @@ func normalizeBillingModelName(model string) string {
 }
 
 func normalizeCodexBillingModel(model string) (string, bool) {
-	compact := strings.NewReplacer(" ", "-", "_", "-").Replace(model)
+	compact := strings.NewReplacer(" ", "-", "_", "-").Replace(strings.ToLower(model))
 	switch {
+	case strings.Contains(compact, "gpt-5.5-pro") || strings.Contains(compact, "gpt5-5-pro") || strings.Contains(compact, "gpt5.5-pro"):
+		return "gpt-5.5-pro", true
 	case strings.Contains(compact, "gpt-5.5") || strings.Contains(compact, "gpt5-5") || strings.Contains(compact, "gpt5.5"):
 		return "gpt-5.5", true
 	case strings.Contains(compact, "gpt-5.4-mini") || strings.Contains(compact, "gpt5-4-mini") || strings.Contains(compact, "gpt5.4-mini"):
 		return "gpt-5.4-mini", true
 	case strings.Contains(compact, "gpt-5.4-nano") || strings.Contains(compact, "gpt5-4-nano") || strings.Contains(compact, "gpt5.4-nano"):
 		return "gpt-5.4-nano", true
+	case strings.Contains(compact, "gpt-5.4-pro") || strings.Contains(compact, "gpt5-4-pro") || strings.Contains(compact, "gpt5.4-pro"):
+		return "gpt-5.4-pro", true
 	case strings.Contains(compact, "gpt-5.4") || strings.Contains(compact, "gpt5-4") || strings.Contains(compact, "gpt5.4"):
 		return "gpt-5.4", true
 	case strings.Contains(compact, "gpt-5.2") || strings.Contains(compact, "gpt5-2") || strings.Contains(compact, "gpt5.2"):
@@ -196,6 +246,12 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 		return "gpt-5.3-codex", true
 	case strings.Contains(compact, "gpt-5.3") || strings.Contains(compact, "gpt5-3") || strings.Contains(compact, "gpt5.3"):
 		return "gpt-5.3-codex", true
+	case strings.Contains(compact, "codex-auto-review"):
+		// Codex internal auto-review model. ChatGPT backend API only
+		// (chatgpt.com/backend-api/codex). Not available via public API.
+		// Official catalog: Plus/Pro/Team/Business only, excludes free.
+		// Specs match gpt-5.4 (272K context, 4 thinking levels).
+		return "gpt-5.4", true
 	case strings.Contains(compact, "codex"):
 		return "gpt-5.3-codex", true
 	case strings.Contains(compact, "gpt-5") || strings.Contains(compact, "gpt5"):
@@ -270,7 +326,8 @@ func geminiFamilyPricing(model string) *ModelPricing {
 }
 
 func usePriorityPricing(serviceTier string, pricing *ModelPricing) bool {
-	if normalizeServiceTier(serviceTier) != "priority" {
+	tier := normalizeServiceTier(serviceTier)
+	if tier != "priority" && tier != "fast" {
 		return false
 	}
 	return pricing.InputPricePerMTokenPriority > 0 ||
@@ -280,8 +337,6 @@ func usePriorityPricing(serviceTier string, pricing *ModelPricing) bool {
 
 func serviceTierCostMultiplier(serviceTier string) float64 {
 	switch normalizeServiceTier(serviceTier) {
-	case "priority":
-		return 2.0
 	case "flex":
 		return 0.5
 	default:
@@ -291,4 +346,13 @@ func serviceTierCostMultiplier(serviceTier string) float64 {
 
 func normalizeServiceTier(serviceTier string) string {
 	return strings.ToLower(strings.TrimSpace(serviceTier))
+}
+
+// lowercase aliases for internal callers
+func calculateCost(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) float64 {
+	return CalculateCost(inputTokens, outputTokens, cachedTokens, model, serviceTier)
+}
+
+func calculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) CostBreakdown {
+	return CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens, model, serviceTier)
 }

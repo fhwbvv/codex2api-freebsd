@@ -33,26 +33,31 @@ type fastSchedulerPosition struct {
 // 调度策略：按健康层级分桶，桶内按调度分排序后 round-robin。
 // 验证过的账号只作为同分 tie-breaker，避免历史请求量盖过额度快重置优先级。
 type FastScheduler struct {
-	mu         sync.RWMutex
-	baseLimit  int64
-	buckets    map[AccountHealthTier][]fastSchedulerEntry
-	positions  map[int64]fastSchedulerPosition
-	cursors    [3]atomic.Uint64
-	groupCheck func(apiKeyID int64, account *Account) bool
+	mu            sync.RWMutex
+	baseLimit     int64
+	schedulerMode string
+	buckets       map[AccountHealthTier][]fastSchedulerEntry
+	positions     map[int64]fastSchedulerPosition
+	cursors       [3]atomic.Uint64
+	groupCheck    func(apiKeyID int64, account *Account) bool
 }
 
-func NewFastScheduler(baseLimit int64) *FastScheduler {
+func NewFastScheduler(baseLimit int64, schedulerMode string) *FastScheduler {
 	if baseLimit <= 0 {
 		baseLimit = 1
 	}
+	if schedulerMode == "" {
+		schedulerMode = "round_robin"
+	}
 	return &FastScheduler{
-		baseLimit: baseLimit,
+		baseLimit:     baseLimit,
+		schedulerMode: schedulerMode,
 		buckets: map[AccountHealthTier][]fastSchedulerEntry{
 			HealthTierHealthy: nil,
 			HealthTierWarm:    nil,
 			HealthTierRisky:   nil,
 		},
-		positions: make(map[int64]fastSchedulerPosition),
+		positions: map[int64]fastSchedulerPosition{},
 	}
 }
 
@@ -65,13 +70,67 @@ func (s *FastScheduler) SetGroupCheck(check func(apiKeyID int64, account *Accoun
 	s.mu.Unlock()
 }
 
+func (s *FastScheduler) SetSchedulerMode(mode string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if mode == "" {
+		mode = "round_robin"
+	}
+	s.schedulerMode = mode
+
+	// Re-sort all tier buckets according to the new mode.
+	for _, tier := range fastSchedulerTierOrder {
+		entries := s.buckets[tier]
+		if len(entries) == 0 {
+			continue
+		}
+		if mode == "remaining_quota" {
+			sort.SliceStable(entries, func(i, j int) bool {
+				usageI := entries[i].acc.usagePercentForScheduling()
+				usageJ := entries[j].acc.usagePercentForScheduling()
+				if usageI == usageJ {
+					if entries[i].proven != entries[j].proven {
+						return entries[i].proven
+					}
+					return entries[i].dbID < entries[j].dbID
+				}
+				return usageI < usageJ
+			})
+		} else {
+			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].dispatchScore == entries[j].dispatchScore {
+					if entries[i].proven != entries[j].proven {
+						return entries[i].proven
+					}
+					return entries[i].dbID < entries[j].dbID
+				}
+				return entries[i].dispatchScore > entries[j].dispatchScore
+			})
+		}
+		s.buckets[tier] = entries
+		s.rebuildPositionsLocked(tier)
+	}
+}
+
+func (s *FastScheduler) SchedulerMode() string {
+	if s == nil {
+		return "round_robin"
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.schedulerMode
+}
+
 // BuildFastScheduler 用当前 Store 快照构建一个独立 scheduler。
 // 该方法不会影响现有生产流量路径，只用于 POC/benchmark/灰度验证。
 func (s *Store) BuildFastScheduler() *FastScheduler {
 	if s == nil {
-		return NewFastScheduler(1)
+		return NewFastScheduler(1, "round_robin")
 	}
-	scheduler := NewFastScheduler(atomic.LoadInt64(&s.maxConcurrency))
+	scheduler := NewFastScheduler(atomic.LoadInt64(&s.maxConcurrency), s.GetSchedulerMode())
 
 	s.mu.RLock()
 	accounts := make([]*Account, len(s.accounts))
@@ -124,15 +183,29 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		if len(entries) == 0 {
 			continue
 		}
-		sort.SliceStable(entries, func(i, j int) bool {
-			if entries[i].dispatchScore == entries[j].dispatchScore {
-				if entries[i].proven != entries[j].proven {
-					return entries[i].proven
+		if s.schedulerMode == "remaining_quota" {
+			sort.SliceStable(entries, func(i, j int) bool {
+				usageI := entries[i].acc.usagePercentForScheduling()
+				usageJ := entries[j].acc.usagePercentForScheduling()
+				if usageI == usageJ {
+					if entries[i].proven != entries[j].proven {
+						return entries[i].proven
+					}
+					return entries[i].dbID < entries[j].dbID
 				}
-				return entries[i].dbID < entries[j].dbID
-			}
-			return entries[i].dispatchScore > entries[j].dispatchScore
-		})
+				return usageI < usageJ
+			})
+		} else {
+			sort.SliceStable(entries, func(i, j int) bool {
+				if entries[i].dispatchScore == entries[j].dispatchScore {
+					if entries[i].proven != entries[j].proven {
+						return entries[i].proven
+					}
+					return entries[i].dbID < entries[j].dbID
+				}
+				return entries[i].dispatchScore > entries[j].dispatchScore
+			})
+		}
 		s.buckets[tier] = entries
 		s.rebuildPositionsLocked(tier)
 	}
@@ -193,6 +266,7 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 	defer s.mu.Unlock()
 
 	baseLimit := s.baseLimit
+	var zeroCursor atomic.Uint64
 	for {
 		changed := false
 		for tierIdx, tier := range fastSchedulerTierOrder {
@@ -201,7 +275,12 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 				continue
 			}
 
-			acc, stale := s.scanRangeLocked(tier, 0, len(bucket), &s.cursors[tierIdx], baseLimit, now, apiKeyID, exclude, filter)
+			cursor := &s.cursors[tierIdx]
+			if s.schedulerMode == "remaining_quota" {
+				zeroCursor.Store(0)
+				cursor = &zeroCursor
+			}
+			acc, stale := s.scanRangeLocked(tier, 0, len(bucket), cursor, baseLimit, now, apiKeyID, exclude, filter)
 			if acc != nil {
 				return acc
 			}
@@ -301,15 +380,29 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		dispatchScore: dispatchScore,
 		proven:        proven,
 	})
-	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].dispatchScore == entries[j].dispatchScore {
-			if entries[i].proven != entries[j].proven {
-				return entries[i].proven
+	if s.schedulerMode == "remaining_quota" {
+		sort.SliceStable(entries, func(i, j int) bool {
+			usageI := entries[i].acc.usagePercentForScheduling()
+			usageJ := entries[j].acc.usagePercentForScheduling()
+			if usageI == usageJ {
+				if entries[i].proven != entries[j].proven {
+					return entries[i].proven
+				}
+				return entries[i].dbID < entries[j].dbID
 			}
-			return entries[i].dbID < entries[j].dbID
-		}
-		return entries[i].dispatchScore > entries[j].dispatchScore
-	})
+			return usageI < usageJ
+		})
+	} else {
+		sort.SliceStable(entries, func(i, j int) bool {
+			if entries[i].dispatchScore == entries[j].dispatchScore {
+				if entries[i].proven != entries[j].proven {
+					return entries[i].proven
+				}
+				return entries[i].dbID < entries[j].dbID
+			}
+			return entries[i].dispatchScore > entries[j].dispatchScore
+		})
+	}
 	s.buckets[tier] = entries
 	s.rebuildPositionsLocked(tier)
 }

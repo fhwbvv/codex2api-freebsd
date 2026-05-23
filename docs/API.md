@@ -21,6 +21,7 @@
   - [代理池管理](#代理池管理)
   - [运维监控](#运维监控)
   - [模型管理](#模型管理)
+  - [生图工作台](#生图工作台) — 文生图、图生图任务与图库管理
   - [OAuth 授权](#oauth-授权) — PKCE 流程获取 Token
 - [支持模型](#支持模型)
 - [错误码](#错误码)
@@ -287,7 +288,7 @@ data: [DONE]
   "object": "list",
   "data": [
     { "id": "gpt-5.5", "object": "model", "owned_by": "openai" },
-    { "id": "gpt-5.5", "object": "model", "owned_by": "openai" },
+    { "id": "gpt-5.4", "object": "model", "owned_by": "openai" },
     { "id": "gpt-5.4-mini", "object": "model", "owned_by": "openai" },
     { "id": "gpt-5.3-codex", "object": "model", "owned_by": "openai" },
     { "id": "gpt-5.3-codex-spark", "object": "model", "owned_by": "openai" },
@@ -384,6 +385,10 @@ data: [DONE]
       "last_used_at": "2024-01-01T11:00:00Z",
       "success_requests": 95,
       "error_requests": 5,
+      "credit_enabled": false,
+      "credit_skip_usage_window": false,
+      "billed_5h": 0.25,
+      "billed_7d": 3.50,
       "usage_percent_7d": 45.2,
       "usage_percent_5h": 12.5,
       "reset_5h_at": "2024-01-01T17:00:00Z",
@@ -416,6 +421,10 @@ data: [DONE]
 | base_concurrency_override  | integer/null | 手工配置的基础并发覆盖值，`null` 表示跟随全局 `max_concurrency`   |
 | base_concurrency_effective | integer      | 当前生效的基础并发值                                              |
 | allowed_api_key_ids        | integer[]    | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
+| credit_enabled             | bool         | 是否为信用计费模式账号                                            |
+| credit_skip_usage_window   | bool         | 是否跳过 7 天/5 小时用量窗口惩罚                                  |
+| billed_5h                  | number/null  | 过去 5 小时窗口内的累计计费金额（USD）                            |
+| billed_7d                  | number/null  | 过去 7 天窗口内的累计计费金额（USD）                              |
 
 #### PATCH /api/admin/accounts/:id/scheduler
 
@@ -454,6 +463,36 @@ data: [DONE]
 ```json
 {
   "message": "账号调度配置已更新"
+}
+```
+
+#### PATCH /api/admin/accounts/:id/credit
+
+更新账号信用设置。
+
+**请求:**
+
+```json
+{
+  "credit_enabled": true,
+  "credit_skip_usage_window": true
+}
+```
+
+**参数说明:**
+
+| 参数                       | 类型  | 必填 | 说明                                     |
+| -------------------------- | ----- | ---- | ---------------------------------------- |
+| credit_enabled             | bool  | 否   | 标记账号为信用计费模式，省略时保持原值   |
+| credit_skip_usage_window   | bool  | 否   | 跳过 7 天/5 小时用量窗口惩罚（仅在 `credit_enabled=true` 时生效），省略时保持原值 |
+
+**响应:**
+
+```json
+{
+  "message": "信用设置已更新",
+  "credit_enabled": true,
+  "credit_skip_usage_window": true
 }
 ```
 
@@ -1152,6 +1191,8 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "proxy_pool_enabled": false,
   "fast_scheduler_enabled": false,
   "max_retries": 3,
+  "max_rate_limit_retries": 2,
+  "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
   "database_driver": "postgres",
   "database_label": "PostgreSQL",
@@ -1177,7 +1218,9 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "proxy_url": "http://proxy.example.com:8080",
   "auto_clean_unauthorized": true,
   "auto_clean_rate_limited": false,
-  "fast_scheduler_enabled": true
+  "fast_scheduler_enabled": true,
+  "scheduler_mode": "remaining_quota",
+  "max_rate_limit_retries": 2
 }
 ```
 
@@ -1413,6 +1456,127 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 }
 ```
 
+### 生图工作台
+
+管理后台生图工作台的 API，支持文生图（`/images/jobs`）和图生图（`/images/edit-jobs`）任务，以及图库管理。
+
+#### POST /api/admin/images/jobs
+
+创建文生图任务。
+
+**请求:**
+
+```json
+{
+  "prompt": "A small orange cat sitting on a cloud",
+  "model": "gpt-image-2",
+  "size": "1024x1024",
+  "quality": "high",
+  "output_format": "png",
+  "style": "photorealistic",
+  "api_key_id": 0
+}
+```
+
+**参数说明:**
+
+| 参数          | 类型   | 必填 | 说明                          |
+| ------------- | ------ | ---- | ----------------------------- |
+| prompt        | string | 是   | 提示词，最长 8000 字符        |
+| model         | string | 否   | 模型，默认 `gpt-image-2`      |
+| size          | string | 否   | 输出尺寸                      |
+| quality       | string | 否   | 质量等级                      |
+| output_format | string | 否   | 输出格式，默认 `png`          |
+| style         | string | 否   | 风格说明                      |
+| upscale       | string | 否   | 超分选项                      |
+| api_key_id    | int    | 否   | 指定 API Key ID               |
+
+**响应:**
+
+```json
+{
+  "id": 1,
+  "status": "pending"
+}
+```
+
+#### POST /api/admin/images/edit-jobs
+
+创建图生图（image-to-image）任务。与文生图参数类似，但需要额外提供参考图片。
+
+**请求:**
+
+```json
+{
+  "prompt": "Replace the background with a sunset scene",
+  "model": "gpt-image-2",
+  "size": "1024x1024",
+  "output_format": "png",
+  "input_images": [
+    "https://example.com/source.png",
+    "data:image/png;base64,iVBORw0KGgo..."
+  ]
+}
+```
+
+**参数说明:**
+
+| 参数          | 类型     | 必填 | 说明                                 |
+| ------------- | -------- | ---- | ------------------------------------ |
+| prompt        | string   | 是   | 编辑提示词，最长 8000 字符           |
+| model         | string   | 否   | 模型，默认 `gpt-image-2`             |
+| input_images  | string[] | 是   | 参考图片 URL 或 data URI 列表        |
+| size          | string   | 否   | 输出尺寸                             |
+| quality       | string   | 否   | 质量等级                             |
+| output_format | string   | 否   | 输出格式，默认 `png`                 |
+| api_key_id    | int      | 否   | 指定 API Key ID                      |
+
+#### GET /api/admin/images/jobs
+
+获取生图任务列表。支持分页和状态过滤。
+
+**响应:**
+
+```json
+{
+  "jobs": [
+    {
+      "id": 1,
+      "prompt": "A small orange cat",
+      "model": "gpt-image-2",
+      "status": "completed",
+      "created_at": "2024-01-01T12:00:00Z"
+    }
+  ],
+  "total": 50
+}
+```
+
+#### GET /api/admin/images/jobs/:id
+
+获取单个生图任务详情及结果。
+
+#### DELETE /api/admin/images/jobs/:id
+
+删除一个生图任务及其关联的所有图库资产。
+
+```bash
+curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
+  -H "X-Admin-Key: your-secret"
+```
+
+#### GET /api/admin/images/assets
+
+获取图库资产列表。
+
+#### GET /api/admin/images/assets/:id/file
+
+获取单个图库资产文件（返回图片二进制或签名 URL）。
+
+#### DELETE /api/admin/images/assets/:id
+
+删除单个图库资产。
+
 ### OAuth 授权
 
 通过 OAuth PKCE 流程授权获取 Codex 账号的 Refresh Token，适用于无法手动获取 RT 的场景。
@@ -1491,10 +1655,10 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 
 ## 支持模型
 
-| 模型                | 说明                                    |
-| ------------------- | --------------------------------------- |
-| gpt-5.5             | 最新旗舰模型                            |
-| gpt-5.4             | 旗舰模型                                |
+| 模型                | 说明                                                        |
+| ------------------- | ----------------------------------------------------------- |
+| gpt-5.5             | 最新旗舰模型。计费：$5.00/M 输入 / $30.00/M 输出（标准），priority 分别为 $12.50/M / $75.00/M |
+| gpt-5.4             | 旗舰模型                                                    |
 | gpt-5.4-mini        | 轻量版                                  |
 | gpt-5.3-codex       | 较新版本                                |
 | gpt-5.3-codex-spark | Codex Spark 模型，仅 Pro 订阅账号可调用 |

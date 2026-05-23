@@ -224,6 +224,9 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 	if trimmed := strings.TrimSpace(req.ProxyURL); trimmed != "" {
 		proxyURL = trimmed
 	}
+	if proxyURL == "" {
+		proxyURL = h.store.GetProxyURL()
+	}
 
 	// Resin 临时身份用于 OAuth 兑换（新账号尚无 DBID）
 	resinTempID := "oauth-" + req.SessionID
@@ -391,8 +394,12 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	sess.CallbackAt = time.Now()
 
 	// 执行 code exchange（Resin 临时身份）
+	proxyURL := sess.ProxyURL
+	if proxyURL == "" {
+		proxyURL = h.store.GetProxyURL()
+	}
 	resinTempID := "oauth-" + sessionID
-	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), code, sess.CodeVerifier, sess.RedirectURI, sess.ProxyURL, resinTempID)
+	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), code, sess.CodeVerifier, sess.RedirectURI, proxyURL, resinTempID)
 	if err != nil {
 		sess.ExchangeResult = &oauthExchangeResult{
 			Success: false,
@@ -429,7 +436,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
-	id, err := h.db.InsertAccount(ctx, name, tokenResp.RefreshToken, sess.ProxyURL)
+	id, err := h.db.InsertAccount(ctx, name, tokenResp.RefreshToken, proxyURL)
 	if err != nil {
 		sess.ExchangeResult = &oauthExchangeResult{
 			Success: false,
@@ -453,7 +460,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		go proxy.InheritLease(resinTempID, fmt.Sprintf("%d", id))
 	}
 
-	newAcc := accountFromCredentialSeed(id, sess.ProxyURL, seed)
+	newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 	h.store.AddAccount(newAcc)
 
 	email := ""

@@ -7,7 +7,7 @@ import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
 import ToastNotice from "../components/ToastNotice";
-import { useDataLoader } from "../hooks/useDataLoader";
+import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
 import { useToast } from "../hooks/useToast";
 import type {
@@ -19,6 +19,7 @@ import type {
   APIKeyRow,
   OpsOverviewResponse,
   AccountGroup,
+  SystemSettings,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatCompactEmail } from "../lib/utils";
@@ -56,6 +57,7 @@ import {
   Search,
   Fingerprint,
   FolderOpen,
+  Cloud,
   Lock,
   Unlock,
   RotateCcw,
@@ -63,6 +65,7 @@ import {
   Check,
   ChevronDown,
   Copy,
+  Cookie,
   Power,
   PowerOff,
   Hourglass,
@@ -71,6 +74,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
+import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import ChipInput from "../components/ChipInput";
@@ -88,6 +92,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "status",
   "requests",
   "usage",
+	"billed",
   "importTime",
   "updatedAt",
   "actions",
@@ -268,6 +273,7 @@ export default function Accounts() {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: "",
+    session_token: "",
     proxy_url: "",
   });
   const [submitting, setSubmitting] = useState(false);
@@ -316,6 +322,7 @@ export default function Accounts() {
   const [editOpenAIModelsLoading, setEditOpenAIModelsLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [showImportPicker, setShowImportPicker] = useState(false);
+  const [showSub2APIImport, setShowSub2APIImport] = useState(false);
   const [dragging, setDragging] = useState(false);
   const dragCounter = useRef(0);
   const [showExportPicker, setShowExportPicker] = useState(false);
@@ -344,9 +351,9 @@ export default function Accounts() {
     failed: 0,
     done: false,
   });
-  const [addMethod, setAddMethod] = useState<"rt" | "at" | "openai" | "oauth">(
-    "rt",
-  );
+  const [addMethod, setAddMethod] = useState<
+    "rt" | "st" | "at" | "openai" | "oauth"
+  >("rt");
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
@@ -393,25 +400,41 @@ export default function Accounts() {
   >(getInitialAccountVisibleColumns);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
+  const jsonAtInputRef = useRef<HTMLInputElement>(null);
   const atFileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const lazyModeRef = useRef<boolean | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
 
-  const loadAccounts = useCallback(async () => {
-    const [accountsResponse, apiKeysResponse, opsOverview, groupsResponse] =
+  const loadAccounts = useCallback(async (options?: LoadOptions) => {
+    const shouldLoadSettings = !options?.silent || lazyModeRef.current === null;
+    const [
+      accountsResponse,
+      apiKeysResponse,
+      opsOverview,
+      groupsResponse,
+      settings,
+    ] =
       await Promise.all([
         api.getAccounts(),
         api.getAPIKeys(),
         api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
         api.listAccountGroups().catch(() => ({ groups: [] })),
+        shouldLoadSettings
+          ? api.getSettings().catch((): SystemSettings | null => null)
+          : Promise.resolve<SystemSettings | null>(null),
       ]);
+    if (settings) {
+      lazyModeRef.current = settings.lazy_mode;
+    }
     setAllGroups(groupsResponse.groups ?? []);
     return {
       accounts: accountsResponse.accounts ?? [],
       apiKeys: apiKeysResponse.keys ?? [],
       opsOverview,
+      lazyMode: lazyModeRef.current ?? false,
     };
   }, []);
 
@@ -419,17 +442,20 @@ export default function Accounts() {
     accounts: AccountRow[];
     apiKeys: APIKeyRow[];
     opsOverview: OpsOverviewResponse | null;
+    lazyMode: boolean;
   }>({
     initialData: {
       accounts: [],
       apiKeys: [],
       opsOverview: null,
+      lazyMode: false,
     },
     load: loadAccounts,
   });
   const accounts = data.accounts;
   const apiKeys = data.apiKeys;
   const opsOverview = data.opsOverview;
+  const lazyMode = data.lazyMode;
   const usageReloadAttemptsRef = useRef<Map<number, number>>(new Map());
 
   useEffect(() => {
@@ -460,16 +486,16 @@ export default function Accounts() {
       const has5h =
         account.usage_percent_5h !== null &&
         account.usage_percent_5h !== undefined;
-
-      if (plan === "free") {
-        return !has7d;
-      }
-      if (
+      // 与 UsageCell 的显示判定保持一致:plan_type 可能滞后于真实订阅状态,
+      // 看到 5h 重置时间就当订阅账号处理,触发拉取 5h 数据。
+      const looksLikeSubscription =
         plan === "pro" ||
         plan === "team" ||
         plan === "plus" ||
-        plan === "teamplus"
-      ) {
+        plan === "teamplus" ||
+        !!account.reset_5h_at;
+
+      if (looksLikeSubscription) {
         return !has5h || !has7d;
       }
       return !has7d;
@@ -743,14 +769,23 @@ export default function Accounts() {
     }
   }, [allPageSelected, pagedAccountIds]);
 
-  const handleAdd = async () => {
-    if (!addForm.refresh_token.trim()) return;
+  const handleAdd = async (credential: "rt" | "st" = "rt") => {
+    const payload: AddAccountRequest =
+      credential === "st"
+        ? { ...addForm, refresh_token: "" }
+        : { ...addForm, session_token: "" };
+    if (
+      !payload.refresh_token?.trim() &&
+      !payload.session_token?.trim()
+    ) {
+      return;
+    }
     setSubmitting(true);
     try {
-      await api.addAccount(addForm);
+      await api.addAccount(payload);
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
-      setAddForm({ refresh_token: "", proxy_url: "" });
+      setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
       void reload();
     } catch (error) {
       showToast(
@@ -1045,7 +1080,7 @@ export default function Accounts() {
 
   const importFiles = async (
     files: File[],
-    format: "txt" | "json" | "at_txt",
+    format: "txt" | "json" | "json_at" | "at_txt",
   ) => {
     setImporting(true);
     try {
@@ -1232,6 +1267,14 @@ export default function Accounts() {
     setShowImportPicker(false);
     await importFiles(Array.from(files), "json");
     if (jsonInputRef.current) jsonInputRef.current.value = "";
+  };
+
+  const handleJsonAtImport = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    setShowImportPicker(false);
+    await importFiles(Array.from(files), "json_at");
+    if (jsonAtInputRef.current) jsonAtInputRef.current.value = "";
   };
 
   const handleAtFileImport = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -2163,6 +2206,12 @@ export default function Accounts() {
                       disabled: migrating,
                       onSelect: () => setShowMigrate(true),
                     },
+                    {
+                      key: "sub2api",
+                      label: t("accounts.sub2api.entry"),
+                      icon: <Cloud className="size-3.5" />,
+                      onSelect: () => setShowSub2APIImport(true),
+                    },
                   ]}
                 />
                 <Button onClick={() => setShowAdd(true)}>
@@ -2184,6 +2233,14 @@ export default function Accounts() {
                   multiple
                   className="hidden"
                   onChange={(e) => void handleJsonImport(e)}
+                />
+                <input
+                  ref={jsonAtInputRef}
+                  type="file"
+                  accept=".json"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => void handleJsonAtImport(e)}
                 />
                 <input
                   ref={atFileInputRef}
@@ -2435,6 +2492,7 @@ export default function Accounts() {
                   status: t("accounts.status"),
                   requests: t("accounts.requests"),
                   usage: t("accounts.usage"),
+                  billed: t("accounts.billed"),
                   importTime: t("accounts.importTime"),
                   updatedAt: t("accounts.updatedAt"),
                   actions: t("accounts.actions"),
@@ -2645,6 +2703,11 @@ export default function Accounts() {
                               : ""}
                           </TableHead>
                         )}
+                        {visibleColumns.billed && (
+                          <TableHead className="text-[13px] font-semibold">
+                            {t("accounts.billed")}
+                          </TableHead>
+                        )}
                         {visibleColumns.importTime && (
                           <TableHead
                             className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
@@ -2837,14 +2900,40 @@ export default function Accounts() {
                                 <UsageCell account={account} />
                               </TableCell>
                             )}
+                            {visibleColumns.billed && (
+                              <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">
+                                <BilledCell account={account} />
+                              </TableCell>
+                            )}
                             {visibleColumns.importTime && (
                               <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">
                                 {formatBeijingTime(account.created_at)}
                               </TableCell>
                             )}
                             {visibleColumns.updatedAt && (
-                              <TableCell className="text-[14px] text-muted-foreground">
-                                {formatRelativeTime(account.updated_at)}
+                              <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">
+                                {lazyMode ? (
+                                  <div className="space-y-0.5 leading-tight">
+                                    <div title={t("accounts.recordUpdatedAt")}>
+                                      <span className="mr-1 text-[11px] text-muted-foreground/70">
+                                        {t("accounts.recordUpdatedAtShort")}
+                                      </span>
+                                      {formatRelativeTime(account.updated_at)}
+                                    </div>
+                                    <div title={t("accounts.usageUpdatedAt")}>
+                                      <span className="mr-1 text-[11px] text-muted-foreground/70">
+                                        {t("accounts.usageUpdatedAtShort")}
+                                      </span>
+                                      {account.codex_usage_updated_at
+                                        ? formatRelativeTime(
+                                            account.codex_usage_updated_at,
+                                          )
+                                        : t("accounts.noUsageUpdatedAt")}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  formatRelativeTime(account.updated_at)
+                                )}
                               </TableCell>
                             )}
                             {visibleColumns.actions && (
@@ -3011,7 +3100,7 @@ export default function Accounts() {
           <Modal
             show={showAdd}
             title={t("accounts.addTitle")}
-            contentClassName="sm:max-w-[640px]"
+            contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
               setAddMethod("rt");
@@ -3052,7 +3141,14 @@ export default function Accounts() {
                 {addMethod === "rt" ? (
                   <Button
                     onClick={() => void handleAdd()}
-                    disabled={submitting || !addForm.refresh_token.trim()}
+                    disabled={submitting || !addForm.refresh_token?.trim()}
+                  >
+                    {submitting ? t("accounts.adding") : t("accounts.submit")}
+                  </Button>
+                ) : addMethod === "st" ? (
+                  <Button
+                    onClick={() => void handleAdd("st")}
+                    disabled={submitting || !addForm.session_token?.trim()}
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
@@ -3097,10 +3193,10 @@ export default function Accounts() {
             }
           >
             {/* Tab switcher */}
-            <div className="flex gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
                 onClick={() => setAddMethod("rt")}
-                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "rt"
                     ? "bg-background shadow-sm text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -3110,8 +3206,19 @@ export default function Accounts() {
                 {t("accounts.addMethodRT")}
               </button>
               <button
+                onClick={() => setAddMethod("st")}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "st"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Cookie className="size-3.5" />
+                {t("accounts.addMethodSessionToken")}
+              </button>
+              <button
                 onClick={() => setAddMethod("at")}
-                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "at"
                     ? "bg-background shadow-sm text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -3122,7 +3229,7 @@ export default function Accounts() {
               </button>
               <button
                 onClick={() => setAddMethod("openai")}
-                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "openai"
                     ? "bg-background shadow-sm text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -3138,7 +3245,7 @@ export default function Accounts() {
                   setOauthSession(null);
                   setOauthCallbackUrl("");
                 }}
-                className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "oauth"
                     ? "bg-background shadow-sm text-foreground"
                     : "text-muted-foreground hover:text-foreground"
@@ -3158,11 +3265,46 @@ export default function Accounts() {
                   <textarea
                     className="w-full min-h-[160px] p-3 border border-input rounded-xl bg-background text-sm resize-y focus:outline-none focus:ring-2 focus:ring-ring"
                     placeholder={t("accounts.refreshTokenPlaceholder")}
-                    value={addForm.refresh_token}
+                    value={addForm.refresh_token ?? ""}
                     onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
                       setAddForm((form) => ({
                         ...form,
                         refresh_token: event.target.value,
+                      }))
+                    }
+                    rows={6}
+                  />
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.proxyUrl")}
+                  </label>
+                  <Input
+                    placeholder={t("accounts.proxyUrlPlaceholder")}
+                    value={addForm.proxy_url}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                      setAddForm((form) => ({
+                        ...form,
+                        proxy_url: event.target.value,
+                      }))
+                    }
+                  />
+                </div>
+              </div>
+            ) : addMethod === "st" ? (
+              <div className="space-y-4">
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.sessionTokenLabel")} *
+                  </label>
+                  <textarea
+                    className="w-full min-h-[160px] p-3 border border-input rounded-xl bg-background text-sm resize-y focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder={t("accounts.sessionTokenPlaceholder")}
+                    value={addForm.session_token ?? ""}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                      setAddForm((form) => ({
+                        ...form,
+                        session_token: event.target.value,
                       }))
                     }
                     rows={6}
@@ -3491,6 +3633,23 @@ export default function Accounts() {
                 className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
                 onClick={() => {
                   setShowImportPicker(false);
+                  jsonAtInputRef.current?.click();
+                }}
+              >
+                <FileJson className="size-5 shrink-0 text-muted-foreground" />
+                <div>
+                  <div className="text-sm font-medium">
+                    {t("accounts.importJsonAt")}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t("accounts.importJsonAtDesc")}
+                  </div>
+                </div>
+              </button>
+              <button
+                className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
+                onClick={() => {
+                  setShowImportPicker(false);
                   atFileInputRef.current?.click();
                 }}
               >
@@ -3523,6 +3682,19 @@ export default function Accounts() {
               </button>
             </div>
           </Modal>
+          <Sub2APIImportModal
+            show={showSub2APIImport}
+            onClose={() => setShowSub2APIImport(false)}
+            onImportStart={async (res) => {
+              setImporting(true);
+              try {
+                await readImportSSE(res);
+              } finally {
+                setImporting(false);
+              }
+            }}
+            onShowToast={(message, kind) => showToast(message, kind ?? "success")}
+          />
 
           <Modal
             show={showExportPicker}
@@ -6018,6 +6190,12 @@ function UsageWindowStat({
 }
 
 // 用量列组件
+//
+// 显示策略不再单独依赖 plan_type:
+// 当 plan_type 还停留在按 RT 刷新出来的旧值(例如 "free")、但账号实际已订阅、
+// 后端已经返回 5h 窗口数据时,只看 plan_type 会把 5h 吞掉。
+// 因此这里以"是否真的存在 5h / 7d 数据(含 reset 时间)"作为主判据,
+// plan_type 仅作为 5h 数据缺位时的辅助提示。
 function UsageCell({ account }: { account: AccountRow }) {
   const plan = normalizePlanType(account.plan_type);
   const has7d =
@@ -6026,33 +6204,21 @@ function UsageCell({ account }: { account: AccountRow }) {
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
   const has5hDetail = hasUsageWindowDetail(account.usage_5h_detail);
+  const has5hReset = !!account.reset_5h_at;
+  const has7dReset = !!account.reset_7d_at;
 
-  if (plan === "free") {
-    if (!has7d && !has7dDetail)
-      return <span className="text-[12px] text-muted-foreground">-</span>;
-    return (
-      <div className="w-48">
-        {has7d ? (
-          <UsageBar
-            label="7d"
-            pct={account.usage_percent_7d!}
-            resetAt={account.reset_7d_at}
-            detail={account.usage_7d_detail}
-          />
-        ) : (
-          <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
-        )}
-      </div>
-    );
-  }
-
-  if (
+  const fiveHourPresent = has5h || has5hDetail || has5hReset;
+  const sevenDayPresent = has7d || has7dDetail || has7dReset;
+  // plan 表明是订阅型时,即使数据暂未拉到也按订阅布局占位,避免抖动
+  const planSuggestsPremium =
     plan === "pro" ||
     plan === "team" ||
     plan === "plus" ||
-    plan === "teamplus"
-  ) {
-    if (!has5h && !has7d && !has5hDetail && !has7dDetail)
+    plan === "teamplus";
+  const showFiveHour = fiveHourPresent || planSuggestsPremium;
+
+  if (showFiveHour) {
+    if (!has5h && !has7d && !has5hDetail && !has7dDetail && !has5hReset && !has7dReset)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
       <div className="w-52 space-y-1.5">
@@ -6080,7 +6246,7 @@ function UsageCell({ account }: { account: AccountRow }) {
     );
   }
 
-  if (has7d || has7dDetail) {
+  if (sevenDayPresent) {
     return (
       <div className="w-48">
         {has7d ? (
@@ -6096,7 +6262,21 @@ function UsageCell({ account }: { account: AccountRow }) {
       </div>
     );
   }
+
   return <span className="text-[13px] text-muted-foreground">-</span>;
+}
+
+function BilledCell({ account }: { account: AccountRow }) {
+  const h5 = typeof account.billed_5h === "number" ? account.billed_5h.toFixed(2) : null;
+  const d7 = typeof account.billed_7d === "number" ? account.billed_7d.toFixed(2) : null;
+  if (h5 === null && d7 === null) return <span className="text-[12px] text-muted-foreground">-</span>;
+  return (
+    <span className="text-[12px] text-muted-foreground">
+      {h5 !== null ? `5h: $${h5}` : "5h: -"}
+      {" / "}
+      {d7 !== null ? `7d: $${d7}` : "7d: -"}
+    </span>
+  );
 }
 
 function getAccountStatusCountdownUntil(

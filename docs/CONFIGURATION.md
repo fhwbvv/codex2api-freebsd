@@ -43,7 +43,10 @@ Codex2API 采用三层配置架构：
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `CODEX_PORT` | 否 | 8080 | HTTP 服务端口 |
+| `BIND_HOST` | 否 | `127.0.0.1`（SQLite）/ `0.0.0.0`（PostgreSQL） | Docker 端口发布绑定地址（非进程监听地址，由 `CODEX_BIND` 控制）。SQLite compose 默认 `127.0.0.1` 仅本机访问；标准 compose 默认 `0.0.0.0` 所有网络接口 |
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
+| `CODEX_ALLOW_ANONYMOUS` | 否 | `false` | 设为 `true` 时，未配置任何对外 API Key 也允许 `/v1/*` 直接调用（仅限内网测试场景） |
+| `FAST_SCHEDULER_ENABLED` | 否 | `false` | 通过环境变量启用快速调度器（也可在管理后台运行时开启） |
 | `TZ` | 否 | UTC | 时区，如 `Asia/Shanghai` |
 
 ### Codex 上游稳定性配置
@@ -51,6 +54,7 @@ Codex2API 采用三层配置架构：
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `CODEX_UPSTREAM_TRANSPORT` | 否 | `http` | Codex 上游协议：`http` / `auto` / `ws`。HTTP 入站在 `auto` 下仍走 HTTP 上游 |
+| `CODEX_PROXY_URL` | 否 | - | 全局代理 URL，适用于需要为所有 Codex 上游请求统一配置代理的场景 |
 | `USE_WEBSOCKET` | 否 | `false` | 旧版开关；未设置 `CODEX_UPSTREAM_TRANSPORT` 时，`true` 等价于 `CODEX_UPSTREAM_TRANSPORT=ws` |
 | `CODEX_TRANSPORT_MODE` | 否 | `standard` | Codex HTTP transport：默认标准 Go TLS；`utls_chrome` 可回滚旧 Chrome uTLS 行为 |
 | `CODEX_WS_SEND_USER_AGENT` | 否 | `false` | WS 握手是否发送 `User-Agent`/`Version`；默认关闭 |
@@ -128,7 +132,9 @@ Codex2API 采用三层配置架构：
 | `MaxConcurrency` | int | 2 | 1-50 | 单账号最大并发请求数 |
 | `GlobalRPM` | int | 0 | 0-∞ | 全局每分钟请求限制，0 表示不限 |
 | `MaxRetries` | int | 3 | 0-10 | 请求失败最大重试次数 |
+| `MaxRateLimitRetries` | int | 2 | 0-10 | 遇到 429 限流时的最大额外重试次数 |
 | `FastSchedulerEnabled` | bool | false | - | 启用快速调度器 |
+| `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）或 `remaining_quota`（优先使用用量少的账号） |
 
 ### 测试配置
 
@@ -143,6 +149,17 @@ Codex2API 采用三层配置架构：
 |------|------|--------|------|
 | `ProxyURL` | string | "" | 全局代理 URL |
 | `ProxyPoolEnabled` | bool | false | 启用代理池 |
+
+### 账号级设置（单账号）
+
+以下字段存储在 `accounts` 表中，可通过管理后台账号详情或 API 按账号单独设置：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `credit_enabled` | bool | false | 标记账号为信用计费模式 |
+| `credit_skip_usage_window` | bool | false | 跳过 7 天/5 小时用量窗口惩罚（适用于信用账号） |
+| `score_bias_override` | int/null | null | 手工覆盖调度权重分，`null` 跟随套餐默认 |
+| `base_concurrency_override` | int/null | null | 手工覆盖基础并发值，`null` 跟随全局默认 |
 
 ### 连接池配置
 

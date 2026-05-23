@@ -23,9 +23,10 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 
 <table>
 <tr><td width="210"><b>One compatible gateway</b></td><td>OpenAI-style Chat Completions / Responses / Images, Anthropic Messages, prefixless compatibility routes, and native Codex Responses forwarding are all exposed through one service.</td></tr>
-<tr><td><b>Account-pool scheduler</b></td><td>Selection is driven by account status, health tier, scheduler score, dynamic concurrency, cooldown recovery, and recent usage so unhealthy accounts are avoided automatically.</td></tr>
-<tr><td><b>Visual admin console</b></td><td>The embedded React / Vite dashboard covers account import and testing, API keys, proxy pools, image studio, prompt filtering, usage analytics, operations, scheduler board, and system settings.</td></tr>
-<tr><td><b>Two deployment shapes</b></td><td>Use PostgreSQL + Redis for production or SQLite + Memory for lightweight single-node deployments; Docker images, source builds, local development, and the interactive deploy script are ready to use.</td></tr>
+<tr><td><b>Account-pool scheduler</b></td><td>Selection is driven by account status, health tier, scheduler score, dynamic concurrency, cooldown recovery, and recent usage so unhealthy accounts are avoided automatically. Supports <code>round_robin</code> and <code>remaining_quota</code> modes, with per-account credit billing flags.</td></tr>
+<tr><td><b>Visual admin console</b></td><td>The embedded React / Vite dashboard covers account import and testing, API keys, proxy pools, image studio (text-to-image + image-to-image), prompt filtering, usage analytics, operations, scheduler board, and system settings.</td></tr>
+<tr><td><b>Two deployment shapes</b></td><td>Use PostgreSQL + Redis for production or SQLite + Memory for lightweight single-node deployments; Docker images, source builds, local development, and the interactive deploy script are ready to use. SQLite mode binds to <code>127.0.0.1</code> by default for security.</td></tr>
+<tr><td><b>Billing and observability</b></td><td>Per-account 5h/7d windowed USD cost tracking, credit quota support, API key usage tracking, OAuth PKCE token acquisition, prompt filtering, and a usage dashboard with request logs and trend charts.</td></tr>
 </table>
 
 ---
@@ -164,6 +165,7 @@ Notes:
 - Standard and SQLite modes both read `.env`.
 - Before switching deployment modes, replace `.env` with the matching example file.
 - The SQLite lightweight mode runs a single `codex2api` container and stores data at `/data/codex2api.db`.
+- **SQLite compose files bind to `127.0.0.1` by default for security.** To expose the SQLite service on all interfaces, set `BIND_HOST=0.0.0.0` in `.env` or override the port binding in the compose file. The standard compose files bind to `0.0.0.0` by default.
 - The image studio library is stored under `/data/images`; Docker configurations persist `/data`.
 - `docker compose down` does not delete named volumes by default. Data is removed only by commands such as `docker compose down -v`, `docker volume rm`, or `docker volume prune`.
 
@@ -262,7 +264,7 @@ The standard `.env.example` declares `DATABASE_DRIVER=postgres` and `CACHE_DRIVE
 
 Runtime business settings are stored in the database `SystemSettings` table and can be updated from the admin settings page.
 
-Examples include `MaxConcurrency`, `GlobalRPM`, `TestModel`, `TestConcurrency`, `ProxyURL`, `PgMaxConns`, `RedisPoolSize`, `AdminSecret`, and auto-cleanup switches.
+Examples include `MaxConcurrency`, `GlobalRPM`, `TestModel`, `TestConcurrency`, `ProxyURL`, `PgMaxConns`, `RedisPoolSize`, `AdminSecret`, `SchedulerMode`, and auto-cleanup switches.
 
 Default settings are written automatically on first startup.
 
@@ -284,8 +286,10 @@ Default settings are written automatically on first startup.
 | `POST /v1/responses` | Responses style endpoint |
 | `POST /v1/images/generations` | OpenAI Images generation endpoint |
 | `POST /v1/images/edits` | OpenAI Images edit endpoint |
-| `GET /v1/models` | List available models |
+| `GET /v1/models` | List available models (includes gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-image-2, etc.) |
 | `GET /health` | Health check |
+
+> **Pricing**: gpt-5.5 is billed at $5.00/M input and $30.00/M output (standard tier). Priority tier: $12.50/M input, $75.00/M output. Other models follow pricing rules in the billing engine.
 
 See [API.md](docs/API.md) for full request formats, response formats, and error codes.
 
@@ -349,6 +353,27 @@ curl -X POST http://localhost:8080/api/admin/accounts/import \
 
 Import endpoints deduplicate tokens automatically. Existing tokens are not inserted again.
 
+#### OAuth PKCE Authorization
+
+Codex2API supports acquiring Refresh Tokens through the OAuth PKCE flow, useful when manual token extraction is impractical:
+
+```bash
+# Step 1: Generate an authorization URL
+curl -X POST http://localhost:8080/api/admin/oauth/generate-auth-url \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# Step 2: Open the returned auth_url in a browser, complete authorization
+# Step 3: Exchange the authorization code for a token (auto-creates account)
+curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
+  -H "X-Admin-Key: your-admin-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "...", "code": "...", "state": "..."}'
+```
+
+See [API.md](docs/API.md) for the full OAuth flow and all admin endpoints.
+
 ---
 
 ## Admin Dashboard
@@ -361,7 +386,7 @@ Open `/admin/` in a browser.
 | Accounts | `/admin/accounts` | Import, test, batch actions, scheduler state |
 | API Keys | `/admin/api-keys` | API key creation, inspection, deletion, and credential management |
 | Proxies | `/admin/proxies` | Proxy pool management, account proxy assignment, connectivity checks |
-| Image Studio | `/admin/images/studio` | Text-to-image, prompt templates, task history, server-side image library |
+| Image Studio | `/admin/images/studio` | Text-to-image, image-to-image, prompt templates, task history, server-side image library |
 | Prompt Filter | `/admin/prompt-filter/overview` | Rules, hit logs, testing, and handling mode configuration |
 | Usage | `/admin/usage` | Request logs, metric cards, charts, log cleanup |
 | Operations | `/admin/ops` | Runtime monitoring and system overview |
@@ -430,6 +455,24 @@ Observability:
 - `GET /api/admin/accounts` shows health tier, scheduler score, and penalty details.
 - `GET /api/admin/ops/overview` shows runtime and connection pool state.
 - `/admin/ops/scheduler` provides the scheduler board.
+
+**Scheduler mode** (`scheduler_mode`, via Admin Settings):
+
+| Mode | Behavior |
+| --- | --- |
+| `round_robin` (default) | Round-robin across available accounts per health tier, weighted by dispatch score |
+| `remaining_quota` | Prioritizes accounts with lower usage percent; round-robin for ties |
+
+**Credit accounts** (per-account flags):
+
+When an account has a credit-based billing model instead of a usage-based Free/Pro plan, you can mark it so the scheduler skips usage-window penalties:
+
+| Field | Type | Effect |
+| --- | --- | --- |
+| `credit_enabled` | bool | Mark account as credit-based billing |
+| `credit_skip_usage_window` | bool | When true, skip 7d/5h usage-window penalties for this account |
+
+**Windowed USD cost**: The accounts table displays per-account billed cost over two windows -- the past 5 hours and the past 7 days -- aligned with each account's usage reset boundaries. This shows actual spending per account rather than estimated token costs.
 
 ---
 

@@ -65,6 +65,7 @@ export interface AccountRow {
   proxy_url: string
   created_at: ISODateString
   updated_at: ISODateString
+  codex_usage_updated_at?: ISODateString
   active_requests?: number
   total_requests?: number
   last_used_at?: ISODateString
@@ -78,6 +79,8 @@ export interface AccountRow {
   usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
+  billed_5h?: number
+  billed_7d?: number
   cooldown_until?: ISODateString
   cooldown_reason?: string
   model_cooldowns?: Array<{
@@ -88,6 +91,8 @@ export interface AccountRow {
   }>
   enabled?: boolean
   locked?: boolean
+  credit_enabled?: boolean
+  credit_skip_usage_window?: boolean
   // 图片配额信息
   image_quota_remaining?: number
   image_quota_total?: number
@@ -99,7 +104,8 @@ export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
 
 export interface AddAccountRequest {
   name?: string
-  refresh_token: string
+  refresh_token?: string
+  session_token?: string
   proxy_url: string
 }
 
@@ -289,6 +295,7 @@ export interface SystemSettings {
   background_refresh_interval_minutes: number
   usage_probe_max_age_minutes: number
   recovery_probe_interval_minutes: number
+  lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number
   redis_pool_size: number
@@ -302,6 +309,7 @@ export interface SystemSettings {
   auto_clean_expired: boolean
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
+  scheduler_mode: string
   max_retries: number
   max_rate_limit_retries: number
   allow_remote_migration: boolean
@@ -748,6 +756,7 @@ export interface CreateImageJobPayload {
   upscale?: string
   api_key_id?: number
   template_id?: number
+  input_images?: string[]
 }
 
 export type ApiListResponse<K extends string, T> = {

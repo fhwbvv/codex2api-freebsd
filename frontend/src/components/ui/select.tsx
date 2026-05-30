@@ -116,6 +116,7 @@ export function Select({
     <div className={cn('relative w-full', className)}>
       <button
         ref={triggerRef}
+        data-slot="select-trigger"
         type="button"
         disabled={disabled}
         aria-haspopup="listbox"

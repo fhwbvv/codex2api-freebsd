@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Copy, Check, Play, Loader2 } from 'lucide-react'
+import { Copy, Check, Download, Image as ImageIcon, Play, Loader2 } from 'lucide-react'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import { Card, CardContent } from '@/components/ui/card'
@@ -111,6 +111,151 @@ function MethodBadge({ method, sm }: { method: string; sm?: boolean }) {
   )
 }
 
+type ImagePreview = {
+  src: string
+  format: string
+  filename: string
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseJSON(value: string): unknown | null {
+  try {
+    return JSON.parse(value)
+  } catch {
+    return null
+  }
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return null
+}
+
+function normalizeImageFormat(value: unknown): string {
+  const raw = typeof value === 'string' ? value.trim().toLowerCase() : ''
+  if (!raw) return 'png'
+  const withoutMime = raw.startsWith('image/') ? raw.slice('image/'.length) : raw
+  const withoutDot = withoutMime.startsWith('.') ? withoutMime.slice(1) : withoutMime
+  if (withoutDot === 'jpg') return 'jpeg'
+  if (['png', 'jpeg', 'webp', 'gif'].includes(withoutDot)) return withoutDot
+  return 'png'
+}
+
+function imageMime(format: string): string {
+  const normalized = normalizeImageFormat(format)
+  return normalized === 'jpeg' ? 'image/jpeg' : `image/${normalized}`
+}
+
+function imageExtension(format: string): string {
+  return normalizeImageFormat(format) === 'jpeg' ? 'jpg' : normalizeImageFormat(format)
+}
+
+function inferDataUrlFormat(value: string): string | null {
+  const match = value.match(/^data:image\/([^;,]+)[;,]/i)
+  return match?.[1] ? normalizeImageFormat(match[1]) : null
+}
+
+function isLikelyImageBase64(value: string): boolean {
+  const raw = value.trim()
+  if (raw.startsWith('data:image/')) return true
+  const normalized = raw.replace(/\s+/g, '')
+  return normalized.length > 64 && /^[A-Za-z0-9+/_-]+={0,2}$/.test(normalized)
+}
+
+function imageFormatFromBody(body: unknown): string | null {
+  if (!isRecord(body)) return null
+  const direct = firstString(body.output_format, body.format)
+  if (direct) return normalizeImageFormat(direct)
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      if (!isRecord(tool)) continue
+      const toolFormat = firstString(tool.output_format, tool.format)
+      if (toolFormat) return normalizeImageFormat(toolFormat)
+    }
+  }
+  return null
+}
+
+function extractImagePreviews(responseText: string, requestBody: string): ImagePreview[] {
+  const responseJSON = parseJSON(responseText)
+  if (!isRecord(responseJSON)) return []
+
+  const requestFormat = imageFormatFromBody(parseJSON(requestBody))
+  const rootFormat = firstString(responseJSON.output_format, responseJSON.format, requestFormat) ?? 'png'
+  const previews: ImagePreview[] = []
+  const seen = new Set<string>()
+
+  const addPreview = (src: string, format: unknown) => {
+    const normalizedFormat = inferDataUrlFormat(src) ?? normalizeImageFormat(format)
+    const key = `${src.length}:${src.slice(0, 128)}`
+    if (seen.has(key)) return
+    seen.add(key)
+    previews.push({
+      src,
+      format: normalizedFormat,
+      filename: `image-${previews.length + 1}.${imageExtension(normalizedFormat)}`,
+    })
+  }
+
+  const addBase64 = (raw: unknown, format: unknown) => {
+    if (typeof raw !== 'string' || !isLikelyImageBase64(raw)) return
+    const trimmed = raw.trim()
+    if (trimmed.startsWith('data:image/')) {
+      addPreview(trimmed, format)
+      return
+    }
+    const normalized = trimmed.replace(/\s+/g, '')
+    const nextFormat = normalizeImageFormat(format)
+    addPreview(`data:${imageMime(nextFormat)};base64,${normalized}`, nextFormat)
+  }
+
+  const addURL = (raw: unknown, format: unknown) => {
+    if (typeof raw !== 'string') return
+    const url = raw.trim()
+    if (!/^(https?:|blob:|data:image\/)/i.test(url)) return
+    addPreview(url, format)
+  }
+
+  const addFromItem = (item: unknown) => {
+    if (!isRecord(item)) return
+    const format = firstString(item.output_format, item.format, item.mime_type, rootFormat)
+    addBase64(item.b64_json, format)
+    addBase64(item.result, format)
+    addURL(item.url, format)
+    addURL(item.image_url, format)
+    if (isRecord(item.image_url)) {
+      addURL(item.image_url.url, format)
+    }
+  }
+
+  if (Array.isArray(responseJSON.data)) {
+    responseJSON.data.forEach(addFromItem)
+  } else {
+    addFromItem(responseJSON.data)
+  }
+
+  if (Array.isArray(responseJSON.output)) {
+    responseJSON.output.forEach(addFromItem)
+  }
+
+  return previews
+}
+
+function downloadImagePreview(preview: ImagePreview) {
+  const a = document.createElement('a')
+  a.href = preview.src
+  a.download = preview.filename
+  a.rel = 'noreferrer'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+
 // Try It 测试弹窗
 function TryItDialog({ open, onClose, method, path, defaultBody, apiKey, baseUrl, allKeys }: {
   open: boolean
@@ -129,6 +274,7 @@ function TryItDialog({ open, onClose, method, path, defaultBody, apiKey, baseUrl
   const [status, setStatus] = useState<number | null>(null)
   const [loading, setLoading] = useState(false)
   const [duration, setDuration] = useState<number | null>(null)
+  const imagePreviews = useMemo(() => extractImagePreviews(response, body), [response, body])
 
   useEffect(() => {
     if (open) {
@@ -199,7 +345,7 @@ function TryItDialog({ open, onClose, method, path, defaultBody, apiKey, baseUrl
             className="gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-5 shrink-0"
           >
             {loading ? <Loader2 className="size-4 animate-spin" /> : <Play className="size-4" />}
-            {loading ? t('apiRef.tryIt.sending') : 'Send'}
+            {loading ? t('apiRef.tryIt.sending') : t('apiRef.tryIt.send')}
           </Button>
         </div>
 
@@ -266,7 +412,7 @@ function TryItDialog({ open, onClose, method, path, defaultBody, apiKey, baseUrl
           <div className="flex-1 overflow-auto p-5">
             <div className="rounded-xl border border-border overflow-hidden h-full flex flex-col">
               <div className="px-4 py-2.5 bg-muted/30 border-b border-border flex items-center justify-between">
-                <span className="text-sm font-semibold text-foreground">Response</span>
+                <span className="text-sm font-semibold text-foreground">{t('apiRef.tryIt.responseTitle')}</span>
                 {status !== null && (
                   <div className="flex items-center gap-2.5">
                     <span className={`px-2 py-0.5 rounded-md text-xs font-bold ${statusColor} ${statusBg}`}>{status}</span>
@@ -276,9 +422,46 @@ function TryItDialog({ open, onClose, method, path, defaultBody, apiKey, baseUrl
               </div>
               <div className="flex-1 overflow-auto">
                 {response ? (
-                  <pre className="p-4 font-mono text-[20px] text-foreground leading-relaxed whitespace-pre-wrap">
-                    <code>{response}</code>
-                  </pre>
+                  <div className="min-h-full">
+                    {imagePreviews.length > 0 && (
+                      <div className="border-b border-border bg-muted/10 p-4 space-y-3">
+                        <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                          <ImageIcon className="size-4 text-muted-foreground" />
+                          <span>{t('apiRef.tryIt.imagePreview')}</span>
+                        </div>
+                        <div className={`grid gap-3 ${imagePreviews.length > 1 ? 'sm:grid-cols-2' : 'grid-cols-1'}`}>
+                          {imagePreviews.map((preview, index) => (
+                            <div key={`${preview.filename}-${index}`} className="overflow-hidden rounded-lg border border-border bg-background">
+                              <div className="flex items-center justify-between gap-3 border-b border-border bg-muted/20 px-3 py-2">
+                                <span className="truncate text-xs font-medium text-muted-foreground">
+                                  #{index + 1} · {preview.format.toUpperCase()}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => downloadImagePreview(preview)}
+                                  className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                                  title={t('apiRef.tryIt.downloadImage')}
+                                  aria-label={t('apiRef.tryIt.downloadImage')}
+                                >
+                                  <Download className="size-3.5" />
+                                </button>
+                              </div>
+                              <div className="flex min-h-[220px] items-center justify-center bg-zinc-100 p-2 dark:bg-zinc-950">
+                                <img
+                                  src={preview.src}
+                                  alt={`${t('apiRef.tryIt.imagePreview')} ${index + 1}`}
+                                  className="max-h-[360px] w-full object-contain"
+                                />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <pre className="p-4 font-mono text-[20px] text-foreground leading-relaxed whitespace-pre-wrap">
+                      <code>{response}</code>
+                    </pre>
+                  </div>
                 ) : (
                   <div className="flex items-center justify-center h-full min-h-[200px] text-sm text-muted-foreground">
                     {loading ? (

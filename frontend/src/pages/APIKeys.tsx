@@ -2,14 +2,15 @@ import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
+import APIKeyTokenUsagePanel from "../components/APIKeyTokenUsagePanel";
+import ChipInput from "../components/ChipInput";
 import Modal from "../components/Modal";
 import PageHeader from "../components/PageHeader";
 import StateShell from "../components/StateShell";
-import ToastNotice from "../components/ToastNotice";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
 import { useDataLoader } from "../hooks/useDataLoader";
 import { useToast } from "../hooks/useToast";
-import type { AccountGroup, APIKeyRow } from "../types";
+import type { AccountGroup, APIKeyLimits, APIKeyRow } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
 import { Badge } from "@/components/ui/badge";
@@ -49,6 +50,7 @@ interface CreateKeyFormState {
   expireMode: ExpireMode;
   expiresAt: string;
   allowedGroupIds: number[];
+  limits: LimitsFormState;
 }
 
 interface EditKeyFormState {
@@ -57,7 +59,30 @@ interface EditKeyFormState {
   expireMode: ExpireMode;
   expiresAt: string;
   allowedGroupIds: number[];
+  limits: LimitsFormState;
 }
+
+interface LimitsFormState {
+  modelAllow: string[];
+  modelDeny: string[];
+  rpm: string;
+  rpd: string;
+  costLimit5h: string;
+  costLimit7d: string;
+  tokenLimit5h: string;
+  tokenLimit7d: string;
+}
+
+const emptyLimitsForm: LimitsFormState = {
+  modelAllow: [],
+  modelDeny: [],
+  rpm: "",
+  rpd: "",
+  costLimit5h: "",
+  costLimit7d: "",
+  tokenLimit5h: "",
+  tokenLimit7d: "",
+};
 
 const initialCreateForm: CreateKeyFormState = {
   name: "",
@@ -66,6 +91,7 @@ const initialCreateForm: CreateKeyFormState = {
   expireMode: "never",
   expiresAt: "",
   allowedGroupIds: [],
+  limits: emptyLimitsForm,
 };
 
 const initialEditForm: EditKeyFormState = {
@@ -74,6 +100,7 @@ const initialEditForm: EditKeyFormState = {
   expireMode: "never",
   expiresAt: "",
   allowedGroupIds: [],
+  limits: emptyLimitsForm,
 };
 
 export default function APIKeys() {
@@ -83,6 +110,7 @@ export default function APIKeys() {
     useState<CreateKeyFormState>(initialCreateForm);
   const [createdKeyId, setCreatedKeyId] = useState<number | null>(null);
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set());
+  const [activeTab, setActiveTab] = useState<"keys" | "token-usage">("keys");
   const [creating, setCreating] = useState(false);
   const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
@@ -92,25 +120,33 @@ export default function APIKeys() {
   const { confirm, confirmDialog } = useConfirmDialog();
 
   const loadKeys = useCallback(async () => {
-    const [keysResponse, groupsResponse] = await Promise.all([
+    const [keysResponse, groupsResponse, modelsResponse] = await Promise.all([
       api.getAPIKeys(),
       api.listAccountGroups().catch(() => ({ groups: [] })),
+      api
+        .getModels()
+        .catch(() => ({ models: [] as string[] })) as Promise<{
+        models?: string[];
+      }>,
     ]);
     return {
       keys: keysResponse.keys ?? [],
       groups: groupsResponse.groups ?? [],
+      modelOptions: modelsResponse.models ?? [],
     };
   }, []);
 
   const { data, loading, error, reload } = useDataLoader<{
     keys: APIKeyRow[];
     groups: AccountGroup[];
+    modelOptions: string[];
   }>({
-    initialData: { keys: [], groups: [] },
+    initialData: { keys: [], groups: [], modelOptions: [] },
     load: loadKeys,
   });
   const keys = data.keys;
   const groups = data.groups;
+  const modelOptions = data.modelOptions;
 
   const latestKey = useMemo(() => {
     return keys
@@ -165,6 +201,7 @@ export default function APIKeys() {
         ...(createForm.key.trim() ? { key: createForm.key.trim() } : {}),
         ...(quotaLimit && quotaLimit > 0 ? { quota_limit: quotaLimit } : {}),
         allowed_group_ids: createForm.allowedGroupIds,
+        limits: limitsFormToPayload(createForm.limits),
         ...expirationPayload,
       };
 
@@ -264,6 +301,7 @@ export default function APIKeys() {
       expireMode: keyRow.expires_at ? "custom" : "never",
       expiresAt: toDateTimeLocalValue(keyRow.expires_at),
       allowedGroupIds: keyRow.allowed_group_ids ?? [],
+      limits: limitsFromAPIKey(keyRow.limits),
     });
   };
 
@@ -292,6 +330,7 @@ export default function APIKeys() {
         name: trimmed,
         quota_limit: quotaLimit,
         allowed_group_ids: editForm.allowedGroupIds,
+        limits: limitsFormToPayload(editForm.limits),
         ...buildExpirationPayload(editForm, t, { clearNever: true }),
       });
       showToast(t("apiKeys.keyUpdated"));
@@ -377,6 +416,30 @@ export default function APIKeys() {
         </div>
 
         <div className="space-y-4">
+          {/* Tab 切换：密钥列表 / Token 用量统计（issue #162）*/}
+          <div className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5">
+            {(
+              [
+                ["keys", t("apiKeys.tabKeys")],
+                ["token-usage", t("apiKeys.tabTokenUsage")],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setActiveTab(key)}
+                className={`rounded-md px-3 py-1.5 text-[13px] font-semibold transition-colors ${
+                  activeTab === key
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {activeTab === "keys" && (
           <Card>
             <CardContent className="p-3 sm:p-4">
               <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
@@ -553,6 +616,15 @@ export default function APIKeys() {
               </StateShell>
             </CardContent>
           </Card>
+          )}
+
+          {activeTab === "token-usage" && (
+            <Card>
+              <CardContent className="p-3 sm:p-4">
+                <APIKeyTokenUsagePanel />
+              </CardContent>
+            </Card>
+          )}
 
           <Card className="py-0">
             <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
@@ -705,6 +777,12 @@ export default function APIKeys() {
                 {t("apiKeys.allowedGroupsHint")}
               </p>
             </FormField>
+
+            <LimitsEditor
+              value={createForm.limits}
+              onChange={(limits) => updateCreateForm({ limits })}
+              modelOptions={modelOptions}
+            />
           </form>
         </Modal>
 
@@ -838,11 +916,16 @@ export default function APIKeys() {
                   {t("apiKeys.allowedGroupsHint")}
                 </p>
               </FormField>
+
+              <LimitsEditor
+                value={editForm.limits}
+                onChange={(limits) => updateEditForm({ limits })}
+                modelOptions={modelOptions}
+              />
             </form>
           ) : null}
         </Modal>
 
-        <ToastNotice toast={toast} />
         {confirmDialog}
       </>
     </StateShell>
@@ -882,6 +965,52 @@ function buildExpirationPayload(
     throw new Error(t("apiKeys.expiresAtPast"));
   }
   return { expires_at: date.toISOString() };
+}
+
+function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
+  if (!limits) return emptyLimitsForm;
+  return {
+    modelAllow: Array.isArray(limits.model_allow) ? limits.model_allow : [],
+    modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
+    rpm: limits.rpm && limits.rpm > 0 ? String(limits.rpm) : "",
+    rpd: limits.rpd && limits.rpd > 0 ? String(limits.rpd) : "",
+    costLimit5h:
+      limits.cost_limit_5h && limits.cost_limit_5h > 0
+        ? String(limits.cost_limit_5h)
+        : "",
+    costLimit7d:
+      limits.cost_limit_7d && limits.cost_limit_7d > 0
+        ? String(limits.cost_limit_7d)
+        : "",
+    tokenLimit5h:
+      limits.token_limit_5h && limits.token_limit_5h > 0
+        ? String(limits.token_limit_5h)
+        : "",
+    tokenLimit7d:
+      limits.token_limit_7d && limits.token_limit_7d > 0
+        ? String(limits.token_limit_7d)
+        : "",
+  };
+}
+
+// limitsFormToPayload 把表单值转为后端期望的 APIKeyLimits。
+// 空字符串或 0 在后端被视为 "未配置";所以不一一过滤,直接把全部字段都发出去。
+// (sanitizeAPIKeyLimits 在后端会把负值与空白清理掉)
+function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
+  const num = (s: string) => {
+    const n = Number(s.trim());
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  return {
+    model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
+    model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
+    rpm: num(form.rpm),
+    rpd: num(form.rpd),
+    cost_limit_5h: num(form.costLimit5h),
+    cost_limit_7d: num(form.costLimit7d),
+    token_limit_5h: num(form.tokenLimit5h),
+    token_limit_7d: num(form.tokenLimit7d),
+  };
 }
 
 function toDateTimeLocalValue(value?: string | null) {
@@ -1046,6 +1175,168 @@ function GroupMultiSelect({
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+// LimitsEditor 渲染 API Key 的"高级限制"配置:模型白/黑名单 + 滑动窗口配额。
+// 默认折叠,有任一字段非默认时展开。
+function LimitsEditor({
+  value,
+  onChange,
+  modelOptions,
+}: {
+  value: LimitsFormState;
+  onChange: (next: LimitsFormState) => void;
+  modelOptions: string[];
+}) {
+  const { t } = useTranslation();
+  const hasAny =
+    value.modelAllow.length > 0 ||
+    value.modelDeny.length > 0 ||
+    value.rpm !== "" ||
+    value.rpd !== "" ||
+    value.costLimit5h !== "" ||
+    value.costLimit7d !== "" ||
+    value.tokenLimit5h !== "" ||
+    value.tokenLimit7d !== "";
+  const [open, setOpen] = useState(hasAny);
+
+  const patch = (next: Partial<LimitsFormState>) =>
+    onChange({ ...value, ...next });
+
+  return (
+    <div className="rounded-lg border border-border">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between px-3 py-2.5 text-left text-sm font-medium hover:bg-muted/30 transition-colors"
+      >
+        <span className="flex items-center gap-2">
+          <span>{t("apiKeys.limits.title")}</span>
+          {hasAny && (
+            <span className="inline-flex items-center rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+              {t("apiKeys.limits.active")}
+            </span>
+          )}
+        </span>
+        <span className="text-xs text-muted-foreground">
+          {open ? t("apiKeys.limits.hide") : t("apiKeys.limits.show")}
+        </span>
+      </button>
+      {open && (
+        <div className="space-y-3 border-t border-border p-3">
+          <p className="text-[11px] text-muted-foreground">
+            {t("apiKeys.limits.desc")}
+          </p>
+          <div className="space-y-2">
+            <label className="text-xs font-medium">
+              {t("apiKeys.limits.modelAllow")}
+            </label>
+            <ChipInput
+              value={value.modelAllow}
+              onChange={(modelAllow) => patch({ modelAllow })}
+              options={modelOptions}
+              placeholder={t("apiKeys.limits.modelAllowPlaceholder")}
+            />
+            <p className="text-[10px] text-muted-foreground">
+              {t("apiKeys.limits.modelAllowHint")}
+            </p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-xs font-medium">
+              {t("apiKeys.limits.modelDeny")}
+            </label>
+            <ChipInput
+              value={value.modelDeny}
+              onChange={(modelDeny) => patch({ modelDeny })}
+              options={modelOptions}
+              placeholder={t("apiKeys.limits.modelDenyPlaceholder")}
+            />
+            <p className="text-[10px] text-muted-foreground">
+              {t("apiKeys.limits.modelDenyHint")}
+            </p>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <LimitNumberField
+              label={t("apiKeys.limits.rpm")}
+              value={value.rpm}
+              onChange={(rpm) => patch({ rpm })}
+              suffix={t("apiKeys.limits.rpmSuffix")}
+            />
+            <LimitNumberField
+              label={t("apiKeys.limits.rpd")}
+              value={value.rpd}
+              onChange={(rpd) => patch({ rpd })}
+              suffix={t("apiKeys.limits.rpdSuffix")}
+            />
+            <LimitNumberField
+              label={t("apiKeys.limits.cost5h")}
+              value={value.costLimit5h}
+              onChange={(costLimit5h) => patch({ costLimit5h })}
+              suffix="$"
+              step="0.01"
+            />
+            <LimitNumberField
+              label={t("apiKeys.limits.cost7d")}
+              value={value.costLimit7d}
+              onChange={(costLimit7d) => patch({ costLimit7d })}
+              suffix="$"
+              step="0.01"
+            />
+            <LimitNumberField
+              label={t("apiKeys.limits.tokens5h")}
+              value={value.tokenLimit5h}
+              onChange={(tokenLimit5h) => patch({ tokenLimit5h })}
+              suffix="tk"
+            />
+            <LimitNumberField
+              label={t("apiKeys.limits.tokens7d")}
+              value={value.tokenLimit7d}
+              onChange={(tokenLimit7d) => patch({ tokenLimit7d })}
+              suffix="tk"
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LimitNumberField({
+  label,
+  value,
+  onChange,
+  suffix,
+  step,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+  suffix?: string;
+  step?: string;
+}) {
+  return (
+    <div className="space-y-1">
+      <label className="text-[11px] font-medium text-muted-foreground">
+        {label}
+      </label>
+      <div className="relative">
+        <Input
+          type="number"
+          min="0"
+          step={step || "1"}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="0"
+          className="pr-10 text-xs"
+        />
+        {suffix && (
+          <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground">
+            {suffix}
+          </span>
+        )}
+      </div>
     </div>
   );
 }

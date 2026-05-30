@@ -556,7 +556,8 @@ curl --request POST \\
   "group_ids": [1, 2],
   "allowed_api_key_ids": [],
   "score_bias_override": null,
-  "base_concurrency_override": null
+  "base_concurrency_override": null,
+  "skip_warm_tier": true
 }`,
       curl: `curl --request PATCH \\
   --url ${baseUrl}/api/admin/accounts/1/scheduler \\
@@ -565,7 +566,8 @@ curl --request POST \\
   --data '{
   "tags": ["team", "paid"],
   "group_ids": [1, 2],
-  "allowed_api_key_ids": []
+  "allowed_api_key_ids": [],
+  "skip_warm_tier": true
 }'`,
       responses: [
         { code: 200, body: `{"message": "账号调度配置已更新"}` },

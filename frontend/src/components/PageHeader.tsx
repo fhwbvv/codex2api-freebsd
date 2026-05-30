@@ -25,7 +25,7 @@ export default function PageHeader({
   const resolvedRefreshLabel = refreshLabel ?? t('common.refresh')
 
   return (
-    <div className="flex items-end justify-between gap-5 mb-6 max-sm:flex-col max-sm:items-stretch">
+    <div data-slot="page-header" className="flex items-end justify-between gap-5 mb-6 max-sm:flex-col max-sm:items-stretch">
       <div className="max-w-[760px]">
         <h2 className="text-2xl font-semibold leading-tight text-foreground sm:text-[28px]">
           {title}

@@ -10,7 +10,7 @@ import UsageStatsSummary from '../components/UsageStatsSummary'
 import type { StatsResponse, UsageStats, ChartAggregation } from '../types'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { Card, CardContent } from '@/components/ui/card'
-import { Users, CheckCircle, XCircle, Activity } from 'lucide-react'
+import { Users, CheckCircle, Gauge, XCircle, Activity } from 'lucide-react'
 
 const DashboardUsageCharts = lazy(() => import('../components/DashboardUsageCharts'))
 
@@ -111,12 +111,14 @@ export default function Dashboard() {
   const { stats, usageStats } = data
   const total = stats?.total ?? 0
   const available = stats?.available ?? 0
+  const rateLimited = stats?.rate_limited ?? 0
   const errorCount = stats?.error ?? 0
   const todayRequests = stats?.today_requests ?? 0
 
   const icons: Record<string, ReactNode> = {
     total: <Users className="size-[22px]" />,
     available: <CheckCircle className="size-[22px]" />,
+    rateLimited: <Gauge className="size-[22px]" />,
     error: <XCircle className="size-[22px]" />,
     requests: <Activity className="size-[22px]" />,
   }
@@ -146,6 +148,12 @@ export default function Dashboard() {
             iconClass="green"
             label={t('dashboard.available')}
             value={available}
+          />
+          <StatCard
+            icon={icons.rateLimited}
+            iconClass="amber"
+            label={t('dashboard.rateLimited')}
+            value={rateLimited}
           />
           <StatCard icon={icons.error} iconClass="red" label={t('dashboard.error')} value={errorCount} />
           <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} />

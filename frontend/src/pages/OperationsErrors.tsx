@@ -18,9 +18,9 @@ import OpsTabs from '../components/OpsTabs'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
-import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
+import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
@@ -47,7 +47,7 @@ import {
 } from '@/components/ui/table'
 
 const ERROR_TIME_RANGES: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
-const pageSizeOptions = [10, 20, 50, 100]
+const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
 
 const errorTableHeadClass = 'text-[12px] font-semibold'
 const errorTableTextClass = 'text-[14px]'
@@ -58,7 +58,7 @@ export default function OperationsErrors() {
   const { toast, showToast } = useToast()
   const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
+  const [pageSize, setPageSize] = usePersistedPageSize('ops_errors', 20, pageSizeOptions)
   const [statusFilter, setStatusFilter] = useState('')
   const [errorKindFilter, setErrorKindFilter] = useState('')
   const [endpointFilter, setEndpointFilter] = useState('')
@@ -567,7 +567,6 @@ export default function OperationsErrors() {
             </DialogContent>
           ) : null}
         </Dialog>
-        <ToastNotice toast={toast} />
       </>
     </StateShell>
   )

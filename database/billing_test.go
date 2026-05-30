@@ -110,24 +110,6 @@ func TestCalculateCostHandlesCachedTokensAndServiceTier(t *testing.T) {
 			want:         0.0191,
 		},
 		{
-			name:         "does not invent priority multiplier when priority price is unknown",
-			model:        "gpt-4o",
-			serviceTier:  "priority",
-			inputTokens:  1000,
-			outputTokens: 500,
-			cachedTokens: 200,
-			want:         0.0075,
-		},
-		{
-			name:         "fast tier falls back to standard pricing when priority price is unknown",
-			model:        "gpt-4o",
-			serviceTier:  "fast",
-			inputTokens:  1000,
-			outputTokens: 500,
-			cachedTokens: 200,
-			want:         0.0075,
-		},
-		{
 			name:         "applies flex multiplier",
 			model:        "gpt-5.4",
 			serviceTier:  "flex",
@@ -159,6 +141,25 @@ func TestCalculateCostBreakdownExposesDisplayFields(t *testing.T) {
 	assertFloatEqual(t, got.CacheReadPricePerMToken, 0.125)
 	assertFloatEqual(t, got.OutputPricePerMToken, 7.5)
 	assertFloatEqual(t, got.ServiceTierCostMultiplier, 0.5)
+	if got.LongContext {
+		t.Fatal("LongContext = true, want false")
+	}
+	if got.LongContextThreshold != longContextThreshold {
+		t.Fatalf("LongContextThreshold = %d, want %d", got.LongContextThreshold, longContextThreshold)
+	}
+}
+
+func TestFastTierFallbackDoublesCostForModelsWithoutPriorityPricing(t *testing.T) {
+	for _, model := range []string{"gpt-5.4-mini", "gpt-5.4-nano"} {
+		base := calculateCostBreakdown(1000, 500, 200, model, "")
+		fast := calculateCostBreakdown(1000, 500, 200, model, "fast")
+		priority := calculateCostBreakdown(1000, 500, 200, model, "priority")
+
+		assertFloatEqual(t, fast.TotalCost, base.TotalCost*2)
+		assertFloatEqual(t, priority.TotalCost, base.TotalCost*2)
+		assertFloatEqual(t, fast.ServiceTierCostMultiplier, 2.0)
+		assertFloatEqual(t, priority.ServiceTierCostMultiplier, 2.0)
+	}
 }
 
 func TestGPT55PricingDoesNotMatchGPT54(t *testing.T) {
@@ -262,6 +263,12 @@ func TestLongContextPricingTriggersAbove272KTokens(t *testing.T) {
 	long := CalculateCostBreakdown(272001, 1000, 0, "gpt-5.4", "")
 	assertFloatEqual(t, long.InputPricePerMToken, 5.0)
 	assertFloatEqual(t, long.OutputPricePerMToken, 22.5)
+	if !long.LongContext {
+		t.Fatal("LongContext = false, want true")
+	}
+	if long.LongContextThreshold != longContextThreshold {
+		t.Fatalf("LongContextThreshold = %d, want %d", long.LongContextThreshold, longContextThreshold)
+	}
 
 	// Verify total cost is higher for long context.
 	if long.TotalCost <= std.TotalCost {
@@ -284,6 +291,9 @@ func TestLongContextPricingDoesNotApplyWhenNoLongPricingDefined(t *testing.T) {
 	// Input price should be the same since no long variant exists.
 	assertFloatEqual(t, std.InputPricePerMToken, long.InputPricePerMToken)
 	assertFloatEqual(t, std.OutputPricePerMToken, long.OutputPricePerMToken)
+	if long.LongContext {
+		t.Fatal("LongContext = true for model without long pricing, want false")
+	}
 }
 
 func TestCodexAutoReviewModelNormalizesToGPT54(t *testing.T) {

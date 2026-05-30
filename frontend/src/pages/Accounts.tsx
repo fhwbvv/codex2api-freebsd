@@ -1,14 +1,17 @@
 import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
-import { api, getAdminKey } from "../api";
+import { api, getAdminKey, resetAdminAuthState } from "../api";
 import Modal from "../components/Modal";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
-import ToastNotice from "../components/ToastNotice";
 import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
+import {
+  DEFAULT_PAGE_SIZE_OPTIONS,
+  usePersistedPageSize,
+} from "../hooks/usePersistedPageSize";
 import { useToast } from "../hooks/useToast";
 import type {
   AccountRow,
@@ -71,6 +74,8 @@ import {
   Hourglass,
   X,
   SlidersHorizontal,
+  LayoutGrid,
+  Rows3,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
@@ -80,7 +85,7 @@ import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecover
 import ChipInput from "../components/ChipInput";
 
 const ACCOUNT_BATCH_CONCURRENCY = 6;
-const ACCOUNT_REFRESH_BATCH_CONCURRENCY = 4;
+const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_VISIBLE_COLUMNS_KEY = "codex2api:accounts:visible-columns";
 const ACCOUNT_TABLE_COLUMNS = [
@@ -92,7 +97,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "status",
   "requests",
   "usage",
-	"billed",
+  "billed",
   "importTime",
   "updatedAt",
   "actions",
@@ -163,6 +168,27 @@ function persistAccountVisibleColumns(
   }
 }
 
+const ACCOUNT_VIEW_MODE_KEY = "codex2api:accounts:view-mode";
+type AccountViewMode = "table" | "grid";
+
+function getInitialAccountViewMode(): AccountViewMode {
+  try {
+    const raw = window.localStorage.getItem(ACCOUNT_VIEW_MODE_KEY);
+    if (raw === "grid" || raw === "table") return raw;
+  } catch {
+    // ignore
+  }
+  return "table";
+}
+
+function persistAccountViewMode(mode: AccountViewMode) {
+  try {
+    window.localStorage.setItem(ACCOUNT_VIEW_MODE_KEY, mode);
+  } catch {
+    // ignore
+  }
+}
+
 function getInitialAnalysisVisibility(): boolean {
   try {
     return (
@@ -219,6 +245,30 @@ function formatAccountName(account: AccountRow): string {
   return account.email || account.name || `ID ${account.id}`;
 }
 
+function getMediaQueryMatch(query: string): boolean {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+    return false;
+  }
+  return window.matchMedia(query).matches;
+}
+
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() => getMediaQueryMatch(query));
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
+      return;
+    }
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [query]);
+
+  return matches;
+}
+
 async function runAccountBatch(
   ids: number[],
   action: (id: number) => Promise<unknown>,
@@ -247,12 +297,105 @@ async function runAccountBatch(
   return { success, fail };
 }
 
+type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh";
+
+interface BatchOperationEvent {
+  type: "start" | "progress" | "complete";
+  action: BatchOperationAction;
+  current?: number;
+  total?: number;
+  success?: number;
+  failed?: number;
+  banned?: number;
+  rate_limited?: number;
+  deleted?: number;
+  account_id?: number;
+  message?: string;
+  error?: string;
+}
+
+interface OperationProgressState {
+  show: boolean;
+  action: BatchOperationAction;
+  title: string;
+  current: number;
+  total: number;
+  success: number;
+  failed: number;
+  banned: number;
+  rateLimited: number;
+  deleted: number;
+  done: boolean;
+  message?: string;
+}
+
+async function readOperationSSE(
+  res: Response,
+  onEvent: (event: BatchOperationEvent) => void,
+) {
+  const reader = res.body?.getReader();
+  if (!reader) return;
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      try {
+        onEvent(JSON.parse(line.slice(6)) as BatchOperationEvent);
+      } catch {
+        /* 忽略格式异常的进度帧 */
+      }
+    }
+  }
+}
+
+async function readAdminStreamError(res: Response): Promise<string> {
+  const body = await res.text();
+  if (!body.trim()) return `HTTP ${res.status}`;
+  try {
+    const parsed = JSON.parse(body) as { error?: string };
+    if (parsed.error?.trim()) return parsed.error;
+  } catch {
+    /* ignore */
+  }
+  return body;
+}
+
+async function postAdminSSE(path: string, body?: unknown): Promise<Response> {
+  const headers: Record<string, string> = {};
+  const adminKey = getAdminKey();
+  if (adminKey) headers["X-Admin-Key"] = adminKey;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  const res = await fetch(`/api/admin${path}`, {
+    method: "POST",
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    if (res.status === 401) resetAdminAuthState();
+    throw new Error(await readAdminStreamError(res));
+  }
+  return res;
+}
+
 export default function Accounts() {
   const { t } = useTranslation();
-  const pageSizeOptions = [10, 20, 50, 100];
+  const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [showAdd, setShowAdd] = useState(false);
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(20);
+  const [pageSize, setPageSize] = usePersistedPageSize(
+    "accounts",
+    20,
+    pageSizeOptions,
+  );
   const [statusFilter, setStatusFilter] = useState<
     | "all"
     | "normal"
@@ -289,6 +432,16 @@ export default function Accounts() {
   const [batchLoading, setBatchLoading] = useState(false);
   const [batchRefreshing, setBatchRefreshing] = useState(false);
   const [batchTesting, setBatchTesting] = useState(false);
+  const [operationProgress, setOperationProgress] =
+    useState<OperationProgressState | null>(null);
+  const operationProgressHideTimer = useRef<number | null>(null);
+  const operationProgressFrame = useRef<number | null>(null);
+  const operationProgressFlushTimer = useRef<number | null>(null);
+  const lastOperationProgressFlushAt = useRef(0);
+  const pendingOperationProgress = useRef<{
+    title: string;
+    event: BatchOperationEvent;
+  } | null>(null);
   const [lockingSubscriptionAccounts, setLockingSubscriptionAccounts] =
     useState(false);
   const [cleaningBanned, setCleaningBanned] = useState(false);
@@ -305,6 +458,7 @@ export default function Accounts() {
     "default",
   );
   const [concurrencyInput, setConcurrencyInput] = useState("");
+  const [skipWarmTier, setSkipWarmTier] = useState(false);
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
     number[]
   >([]);
@@ -398,6 +552,10 @@ export default function Accounts() {
   const [visibleColumns, setVisibleColumns] = useState<
     Record<AccountTableColumn, boolean>
   >(getInitialAccountVisibleColumns);
+  const [viewMode, setViewMode] = useState<AccountViewMode>(
+    getInitialAccountViewMode,
+  );
+  const isDesktopLayout = useMediaQuery("(min-width: 1024px)");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
   const jsonAtInputRef = useRef<HTMLInputElement>(null);
@@ -407,6 +565,139 @@ export default function Accounts() {
   const lazyModeRef = useRef<boolean | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
+
+  useEffect(() => {
+    return () => {
+      if (operationProgressHideTimer.current !== null) {
+        window.clearTimeout(operationProgressHideTimer.current);
+      }
+      if (operationProgressFrame.current !== null) {
+        window.cancelAnimationFrame(operationProgressFrame.current);
+      }
+      if (operationProgressFlushTimer.current !== null) {
+        window.clearTimeout(operationProgressFlushTimer.current);
+      }
+      pendingOperationProgress.current = null;
+    };
+  }, []);
+
+  const closeOperationProgress = useCallback(() => {
+    if (operationProgressHideTimer.current !== null) {
+      window.clearTimeout(operationProgressHideTimer.current);
+      operationProgressHideTimer.current = null;
+    }
+    setOperationProgress(null);
+  }, []);
+
+  const scheduleOperationProgressClose = useCallback(() => {
+    if (operationProgressHideTimer.current !== null) {
+      window.clearTimeout(operationProgressHideTimer.current);
+    }
+    operationProgressHideTimer.current = window.setTimeout(() => {
+      setOperationProgress(null);
+      operationProgressHideTimer.current = null;
+    }, 5000);
+  }, []);
+
+  const commitOperationProgressEvent = useCallback(
+    (title: string, event: BatchOperationEvent) => {
+      setOperationProgress((prev) => ({
+        show: true,
+        action: event.action,
+        title,
+        current: event.current ?? prev?.current ?? 0,
+        total: event.total ?? prev?.total ?? 0,
+        success: event.success ?? prev?.success ?? 0,
+        failed: event.failed ?? prev?.failed ?? 0,
+        banned: event.banned ?? prev?.banned ?? 0,
+        rateLimited: event.rate_limited ?? prev?.rateLimited ?? 0,
+        deleted: event.deleted ?? prev?.deleted ?? 0,
+        done: event.type === "complete",
+        message: event.error || event.message || prev?.message,
+      }));
+      if (event.type === "complete") {
+        scheduleOperationProgressClose();
+      }
+    },
+    [scheduleOperationProgressClose],
+  );
+
+  const flushOperationProgressEvent = useCallback(() => {
+    operationProgressFrame.current = null;
+    const pending = pendingOperationProgress.current;
+    if (!pending) return;
+    pendingOperationProgress.current = null;
+    lastOperationProgressFlushAt.current = performance.now();
+    commitOperationProgressEvent(pending.title, pending.event);
+  }, [commitOperationProgressEvent]);
+
+  const applyOperationProgressEvent = useCallback(
+    (title: string, event: BatchOperationEvent) => {
+      if (operationProgressHideTimer.current !== null) {
+        window.clearTimeout(operationProgressHideTimer.current);
+        operationProgressHideTimer.current = null;
+      }
+
+      pendingOperationProgress.current = { title, event };
+
+      if (event.type === "complete") {
+        if (operationProgressFrame.current !== null) {
+          window.cancelAnimationFrame(operationProgressFrame.current);
+          operationProgressFrame.current = null;
+        }
+        if (operationProgressFlushTimer.current !== null) {
+          window.clearTimeout(operationProgressFlushTimer.current);
+          operationProgressFlushTimer.current = null;
+        }
+        flushOperationProgressEvent();
+        return;
+      }
+
+      if (
+        operationProgressFrame.current === null &&
+        operationProgressFlushTimer.current === null
+      ) {
+        const now = performance.now();
+        const delay = Math.max(
+          0,
+          OPERATION_PROGRESS_FLUSH_INTERVAL_MS -
+            (now - lastOperationProgressFlushAt.current),
+        );
+        if (delay > 0) {
+          operationProgressFlushTimer.current = window.setTimeout(() => {
+            operationProgressFlushTimer.current = null;
+            operationProgressFrame.current = window.requestAnimationFrame(
+              flushOperationProgressEvent,
+            );
+          }, delay);
+          return;
+        }
+        operationProgressFrame.current = window.requestAnimationFrame(
+          flushOperationProgressEvent,
+        );
+      }
+    },
+    [flushOperationProgressEvent],
+  );
+
+  const runStreamingAccountOperation = useCallback(
+    async (
+      path: string,
+      body: unknown,
+      title: string,
+    ): Promise<BatchOperationEvent | null> => {
+      let finalEvent: BatchOperationEvent | null = null;
+      const res = await postAdminSSE(path, body);
+      await readOperationSSE(res, (event) => {
+        applyOperationProgressEvent(title, event);
+        if (event.type === "complete") {
+          finalEvent = event;
+        }
+      });
+      return finalEvent;
+    },
+    [applyOperationProgressEvent],
+  );
 
   const loadAccounts = useCallback(async (options?: LoadOptions) => {
     const shouldLoadSettings = !options?.silent || lazyModeRef.current === null;
@@ -465,6 +756,10 @@ export default function Accounts() {
   useEffect(() => {
     persistAccountVisibleColumns(visibleColumns);
   }, [visibleColumns]);
+
+  useEffect(() => {
+    persistAccountViewMode(viewMode);
+  }, [viewMode]);
 
   useEffect(() => {
     if (groupFilter === null) return;
@@ -708,6 +1003,8 @@ export default function Accounts() {
     () => pagedAccounts.map((account) => account.id),
     [pagedAccounts],
   );
+  const shouldRenderMobileCards = viewMode === "grid" || !isDesktopLayout;
+  const shouldRenderDesktopTable = viewMode !== "grid" && isDesktopLayout;
   const pageSelectedCount = useMemo(
     () =>
       pagedAccountIds.reduce(
@@ -1346,11 +1643,11 @@ export default function Accounts() {
         const blob = new Blob([JSON.stringify(data, null, 2)], {
           type: "application/json",
         });
-        downloadBlob(blob, `cpa-${ts}-${data.length}.json`);
+        downloadBlob(blob, `codex2api-${ts}-${data.length}.json`);
       } else {
         const text = data.map((e) => e.refresh_token).join("\n");
         const blob = new Blob([text], { type: "text/plain" });
-        downloadBlob(blob, `rt-${ts}-${data.length}.txt`);
+        downloadBlob(blob, `codex2api-rt-${ts}-${data.length}.txt`);
       }
       showToast(t("accounts.exportSuccess", { count: data.length }));
     } catch (error) {
@@ -1567,10 +1864,21 @@ export default function Accounts() {
     if (!confirmed) return;
     setBatchLoading(true);
     try {
-      const { success, fail } = await runAccountBatch(ids, api.deleteAccount);
+      const result = await runStreamingAccountOperation(
+        "/accounts/batch-delete?stream=true",
+        { ids },
+        t("accounts.batchDeleteProgressTitle"),
+      );
+      const success = result?.success ?? result?.deleted ?? 0;
+      const fail = result?.failed ?? 0;
       showToast(t("accounts.batchDeleteDone", { success, fail }));
       setSelected(new Set());
       void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.batchDeleteFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
     } finally {
       setBatchLoading(false);
     }
@@ -1582,13 +1890,20 @@ export default function Accounts() {
     setBatchLoading(true);
     setBatchRefreshing(true);
     try {
-      const { success, fail } = await runAccountBatch(
-        targetIds,
-        api.refreshAccount,
-        ACCOUNT_REFRESH_BATCH_CONCURRENCY,
+      const result = await runStreamingAccountOperation(
+        "/accounts/batch-refresh?stream=true",
+        { ids: targetIds },
+        t("accounts.batchRefreshProgressTitle"),
       );
+      const success = result?.success ?? 0;
+      const fail = result?.failed ?? 0;
       showToast(t("accounts.batchRefreshDone", { success, fail }));
       void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.batchRefreshFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
     } finally {
       setBatchLoading(false);
       setBatchRefreshing(false);
@@ -1717,16 +2032,20 @@ export default function Accounts() {
     if (ids && ids.length === 0) return;
     setBatchTesting(true);
     try {
-      const result = await api.batchTestAccounts(ids);
+      const result = await runStreamingAccountOperation(
+        "/accounts/batch-test?stream=true",
+        ids ? { ids } : undefined,
+        t("accounts.batchTestProgressTitle"),
+      );
       showToast(
         t("accounts.batchTestDone", {
-          success: result.success,
-          banned: result.banned,
-          rateLimited: result.rate_limited,
-          failed: result.failed,
+          success: result?.success ?? 0,
+          banned: result?.banned ?? 0,
+          rateLimited: result?.rate_limited ?? 0,
+          failed: result?.failed ?? 0,
         }),
       );
-      void reload();
+      void reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.batchTestFailed", { error: getErrorMessage(error) }),
@@ -1833,6 +2152,7 @@ export default function Accounts() {
         ? ""
         : String(account.base_concurrency_override),
     );
+    setSkipWarmTier(account.skip_warm_tier ?? false);
     setAllowedAPIKeySelection(
       filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
@@ -1857,6 +2177,7 @@ export default function Accounts() {
     setScoreInput("");
     setConcurrencyMode("default");
     setConcurrencyInput("");
+    setSkipWarmTier(false);
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditTags([]);
@@ -1903,6 +2224,7 @@ export default function Accounts() {
       concurrencyMode === "custom"
         ? (parsedBaseConcurrency ?? getEffectiveBaseConcurrency(editingAccount))
         : getEffectiveBaseConcurrency(editingAccount);
+    const healthTier = getPreviewHealthTier(editingAccount, skipWarmTier);
 
     return {
       rawScore,
@@ -1911,8 +2233,9 @@ export default function Accounts() {
         rawScore,
         appliedBias,
       ),
-      healthTier: editingAccount.health_tier,
+      healthTier,
       dynamicConcurrency: computePreviewDynamicConcurrency(
+        healthTier,
         editingAccount,
         baseConcurrency,
       ),
@@ -1925,6 +2248,7 @@ export default function Accounts() {
     parsedScoreBias,
     concurrencyMode,
     parsedBaseConcurrency,
+    skipWarmTier,
   ]);
 
   const handleSaveScheduler = async () => {
@@ -1940,6 +2264,7 @@ export default function Accounts() {
         score_bias_override: scoreMode === "custom" ? parsedScoreBias : null,
         base_concurrency_override:
           concurrencyMode === "custom" ? parsedBaseConcurrency : null,
+        skip_warm_tier: skipWarmTier,
         allowed_api_key_ids: allowedAPIKeySelection,
         proxy_url: editProxyUrl.trim() || null,
         tags: editTags,
@@ -2068,6 +2393,10 @@ export default function Accounts() {
           </div>
         </div>
       )}
+      <OperationProgressToast
+        progress={operationProgress}
+        onClose={closeOperationProgress}
+      />
       <StateShell
         variant="page"
         loading={loading}
@@ -2306,6 +2635,14 @@ export default function Accounts() {
                 accounts={accounts}
                 compact
                 className="min-w-0"
+                onProbeStarted={() => {
+                  showToast(t('accounts.quotaDistributionRefreshStarted'), 'success')
+                  // 探针在后台并发执行；稍等一下再静默拉取，让首批结果有机会回流
+                  window.setTimeout(() => {
+                    void reloadSilently()
+                  }, 4000)
+                }}
+                onProbeError={(message) => showToast(message, 'error')}
               />
               <AccountRateLimitRecoveryChart
                 accounts={accounts}
@@ -2319,7 +2656,7 @@ export default function Accounts() {
           ) : null}
 
           <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_max-content]">
-            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:overflow-x-auto xl:flex-nowrap">
+            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:flex-wrap max-lg:overflow-visible xl:flex-nowrap">
               <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">
                 {t("accounts.filter")}
               </span>
@@ -2367,7 +2704,7 @@ export default function Accounts() {
               ))}
             </div>
 
-            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:overflow-x-auto xl:flex-nowrap">
+            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:flex-wrap max-lg:overflow-visible xl:flex-nowrap">
               <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">
                 {t("accounts.schedulerView")}
               </span>
@@ -2394,7 +2731,7 @@ export default function Accounts() {
             </div>
           </div>
 
-          <div className="mb-4 flex items-center gap-2 overflow-visible max-lg:flex-wrap max-lg:overflow-x-auto">
+          <div className="mb-4 flex items-center gap-2 overflow-visible max-lg:flex-wrap max-lg:overflow-visible">
             <div className="relative w-64 shrink-0 max-sm:w-full">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
               <Input
@@ -2407,7 +2744,7 @@ export default function Accounts() {
                 }}
               />
             </div>
-            <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5">
+            <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5 max-sm:w-full max-sm:flex-wrap">
               {(["all", "pro", "prolite", "plus", "team", "free"] as const).map(
                 (key) => (
                   <button
@@ -2470,7 +2807,39 @@ export default function Accounts() {
               <FolderOpen className="size-3.5" />
               {t("accounts.groupManage")}
             </Button>
-            <div className="ml-auto shrink-0">
+            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+              <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
+                <button
+                  type="button"
+                  onClick={() => setViewMode("table")}
+                  title={t("accounts.viewModeTable")}
+                  aria-label={t("accounts.viewModeTable")}
+                  aria-pressed={viewMode === "table"}
+                  className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
+                    viewMode === "table"
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <Rows3 className="size-3.5" />
+                  {t("accounts.viewModeTable")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode("grid")}
+                  title={t("accounts.viewModeGrid")}
+                  aria-label={t("accounts.viewModeGrid")}
+                  aria-pressed={viewMode === "grid"}
+                  className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
+                    viewMode === "grid"
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <LayoutGrid className="size-3.5" />
+                  {t("accounts.viewModeGrid")}
+                </button>
+              </div>
               <ColumnSettingsMenu
                 columns={visibleColumns}
                 onToggle={(column) =>
@@ -2602,7 +2971,7 @@ export default function Accounts() {
           )}
 
           <Card>
-            <CardContent className="p-4">
+            <CardContent className="p-3 sm:p-4">
               <StateShell
                 variant="section"
                 isEmpty={accounts.length === 0}
@@ -2614,7 +2983,49 @@ export default function Accounts() {
                   </Button>
                 }
               >
-                <div className="data-table-shell">
+                {shouldRenderMobileCards ? (
+                  <div
+                    className={
+                      viewMode === "grid"
+                        ? "grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5"
+                        : "grid gap-3 lg:hidden"
+                    }
+                  >
+                    {pagedAccounts.map((account, index) => {
+                      const isSelected = selected.has(account.id);
+                      return (
+                        <AccountMobileCard
+                          key={account.id}
+                          account={account}
+                          sequence={(currentPage - 1) * pageSize + index + 1}
+                          selected={isSelected}
+                          allGroups={allGroups}
+                          lazyMode={lazyMode}
+                          refreshing={refreshingIds.has(account.id)}
+                          authJsonExporting={authJsonExportingIds.has(account.id)}
+                          t={t}
+                          onToggleSelect={() => toggleSelect(account.id)}
+                          onEdit={() => openSchedulerEditor(account)}
+                          onUsage={() => setUsageAccount(account)}
+                          onTest={() => setTestingAccount(account)}
+                          onRefresh={() => void handleRefresh(account)}
+                          onGenerateAuthJson={() =>
+                            void handleGenerateAuthJSON(account)
+                          }
+                          onToggleEnabled={() =>
+                            void handleToggleEnabled(account)
+                          }
+                          onToggleLock={() => void handleToggleLock(account)}
+                          onResetStatus={() => void handleResetStatus(account)}
+                          onDelete={() => void handleDelete(account)}
+                        />
+                      );
+                    })}
+                  </div>
+                ) : null}
+
+                {shouldRenderDesktopTable ? (
+                  <div className="data-table-shell hidden lg:block">
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -2818,7 +3229,13 @@ export default function Accounts() {
                             )}
                             {visibleColumns.plan && (
                               <TableCell>
-                                <PlanBadge planType={account.plan_type} />
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <PlanBadge planType={account.plan_type} />
+                                  <ExpiryBadge
+                                    expiresAt={account.subscription_expires_at}
+                                    planType={account.plan_type}
+                                  />
+                                </div>
                               </TableCell>
                             )}
                             {visibleColumns.status && (
@@ -2831,6 +3248,7 @@ export default function Accounts() {
                                         getAccountRateLimitWindow(account) ??
                                         undefined
                                       }
+                                      errorMessage={account.error_message}
                                     />
                                     <AccountStatusCountdown account={account} />
                                   </div>
@@ -3080,7 +3498,8 @@ export default function Accounts() {
                       })}
                     </TableBody>
                   </Table>
-                </div>
+                  </div>
+                ) : null}
                 <Pagination
                   page={currentPage}
                   totalPages={totalPages}
@@ -4214,34 +4633,64 @@ export default function Accounts() {
                                         editingAccount,
                                       ),
                                   })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4">
+                        <div className="flex items-start justify-between gap-4">
+                          <div>
+                            <div className="text-sm font-semibold text-foreground">
+                              {t("accounts.schedulerSkipWarmLabel")}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {t("accounts.schedulerSkipWarmHint")}
                             </div>
                           </div>
-                        )}
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-label={t("accounts.schedulerSkipWarmLabel")}
+                            aria-checked={skipWarmTier}
+                            onClick={() =>
+                              setSkipWarmTier((current) => !current)
+                            }
+                            className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${skipWarmTier ? "bg-primary" : "bg-muted"}`}
+                          >
+                            <span
+                              className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${skipWarmTier ? "translate-x-4" : "translate-x-0"}`}
+                            />
+                          </button>
+                        </div>
                       </div>
-                    </div>
 
-                    <div className="rounded-xl border border-border p-4">
-                      <div className="text-sm font-semibold text-foreground">
-                        {t("accounts.allowedAPIKeysLabel")}
-                      </div>
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        {t("accounts.allowedAPIKeysHint")}
-                      </div>
-                      <div className="mt-3">
-                        <APIKeyMultiSelect
-                          options={apiKeys}
-                          value={allowedAPIKeySelection}
-                          disabled={apiKeys.length === 0}
-                          onChange={setAllowedAPIKeySelection}
-                          allLabel={t("accounts.allowedAPIKeysAll")}
-                          selectedLabel={t("accounts.allowedAPIKeysSelected", {
-                            count: allowedAPIKeySelection.length,
-                          })}
-                          placeholder={t("accounts.allowedAPIKeysPlaceholder")}
-                          emptyLabel={t("accounts.allowedAPIKeysNoOptions")}
-                          emptyHint={t("accounts.allowedAPIKeysNoOptionsHint")}
-                        />
-                      </div>
+                      <div className="rounded-xl border border-border p-4">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.allowedAPIKeysLabel")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.allowedAPIKeysHint")}
+                        </div>
+                          <div className="mt-3">
+                            <APIKeyMultiSelect
+                              options={apiKeys}
+                              value={allowedAPIKeySelection}
+                              disabled={apiKeys.length === 0}
+                              onChange={setAllowedAPIKeySelection}
+                              allLabel={t("accounts.allowedAPIKeysAll")}
+                              selectedLabel={t(
+                                "accounts.allowedAPIKeysSelected",
+                                {
+                                  count: allowedAPIKeySelection.length,
+                                },
+                              )}
+                              placeholder={t("accounts.allowedAPIKeysPlaceholder")}
+                              emptyLabel={t("accounts.allowedAPIKeysNoOptions")}
+                              emptyHint={t("accounts.allowedAPIKeysNoOptionsHint")}
+                            />
+                          </div>
                     </div>
 
                     <div className="rounded-xl border border-border p-4">
@@ -4737,8 +5186,6 @@ export default function Accounts() {
           </Modal>
 
           {confirmDialog}
-
-          <ToastNotice toast={toast} />
         </>
       </StateShell>
     </div>
@@ -4766,8 +5213,12 @@ function formatJSONText(text: string) {
 
 async function copyTextToClipboard(text: string) {
   if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall back for non-secure contexts or browsers that block clipboard writes.
+    }
   }
 
   const textarea = document.createElement("textarea");
@@ -4776,8 +5227,11 @@ async function copyTextToClipboard(text: string) {
   textarea.style.position = "fixed";
   textarea.style.top = "-1000px";
   textarea.style.opacity = "0";
+  textarea.style.pointerEvents = "none";
   document.body.appendChild(textarea);
+  textarea.focus({ preventScroll: true });
   textarea.select();
+  textarea.setSelectionRange(0, text.length);
   const copied = document.execCommand("copy");
   document.body.removeChild(textarea);
   if (!copied) {
@@ -5246,6 +5700,129 @@ function HeaderActionMenu({
   );
 }
 
+function OperationProgressToast({
+  progress,
+  onClose,
+}: {
+  progress: OperationProgressState | null;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  if (!progress?.show) return null;
+
+  const percent =
+    progress.total > 0
+      ? Math.min(100, Math.max(0, Math.round((progress.current / progress.total) * 100)))
+      : 0;
+  const metrics =
+    progress.action === "batch_delete"
+      ? [
+          {
+            label: t("accounts.operationProgressDeleted"),
+            value: progress.deleted || progress.success,
+            tone: "text-emerald-600 dark:text-emerald-400",
+          },
+          {
+            label: t("accounts.operationProgressFailed"),
+            value: progress.failed,
+            tone: "text-red-600 dark:text-red-400",
+          },
+        ]
+      : progress.action === "batch_refresh"
+        ? [
+            {
+              label: t("accounts.operationProgressSuccess"),
+              value: progress.success,
+              tone: "text-emerald-600 dark:text-emerald-400",
+            },
+            {
+              label: t("accounts.operationProgressFailed"),
+              value: progress.failed,
+              tone: "text-red-600 dark:text-red-400",
+            },
+          ]
+        : [
+            {
+              label: t("accounts.operationProgressSuccess"),
+              value: progress.success,
+              tone: "text-emerald-600 dark:text-emerald-400",
+            },
+            {
+              label: t("accounts.operationProgressBanned"),
+              value: progress.banned,
+              tone: "text-red-600 dark:text-red-400",
+            },
+            {
+              label: t("accounts.operationProgressRateLimited"),
+              value: progress.rateLimited,
+              tone: "text-amber-600 dark:text-amber-400",
+            },
+            {
+              label: t("accounts.operationProgressFailed"),
+              value: progress.failed,
+              tone: "text-red-600 dark:text-red-400",
+            },
+          ];
+
+  return (
+    <div className="fixed right-4 top-4 z-[80] w-[min(380px,calc(100vw-2rem))] rounded-lg border border-border bg-card/98 p-4 text-card-foreground shadow-xl backdrop-blur">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            {progress.done ? (
+              <Check className="size-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
+            ) : (
+              <Hourglass className="size-4 shrink-0 animate-pulse text-primary" />
+            )}
+            <div className="truncate text-sm font-semibold">{progress.title}</div>
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {progress.done
+              ? t("accounts.operationProgressDone")
+              : t("accounts.operationProgressRunning")}
+            {" · "}
+            {progress.current}/{progress.total || 0}
+          </div>
+        </div>
+        <button
+          type="button"
+          className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+          onClick={onClose}
+          aria-label={t("common.close")}
+        >
+          <X className="size-4" />
+        </button>
+      </div>
+
+      <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
+        <div
+          className={`h-full rounded-full transition-all duration-300 ease-out ${
+            progress.done ? "bg-emerald-500" : "bg-primary"
+          }`}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+        {metrics.map((metric) => (
+          <div key={metric.label} className="rounded-md bg-muted/40 px-2 py-1.5">
+            <div className="text-muted-foreground">{metric.label}</div>
+            <div className={`mt-0.5 font-semibold ${metric.tone}`}>
+              {metric.value}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {progress.message ? (
+        <div className="mt-3 max-h-10 overflow-hidden break-words text-xs text-muted-foreground">
+          {progress.message}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function formatPlanLabel(planType?: string): string {
   const raw = (planType || "").trim();
   if (!raw) return "-";
@@ -5253,6 +5830,53 @@ function formatPlanLabel(planType?: string): string {
   if (lower === "prolite" || lower === "pro_lite" || lower === "pro-lite")
     return "ProLite";
   return raw;
+}
+
+function ExpiryBadge({ expiresAt, planType }: { expiresAt?: string; planType?: string }) {
+  const { t, i18n } = useTranslation();
+  if (!expiresAt) return null;
+  const plan = (planType || "").toLowerCase().trim();
+  if (plan === "" || plan === "free" || plan === "api") return null;
+
+  const timestamp = Date.parse(expiresAt);
+  if (Number.isNaN(timestamp)) return null;
+
+  const days = Math.floor((timestamp - Date.now()) / 86_400_000);
+  const localDate = new Date(timestamp).toLocaleDateString(i18n.language);
+
+  if (days < 0) {
+    return (
+      <span
+        title={t("accounts.subscriptionExpiredTitle", { date: localDate })}
+        className="inline-flex items-center rounded-md bg-zinc-200 px-1.5 py-0.5 text-[11px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-400/30 dark:bg-zinc-700/50 dark:text-zinc-300 dark:ring-zinc-500/30"
+      >
+        {t("accounts.subscriptionExpiredDays", { days: -days })}
+      </span>
+    );
+  }
+  if (days <= 3) {
+    return (
+      <span
+        title={t("accounts.subscriptionExpiresTitle", { date: localDate })}
+        className="inline-flex items-center rounded-md bg-red-100 px-1.5 py-0.5 text-[11px] font-semibold text-red-700 ring-1 ring-inset ring-red-500/30 dark:bg-red-500/20 dark:text-red-300 dark:ring-red-400/30"
+      >
+        {days === 0
+          ? t("accounts.subscriptionExpiresToday")
+          : t("accounts.subscriptionExpiresDays", { days })}
+      </span>
+    );
+  }
+  if (days <= 7) {
+    return (
+      <span
+        title={t("accounts.subscriptionExpiresTitle", { date: localDate })}
+        className="inline-flex items-center rounded-md bg-amber-100 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 ring-1 ring-inset ring-amber-500/30 dark:bg-amber-500/20 dark:text-amber-300 dark:ring-amber-400/30"
+      >
+        {t("accounts.subscriptionExpiresDays", { days })}
+      </span>
+    );
+  }
+  return null;
 }
 
 function PlanBadge({ planType }: { planType?: string }) {
@@ -5342,11 +5966,20 @@ function computePreviewDispatchScore(
   return rawScore;
 }
 
+function getPreviewHealthTier(
+  account: AccountRow,
+  skipWarmTier: boolean,
+): string | undefined {
+  if (skipWarmTier && account.health_tier === "warm") return "healthy";
+  return account.health_tier;
+}
+
 function computePreviewDynamicConcurrency(
+  healthTier: string | undefined,
   account: AccountRow,
   baseConcurrency: number,
 ): number {
-  switch (account.health_tier) {
+  switch (healthTier) {
     case "healthy":
       return baseConcurrency;
     case "warm":
@@ -5616,6 +6249,350 @@ function ColumnSettingsMenu({
         </div>
       ) : null}
     </div>
+  );
+}
+
+function AccountMobileCard({
+  account,
+  sequence,
+  selected,
+  allGroups,
+  lazyMode,
+  refreshing,
+  authJsonExporting,
+  t,
+  onToggleSelect,
+  onEdit,
+  onUsage,
+  onTest,
+  onRefresh,
+  onGenerateAuthJson,
+  onToggleEnabled,
+  onToggleLock,
+  onResetStatus,
+  onDelete,
+}: {
+  account: AccountRow;
+  sequence: number;
+  selected: boolean;
+  allGroups: AccountGroup[];
+  lazyMode: boolean;
+  refreshing: boolean;
+  authJsonExporting: boolean;
+  t: ReturnType<typeof useTranslation>["t"];
+  onToggleSelect: () => void;
+  onEdit: () => void;
+  onUsage: () => void;
+  onTest: () => void;
+  onRefresh: () => void;
+  onGenerateAuthJson: () => void;
+  onToggleEnabled: () => void;
+  onToggleLock: () => void;
+  onResetStatus: () => void;
+  onDelete: () => void;
+}) {
+  const displayName = account.openai_responses_api
+    ? formatAccountName(account)
+    : formatCompactEmail(account.email);
+  const fullName = formatAccountName(account);
+  const groups = resolveAccountGroups(account.group_ids ?? [], allGroups);
+  const refreshDisabled =
+    refreshing || account.at_only || account.openai_responses_api;
+  const authJsonDisabled =
+    authJsonExporting || account.at_only || account.openai_responses_api;
+
+  return (
+    <article
+      className={`min-w-0 rounded-lg border bg-card p-3 shadow-sm ${
+        selected ? "border-primary/35 bg-primary/5" : "border-border"
+      }`}
+    >
+      <div className="flex min-w-0 items-start gap-3">
+        <input
+          type="checkbox"
+          className="mt-1 size-4 shrink-0 cursor-pointer accent-primary"
+          checked={selected}
+          onChange={onToggleSelect}
+          aria-label={fullName}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-start justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
+                  #{sequence}
+                </span>
+                <PlanBadge planType={account.plan_type} />
+                <ExpiryBadge
+                  expiresAt={account.subscription_expires_at}
+                  planType={account.plan_type}
+                />
+              </div>
+              <div
+                className="mt-1 truncate text-[15px] font-semibold leading-tight text-foreground"
+                title={fullName}
+              >
+                {displayName}
+              </div>
+            </div>
+            <div className="shrink-0">
+              <StatusBadge
+                status={account.status}
+                detail={getAccountRateLimitWindow(account) ?? undefined}
+                errorMessage={account.error_message}
+              />
+            </div>
+          </div>
+
+          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+            {account.at_only && (
+              <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
+                AT
+              </span>
+            )}
+            {account.openai_responses_api && (
+              <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
+                Responses API
+              </span>
+            )}
+            {account.enabled === false && (
+              <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
+                <PowerOff className="mr-0.5 size-2.5" />
+                {t("accounts.disabled")}
+              </span>
+            )}
+            {account.locked && (
+              <span className="inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                <Lock className="mr-0.5 size-2.5" />
+                {t("accounts.lock")}
+              </span>
+            )}
+            <AccountStatusCountdown account={account} />
+          </div>
+
+          {account.status === "error" && account.error_message && (
+            <div
+              className="mt-2 line-clamp-3 break-words text-[11px] leading-tight text-red-500"
+              title={account.error_message}
+            >
+              {account.error_message}
+            </div>
+          )}
+          {(account.model_cooldowns?.length ?? 0) > 0 && (
+            <div className="mt-2 text-[11px] leading-tight text-amber-600">
+              model {account.model_cooldowns?.[0]?.model}
+              {(account.model_cooldowns?.length ?? 0) > 1
+                ? ` +${(account.model_cooldowns?.length ?? 1) - 1}`
+                : ""}
+            </div>
+          )}
+          <div className="mt-1 text-[11px] text-muted-foreground">
+            {t("accounts.healthSummary", {
+              health: formatHealthTier(account.health_tier, t),
+              score: Math.round(getDispatchScore(account)),
+              concurrency: account.dynamic_concurrency_limit ?? "-",
+            })}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 grid min-w-0 grid-cols-2 gap-2 max-[380px]:grid-cols-1">
+        <AccountMobileMetric label={t("accounts.requests")}>
+          <div className="flex items-center gap-2 text-[13px]">
+            <span className="font-medium text-emerald-600">
+              {account.success_requests ?? 0}
+            </span>
+            <span className="text-muted-foreground">/</span>
+            <span className="font-medium text-red-500">
+              {account.error_requests ?? 0}
+            </span>
+          </div>
+          {((account.retry_error_requests ?? 0) > 0 ||
+            (account.rate_limit_attempts ?? 0) > 0) && (
+            <div className="mt-0.5 text-[11px] text-muted-foreground">
+              retry {account.retry_error_requests ?? 0} · 429{" "}
+              {account.rate_limit_attempts ?? 0}
+            </div>
+          )}
+        </AccountMobileMetric>
+        <AccountMobileMetric label={t("accounts.billed")}>
+          <BilledCell account={account} />
+        </AccountMobileMetric>
+        <AccountMobileMetric
+          label={t("accounts.usage")}
+          className="col-span-2 max-[380px]:col-span-1"
+        >
+          <UsageCell account={account} />
+        </AccountMobileMetric>
+        <AccountMobileMetric label={t("accounts.updatedAt")}>
+          {lazyMode ? (
+            <div className="space-y-0.5">
+              <div>
+                <span className="mr-1 text-muted-foreground/70">
+                  {t("accounts.recordUpdatedAtShort")}
+                </span>
+                {formatRelativeTime(account.updated_at)}
+              </div>
+              <div>
+                <span className="mr-1 text-muted-foreground/70">
+                  {t("accounts.usageUpdatedAtShort")}
+                </span>
+                {account.codex_usage_updated_at
+                  ? formatRelativeTime(account.codex_usage_updated_at)
+                  : t("accounts.noUsageUpdatedAt")}
+              </div>
+            </div>
+          ) : (
+            formatRelativeTime(account.updated_at)
+          )}
+        </AccountMobileMetric>
+        <AccountMobileMetric label={t("accounts.importTime")}>
+          {formatBeijingTime(account.created_at)}
+        </AccountMobileMetric>
+      </div>
+
+      {((account.tags ?? []).length > 0 || groups.length > 0) && (
+        <div className="mt-3 space-y-1.5 border-t border-border pt-2">
+          <ChipList items={account.tags ?? []} tone="purple" />
+          <GroupChipList groups={groups} />
+        </div>
+      )}
+
+      <div className="mt-3 grid grid-cols-5 gap-1.5 max-[380px]:grid-cols-4">
+        <AccountMobileActionButton
+          title={t("accounts.editScheduler")}
+          onClick={onEdit}
+          icon={<Pencil className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t("accounts.usageDetail")}
+          onClick={onUsage}
+          icon={<BarChart3 className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t("accounts.testConnection")}
+          onClick={onTest}
+          icon={<Zap className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={
+            account.at_only || account.openai_responses_api
+              ? t("accounts.atRefreshDisabled")
+              : t("accounts.refreshAccessToken")
+          }
+          disabled={refreshDisabled}
+          onClick={onRefresh}
+          icon={
+            <RefreshCw
+              className={`size-3.5 ${refreshing ? "animate-spin" : ""}`}
+            />
+          }
+        />
+        <AccountMobileActionButton
+          title={
+            account.at_only || account.openai_responses_api
+              ? t("accounts.authJsonDisabled")
+              : t("accounts.generateAuthJson")
+          }
+          disabled={authJsonDisabled}
+          onClick={onGenerateAuthJson}
+          icon={<FileJson className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={
+            account.enabled === false
+              ? t("accounts.enableHint")
+              : t("accounts.disableHint")
+          }
+          variant={account.enabled === false ? "default" : "outline"}
+          onClick={onToggleEnabled}
+          icon={
+            account.enabled === false ? (
+              <Power className="size-3.5" />
+            ) : (
+              <PowerOff className="size-3.5" />
+            )
+          }
+        />
+        <AccountMobileActionButton
+          title={
+            account.locked ? t("accounts.unlockHint") : t("accounts.lockHint")
+          }
+          variant={account.locked ? "default" : "outline"}
+          onClick={onToggleLock}
+          icon={
+            account.locked ? (
+              <Lock className="size-3.5" />
+            ) : (
+              <Unlock className="size-3.5" />
+            )
+          }
+        />
+        <AccountMobileActionButton
+          title={t("accounts.resetStatusHint")}
+          onClick={onResetStatus}
+          icon={<RotateCcw className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t("accounts.deleteAccount")}
+          variant="destructive"
+          onClick={onDelete}
+          icon={<Trash2 className="size-3.5" />}
+        />
+      </div>
+    </article>
+  );
+}
+
+function AccountMobileMetric({
+  label,
+  children,
+  className = "",
+}: {
+  label: string;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`min-w-0 rounded-lg border border-border bg-muted/20 p-2 ${className}`}
+    >
+      <div className="mb-1 text-[11px] font-bold uppercase text-muted-foreground">
+        {label}
+      </div>
+      <div className="min-w-0 break-words text-[12px] leading-snug text-foreground">
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function AccountMobileActionButton({
+  title,
+  icon,
+  onClick,
+  disabled,
+  variant = "outline",
+}: {
+  title: string;
+  icon: ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  variant?: "default" | "outline" | "destructive";
+}) {
+  return (
+    <Button
+      type="button"
+      variant={variant}
+      size="icon-sm"
+      className="h-9 w-full"
+      disabled={disabled}
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+    >
+      {icon}
+    </Button>
   );
 }
 

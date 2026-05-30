@@ -639,6 +639,9 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/generations", imageModel) {
 		return
 	}
+	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -742,6 +745,9 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
 		return
 	}
+	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
+		return
+	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
@@ -834,6 +840,9 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
 	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+		return
+	}
+	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)

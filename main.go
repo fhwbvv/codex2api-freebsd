@@ -74,6 +74,7 @@ func main() {
 			MaxRateLimitRetries:              1,
 			BackgroundRefreshIntervalMinutes: 2,
 			UsageProbeMaxAgeMinutes:          10,
+			UsageProbeConcurrency:            16,
 			RecoveryProbeIntervalMinutes:     30,
 			LazyMode:                         false,
 			ProxyURL:                         "",
@@ -95,6 +96,7 @@ func main() {
 			UsageLogFlushIntervalSeconds:     5,
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
+			FirstTokenTimeoutSeconds:         0,
 			ImageStorageConfig:               "{}",
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
@@ -109,6 +111,7 @@ func main() {
 			MaxRateLimitRetries:              1,
 			BackgroundRefreshIntervalMinutes: 2,
 			UsageProbeMaxAgeMinutes:          10,
+			UsageProbeConcurrency:            16,
 			RecoveryProbeIntervalMinutes:     30,
 			LazyMode:                         false,
 			PgMaxConns:                       50,
@@ -127,6 +130,7 @@ func main() {
 			UsageLogFlushIntervalSeconds:     5,
 			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:            20,
+			FirstTokenTimeoutSeconds:         0,
 			ImageStorageConfig:               "{}",
 		}
 	} else {
@@ -173,7 +177,7 @@ func main() {
 	}
 	db.SetUsageLogConfig(settings.UsageLogMode, settings.UsageLogBatchSize, settings.UsageLogFlushIntervalSeconds)
 	runtimeSettings := proxy.ApplyRuntimeSettingsFromSystem(settings)
-	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms",
+	log.Printf("运行时优化配置: client_compat=%s min_cli=%s usage_log=%s batch=%d flush=%ds stream_flush=%s/%dms first_token_timeout=%ds",
 		runtimeSettings.ClientCompatMode,
 		runtimeSettings.CodexMinCLIVersion,
 		db.GetUsageLogMode(),
@@ -181,6 +185,7 @@ func main() {
 		db.GetUsageLogFlushIntervalSeconds(),
 		runtimeSettings.StreamFlushPolicy,
 		runtimeSettings.StreamFlushIntervalMS,
+		runtimeSettings.FirstTokenTimeoutSec,
 	)
 
 	// 4b'. 应用图片存储后端配置

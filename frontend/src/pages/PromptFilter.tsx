@@ -7,7 +7,7 @@ import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
-import ToastNotice from '../components/ToastNotice'
+import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import { formatBeijingTime, formatRelativeTime } from '../utils/time'
@@ -324,7 +324,6 @@ export default function PromptFilter() {
           />
         ) : null}
 
-        <ToastNotice toast={toast} />
       </>
     </StateShell>
   )
@@ -525,7 +524,7 @@ function LogsView({ clearLogs, clearing }: { clearLogs: () => Promise<void>; cle
   const [draftFilters, setDraftFilters] = useState<LogFilters>(emptyFilters)
   const [filters, setFilters] = useState<LogFilters>(emptyFilters)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
+  const [pageSize, setPageSize] = usePersistedPageSize('prompt_filter_logs', 20, DEFAULT_PAGE_SIZE_OPTIONS)
   const [logs, setLogs] = useState<PromptFilterLog[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
@@ -623,7 +622,7 @@ function LogsView({ clearLogs, clearing }: { clearLogs: () => Promise<void>; cle
 
         <StateShell loading={loading} error={error} isEmpty={!loading && logs.length === 0} onRetry={() => void loadLogs()} emptyTitle={t('promptFilter.noLogs')}>
           <PromptFilterLogsTable logs={logs} />
-          <Pagination page={page} totalPages={totalPages} totalItems={total} pageSize={pageSize} onPageChange={setPage} onPageSizeChange={(next) => { setPage(1); setPageSize(next) }} pageSizeOptions={[10, 20, 50, 100]} />
+          <Pagination page={page} totalPages={totalPages} totalItems={total} pageSize={pageSize} onPageChange={setPage} onPageSizeChange={(next) => { setPage(1); setPageSize(next) }} pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS} />
         </StateShell>
       </CardContent>
     </Card>

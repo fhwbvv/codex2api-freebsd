@@ -26,6 +26,7 @@ type anthropicRequest struct {
 	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
 	ToolChoice   json.RawMessage        `json:"tool_choice,omitempty"`
 	Metadata     json.RawMessage        `json:"metadata,omitempty"`
+	Speed        string                 `json:"speed,omitempty"`
 }
 
 type anthropicThinking struct {
@@ -240,6 +241,10 @@ func TranslateAnthropicToCodex(rawJSON []byte, modelMappingJSON string) ([]byte,
 	return TranslateAnthropicToCodexWithModels(rawJSON, modelMappingJSON, SupportedModels)
 }
 
+func shouldUseCodexPriorityForAnthropicSpeed(speed string) bool {
+	return strings.ToLower(strings.TrimSpace(speed)) == "fast"
+}
+
 // TranslateAnthropicToCodexWithModels 将 Anthropic Messages 请求转换为 Codex Responses 格式
 // 返回: (codex 请求体, 原始 Anthropic model 名, error)
 func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string, supportedModels []string) ([]byte, string, error) {
@@ -269,6 +274,12 @@ func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string
 	out["reasoning"] = map[string]any{
 		"effort":  resolveReasoningEffort(req.OutputConfig),
 		"summary": "auto",
+	}
+
+	if shouldUseCodexPriorityForAnthropicSpeed(req.Speed) {
+		if upstreamTier, ok := upstreamServiceTier("priority"); ok {
+			out["service_tier"] = upstreamTier
+		}
 	}
 
 	// tools
@@ -532,19 +543,19 @@ func convertAnthropicToolChoice(raw json.RawMessage) any {
 
 // anthropicStreamTranslator 有状态的流式响应翻译器（Codex → Anthropic）
 type anthropicStreamTranslator struct {
-	model                   string
-	responseID              string
-	messageStartSent        bool
-	contentBlockIndex       int
-	contentBlockOpen        bool
-	currentBlockType        string // "text" | "thinking" | "tool_use"
-	currentToolUseID        string
-	currentToolUseName      string
-	currentToolInputBuffer  strings.Builder
-	hasToolUse              bool
-	inputTokens             int
-	outputTokens            int
-	cachedTokens            int
+	model                  string
+	responseID             string
+	messageStartSent       bool
+	contentBlockIndex      int
+	contentBlockOpen       bool
+	currentBlockType       string // "text" | "thinking" | "tool_use"
+	currentToolUseID       string
+	currentToolUseName     string
+	currentToolInputBuffer strings.Builder
+	hasToolUse             bool
+	inputTokens            int
+	outputTokens           int
+	cachedTokens           int
 }
 
 // newAnthropicStreamTranslator 创建流式翻译器
@@ -937,6 +948,113 @@ func anthropicEventToSSE(evt anthropicStreamEvent) string {
 }
 
 // ==================== 非流式响应构建 ====================
+
+type anthropicResponseAccumulator struct {
+	response *anthropicResponse
+	content  []anthropicContentBlock
+}
+
+func newAnthropicResponseAccumulator(model string) *anthropicResponseAccumulator {
+	return &anthropicResponseAccumulator{
+		response: &anthropicResponse{
+			ID:      "msg_" + uuid.New().String()[:24],
+			Type:    "message",
+			Role:    "assistant",
+			Content: []anthropicContentBlock{},
+			Model:   model,
+		},
+	}
+}
+
+func (a *anthropicResponseAccumulator) apply(events []anthropicStreamEvent) {
+	for _, evt := range events {
+		switch evt.Type {
+		case "message_start":
+			if evt.Message != nil {
+				msg := *evt.Message
+				msg.Content = []anthropicContentBlock{}
+				a.response = &msg
+				a.content = a.content[:0]
+			}
+		case "content_block_start":
+			if evt.Index == nil || evt.ContentBlock == nil {
+				continue
+			}
+			a.ensureContentIndex(*evt.Index)
+			a.content[*evt.Index] = *evt.ContentBlock
+		case "content_block_delta":
+			if evt.Index == nil || evt.Delta == nil {
+				continue
+			}
+			a.ensureContentIndex(*evt.Index)
+			switch evt.Delta.Type {
+			case "text_delta":
+				a.content[*evt.Index].Text += evt.Delta.Text
+			case "thinking_delta":
+				a.content[*evt.Index].Thinking += evt.Delta.Thinking
+			case "input_json_delta":
+				a.content[*evt.Index].Input = json.RawMessage(evt.Delta.PartialJSON)
+			}
+		case "message_delta":
+			if evt.Delta != nil && evt.Delta.StopReason != "" {
+				a.response.StopReason = evt.Delta.StopReason
+			}
+			if evt.Usage != nil {
+				a.response.Usage = *evt.Usage
+			}
+		}
+	}
+}
+
+func (a *anthropicResponseAccumulator) ensureContentIndex(idx int) {
+	for len(a.content) <= idx {
+		a.content = append(a.content, anthropicContentBlock{})
+	}
+}
+
+func (a *anthropicResponseAccumulator) build(completedData []byte) *anthropicResponse {
+	fallback := buildAnthropicResponseFromCompleted(completedData, a.response.Model)
+	resp := *a.response
+	resp.Content = compactAnthropicContent(a.content)
+
+	if len(resp.Content) == 0 && len(fallback.Content) > 0 {
+		return fallback
+	}
+	if resp.StopReason == "" {
+		resp.StopReason = fallback.StopReason
+	}
+	if resp.StopReason == "" {
+		resp.StopReason = "end_turn"
+	}
+	if resp.Usage == (anthropicUsage{}) {
+		resp.Usage = fallback.Usage
+	}
+	return &resp
+}
+
+func compactAnthropicContent(content []anthropicContentBlock) []anthropicContentBlock {
+	out := make([]anthropicContentBlock, 0, len(content))
+	for _, block := range content {
+		switch block.Type {
+		case "text":
+			if block.Text == "" {
+				continue
+			}
+		case "thinking":
+			if block.Thinking == "" {
+				continue
+			}
+		case "tool_use":
+			if block.Input == nil || !json.Valid(block.Input) {
+				block.Input = json.RawMessage("{}")
+			}
+		default:
+			continue
+		}
+		out = append(out, block)
+	}
+	return out
+}
 
 // buildAnthropicResponseFromCompleted 从 response.completed 事件构建完整的 Anthropic 响应
 func buildAnthropicResponseFromCompleted(completedData []byte, model string) *anthropicResponse {

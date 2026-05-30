@@ -1,11 +1,13 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imagestore"
 	"github.com/gin-gonic/gin"
 )
 
@@ -47,6 +50,168 @@ func TestRefreshAccountRejectsInvalidID(t *testing.T) {
 	}
 	if got := payload["error"]; got != "无效的账号 ID" {
 		t.Fatalf("error = %q, want %q", got, "无效的账号 ID")
+	}
+}
+
+func TestNormalizeBackgroundUploadMedia(t *testing.T) {
+	tests := []struct {
+		name        string
+		filename    string
+		contentType string
+		data        []byte
+		wantMime    string
+		wantExt     string
+		wantErr     bool
+	}{
+		{
+			name:        "png by content",
+			filename:    "wallpaper.png",
+			contentType: "application/octet-stream",
+			data:        []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 0},
+			wantMime:    "image/png",
+			wantExt:     "png",
+		},
+		{
+			name:        "svg by extension",
+			filename:    "wallpaper.svg",
+			contentType: "image/svg+xml",
+			data:        []byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>`),
+			wantMime:    "image/svg+xml",
+			wantExt:     "svg",
+		},
+		{
+			name:        "mp4 by signature",
+			filename:    "wallpaper.mp4",
+			contentType: "video/mp4",
+			data:        []byte{0, 0, 0, 24, 'f', 't', 'y', 'p', 'm', 'p', '4', '2'},
+			wantMime:    "video/mp4",
+			wantExt:     "mp4",
+		},
+		{
+			name:        "reject fake mp4",
+			filename:    "wallpaper.mp4",
+			contentType: "video/mp4",
+			data:        []byte("not actually an mp4 file"),
+			wantErr:     true,
+		},
+		{
+			name:        "reject html",
+			filename:    "wallpaper.png",
+			contentType: "image/png",
+			data:        []byte("<html><script>alert(1)</script></html>"),
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotMime, gotExt, err := normalizeBackgroundUploadMedia(tt.filename, tt.contentType, tt.data)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotMime != tt.wantMime || gotExt != tt.wantExt {
+				t.Fatalf("mime/ext = %q/%q, want %q/%q", gotMime, gotExt, tt.wantMime, tt.wantExt)
+			}
+		})
+	}
+}
+
+func TestDecodeBackgroundConfigGlassDefaultsAndClamp(t *testing.T) {
+	defaulted := decodeBackgroundConfig(`{"image":"/wallpaper.jpg"}`)
+	if defaulted.Opacity != defaultBackgroundOpacity {
+		t.Fatalf("default opacity = %d, want %d", defaulted.Opacity, defaultBackgroundOpacity)
+	}
+	if defaulted.GlassOpacity != defaultBackgroundGlassOpacity {
+		t.Fatalf("default glass opacity = %d, want %d", defaulted.GlassOpacity, defaultBackgroundGlassOpacity)
+	}
+	if defaulted.GlassBlur != defaultBackgroundGlassBlur {
+		t.Fatalf("default glass blur = %d, want %d", defaulted.GlassBlur, defaultBackgroundGlassBlur)
+	}
+
+	clamped := decodeBackgroundConfig(`{"image":"/wallpaper.jpg","opacity":200,"blur":200,"glass_opacity":200,"glass_blur":200}`)
+	if clamped.Opacity != 100 {
+		t.Fatalf("clamped opacity = %d, want 100", clamped.Opacity)
+	}
+	if clamped.Blur != maxBackgroundBlur {
+		t.Fatalf("clamped blur = %d, want %d", clamped.Blur, maxBackgroundBlur)
+	}
+	if clamped.GlassOpacity != 100 {
+		t.Fatalf("clamped glass opacity = %d, want 100", clamped.GlassOpacity)
+	}
+	if clamped.GlassBlur != maxBackgroundGlassBlur {
+		t.Fatalf("clamped glass blur = %d, want %d", clamped.GlassBlur, maxBackgroundGlassBlur)
+	}
+
+	transparent := decodeBackgroundConfig(`{"image":"/wallpaper.jpg","glass_opacity":0,"glass_blur":0}`)
+	if transparent.GlassOpacity != 0 || transparent.GlassBlur != 0 {
+		t.Fatalf("transparent glass = %d/%d, want 0/0", transparent.GlassOpacity, transparent.GlassBlur)
+	}
+}
+
+func TestBackgroundUploadLimitBytes(t *testing.T) {
+	if got := backgroundUploadLimitBytes("image/png"); got != maxBackgroundImageAssetUploadBytes {
+		t.Fatalf("image upload limit = %d, want %d", got, maxBackgroundImageAssetUploadBytes)
+	}
+	if got := backgroundUploadLimitBytes("video/mp4"); got != maxBackgroundVideoAssetUploadBytes {
+		t.Fatalf("video upload limit = %d, want %d", got, maxBackgroundVideoAssetUploadBytes)
+	}
+	if maxBackgroundVideoAssetUploadBytes != 40*1024*1024 {
+		t.Fatalf("video upload limit = %d, want 40MB", maxBackgroundVideoAssetUploadBytes)
+	}
+}
+
+func TestUploadBackgroundAssetStoresFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("BACKGROUND_ASSET_DIR", t.TempDir())
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "wallpaper.svg")
+	if err != nil {
+		t.Fatalf("create form file: %v", err)
+	}
+	if _, err := part.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>`)); err != nil {
+		t.Fatalf("write form file: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/settings/background-upload", &body)
+	ctx.Request.Header.Set("Content-Type", writer.FormDataContentType())
+
+	handler := &Handler{}
+	handler.UploadBackgroundAsset(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	var payload backgroundAssetUploadResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.HasPrefix(payload.URL, backgroundAssetURLPrefix) {
+		t.Fatalf("url = %q, want prefix %q", payload.URL, backgroundAssetURLPrefix)
+	}
+	if payload.MimeType != "image/svg+xml" || payload.Bytes <= 0 {
+		t.Fatalf("payload = %+v, want svg mime and non-empty bytes", payload)
+	}
+
+	fullPath, ok := backgroundAssetPath(strings.TrimPrefix(payload.URL, backgroundAssetURLPrefix))
+	if !ok {
+		t.Fatalf("invalid stored asset path for url %q", payload.URL)
+	}
+	if _, err := os.Stat(fullPath); err != nil {
+		t.Fatalf("stored file missing: %v", err)
 	}
 }
 
@@ -144,6 +309,176 @@ func TestRefreshAccountReturnsRefreshFailure(t *testing.T) {
 	}
 	if got := payload["error"]; got != "刷新失败: upstream unavailable" {
 		t.Fatalf("error = %q, want %q", got, "刷新失败: upstream unavailable")
+	}
+}
+
+func TestBatchRefreshAccountsReportsCounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{
+		refreshAccount: func(_ context.Context, id int64) error {
+			if id == 8 {
+				return errors.New("upstream unavailable")
+			}
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-refresh", strings.NewReader(`{"ids":[7,8,7,0]}`))
+
+	handler.BatchRefreshAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["success"]; got != float64(1) {
+		t.Fatalf("success = %v, want 1", got)
+	}
+	if got := payload["failed"]; got != float64(1) {
+		t.Fatalf("failed = %v, want 1", got)
+	}
+}
+
+func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{
+		refreshAccount: func(_ context.Context, id int64) error {
+			if id == 8 {
+				return errors.New("账号 8 不存在")
+			}
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-refresh?stream=true", strings.NewReader(`{"ids":[7,8]}`))
+
+	handler.BatchRefreshAccounts(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("content-type = %q, want event-stream", got)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`"type":"start"`,
+		`"type":"progress"`,
+		`"type":"complete"`,
+		`"action":"batch_refresh"`,
+		`"success":1`,
+		`"failed":1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream body missing %s:\n%s", want, body)
+		}
+	}
+}
+
+func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{DBID: 42, AccessToken: "at", PlanType: "free"}
+	account.SetUsageSnapshot(88, time.Now().Add(time.Hour))
+	store.AddAccount(account)
+
+	called := make(chan int64, 1)
+	handler := &Handler{
+		store: store,
+		syncAccountPlanOnReset: func(_ context.Context, acc *auth.Account) error {
+			if acc == nil {
+				t.Errorf("sync account is nil")
+				called <- -1
+				return nil
+			}
+			called <- acc.DBID
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "42"}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/42/reset-status", nil)
+
+	handler.ResetAccountStatus(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	select {
+	case id := <-called:
+		if id != 42 {
+			t.Fatalf("sync DBID = %d, want 42", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected reset to sync plan metadata")
+	}
+	if _, ok := account.GetUsagePercent7d(); ok {
+		t.Fatal("expected reset to clear cached usage")
+	}
+}
+
+func TestBatchResetStatusSyncsEachResolvedAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 11, AccessToken: "at-11", PlanType: "free"})
+	store.AddAccount(&auth.Account{DBID: 22, AccessToken: "at-22", PlanType: "plus"})
+
+	gotIDs := make(chan int64, 2)
+	handler := &Handler{
+		store: store,
+		syncAccountPlanOnReset: func(_ context.Context, acc *auth.Account) error {
+			gotIDs <- acc.DBID
+			if acc.DBID == 22 {
+				return errors.New("temporary upstream failure")
+			}
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-reset-status", strings.NewReader(`{"ids":[11,99,22]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.BatchResetStatus(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["success"] != float64(2) || payload["failed"] != float64(1) {
+		t.Fatalf("payload = %#v, want success=2 failed=1", payload)
+	}
+
+	collected := make(map[int64]bool)
+	deadline := time.After(2 * time.Second)
+	for len(collected) < 2 {
+		select {
+		case id := <-gotIDs:
+			collected[id] = true
+		case <-deadline:
+			t.Fatalf("synced ids = %v, want {11,22}", collected)
+		}
+	}
+	if !collected[11] || !collected[22] {
+		t.Fatalf("synced ids = %v, want both 11 and 22", collected)
 	}
 }
 
@@ -421,6 +756,55 @@ func TestGetUsageLogsRejectsInvalidAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestRuntimeStatusRouteReturnsDependencySnapshot(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	imageDir := t.TempDir()
+	if err := imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: imageDir}); err != nil {
+		t.Fatalf("imagestore.Configure: %v", err)
+	}
+
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	router := gin.New()
+	handler.RegisterRoutes(router)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/runtime-status", nil)
+	req.Header.Set("X-Admin-Key", "admin-secret")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload runtimeStatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Status != runtimeStatusDegraded {
+		t.Fatalf("status = %q, want %q for empty account pool", payload.Status, runtimeStatusDegraded)
+	}
+	if !payload.Database.Healthy || payload.Database.Driver != "sqlite" {
+		t.Fatalf("database = healthy:%v driver:%q, want healthy sqlite", payload.Database.Healthy, payload.Database.Driver)
+	}
+	if !payload.Cache.Healthy || payload.Cache.Driver != "memory" {
+		t.Fatalf("cache = healthy:%v driver:%q, want healthy memory", payload.Cache.Healthy, payload.Cache.Driver)
+	}
+	if !payload.AdminAuth.Configured || payload.AdminAuth.Source != "env" {
+		t.Fatalf("admin auth = configured:%v source:%q, want env configured", payload.AdminAuth.Configured, payload.AdminAuth.Source)
+	}
+	if payload.ImageStorage.Backend != imagestore.BackendLocal || payload.ImageStorage.LocalDir != imageDir {
+		t.Fatalf("image storage = %q %q, want local %q", payload.ImageStorage.Backend, payload.ImageStorage.LocalDir, imageDir)
+	}
+	if payload.UsageLog.Mode != database.UsageLogModeFull || !payload.UsageLog.Enabled {
+		t.Fatalf("usage log = mode:%q enabled:%v, want full enabled", payload.UsageLog.Mode, payload.UsageLog.Enabled)
+	}
+}
+
 func TestUpdateAccountSchedulerRejectsInvalidID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -455,6 +839,26 @@ func TestUpdateAccountSchedulerRejectsInvalidBody(t *testing.T) {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
 	}
 	assertErrorMessage(t, recorder, "score_bias_override 必须是整数或 null")
+}
+
+func TestUpdateAccountSchedulerRejectsInvalidSkipWarmTier(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"skip_warm_tier":"yes"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	assertErrorMessage(t, recorder, "skip_warm_tier 必须是布尔值或 null")
 }
 
 func TestUpdateAccountSchedulerRejectsInvalidAllowedAPIKeyIDs(t *testing.T) {
@@ -551,7 +955,7 @@ func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"score_bias_override":88,"base_concurrency_override":7}`))
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"score_bias_override":88,"base_concurrency_override":7,"skip_warm_tier":true}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ctx)
@@ -572,6 +976,9 @@ func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
 	}
 	if !rows[0].BaseConcurrencyOverride.Valid || rows[0].BaseConcurrencyOverride.Int64 != 7 {
 		t.Fatalf("base_concurrency_override = %+v, want 7", rows[0].BaseConcurrencyOverride)
+	}
+	if !rows[0].SkipWarmTier {
+		t.Fatal("skip_warm_tier = false, want true")
 	}
 }
 
@@ -795,7 +1202,7 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"allowed_api_key_ids":[%d,%d]}`, keyID2, keyID1)))
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"skip_warm_tier":true,"allowed_api_key_ids":[%d,%d]}`, keyID2, keyID1)))
 	ginCtx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ginCtx)
@@ -811,6 +1218,9 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	baseConcurrency, ok := runtimeAccount.GetBaseConcurrencyOverride()
 	if !ok || baseConcurrency != 5 {
 		t.Fatalf("runtime base_concurrency_override = (%d, %t), want (5, true)", baseConcurrency, ok)
+	}
+	if !runtimeAccount.SkipWarmTier {
+		t.Fatal("runtime skip_warm_tier = false, want true")
 	}
 	if got := runtimeAccount.GetAllowedAPIKeyIDs(); len(got) != 2 || got[0] != keyID1 || got[1] != keyID2 {
 		t.Fatalf("runtime allowed_api_key_ids = %v, want [%d %d]", got, keyID1, keyID2)

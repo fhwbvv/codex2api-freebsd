@@ -1,16 +1,17 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
+import { createPortal } from 'react-dom'
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts'
 import { api } from '../api'
 import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
-import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { APIKeyRow, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
+import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
+import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
 import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -29,9 +30,30 @@ import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
-function formatTokens(value?: number | null): string {
+function formatTokens(value?: number | null, showFullNumbers = false): string {
   if (value === undefined || value === null) return '0'
-  return value.toLocaleString()
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) return '0'
+  const roundedValue = Math.round(numericValue)
+  if (showFullNumbers) return roundedValue.toLocaleString()
+
+  const absValue = Math.abs(numericValue)
+  const units = [
+    { value: 1_000_000_000_000, suffix: 'T' },
+    { value: 1_000_000_000, suffix: 'B' },
+    { value: 1_000_000, suffix: 'M' },
+    { value: 1_000, suffix: 'K' },
+  ]
+  const unit = units.find((item) => absValue >= item.value)
+  if (!unit) return roundedValue.toLocaleString()
+
+  const scaled = numericValue / unit.value
+  const fractionDigits = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 2
+  const compact = scaled
+    .toFixed(fractionDigits)
+    .replace(/\.0+$/, '')
+    .replace(/(\.\d*?)0+$/, '$1')
+  return `${compact}${unit.suffix}`
 }
 
 function getStatusBadgeClassName(statusCode: number): string {
@@ -55,7 +77,46 @@ function getStatusBadgeClassName(statusCode: number): string {
 
 const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
 
+// 本页面局部的"自定义"区间标记。不污染全局 TimeRangeKey 类型 (Dashboard 等仍只识别预设档)。
+type UsageTimeRangeKey = TimeRangeKey | 'custom'
+interface CustomRange {
+  start: string // RFC3339 with offset
+  end: string
+}
+const CUSTOM_RANGE_MAX_DAYS = 90
+const CUSTOM_RANGE_MAX_MS = CUSTOM_RANGE_MAX_DAYS * 24 * 60 * 60 * 1000
+
+// datetime-local input 的字面值 ↔ Date 转换。input 本身没有时区,按本地时间解释。
+function dateToLocalInputValue(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+function localInputValueToDate(value: string): Date | null {
+  if (!value) return null
+  const d = new Date(value)
+  return Number.isNaN(d.getTime()) ? null : d
+}
+function dateToLocalRFC3339(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const offset = date.getTimezoneOffset()
+  const sign = offset <= 0 ? '+' : '-'
+  const absOffset = Math.abs(offset)
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${sign}${pad(Math.floor(absOffset / 60))}:${pad(absOffset % 60)}`
+}
+
+function resolveRangeISO(
+  range: UsageTimeRangeKey,
+  custom: CustomRange | null,
+): { start: string; end: string } {
+  if (range === 'custom' && custom) {
+    return { start: custom.start, end: custom.end }
+  }
+  return getTimeRangeISO((range === 'custom' ? '24h' : range) as TimeRangeKey)
+}
+
 const USAGE_ANALYSIS_VISIBILITY_KEY = 'usage_analysis_visible'
+const usageStatCardContentClass = 'flex min-w-0 flex-col gap-1.5 p-3'
+const usageStatValueClass = 'min-w-0 break-words text-[20px] font-bold leading-tight tabular-nums sm:text-[22px]'
 
 function getInitialAnalysisVisibility(): boolean {
   try {
@@ -149,6 +210,7 @@ function UsageCostCell({ log }: { log: UsageLog }) {
   const userBilled = safeNumber(log.user_billed)
   const totalCost = safeNumber(log.total_cost)
   const displayCost = userBilled > 0 ? userBilled : accountBilled
+  const longContextThreshold = safeNumber(log.long_context_threshold)
   const hasCostContext = log.status_code < 400 && (
     accountBilled > 0 ||
     userBilled > 0 ||
@@ -175,7 +237,7 @@ function UsageCostCell({ log }: { log: UsageLog }) {
           <Info className="size-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-blue-500" />
         </button>
       </TooltipTrigger>
-      <TooltipContent side="right" sideOffset={8} className="w-72 max-w-none whitespace-nowrap rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-50 shadow-xl">
+      <TooltipContent side="right" sideOffset={8} className="w-96 max-w-none whitespace-nowrap rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-50 shadow-xl">
         <div className="space-y-1.5">
           <div className="mb-1 text-xs font-semibold text-slate-300">{t('usage.costDetails')}</div>
           {log.input_cost > 0 && (
@@ -195,6 +257,25 @@ function UsageCostCell({ log }: { log: UsageLog }) {
           )}
           {log.cached_tokens > 0 && log.cache_read_price_per_mtoken > 0 && (
             <CostTooltipRow label={t('usage.cacheReadUnitPrice')} value={formatTokenPricePerMillion(log.cache_read_price_per_mtoken)} valueClassName="text-cyan-300" />
+          )}
+          <CostTooltipRow
+            label={t('usage.billingTier')}
+            value={(log.service_tier === 'fast' || log.service_tier === 'priority')
+              ? t('usage.billingTierFast')
+              : t('usage.billingTierStandard')}
+            valueClassName={(log.service_tier === 'fast' || log.service_tier === 'priority')
+              ? 'text-amber-300'
+              : 'text-slate-200'}
+          />
+          {log.long_context && longContextThreshold > 0 && (
+            <CostTooltipRow
+              label={t('usage.billingContext')}
+              value={t('usage.billingContextLong', {
+                input: formatTokens(log.input_tokens, true),
+                threshold: formatTokens(longContextThreshold, true),
+              })}
+              valueClassName="text-orange-300"
+            />
           )}
         </div>
       </TooltipContent>
@@ -251,13 +332,19 @@ function buildModelPieData(stats: UsageModelStat[], useAmount: boolean, otherLab
   }))
 }
 
-function ModelSharePie({ stats }: { stats: UsageModelStat[] }) {
+function ModelSharePie({
+  stats,
+  showFullUsageNumbers,
+}: {
+  stats: UsageModelStat[]
+  showFullUsageNumbers: boolean
+}) {
   const { t } = useTranslation()
   const totalAmount = stats.reduce((sum, item) => sum + safeNumber(item.user_billed), 0)
   const totalRequests = stats.reduce((sum, item) => sum + safeNumber(item.requests), 0)
   const useAmount = totalAmount > 0
   const pieData = buildModelPieData(stats, useAmount, t('usage.modelStatsOther'))
-  const centerValue = useAmount ? formatCostCardValue(totalAmount) : formatTokens(totalRequests)
+  const centerValue = useAmount ? formatCostCardValue(totalAmount) : formatTokens(totalRequests, showFullUsageNumbers)
   const metricLabel = useAmount ? t('usage.modelPieAmount') : t('usage.modelPieRequests')
 
   if (pieData.length === 0) {
@@ -299,7 +386,7 @@ function ModelSharePie({ stats }: { stats: UsageModelStat[] }) {
             </Pie>
             <RechartsTooltip
               formatter={(value, name) => [
-                useAmount ? formatCostCardValue(Number(value ?? 0)) : formatTokens(Number(value ?? 0)),
+                useAmount ? formatCostCardValue(Number(value ?? 0)) : formatTokens(Number(value ?? 0), showFullUsageNumbers),
                 String(name ?? ''),
               ]}
               contentStyle={{
@@ -335,7 +422,13 @@ function ModelSharePie({ stats }: { stats: UsageModelStat[] }) {
   )
 }
 
-function ModelStatsPanel({ stats }: { stats: UsageModelStat[] }) {
+function ModelStatsPanel({
+  stats,
+  showFullUsageNumbers,
+}: {
+  stats: UsageModelStat[]
+  showFullUsageNumbers: boolean
+}) {
   const { t } = useTranslation()
   const totalRequests = stats.reduce((sum, item) => sum + safeNumber(item.requests), 0)
   const maxRequests = Math.max(1, ...stats.map((item) => safeNumber(item.requests)))
@@ -371,10 +464,10 @@ function ModelStatsPanel({ stats }: { stats: UsageModelStat[] }) {
                           {item.model}
                         </div>
                         <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-muted-foreground">
-                          <span>{t('usage.modelStatsRequests')}: {formatTokens(item.requests)}</span>
-                          <span>{t('usage.modelStatsTokens')}: {formatTokens(item.tokens)}</span>
+                          <span>{t('usage.modelStatsRequests')}: {formatTokens(item.requests, showFullUsageNumbers)}</span>
+                          <span>{t('usage.modelStatsTokens')}: {formatTokens(item.tokens, showFullUsageNumbers)}</span>
                           {item.error_count > 0 && (
-                            <span className="text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')}: {formatTokens(item.error_count)}</span>
+                            <span className="text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')}: {formatTokens(item.error_count, showFullUsageNumbers)}</span>
                           )}
                         </div>
                       </div>
@@ -392,7 +485,7 @@ function ModelStatsPanel({ stats }: { stats: UsageModelStat[] }) {
                 )
               })}
             </div>
-            <ModelSharePie stats={stats} />
+            <ModelSharePie stats={stats} showFullUsageNumbers={showFullUsageNumbers} />
           </div>
         )}
       </CardContent>
@@ -400,7 +493,15 @@ function ModelStatsPanel({ stats }: { stats: UsageModelStat[] }) {
   )
 }
 
-function FeatureStatsPanel({ stats, totalRequests }: { stats?: UsageFeatureStats; totalRequests: number }) {
+function FeatureStatsPanel({
+  stats,
+  totalRequests,
+  showFullUsageNumbers,
+}: {
+  stats?: UsageFeatureStats
+  totalRequests: number
+  showFullUsageNumbers: boolean
+}) {
   const { t } = useTranslation()
   const safeStats = stats ?? {
     stream_requests: 0,
@@ -455,7 +556,7 @@ function FeatureStatsPanel({ stats, totalRequests }: { stats?: UsageFeatureStats
                   </span>
                 </div>
                 <div className="mt-0.5 font-geist-mono text-[20px] font-bold leading-tight tabular-nums text-foreground">
-                  {formatTokens(item.value)}
+                  {formatTokens(item.value, showFullUsageNumbers)}
                 </div>
                 <div className="mt-1.5 h-[3px] overflow-hidden rounded-full bg-foreground/5">
                   <div
@@ -472,7 +573,15 @@ function FeatureStatsPanel({ stats, totalRequests }: { stats?: UsageFeatureStats
   )
 }
 
-function EndpointStatsPanel({ stats, totalRequests }: { stats: UsageEndpointStat[]; totalRequests: number }) {
+function EndpointStatsPanel({
+  stats,
+  totalRequests,
+  showFullUsageNumbers,
+}: {
+  stats: UsageEndpointStat[]
+  totalRequests: number
+  showFullUsageNumbers: boolean
+}) {
   const { t } = useTranslation()
   return (
     <DistributionPanel
@@ -488,11 +597,20 @@ function EndpointStatsPanel({ stats, totalRequests }: { stats: UsageEndpointStat
         errors: item.error_count,
       }))}
       totalRequests={totalRequests}
+      showFullUsageNumbers={showFullUsageNumbers}
     />
   )
 }
 
-function APIKeyStatsPanel({ stats, totalRequests }: { stats: UsageAPIKeyStat[]; totalRequests: number }) {
+function APIKeyStatsPanel({
+  stats,
+  totalRequests,
+  showFullUsageNumbers,
+}: {
+  stats: UsageAPIKeyStat[]
+  totalRequests: number
+  showFullUsageNumbers: boolean
+}) {
   const { t } = useTranslation()
   return (
     <DistributionPanel
@@ -509,6 +627,7 @@ function APIKeyStatsPanel({ stats, totalRequests }: { stats: UsageAPIKeyStat[]; 
       }))}
       limit={3}
       totalRequests={totalRequests}
+      showFullUsageNumbers={showFullUsageNumbers}
     />
   )
 }
@@ -521,6 +640,7 @@ function DistributionPanel({
   items,
   limit = 6,
   totalRequests,
+  showFullUsageNumbers,
 }: {
   title: string
   description: string
@@ -529,6 +649,7 @@ function DistributionPanel({
   items: Array<{ key: string; label: string; requests: number; tokens: number; errors: number }>
   limit?: number
   totalRequests: number
+  showFullUsageNumbers: boolean
 }) {
   const { t } = useTranslation()
   const maxRequests = Math.max(1, ...items.map((item) => safeNumber(item.requests)))
@@ -562,10 +683,10 @@ function DistributionPanel({
                         {item.label}
                       </div>
                       <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                        <span>{t('usage.modelStatsRequests')}: {formatTokens(item.requests)}</span>
-                        <span>{t('usage.modelStatsTokens')}: {formatTokens(item.tokens)}</span>
+                        <span>{t('usage.modelStatsRequests')}: {formatTokens(item.requests, showFullUsageNumbers)}</span>
+                        <span>{t('usage.modelStatsTokens')}: {formatTokens(item.tokens, showFullUsageNumbers)}</span>
                         {item.errors > 0 && (
-                          <span className="text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')}: {formatTokens(item.errors)}</span>
+                          <span className="text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')}: {formatTokens(item.errors, showFullUsageNumbers)}</span>
                         )}
                       </div>
                     </div>
@@ -789,9 +910,12 @@ export default function Usage() {
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(20)
+  const [pageSize, setPageSize] = usePersistedPageSize('usage_logs', 20, DEFAULT_PAGE_SIZE_OPTIONS)
   const [clearing, setClearing] = useState(false)
-  const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
+  const [timeRange, setTimeRange] = useState<UsageTimeRangeKey>('1h')
+  const [customRange, setCustomRange] = useState<CustomRange | null>(null)
+  const [showCustomPopover, setShowCustomPopover] = useState(false)
+  const customChipRef = useRef<HTMLButtonElement>(null)
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
@@ -806,7 +930,7 @@ export default function Usage() {
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
-  const pageSizeOptions = [10, 20, 50, 100]
+  const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
   const [visibleColumns, setVisibleColumns] = useState<Record<UsageTableColumn, boolean>>(getInitialUsageVisibleColumns)
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false)
@@ -822,16 +946,21 @@ export default function Usage() {
     }, 400)
   }, [])
 
-  // 仅加载轻量统计（秒级）
+  // 仅加载轻量统计（秒级）—— 联动同页 timeRange,与下方请求记录的范围保持一致
   const loadStats = useCallback(async () => {
-    const stats = await api.getUsageStats()
-    return { stats }
-  }, [])
+    const { start, end } = resolveRangeISO(timeRange, customRange)
+    const [stats, settings] = await Promise.all([
+      api.getUsageStats({ start, end }),
+      api.getSettings().catch((): SystemSettings | null => null),
+    ])
+    return { stats, settings }
+  }, [timeRange, customRange])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
+    settings: SystemSettings | null
   }>({
-    initialData: { stats: null },
+    initialData: { stats: null, settings: null },
     load: loadStats,
   })
 
@@ -850,7 +979,7 @@ export default function Usage() {
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
     try {
-      const { start, end } = getTimeRangeISO(timeRange)
+      const { start, end } = resolveRangeISO(timeRange, customRange)
       const res = await api.getUsageLogsPaged({
         start, end, page, pageSize,
         email: searchEmail || undefined,
@@ -867,7 +996,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -913,7 +1042,8 @@ export default function Usage() {
     persistAnalysisVisibility(showAnalysis)
   }, [showAnalysis])
 
-  const { stats } = data
+  const { stats, settings } = data
+  const showFullUsageNumbers = settings?.show_full_usage_numbers ?? false
   const totalPages = Math.max(1, Math.ceil(logsTotal / pageSize))
   const currentPage = Math.min(page, totalPages)
 
@@ -946,6 +1076,13 @@ export default function Usage() {
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
   ]
+  // 顶部 6 张卡片里的 today_* 字段联动顶部时间范围,标签也跟着改 —— 与下方请求记录的范围一致。
+  // 后端在 GetUsageStats 收到 start/end 后,today_* 字段语义即"该区间统计"。
+  const rangeLabel = timeRange === 'custom'
+    ? t('usage.customRange')
+    : t(`dashboard.timeRange${timeRange.toUpperCase()}`)
+  const rangeRequestsLabel = t('usage.rangeRequests', { range: rangeLabel })
+  const rangeCostLabel = t('usage.rangeCost', { range: rangeLabel })
 
   return (
     <StateShell
@@ -976,100 +1113,100 @@ export default function Usage() {
 
         <div className="space-y-6">
         {/* Stat overview: 6 metrics in a single row */}
-        <div className="grid grid-cols-6 gap-3 max-xl:grid-cols-3 max-sm:grid-cols-2">
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+        <div className="grid grid-cols-1 gap-3 min-[560px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalRequestsCard')}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-primary/12 text-primary">
                   <Activity className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
-                {formatTokens(totalRequests)}
+              <div className={usageStatValueClass}>
+                {formatTokens(totalRequests, showFullUsageNumbers)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
-                <span className="text-[hsl(var(--success))]">● {t('usage.success')}: {formatTokens(successRequests)}</span>
-                <span>● {t('usage.today')}: {formatTokens(todayRequests)}</span>
+                <span className="text-[hsl(var(--success))]">● {t('usage.success')}: {formatTokens(successRequests, showFullUsageNumbers)}</span>
+                <span>● {rangeRequestsLabel}: {formatTokens(todayRequests, showFullUsageNumbers)}</span>
               </div>
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalTokensCard')}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]">
                   <Box className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
-                {formatTokens(totalTokens)}
+              <div className={usageStatValueClass}>
+                {formatTokens(totalTokens, showFullUsageNumbers)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
-                <span>{t('usage.inputTokens')}: {formatTokens(totalPromptTokens)}</span>
-                <span>{t('usage.outputTokens')}: {formatTokens(totalCompletionTokens)}</span>
+                <span>{t('usage.inputTokens')}: {formatTokens(totalPromptTokens, showFullUsageNumbers)}</span>
+                <span>{t('usage.outputTokens')}: {formatTokens(totalCompletionTokens, showFullUsageNumbers)}</span>
               </div>
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalCostCard')}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300">
                   <CircleDollarSign className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums text-emerald-600 dark:text-emerald-400">
+              <div className={`${usageStatValueClass} text-emerald-600 dark:text-emerald-400`}>
                 {formatCostCardValue(totalUserBilled)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
-                <span>{t('usage.todayCost')}: {formatCostCardValue(todayUserBilled)}</span>
+                <span>{rangeCostLabel}: {formatCostCardValue(todayUserBilled)}</span>
                 <span>{t('usage.accountCost')}: {formatCostCardValue(totalAccountBilled)}</span>
               </div>
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">RPM</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]">
                   <Clock className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
+              <div className={usageStatValueClass}>
                 {Math.round(rpm)}
               </div>
               <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.rpmDesc')}</div>
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">TPM</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-destructive/12 text-destructive">
                   <Zap className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
-                {formatTokens(tpm)}
+              <div className={usageStatValueClass}>
+                {formatTokens(tpm, showFullUsageNumbers)}
               </div>
               <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.tpmDesc')}</div>
             </CardContent>
           </Card>
 
-          <Card className="py-0">
-            <CardContent className="flex flex-col gap-1.5 p-3">
+          <Card className="min-w-0 py-0">
+            <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.errorRateCard')}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(36_72%_40%/0.12)] text-[hsl(36,72%,40%)]">
                   <AlertTriangle className="size-4" />
                 </div>
               </div>
-              <div className="text-[22px] font-bold leading-none tabular-nums">
+              <div className={usageStatValueClass}>
                 {errorRate.toFixed(1)}%
               </div>
               <div className="text-[11px] text-muted-foreground leading-snug">{t('usage.avgLatencyInline', { value: Math.round(avgDurationMs) })}</div>
@@ -1080,13 +1217,13 @@ export default function Usage() {
         {showAnalysis && (
           <>
             <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(360px,0.5fr)] gap-3 max-lg:grid-cols-1">
-              <ModelStatsPanel stats={modelStats} />
-              <FeatureStatsPanel stats={featureStats} totalRequests={totalRequests} />
+              <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
+              <FeatureStatsPanel stats={featureStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
             </div>
 
             <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
-              <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} />
-              <APIKeyStatsPanel stats={apiKeyStats} totalRequests={totalRequests} />
+              <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
+              <APIKeyStatsPanel stats={apiKeyStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
             </div>
           </>
         )}
@@ -1102,7 +1239,11 @@ export default function Usage() {
                     <button
                       key={key}
                       type="button"
-                      onClick={() => { setTimeRange(key); setPage(1) }}
+                      onClick={() => {
+                        setTimeRange(key)
+                        setPage(1)
+                        setShowCustomPopover(false)
+                      }}
                       className={`whitespace-nowrap px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 ${
                         timeRange === key
                           ? 'bg-background text-foreground shadow-sm border border-border'
@@ -1112,7 +1253,34 @@ export default function Usage() {
                       {t(`dashboard.timeRange${key.toUpperCase()}`)}
                     </button>
                   ))}
+                  <button
+                    ref={customChipRef}
+                    type="button"
+                    onClick={() => setShowCustomPopover((v) => !v)}
+                    className={`whitespace-nowrap px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 ${
+                      timeRange === 'custom'
+                        ? 'bg-background text-foreground shadow-sm border border-border'
+                        : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {timeRange === 'custom' && customRange
+                      ? t('usage.customRangeChipApplied')
+                      : t('usage.customRange')}
+                  </button>
                 </div>
+                {showCustomPopover && (
+                  <CustomRangePopover
+                    anchorRef={customChipRef}
+                    initial={customRange}
+                    onCancel={() => setShowCustomPopover(false)}
+                    onApply={(range) => {
+                      setCustomRange(range)
+                      setTimeRange('custom')
+                      setPage(1)
+                      setShowCustomPopover(false)
+                    }}
+                  />
+                )}
               </div>
               <div className="flex shrink-0 items-center gap-3">
                 <span className="whitespace-nowrap text-xs text-muted-foreground">{logsLoading ? t('common.loading') : t('usage.recordsCount', { count: logsTotal })}</span>
@@ -1363,13 +1531,13 @@ export default function Usage() {
                         {visibleColumns.token && <TableCell>
                           {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
                             <div className={`${usageTableMonoClass} leading-relaxed`}>
-                              <span className="text-blue-500">↓{formatTokens(log.input_tokens)}</span>
+                              <span className="text-blue-500">↓{formatTokens(log.input_tokens, true)}</span>
                               <span className="mx-1 text-border">|</span>
-                              <span className="text-emerald-500">↑{formatTokens(log.output_tokens)}</span>
+                              <span className="text-emerald-500">↑{formatTokens(log.output_tokens, true)}</span>
                               {log.reasoning_tokens > 0 && (
                                 <>
                                   <span className="mx-1 text-border">|</span>
-                                  <span className="text-amber-500 inline-flex items-center gap-0.5"><Brain className="size-3.5 inline" />{formatTokens(log.reasoning_tokens)}</span>
+                                  <span className="text-amber-500 inline-flex items-center gap-0.5"><Brain className="size-3.5 inline" />{formatTokens(log.reasoning_tokens, true)}</span>
                                 </>
                               )}
                             </div>
@@ -1384,7 +1552,7 @@ export default function Usage() {
                           {log.cached_tokens > 0 ? (
                             <Badge variant="outline" className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
                               <DatabaseZap className="size-3.5" />
-                              {formatTokens(log.cached_tokens)}
+                              {formatTokens(log.cached_tokens, true)}
                             </Badge>
                           ) : (
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
@@ -1429,9 +1597,153 @@ export default function Usage() {
         </Card>
         </div>
 
-        <ToastNotice toast={toast} />
         {confirmDialog}
       </>
     </StateShell>
+  )
+}
+
+// CustomRangePopover 通过 React portal 渲染在 body 下,不受外层 overflow 裁切。
+// 位置根据触发按钮 rect 计算,自动避开右边界。
+function CustomRangePopover({
+  anchorRef,
+  initial,
+  onApply,
+  onCancel,
+}: {
+  anchorRef: React.RefObject<HTMLButtonElement | null>
+  initial: CustomRange | null
+  onApply: (range: CustomRange) => void
+  onCancel: () => void
+}) {
+  const { t } = useTranslation()
+  const now = new Date()
+  const defaultEnd = initial ? new Date(initial.end) : now
+  const defaultStart = initial
+    ? new Date(initial.start)
+    : new Date(now.getTime() - 24 * 60 * 60 * 1000)
+
+  const [startStr, setStartStr] = useState(dateToLocalInputValue(defaultStart))
+  const [endStr, setEndStr] = useState(dateToLocalInputValue(defaultEnd))
+  const [error, setError] = useState<string | null>(null)
+  const popoverRef = useRef<HTMLDivElement>(null)
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(null)
+  const POPOVER_WIDTH = 320
+
+  const recompute = useCallback(() => {
+    const anchor = anchorRef.current
+    if (!anchor) return
+    const rect = anchor.getBoundingClientRect()
+    const top = rect.bottom + 6
+    // 默认让 popover 右边对齐 anchor 右边;若超出窗口左边,夹到 8px 边距。
+    const desiredLeft = rect.right - POPOVER_WIDTH
+    const left = Math.max(8, Math.min(window.innerWidth - POPOVER_WIDTH - 8, desiredLeft))
+    setPosition({ top, left })
+  }, [anchorRef])
+
+  useLayoutEffect(() => {
+    recompute()
+  }, [recompute])
+
+  useEffect(() => {
+    const handle = () => recompute()
+    window.addEventListener('resize', handle)
+    window.addEventListener('scroll', handle, true)
+    return () => {
+      window.removeEventListener('resize', handle)
+      window.removeEventListener('scroll', handle, true)
+    }
+  }, [recompute])
+
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null
+      if (!target) return
+      if (popoverRef.current?.contains(target)) return
+      if (anchorRef.current?.contains(target)) return
+      onCancel()
+    }
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onCancel()
+    }
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleEscape)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [anchorRef, onCancel])
+
+  const handleApply = () => {
+    const startDate = localInputValueToDate(startStr)
+    const endDate = localInputValueToDate(endStr)
+    if (!startDate || !endDate) {
+      setError(t('usage.customRangeInvalid'))
+      return
+    }
+    if (endDate.getTime() <= startDate.getTime()) {
+      setError(t('usage.customRangeEndBeforeStart'))
+      return
+    }
+    if (endDate.getTime() - startDate.getTime() > CUSTOM_RANGE_MAX_MS) {
+      setError(t('usage.customRangeTooLong', { days: CUSTOM_RANGE_MAX_DAYS }))
+      return
+    }
+    setError(null)
+    onApply({
+      start: dateToLocalRFC3339(startDate),
+      end: dateToLocalRFC3339(endDate),
+    })
+  }
+
+  if (!position) return null
+
+  return createPortal(
+    <div
+      ref={popoverRef}
+      style={{
+        position: 'fixed',
+        top: position.top,
+        left: position.left,
+        width: POPOVER_WIDTH,
+      }}
+      className="z-[1000] rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-[0_18px_40px_hsl(222_30%_18%/0.18)]"
+    >
+      <div className="mb-2 text-xs font-semibold text-foreground">
+        {t('usage.customRangeTitle')}
+      </div>
+      <div className="space-y-2">
+        <label className="block text-[11px] text-muted-foreground">
+          {t('usage.customRangeStart')}
+          <input
+            type="datetime-local"
+            value={startStr}
+            onChange={(e) => setStartStr(e.target.value)}
+            className="mt-1 block w-full rounded-md border border-border bg-background px-2 py-1 text-xs"
+          />
+        </label>
+        <label className="block text-[11px] text-muted-foreground">
+          {t('usage.customRangeEnd')}
+          <input
+            type="datetime-local"
+            value={endStr}
+            onChange={(e) => setEndStr(e.target.value)}
+            className="mt-1 block w-full rounded-md border border-border bg-background px-2 py-1 text-xs"
+          />
+        </label>
+      </div>
+      {error && (
+        <div className="mt-2 text-[11px] text-destructive">{error}</div>
+      )}
+      <div className="mt-3 flex justify-end gap-2">
+        <Button variant="ghost" size="sm" onClick={onCancel}>
+          {t('common.cancel', { defaultValue: 'Cancel' })}
+        </Button>
+        <Button size="sm" onClick={handleApply}>
+          {t('usage.customRangeApply')}
+        </Button>
+      </div>
+    </div>,
+    document.body,
   )
 }

@@ -59,11 +59,11 @@ export default function SecurityBanner() {
   }
 
   return (
-    <div className="mb-4 flex items-start gap-3 rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-red-700 dark:text-red-200">
+    <div className="mb-4 flex min-w-0 max-w-full items-start gap-3 overflow-hidden rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-red-700 dark:text-red-200">
       <ShieldAlert className="mt-0.5 size-5 shrink-0" />
       <div className="flex-1 min-w-0">
         <p className="text-sm font-bold">{copy.title}</p>
-        <p className="mt-1 text-sm leading-relaxed">{copy.body}</p>
+        <p className="mt-1 break-words text-sm leading-relaxed [overflow-wrap:anywhere]">{copy.body}</p>
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <a
             href="/admin/api-keys"

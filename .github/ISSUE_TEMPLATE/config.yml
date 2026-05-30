@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用交流 / 闲聊讨论
+    url: https://linux.do
+    about: 不是明确的 bug 或建议？先到社区聊聊，可能很快就有答案。
+  - name: 安全漏洞私密披露
+    url: https://github.com/james-6-23/codex2api/security/advisories/new
+    about: 发现安全问题请走 GitHub Security Advisory，不要在公开 issue 中提交。
+  - name: 先翻一下文档
+    url: https://github.com/james-6-23/codex2api#documentation
+    about: 部署、配置、API 用法在 README 和 docs/ 里大多能找到答案。

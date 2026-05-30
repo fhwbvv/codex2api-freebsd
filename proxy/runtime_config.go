@@ -22,6 +22,8 @@ const (
 	defaultStreamFlushIntervalMS = 20
 	minStreamFlushIntervalMS     = 1
 	maxStreamFlushIntervalMS     = 1000
+	defaultFirstTokenTimeoutSec  = 0
+	maxFirstTokenTimeoutSec      = 600
 )
 
 type RuntimeSettings struct {
@@ -29,6 +31,7 @@ type RuntimeSettings struct {
 	CodexMinCLIVersion    string
 	StreamFlushPolicy     string
 	StreamFlushIntervalMS int
+	FirstTokenTimeoutSec  int
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -43,6 +46,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexMinCLIVersion:    defaultCodexMinCLIVersion,
 		StreamFlushPolicy:     defaultStreamFlushPolicy,
 		StreamFlushIntervalMS: defaultStreamFlushIntervalMS,
+		FirstTokenTimeoutSec:  defaultFirstTokenTimeoutSec,
 	}
 }
 
@@ -85,6 +89,12 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.StreamFlushIntervalMS > maxStreamFlushIntervalMS {
 		settings.StreamFlushIntervalMS = maxStreamFlushIntervalMS
 	}
+	if settings.FirstTokenTimeoutSec < 0 {
+		settings.FirstTokenTimeoutSec = defaultFirstTokenTimeoutSec
+	}
+	if settings.FirstTokenTimeoutSec > maxFirstTokenTimeoutSec {
+		settings.FirstTokenTimeoutSec = maxFirstTokenTimeoutSec
+	}
 	return settings
 }
 
@@ -95,6 +105,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexMinCLIVersion = settings.CodexMinCLIVersion
 		next.StreamFlushPolicy = settings.StreamFlushPolicy
 		next.StreamFlushIntervalMS = settings.StreamFlushIntervalMS
+		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)
@@ -120,4 +131,12 @@ func currentStreamFlushInterval() time.Duration {
 		ms = defaultStreamFlushIntervalMS
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+func currentFirstTokenTimeout() time.Duration {
+	seconds := CurrentRuntimeSettings().FirstTokenTimeoutSec
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }

@@ -12,8 +12,10 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { BarChart3 } from 'lucide-react'
+import { BarChart3, RefreshCw } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
+import { api } from '../api'
+import { getErrorMessage } from '../utils/error'
 import type { AccountRow } from '../types'
 
 type QuotaWindow = '5h' | '7d'
@@ -22,6 +24,8 @@ interface AccountQuotaDistributionChartProps {
   accounts: AccountRow[]
   className?: string
   compact?: boolean
+  onProbeStarted?: () => void
+  onProbeError?: (message: string) => void
 }
 
 interface DistributionBucket {
@@ -64,9 +68,29 @@ const tooltipLabelStyle = { color: 'var(--color-foreground)', fontWeight: 600 }
 const tooltipItemStyle = { color: 'var(--color-foreground)' }
 const legendWrapperStyle = { paddingTop: 4, fontSize: 12, color: axisColor }
 
-export default function AccountQuotaDistributionChart({ accounts, className = '', compact = false }: AccountQuotaDistributionChartProps) {
+export default function AccountQuotaDistributionChart({
+  accounts,
+  className = '',
+  compact = false,
+  onProbeStarted,
+  onProbeError,
+}: AccountQuotaDistributionChartProps) {
   const { t } = useTranslation()
   const [windowKey, setWindowKey] = useState<QuotaWindow>('7d')
+  const [probing, setProbing] = useState(false)
+
+  const handleProbe = async () => {
+    if (probing) return
+    setProbing(true)
+    try {
+      await api.forceUsageProbe()
+      onProbeStarted?.()
+    } catch (err) {
+      onProbeError?.(getErrorMessage(err))
+    } finally {
+      setProbing(false)
+    }
+  }
 
   const distribution = useMemo(() => {
     const eligibleAccounts = accounts.filter((account) => isEligibleForQuotaWindow(account, windowKey))
@@ -133,21 +157,33 @@ export default function AccountQuotaDistributionChart({ accounts, className = ''
               })}
             </p>
           </div>
-          <div className="inline-flex rounded-lg border border-border bg-muted/50 p-0.5">
-            {quotaWindows.map((key) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setWindowKey(key)}
-                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
-                  windowKey === key
-                    ? 'border border-border bg-background text-foreground shadow-sm'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {key}
-              </button>
-            ))}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={handleProbe}
+              disabled={probing}
+              title={t('accounts.quotaDistributionRefreshTitle')}
+              className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1.5 text-xs font-medium text-muted-foreground transition-all hover:text-foreground disabled:opacity-50"
+            >
+              <RefreshCw className={`size-3.5 ${probing ? 'animate-spin' : ''}`} />
+              <span>{probing ? t('accounts.quotaDistributionRefreshing') : t('accounts.quotaDistributionRefresh')}</span>
+            </button>
+            <div className="inline-flex rounded-lg border border-border bg-muted/50 p-0.5">
+              {quotaWindows.map((key) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setWindowKey(key)}
+                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
+                    windowKey === key
+                      ? 'border border-border bg-background text-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  {key}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 

@@ -1,0 +1,44 @@
+name: Idea / Enhancement (English)
+description: A new feature, an improvement, or a "wouldn't it be nice if…" — keep it short.
+title: "[Idea] "
+labels: ["type/enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Even a one-liner is welcome. Don't worry about writing a full spec.
+
+  - type: checkboxes
+    id: prechecks
+    attributes:
+      label: Before I submit
+      options:
+        - label: I searched [existing issues](https://github.com/james-6-23/codex2api/issues?q=is%3Aissue) and didn't see a similar idea
+          required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: My idea
+      placeholder: |
+        e.g. group accounts by region/latency in the scheduler;
+        batch jobs in Image Studio; per-API-key rate limits…
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: What problem does it solve? (optional)
+      placeholder: How I'm using it today, what's awkward, and what changes if this lands.
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: How important is it to me? (just a vibe check)
+      options:
+        - Nice to have
+        - Would noticeably improve daily use
+        - Real pain point right now
+    validations:
+      required: false

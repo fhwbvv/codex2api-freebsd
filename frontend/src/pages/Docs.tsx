@@ -12,7 +12,6 @@ import {
   Server,
 } from "lucide-react";
 import { api, getAdminKey } from "../api";
-import ToastNotice from "../components/ToastNotice";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -43,6 +42,8 @@ const FALLBACK_MODELS = [
 ];
 type CCSwitchApp = "claude" | "codex" | "gemini";
 type QuickToolTab = "codex-cli" | "claude-code" | "cc-switch" | "cherry-studio";
+type QuickServiceTier = "default" | "fast";
+type QuickReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 const CC_SWITCH_LOGO = "https://ccswitch.io/assets/cc-switch-logo-BPrI77SG.png";
 const LOBE_ICON_BASE =
@@ -473,6 +474,8 @@ function buildCCSwitchImportUrl({
   apiKey,
   models,
   homepage,
+  serviceTier,
+  reasoningEffort,
 }: {
   app: CCSwitchApp;
   name: string;
@@ -480,6 +483,8 @@ function buildCCSwitchImportUrl({
   apiKey: string;
   models: Record<string, string>;
   homepage: string;
+  serviceTier?: QuickServiceTier;
+  reasoningEffort?: QuickReasoningEffort;
 }) {
   const params = new URLSearchParams();
   params.set("resource", "provider");
@@ -490,6 +495,12 @@ function buildCCSwitchImportUrl({
   Object.entries(models).forEach(([key, value]) => {
     if (value) params.set(key, value);
   });
+  if (app === "codex" && serviceTier === "fast") {
+    params.set("service_tier", "fast");
+  }
+  if (app === "codex" && reasoningEffort) {
+    params.set("model_reasoning_effort", reasoningEffort);
+  }
   params.set("homepage", homepage);
   params.set("enabled", "true");
   return `ccswitch://v1/import?${params.toString()}`;
@@ -603,6 +614,10 @@ export default function Docs() {
   const [selectedKey, setSelectedKey] = useState("");
   const [activeToolTab, setActiveToolTab] = useState<QuickToolTab>("codex-cli");
   const [quickStartModel, setQuickStartModel] = useState("gpt-5.4");
+  const [quickServiceTier, setQuickServiceTier] =
+    useState<QuickServiceTier>("default");
+  const [quickReasoningEffort, setQuickReasoningEffort] =
+    useState<QuickReasoningEffort>("xhigh");
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [ccSwitchApp, setCcSwitchApp] = useState<CCSwitchApp>("codex");
   const [ccSwitchName, setCcSwitchName] = useState("");
@@ -701,6 +716,9 @@ export default function Docs() {
   const siteName = settings?.site_name?.trim() || "CodexProxy";
   const defaultCcSwitchName = `${siteName} ${ccSwitchConfig.suffix}`;
   const defaultCherryProviderId = slugProviderId(siteName);
+  const showQuickCodexOptions =
+    activeToolTab === "codex-cli" ||
+    (activeToolTab === "cc-switch" && ccSwitchApp === "codex");
 
   useEffect(() => {
     if (!ccSwitchNameEdited) setCcSwitchName(defaultCcSwitchName);
@@ -879,10 +897,12 @@ export default function Docs() {
       : `${claudeConfigDir}/settings.json`;
   const activeKey = selectedKey || firstKey || "YOUR_API_KEY";
 
+  const codexServiceTierLine =
+    quickServiceTier === "fast" ? '\nservice_tier = "fast"' : "";
   const codexConfigToml = `model_provider = "OpenAI"
 model = "${quickStartModel}"
 review_model = "${quickStartModel}"
-model_reasoning_effort = "xhigh"
+model_reasoning_effort = "${quickReasoningEffort}"${codexServiceTierLine}
 disable_response_storage = true
 network_access = "enabled"
 model_context_window = 1000000
@@ -951,6 +971,9 @@ set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`;
     apiKey: activeKey,
     models: ccSwitchModels,
     homepage: quickBaseUrl,
+    serviceTier: ccSwitchApp === "codex" ? quickServiceTier : "default",
+    reasoningEffort:
+      ccSwitchApp === "codex" ? quickReasoningEffort : undefined,
   });
   const cherryConfig = `cherrystudio://providers/api-keys?v=1&data=${encodeURIComponent(
     encodeBase64(
@@ -994,7 +1017,6 @@ set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`;
         </div>
       </div>
 
-      <ToastNotice toast={toast} />
 
       <div className="xl:hidden mb-3 -mx-2 overflow-x-auto px-2">
         <div className="flex gap-1.5 pb-1">
@@ -1082,7 +1104,11 @@ set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`;
                 </div>
               </div>
               <div
-                className={`mb-4 ${CONFIG_PANEL} md:grid-cols-[minmax(0,1fr)_260px]`}
+                className={`mb-4 ${CONFIG_PANEL} ${
+                  showQuickCodexOptions
+                    ? "md:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_190px_170px_150px]"
+                    : "md:grid-cols-[minmax(0,1fr)_260px]"
+                }`}
               >
                 <FieldBox label={t("docs.clientConfig.endpointLabel")}>
                   <input
@@ -1114,6 +1140,44 @@ set CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`;
                     options={modelOptions}
                   />
                 </FieldBox>
+                {showQuickCodexOptions ? (
+                  <FieldBox label={t("docs.clientConfig.reasoningEffort")}>
+                    <Select
+                      compact
+                      value={quickReasoningEffort}
+                      onValueChange={(value) =>
+                        setQuickReasoningEffort(value as QuickReasoningEffort)
+                      }
+                      options={[
+                        { label: "Low", value: "low" },
+                        { label: "Medium", value: "medium" },
+                        { label: "High", value: "high" },
+                        { label: "xhigh", value: "xhigh" },
+                      ]}
+                    />
+                  </FieldBox>
+                ) : null}
+                {showQuickCodexOptions ? (
+                  <FieldBox label={t("docs.clientConfig.fastMode")}>
+                    <Select
+                      compact
+                      value={quickServiceTier}
+                      onValueChange={(value) =>
+                        setQuickServiceTier(value as QuickServiceTier)
+                      }
+                      options={[
+                        {
+                          label: t("docs.clientConfig.fastModeDefault"),
+                          value: "default",
+                        },
+                        {
+                          label: t("docs.clientConfig.fastModeEnabled"),
+                          value: "fast",
+                        },
+                      ]}
+                    />
+                  </FieldBox>
+                ) : null}
               </div>
               <div className="space-y-4">
                 {activeToolTab === "codex-cli" && (

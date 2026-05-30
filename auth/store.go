@@ -112,11 +112,14 @@ type Account struct {
 	BaseConcurrencyOverride *int64
 	CreditEnabled           bool // 信用账号标记
 	CreditSkipUsageWindow   bool // 跳过用量窗口惩罚
+	SkipWarmTier            bool // 跳过 warm 层级降级
 	AllowedAPIKeyIDs        []int64
 	allowedAPIKeySet        map[int64]struct{}
 	Tags                    []string
 	GroupIDs                []int64
 	ModelCooldowns          map[string]ModelCooldown
+
+	SubscriptionExpiresAt time.Time
 }
 
 type ModelCooldown struct {
@@ -133,6 +136,7 @@ type AccountFilter func(*Account) bool
 const (
 	defaultBackgroundRefreshInterval = 2 * time.Minute
 	defaultUsageProbeMaxAge          = 10 * time.Minute
+	defaultUsageProbeConcurrency     = 16
 	defaultRecoveryProbeInterval     = 30 * time.Minute
 	premium5hUrgencyWindow           = 4 * time.Hour
 	premium5hUrgencyMaxBonus         = 25.0
@@ -142,6 +146,10 @@ const (
 	premium7dUrgencyMaxBonus         = 80.0
 	premium7dUrgencyMinRemainingPct  = 5.0
 	premium7dUrgencyFullRemainingPct = 70.0
+	expiryUrgencyUrgentDays          = 3
+	expiryUrgencyWarnDays            = 7
+	expiryUrgencyUrgentBonus         = 60.0
+	expiryUrgencyWarnBonus           = 25.0
 )
 
 // SchedulerBreakdown 调度评分拆解
@@ -156,6 +164,7 @@ type SchedulerBreakdown struct {
 	UsagePenalty7d      float64
 	UsageUrgencyBonus5h float64
 	UsageUrgencyBonus7d float64
+	ExpiryUrgencyBonus  float64
 	LatencyPenalty      float64
 	SuccessRatePenalty  float64 // 滑动窗口成功率惩罚
 }
@@ -774,6 +783,30 @@ func (a *Account) effectiveScoreBiasLocked(now time.Time, tier AccountHealthTier
 	return defaultScoreBiasForPlan(a.PlanType)
 }
 
+// expiryUrgencyBonusLocked 在订阅快到期时给账号加分,促使调度器优先消耗它。
+// <= 3d 紧急(+60) / <= 7d 警告(+25) / 其它(0)。已过期/free/api 不加分。
+func (a *Account) expiryUrgencyBonusLocked(now time.Time) float64 {
+	if a.SubscriptionExpiresAt.IsZero() {
+		return 0
+	}
+	plan := strings.ToLower(strings.TrimSpace(a.PlanType))
+	if plan == "" || plan == "free" || plan == "api" {
+		return 0
+	}
+	remaining := a.SubscriptionExpiresAt.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+	days := remaining.Hours() / 24
+	switch {
+	case days <= expiryUrgencyUrgentDays:
+		return expiryUrgencyUrgentBonus
+	case days <= expiryUrgencyWarnDays:
+		return expiryUrgencyWarnBonus
+	}
+	return 0
+}
+
 func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	now := time.Now()
 	breakdown := a.schedulerBreakdownLocked(now)
@@ -817,14 +850,18 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	if a.premium5hRateLimitedLocked(now) && tier != HealthTierBanned {
 		tier = HealthTierRisky
 	}
+	if a.SkipWarmTier && tier == HealthTierWarm {
+		tier = HealthTierHealthy
+	}
 
 	baseConcurrencyEffective := a.effectiveBaseConcurrencyLocked(baseLimit)
 	scoreBiasEffective := a.effectiveScoreBiasLocked(now, tier)
 	if a.dispatchBonusEligibleLocked(now, tier) {
 		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
 		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
+		breakdown.ExpiryUrgencyBonus = a.expiryUrgencyBonusLocked(now)
 	}
-	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d
+	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus
 
 	a.HealthTier = tier
 	a.SchedulerScore = score
@@ -1341,6 +1378,7 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 	if a.dispatchBonusEligibleLocked(now, a.HealthTier) {
 		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
 		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
+		breakdown.ExpiryUrgencyBonus = a.expiryUrgencyBonusLocked(now)
 	}
 	return SchedulerDebugSnapshot{
 		HealthTier:               string(a.HealthTier),
@@ -1487,6 +1525,7 @@ type Store struct {
 	maxRateLimitRetries       int64 // 429 最大换号重试次数
 	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
+	usageProbeConcurrency     int64 // 用量探针并行度
 	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
 	backgroundRefreshWakeCh   chan struct{}
 	lazyRefreshInFlight       sync.Map
@@ -1509,18 +1548,42 @@ type Store struct {
 	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
 	schedulerMode        atomic.Value // string: "round_robin" or "remaining_quota"
+	affinityMode         atomic.Value // string: "bounded" / "off" / "strict"
 	promptFilterConfig   atomic.Value // promptfilter.Config
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
 }
 
+// sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
+//
+// boundAt / requestCount 用于 bounded affinity 的逃逸条件:
+//   - 累计请求超过 maxAffinityRequests 后强制解绑,避免单账号被一直薅
+//   - 绑定时长超过 maxAffinityDuration 后同样解绑
+//   - 上层在选号时还会检查"绑定账号当前是否还健康",非 healthy 直接换号
+//
+// strict 模式不读这些字段(行为退化为旧实现);off 模式根本不进入这条路径。
 type sessionAffinity struct {
-	accountID int64
-	proxyURL  string
-	expiresAt time.Time
+	accountID    int64
+	proxyURL     string
+	boundAt      time.Time
+	requestCount int64
+	expiresAt    time.Time
 }
 
 const defaultSessionAffinityTTL = time.Hour
+
+// Bounded affinity 默认阈值。命中任一即触发解绑下次走完整挑号策略。
+const (
+	defaultMaxAffinityRequests = 50
+	defaultMaxAffinityDuration = 5 * time.Minute
+)
+
+// Affinity 模式常量。affinity_mode 系统设置使用以下值。
+const (
+	AffinityModeBounded = "bounded" // 默认。粘性但有逃逸条件
+	AffinityModeOff     = "off"     // 关闭粘性。每次都按调度策略重新挑号
+	AffinityModeStrict  = "strict"  // 旧行为。粘到底,直到 TTL 过期或账号失败
+)
 
 const (
 	accountCooldownCacheNamespace = "account-cooldown"
@@ -1856,6 +1919,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			TestModel:                        "gpt-5.4",
 			BackgroundRefreshIntervalMinutes: 2,
 			UsageProbeMaxAgeMinutes:          10,
+			UsageProbeConcurrency:            defaultUsageProbeConcurrency,
 			RecoveryProbeIntervalMinutes:     30,
 			LazyMode:                         false,
 			ProxyURL:                         "",
@@ -1877,6 +1941,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.testModel.Store(settings.TestModel)
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
 	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
+	s.SetUsageProbeConcurrency(settings.UsageProbeConcurrency)
 	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
@@ -1896,6 +1961,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	atomic.StoreInt64(&s.maxRateLimitRetries, rateLimitRetries)
 	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
 	s.schedulerMode.Store(settings.SchedulerMode)
+	s.SetAffinityMode(settings.AffinityMode)
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
@@ -2207,6 +2273,34 @@ func (s *Store) GetUsageProbeMaxAge() time.Duration {
 	return d
 }
 
+// SetUsageProbeConcurrency 设置用量探针并行度。
+func (s *Store) SetUsageProbeConcurrency(n int) {
+	if n <= 0 {
+		n = defaultUsageProbeConcurrency
+	}
+	if n > 128 {
+		n = 128
+	}
+	atomic.StoreInt64(&s.usageProbeConcurrency, int64(n))
+}
+
+// GetUsageProbeConcurrency 获取用量探针并行度。
+func (s *Store) GetUsageProbeConcurrency() int {
+	n := int(atomic.LoadInt64(&s.usageProbeConcurrency))
+	if n <= 0 {
+		return defaultUsageProbeConcurrency
+	}
+	return n
+}
+
+// UsageProbeRunning reports whether a batch usage probe is currently active.
+func (s *Store) UsageProbeRunning() bool {
+	if s == nil {
+		return false
+	}
+	return s.usageProbeBatch.Load()
+}
+
 // SetRecoveryProbeInterval 设置恢复探测最小间隔。
 func (s *Store) SetRecoveryProbeInterval(d time.Duration) {
 	if d <= 0 {
@@ -2222,6 +2316,22 @@ func (s *Store) GetRecoveryProbeInterval() time.Duration {
 		return defaultRecoveryProbeInterval
 	}
 	return d
+}
+
+// RecoveryProbeRunning reports whether a batch recovery probe is currently active.
+func (s *Store) RecoveryProbeRunning() bool {
+	if s == nil {
+		return false
+	}
+	return s.recoveryProbeBatch.Load()
+}
+
+// AutoCleanupRunning reports whether an automatic cleanup pass is currently active.
+func (s *Store) AutoCleanupRunning() bool {
+	if s == nil {
+		return false
+	}
+	return s.autoCleanupBatch.Load()
 }
 
 // CleanExpiredNow 立即执行一次过期清理，返回清理数量
@@ -2316,6 +2426,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		}
 		account.CreditEnabled = row.CreditEnabled
 		account.CreditSkipUsageWindow = row.CreditSkipUsageWindow
+		account.SkipWarmTier = row.SkipWarmTier
 		if row.Status == "error" {
 			account.Status = StatusError
 			account.ErrorMsg = row.ErrorMessage
@@ -2337,6 +2448,11 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 				} else {
 					log.Printf("[账号 %d] 解析 expires_at 失败: %v", row.ID, err)
 				}
+			}
+		}
+		if subExp := row.GetCredential("subscription_expires_at"); subExp != "" {
+			if parsed, err := time.Parse(time.RFC3339, subExp); err == nil {
+				account.SubscriptionExpiresAt = parsed
 			}
 		}
 		if row.CooldownUntil.Valid {
@@ -2472,7 +2588,9 @@ func (s *Store) Stop() {
 	s.wg.Wait()
 }
 
-// CleanByRuntimeStatus 按运行时状态清理账号
+// CleanByRuntimeStatus 按运行时状态清理账号（用于自动清理流程）
+// premium 5h 限流账号会被跳过，因为它们会在 5h 内自然恢复，无需删除。
+// 手动一键清理请改用 CleanRateLimitedManual——它会清掉所有限流账号。
 func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) int {
 	accounts := s.Accounts()
 	cleaned := 0
@@ -2501,6 +2619,45 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 		cleaned++
 		if s.db != nil {
 			s.db.InsertAccountEventAsync(acc.DBID, "deleted", "auto_clean")
+		}
+	}
+
+	return cleaned
+}
+
+// CleanRateLimitedManual 清理所有"限流"含义下的账号（用于手动一键清理）。
+// 与 CleanByRuntimeStatus("rate_limited") 的区别：
+//   - 涵盖 RuntimeStatus 的全部限流相关值：rate_limited / usage_exhausted
+//   - 不跳过 premium 5h 限流：手动触发即代表用户明确意图删除
+//   - 锁定账号依然跳过（与所有清理流程一致）
+func (s *Store) CleanRateLimitedManual(ctx context.Context) int {
+	accounts := s.Accounts()
+	cleaned := 0
+
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		status := acc.RuntimeStatus()
+		if status != "rate_limited" && status != "usage_exhausted" {
+			continue
+		}
+
+		if atomic.LoadInt32(&acc.Locked) == 1 {
+			continue
+		}
+
+		if s.db != nil {
+			if err := s.db.SoftDeleteAccount(ctx, acc.DBID); err != nil {
+				log.Printf("[账号 %d] 手动清理限流账号失败: %v", acc.DBID, err)
+				continue
+			}
+		}
+
+		s.RemoveAccount(acc.DBID)
+		cleaned++
+		if s.db != nil {
+			s.db.InsertAccountEventAsync(acc.DBID, "deleted", "manual_clean")
 		}
 	}
 
@@ -2547,6 +2704,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
+		var bestLimit int64
 		maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 
 		for _, acc := range s.accounts {
@@ -2577,6 +2735,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
 				bestLoad = load
+				bestLimit = limit
 				best = acc
 			}
 		}
@@ -2588,10 +2747,9 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		if s.accountHasCachedCooldown(best) {
 			continue
 		}
-		atomic.AddInt64(&best.ActiveRequests, 1)
-		atomic.AddInt64(&best.TotalRequests, 1)
-		atomic.StoreInt64(&best.LastUsedAt, time.Now().UnixNano())
-		return best
+		if tryAcquireAccount(best, bestLimit) {
+			return best
+		}
 	}
 	return nil
 }
@@ -2777,15 +2935,24 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 		return
 	}
 	ttl := sessionAffinityTTL()
+	now := time.Now()
 	binding := sessionAffinity{
-		accountID: account.DBID,
-		proxyURL:  strings.TrimSpace(proxyURL),
-		expiresAt: time.Now().Add(ttl),
+		accountID:    account.DBID,
+		proxyURL:     strings.TrimSpace(proxyURL),
+		boundAt:      now,
+		requestCount: 0,
+		expiresAt:    now.Add(ttl),
 	}
 
 	s.sessionMu.Lock()
 	if s.sessionBindings == nil {
 		s.sessionBindings = make(map[string]sessionAffinity)
+	}
+	// 同账号的连续 Bind 视为复用,沿用 boundAt 与 requestCount 以保持 bounded 上限计数;
+	// 换账号时则按新绑定从 0 开始计。
+	if existing, ok := s.sessionBindings[key]; ok && existing.accountID == account.DBID {
+		binding.boundAt = existing.boundAt
+		binding.requestCount = existing.requestCount
 	}
 	s.sessionBindings[key] = binding
 	s.sessionMu.Unlock()
@@ -2833,6 +3000,17 @@ func (s *Store) NextForSession(key string, apiKeyID int64, exclude map[int64]boo
 }
 
 // NextForSessionWithFilter 优先复用已绑定的账号和代理，并应用请求级账号过滤器。
+//
+// affinity_mode 决定粘性强度:
+//   - off:     永不读绑定,每次都走完整挑号策略
+//   - bounded (默认): 绑定有效但被以下任一条件解除
+//   - 累计请求超过 defaultMaxAffinityRequests (50)
+//   - 绑定时长超过 defaultMaxAffinityDuration (5min)
+//   - 绑定账号当前已不属于 healthy 桶 (warm/risky/banned)
+//   - strict:  完全沿用旧行为,只在 TTL 过期或显式 Unbind 时换号
+//
+// 解除发生时绕过 binding 走完整挑号策略(NextExcludingWithFilter),后续 BindSessionAffinity
+// 会重新建立绑定。
 func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string) {
 	if s == nil {
 		return nil, ""
@@ -2842,24 +3020,52 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
 	}
 
+	mode := s.GetAffinityMode()
+	if mode == AffinityModeOff {
+		return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
+	}
+
 	now := time.Now()
 	s.sessionMu.RLock()
 	binding, ok := s.sessionBindings[key]
 	s.sessionMu.RUnlock()
 
 	if ok {
-		if !binding.expiresAt.After(now) {
+		expired := !binding.expiresAt.After(now)
+		// bounded 模式下追加逃逸条件检查
+		escape := false
+		if mode == AffinityModeBounded {
+			if binding.requestCount >= defaultMaxAffinityRequests {
+				escape = true
+			} else if !binding.boundAt.IsZero() && now.Sub(binding.boundAt) >= defaultMaxAffinityDuration {
+				escape = true
+			} else if !s.affinityAccountStillHealthy(binding.accountID) {
+				escape = true
+			}
+		}
+
+		if expired || escape {
 			s.sessionMu.Lock()
-			if current, exists := s.sessionBindings[key]; exists && !current.expiresAt.After(now) {
+			if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
 				delete(s.sessionBindings, key)
 			}
 			s.sessionMu.Unlock()
 		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
+			// 命中粘性,记一次复用
+			s.sessionMu.Lock()
+			if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
+				current.requestCount++
+				s.sessionBindings[key] = current
+			}
+			s.sessionMu.Unlock()
 			return acc, binding.proxyURL
 		}
 	}
 	if binding, ok := s.getCachedSessionAffinity(key); ok {
-		if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
+		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康
+		if mode == AffinityModeBounded && !s.affinityAccountStillHealthy(binding.accountID) {
+			// 不复用,落到完整挑号
+		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
 			s.sessionMu.Lock()
 			if s.sessionBindings == nil {
 				s.sessionBindings = make(map[string]sessionAffinity)
@@ -2871,6 +3077,36 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	}
 
 	return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
+}
+
+// affinityAccountStillHealthy 检查一个粘性绑定的账号是否仍处于 healthy 桶。
+// 若已掉到 warm/risky/banned 或不可调度,则 bounded 模式会逃逸并重新挑号。
+func (s *Store) affinityAccountStillHealthy(accountID int64) bool {
+	if s == nil || accountID == 0 {
+		return false
+	}
+	s.mu.RLock()
+	var target *Account
+	for _, acc := range s.accounts {
+		if acc != nil && acc.DBID == accountID {
+			target = acc
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if target == nil {
+		return false
+	}
+	if atomic.LoadInt32(&target.Disabled) != 0 || atomic.LoadInt32(&target.DispatchPaused) != 0 {
+		return false
+	}
+	target.mu.RLock()
+	defer target.mu.RUnlock()
+	if target.Status == StatusError || target.Status == StatusCooldown {
+		return false
+	}
+	tier := target.healthTierLocked()
+	return tier == HealthTierHealthy
 }
 
 func (s *Store) getCachedSessionAffinity(key string) (sessionAffinity, bool) {
@@ -3189,6 +3425,25 @@ func (s *Store) SetSchedulerMode(mode string) {
 	}
 }
 
+// GetAffinityMode 获取当前 session affinity 模式 (bounded / off / strict)
+func (s *Store) GetAffinityMode() string {
+	if v, ok := s.affinityMode.Load().(string); ok && v != "" {
+		return v
+	}
+	return AffinityModeBounded
+}
+
+// SetAffinityMode 设置 session affinity 模式
+func (s *Store) SetAffinityMode(mode string) {
+	switch mode {
+	case AffinityModeBounded, AffinityModeOff, AffinityModeStrict:
+		// ok
+	default:
+		mode = AffinityModeBounded
+	}
+	s.affinityMode.Store(mode)
+}
+
 func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfilter.Config {
 	cfg := promptfilter.DefaultConfig()
 	if settings == nil {
@@ -3270,7 +3525,7 @@ func (s *Store) FindByID(dbID int64) *Account {
 }
 
 // ApplyAccountSchedulerOverrides 更新运行时账号的调度 override 并立即重算。
-func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, baseConcurrencyOverride *int64) bool {
+func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, baseConcurrencyOverride *int64, skipWarmTier *bool) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
@@ -3279,6 +3534,9 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	acc.mu.Lock()
 	acc.ScoreBiasOverride = cloneInt64Ptr(scoreBiasOverride)
 	acc.BaseConcurrencyOverride = cloneInt64Ptr(baseConcurrencyOverride)
+	if skipWarmTier != nil {
+		acc.SkipWarmTier = *skipWarmTier
+	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
@@ -3512,12 +3770,33 @@ func (s *Store) ApplyAccountEnabled(dbID int64, enabled bool) bool {
 	return true
 }
 
+func normalizeAccountErrorMessage(errorMsg string, fallback string) string {
+	errorMsg = strings.TrimSpace(errorMsg)
+	if errorMsg == "" {
+		errorMsg = strings.TrimSpace(fallback)
+	}
+	if len(errorMsg) > 500 {
+		errorMsg = errorMsg[:500]
+	}
+	return errorMsg
+}
+
 // MarkCooldown 标记账号进入冷却，并持久化到数据库
 func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string) {
+	s.markCooldown(acc, duration, reason, "")
+}
+
+// MarkCooldownWithError 标记账号进入冷却，并同时记录本次上游错误详情。
+func (s *Store) MarkCooldownWithError(acc *Account, duration time.Duration, reason string, errorMsg string) {
+	s.markCooldown(acc, duration, reason, errorMsg)
+}
+
+func (s *Store) markCooldown(acc *Account, duration time.Duration, reason string, errorMsg string) {
 	if acc == nil {
 		return
 	}
 
+	errorMsg = normalizeAccountErrorMessage(errorMsg, "")
 	now := time.Now()
 	acc.mu.Lock()
 	switch reason {
@@ -3543,6 +3822,9 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 			acc.HealthTier = HealthTierRisky
 		}
 	}
+	if errorMsg != "" {
+		acc.ErrorMsg = errorMsg
+	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 
@@ -3557,7 +3839,13 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.db.SetCooldown(ctx, acc.DBID, reason, until); err != nil {
+	var err error
+	if errorMsg != "" {
+		err = s.db.SetCooldownWithError(ctx, acc.DBID, reason, until, errorMsg)
+	} else {
+		err = s.db.SetCooldown(ctx, acc.DBID, reason, until)
+	}
+	if err != nil {
 		log.Printf("[账号 %d] 持久化冷却状态失败: %v", acc.DBID, err)
 	}
 }
@@ -3659,13 +3947,7 @@ func (s *Store) MarkError(acc *Account, errorMsg string) {
 		return
 	}
 
-	errorMsg = strings.TrimSpace(errorMsg)
-	if errorMsg == "" {
-		errorMsg = "账号测试失败"
-	}
-	if len(errorMsg) > 500 {
-		errorMsg = errorMsg[:500]
-	}
+	errorMsg = normalizeAccountErrorMessage(errorMsg, "账号测试失败")
 
 	now := time.Now()
 	acc.mu.Lock()
@@ -3730,6 +4012,54 @@ func (s *Store) ClearCooldown(acc *Account) {
 	defer cancel()
 	if err := s.db.ClearError(ctx, acc.DBID); err != nil {
 		log.Printf("[账号 %d] 清理账号状态失败: %v", acc.DBID, err)
+	}
+}
+
+// RecordManualTestSuccess clears failure/cooldown state after an explicit admin
+// connection test succeeds.
+func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
+	if acc == nil {
+		return
+	}
+
+	now := time.Now()
+	atomic.StoreInt32(&acc.Disabled, 0)
+	acc.mu.Lock()
+	wasCooling := acc.Status == StatusCooldown
+	wasError := acc.Status == StatusError
+	wasBanned := acc.HealthTier == HealthTierBanned
+	premium5hLimited := acc.premium5hRateLimitedLocked(now)
+	acc.recordLatencyLocked(latency)
+	acc.recordResultLocked(true)
+	if wasCooling || wasError {
+		acc.Status = StatusReady
+	}
+	acc.ErrorMsg = ""
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.LastSuccessAt = now
+	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
+	acc.FailureStreak = 0
+	if premium5hLimited {
+		acc.HealthTier = HealthTierRisky
+	} else if wasBanned || wasCooling || wasError {
+		acc.HealthTier = HealthTierWarm
+	} else if acc.HealthTier == "" {
+		acc.HealthTier = HealthTierHealthy
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	s.deleteCachedAccountCooldown(acc.DBID)
+
+	if s.db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.ClearError(ctx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 清理账号测试成功状态失败: %v", acc.DBID, err)
 	}
 }
 
@@ -3833,6 +4163,39 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 	if err := s.db.UpdateUsageSnapshot(ctx, acc.DBID, pct7d, now); err != nil {
 		log.Printf("[账号 %d] 持久化用量快照失败: %v", acc.DBID, err)
 	}
+}
+
+// UpdateAccountPlanType persists the latest Codex plan type observed from upstream headers.
+func (s *Store) UpdateAccountPlanType(acc *Account, planType string) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	if plan == "" {
+		return false
+	}
+
+	acc.mu.Lock()
+	changed := acc.PlanType != plan
+	if changed {
+		acc.PlanType = plan
+		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	}
+	acc.mu.Unlock()
+	if changed {
+		s.fastSchedulerUpdate(acc)
+	}
+
+	if s.db == nil || !changed {
+		return changed
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"plan_type": plan}); err != nil {
+		log.Printf("[账号 %d] 持久化 plan_type 失败: %v", acc.DBID, err)
+	}
+	return changed
 }
 
 // ApplyUsageLimitMetadata applies metadata returned by Codex usage_limit_reached errors.
@@ -4111,6 +4474,12 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 }
 
 func (s *Store) parallelProbeUsage(ctx context.Context) {
+	s.parallelProbeUsageWith(ctx, s.GetUsageProbeMaxAge())
+}
+
+// parallelProbeUsageWith 以指定 maxAge 阈值执行一次批量用量探针。
+// maxAge<=0 时视为"立即探针"——只要账号能跑就刷一次。
+func (s *Store) parallelProbeUsageWith(ctx context.Context, maxAge time.Duration) {
 	s.usageProbeMu.RLock()
 	probeFn := s.usageProbe
 	s.usageProbeMu.RUnlock()
@@ -4123,11 +4492,11 @@ func (s *Store) parallelProbeUsage(ctx context.Context) {
 	copy(accounts, s.accounts)
 	s.mu.RUnlock()
 
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, s.GetUsageProbeConcurrency())
 	var wg sync.WaitGroup
 
 	for _, acc := range accounts {
-		if !acc.NeedsUsageProbe(s.GetUsageProbeMaxAge()) {
+		if !acc.NeedsUsageProbe(maxAge) {
 			continue
 		}
 		if !acc.TryBeginUsageProbe() {
@@ -4150,6 +4519,22 @@ func (s *Store) parallelProbeUsage(ctx context.Context) {
 	}
 
 	wg.Wait()
+}
+
+// TriggerUsageProbeForceAsync 异步触发一次"无视缓存阈值"的批量用量探针。
+// 用于管理端手动刷新场景。
+func (s *Store) TriggerUsageProbeForceAsync() {
+	if s.GetLazyMode() {
+		return
+	}
+	if !s.usageProbeBatch.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer s.usageProbeBatch.Store(false)
+		s.parallelProbeUsageWith(context.Background(), 0)
+	}()
 }
 
 func (s *Store) parallelRecoveryProbe(ctx context.Context) {
@@ -4498,6 +4883,9 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 		} else if acc.PlanType == "" {
 			log.Printf("[账号 %d] 刷新后 plan_type 为空，无法识别套餐类型", dbID)
 		}
+		if !info.SubscriptionExpiresAt.IsZero() {
+			acc.SubscriptionExpiresAt = info.SubscriptionExpiresAt
+		}
 	}
 	if activeCooldown {
 		acc.Status = StatusCooldown
@@ -4542,6 +4930,9 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 		}
 		if appliedPlanType != "" {
 			credentials["plan_type"] = appliedPlanType
+		}
+		if !info.SubscriptionExpiresAt.IsZero() {
+			credentials["subscription_expires_at"] = info.SubscriptionExpiresAt.Format(time.RFC3339)
 		}
 	}
 	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {

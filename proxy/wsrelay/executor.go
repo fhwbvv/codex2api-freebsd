@@ -3,7 +3,6 @@ package wsrelay
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -167,7 +166,6 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	}
 
 	// 2. 清理多余字段
-	wsBody, _ = sjson.DeleteBytes(wsBody, "previous_response_id")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "prompt_cache_retention")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "safety_identifier")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "disable_response_storage")
@@ -256,16 +254,7 @@ func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) 
 	if !wc.IsConnected() {
 		return fmt.Errorf("websocket connection is not connected")
 	}
-
-	// 构建消息
-	msg := NewHTTPRequestMessage(requestID, wc.session.ID, body)
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal message failed: %w", err)
-	}
-
-	// 发送消息（使用 marshaled msgBytes）
-	return wc.WriteMessage(websocket.TextMessage, msgBytes)
+	return wc.WriteMessage(websocket.TextMessage, body)
 }
 
 // ==================== WebSocket 响应处理 ====================
@@ -462,19 +451,16 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 		return nil, err
 	}
 
-	// 检查 HTTP 握手响应状态
-	statusCode := http.StatusOK
-	if wsResp.HTTPResponse() != nil {
-		statusCode = wsResp.HTTPResponse().StatusCode
-		// 如果握手失败（非 2xx），返回错误响应
-		if statusCode < 200 || statusCode >= 300 {
-			wsResp.Close()
-			return &http.Response{
-				StatusCode: statusCode,
-				Header:     wsResp.HTTPResponse().Header.Clone(),
-				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
-			}, nil
-		}
+	// 检查 HTTP 握手响应状态。WebSocket 握手成功的标准状态是 101，
+	// 但这里要包装成现有 handler 可消费的 SSE HTTP 200 响应。
+	statusCode, handshakeHeader, handshakeFailed := normalizeWebsocketHandshakeResponse(wsResp.HTTPResponse())
+	if handshakeFailed {
+		wsResp.Close()
+		return &http.Response{
+			StatusCode: statusCode,
+			Header:     handshakeHeader.Clone(),
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
+		}, nil
 	}
 
 	// 将 WebSocket 响应包装为 http.Response
@@ -519,4 +505,17 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 	}()
 
 	return resp, nil
+}
+
+func normalizeWebsocketHandshakeResponse(handshakeResp *http.Response) (statusCode int, header http.Header, failed bool) {
+	if handshakeResp == nil {
+		return http.StatusOK, http.Header{}, false
+	}
+
+	statusCode = handshakeResp.StatusCode
+	header = handshakeResp.Header
+	if statusCode == http.StatusSwitchingProtocols || (statusCode >= 200 && statusCode < 300) {
+		return http.StatusOK, header, false
+	}
+	return statusCode, header, true
 }

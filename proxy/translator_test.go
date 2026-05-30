@@ -65,8 +65,9 @@ func TestResolveBillingServiceTier(t *testing.T) {
 		want      string
 	}{
 		{name: "actual priority wins", actual: "priority", requested: "fast", want: "priority"},
-		{name: "actual default downgrade wins", actual: "default", requested: "fast", want: "default"},
-		{name: "unknown concrete actual tier wins", actual: "burst", requested: "fast", want: "burst"},
+		{name: "requested fast bills priority even when upstream downgrades to default", actual: "default", requested: "fast", want: "priority"},
+		{name: "requested fast bills priority even when upstream reports unknown tier", actual: "burst", requested: "fast", want: "priority"},
+		{name: "upstream concrete tier wins when client did not request fast", actual: "burst", requested: "", want: "burst"},
 		{name: "requested fast fallback bills priority", actual: "", requested: "fast", want: "priority"},
 		{name: "requested priority fallback bills priority", actual: "", requested: "priority", want: "priority"},
 		{name: "default stays default", actual: "default", requested: "", want: "default"},
@@ -711,6 +712,12 @@ func TestPrepareResponsesBody_ConvertsAndSanitizesLegacyResponseFormat(t *testin
 	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.minProperties").Exists() {
 		t.Fatalf("minProperties should be stripped after response_format conversion; body=%s", got)
 	}
+	if v := gjson.GetBytes(got, "text.format.schema.additionalProperties"); !v.Exists() || v.Bool() {
+		t.Fatalf("root object should get additionalProperties=false, got %s; body=%s", v.Raw, got)
+	}
+	if v := gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.additionalProperties"); !v.Exists() || v.Bool() {
+		t.Fatalf("nested object should get additionalProperties=false, got %s; body=%s", v.Raw, got)
+	}
 }
 
 func TestTranslateRequest_ConvertsAndSanitizesResponseFormat(t *testing.T) {
@@ -748,6 +755,12 @@ func TestTranslateRequest_ConvertsAndSanitizesResponseFormat(t *testing.T) {
 	}
 	if gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.minProperties").Exists() {
 		t.Fatalf("minProperties should be stripped in translated response_format schema; body=%s", got)
+	}
+	if v := gjson.GetBytes(got, "text.format.schema.additionalProperties"); !v.Exists() || v.Bool() {
+		t.Fatalf("root object should get additionalProperties=false, got %s; body=%s", v.Raw, got)
+	}
+	if v := gjson.GetBytes(got, "text.format.schema.properties.testEnvironmentContract.additionalProperties"); !v.Exists() || v.Bool() {
+		t.Fatalf("nested object should get additionalProperties=false, got %s; body=%s", v.Raw, got)
 	}
 }
 
@@ -1460,6 +1473,29 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 	}
 	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_123" {
 		t.Fatalf("function_call call_id should be preserved, got %q; body=%s", callID, got)
+	}
+}
+
+func TestPrepareResponsesWebSocketBodyPreservesPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"previous_response_id":"resp_123",
+		"input":"continue"
+	}`)
+
+	got, expandedInputRaw := PrepareResponsesWebSocketBody(raw)
+
+	if prev := gjson.GetBytes(got, "previous_response_id").String(); prev != "resp_123" {
+		t.Fatalf("previous_response_id = %q, want resp_123; body=%s", prev, got)
+	}
+	if store := gjson.GetBytes(got, "store"); store.Exists() {
+		t.Fatalf("store should not be forced for websocket continuity, got %s; body=%s", store.Raw, got)
+	}
+	if !gjson.GetBytes(got, "stream").Bool() {
+		t.Fatalf("stream should be true; body=%s", got)
+	}
+	if content := gjson.Get(expandedInputRaw, "0.content").String(); content != "continue" {
+		t.Fatalf("expanded input content = %q, want continue; expanded=%s", content, expandedInputRaw)
 	}
 }
 

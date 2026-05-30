@@ -1,0 +1,81 @@
+name: Bug Report (English)
+description: Something broke — gateway error, scheduler issue, UI glitch, deploy failure, etc.
+title: "[Bug] "
+labels: ["type/bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please redact **Refresh Tokens / Access Tokens / API keys / cookies** before pasting logs or configs.
+
+  - type: checkboxes
+    id: prechecks
+    attributes:
+      label: Before I submit
+      options:
+        - label: I searched [existing issues](https://github.com/james-6-23/codex2api/issues?q=is%3Aissue) and didn't find a duplicate
+          required: true
+        - label: I redacted tokens, API keys, passwords, and other secrets from logs/configs
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area is affected?
+      options:
+        - Gateway API (/v1/chat/completions, /responses, /messages, Images)
+        - Account pool / scheduler / health / cooldown
+        - Usage tracking / billing / API keys
+        - Admin dashboard UI (React)
+        - Deploy / Docker / env / database
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Blocker — feature is completely unusable
+        - Major — core feature affected, but a workaround exists
+        - Minor — happens occasionally or affects a secondary feature
+        - Trivial — cosmetic / small UX glitch
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What went wrong?
+      description: A short description is fine. Logs or screenshots help a lot.
+      placeholder: |
+        e.g. Calling /v1/chat/completions returned 502, and the backend log shows "no available account"…
+    validations:
+      required: true
+
+  - type: textarea
+    id: how-to-trigger
+    attributes:
+      label: How to reproduce? (optional)
+      description: Rough steps are fine — no need to be exact.
+      placeholder: |
+        1. Connect to the gateway with Codex CLI
+        2. Send a few messages in a row
+        3. The 3rd one starts returning 502
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment (optional, fill what you know)
+      value: |
+        - Deploy shape: PG+Redis / SQLite+Memory / source / other
+        - Version or commit:
+        - Client: Codex CLI / Claude Code / OpenAI SDK / other
+        - Browser (for UI issues):
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else? (optional)
+      description: Free-form notes — your guess at the root cause, things you've tried, related issues, etc.

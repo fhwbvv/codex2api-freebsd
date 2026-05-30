@@ -87,10 +87,15 @@ type streamChoice struct {
 	FinishReason *string      `json:"finish_reason"`
 }
 
-// streamDelta 流式块中的增量内容
+// streamDelta 流式块中的增量内容。
+//
+// reasoning 字段同时输出两种命名,兼容不同客户端:
+//   - reasoning:  OpenAI 官方 o1/GPT-5 风格(Cherry Studio 等默认走这个)
+//   - reasoning_content: DeepSeek / OpenRouter / new-api 等克隆站点风格
 type streamDelta struct {
 	Role             string          `json:"role,omitempty"`
 	Content          *string         `json:"content,omitempty"`
+	Reasoning        *string         `json:"reasoning,omitempty"`
 	ReasoningContent *string         `json:"reasoning_content,omitempty"`
 	ToolCalls        []toolCallDelta `json:"tool_calls,omitempty"`
 }
@@ -126,11 +131,13 @@ type compactChoice struct {
 	FinishReason string         `json:"finish_reason"`
 }
 
-// compactMessage 非流式响应中的消息
+// compactMessage 非流式响应中的消息。reasoning / reasoning_content 同时输出兼容多端。
 type compactMessage struct {
-	Role      string               `json:"role"`
-	Content   *string              `json:"content"`
-	ToolCalls []compactToolCallOut `json:"tool_calls,omitempty"`
+	Role             string               `json:"role"`
+	Content          *string              `json:"content"`
+	Reasoning        *string              `json:"reasoning,omitempty"`
+	ReasoningContent *string              `json:"reasoning_content,omitempty"`
+	ToolCalls        []compactToolCallOut `json:"tool_calls,omitempty"`
 }
 
 // compactToolCallOut 非流式响应中的工具调用
@@ -1147,9 +1154,16 @@ func TranslateRequest(rawJSON []byte) ([]byte, error) {
 	normalizeResponsesInputMessageContent(out)
 	normalizeResponsesInputItemIDs(out)
 
-	// 2. reasoning effort
+	// 2. reasoning effort + summary
+	// 显式向 Codex 请求 summary,否则上游不会发 response.reasoning_summary_text.delta,
+	// chat/completions 客户端就拿不到思考内容(issue #156)。
 	if effort := normalizeReasoningEffort(req.ReasoningEffort); effort != "" {
-		out["reasoning"] = map[string]any{"effort": effort}
+		out["reasoning"] = map[string]any{
+			"effort":  effort,
+			"summary": "auto",
+		}
+	} else {
+		out["reasoning"] = map[string]any{"summary": "auto"}
 	}
 
 	// 3. service tier（兼容客户端字段；只有 fast/priority 会显式传给 Codex 上游）
@@ -1308,10 +1322,31 @@ func normalizeResponsesFunctionTools(body map[string]any) bool {
 	return modified
 }
 
+type responsesBodyPrepareOptions struct {
+	forceStoreFalse            bool
+	expandPreviousResponse     bool
+	preservePreviousResponseID bool
+}
+
 // PrepareResponsesBody 将 Responses API 原始请求转换为上游可接受的格式
 // 采用 Unmarshal→map 操作→Marshal 模式，替代逐字段 sjson 操作
 // 返回: (处理后的 body, 展开后的 input JSON 原始文本)
 func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
+	return prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+		forceStoreFalse:        true,
+		expandPreviousResponse: true,
+	})
+}
+
+// PrepareResponsesWebSocketBody keeps upstream response storage linkage for
+// native Responses WebSocket sessions.
+func PrepareResponsesWebSocketBody(rawBody []byte) ([]byte, string) {
+	return prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+		preservePreviousResponseID: true,
+	})
+}
+
+func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOptions) ([]byte, string) {
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, ""
@@ -1319,7 +1354,9 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 
 	// 1. 强制设置 Codex 必需字段
 	body["stream"] = true
-	body["store"] = false
+	if opts.forceStoreFalse {
+		body["store"] = false
+	}
 	if _, ok := body["include"]; !ok {
 		body["include"] = []string{"reasoning.encrypted_content"}
 	}
@@ -1414,7 +1451,7 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 
 	// 6. 展开 previous_response_id
 	prevID, _ := body["previous_response_id"].(string)
-	if prevID != "" {
+	if opts.expandPreviousResponse && prevID != "" {
 		if cached := getResponseCache(prevID); cached != nil {
 			var cachedItems []any
 			for _, item := range cached {
@@ -1448,10 +1485,13 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
 		"logit_bias", "response_format", "serviceTier", "metadata",
 		"stream_options", "reasoning_effort", "truncation", "context_management",
-		"disable_response_storage", "verbosity", "previous_response_id",
+		"disable_response_storage", "verbosity",
 		"prompt_cache_retention", "safety_identifier",
 	} {
 		delete(body, field)
+	}
+	if !opts.preservePreviousResponseID {
+		delete(body, "previous_response_id")
 	}
 
 	result, err := json.Marshal(body)
@@ -1801,26 +1841,24 @@ func resolveServiceTier(actualTier, requestedTier string) string {
 	return final
 }
 
-// resolveBillingServiceTier keeps UI tier normalization separate from billing:
-// fast/priority intent is billed as priority only when the upstream does not
-// report a concrete tier, or when it confirms fast/priority. Any concrete
-// upstream tier wins so billing follows the actual tier reported by upstream.
+// resolveBillingServiceTier 按"请求意图"决定计费 tier：
+// 只要客户端显式请求 fast/priority，就锁定为 priority 计费（×2），
+// 不被上游降级值（如 default）掩盖——保证 fast 用户不会因为上游通道波动而漏费。
+// 客户端没指定 tier 时，才回退到上游实际报告的 tier。
 func resolveBillingServiceTier(actualTier, requestedTier string) string {
-	actualTier = strings.ToLower(strings.TrimSpace(actualTier))
-	if actualTier != "" {
-		if actualTier == "priority" || actualTier == "fast" {
-			return "priority"
-		}
-		return actualTier
+	requestedTier = strings.ToLower(strings.TrimSpace(requestedTier))
+	if requestedTier == "priority" || requestedTier == "fast" {
+		return "priority"
 	}
 
-	requestedTier = strings.ToLower(strings.TrimSpace(requestedTier))
-	switch requestedTier {
-	case "priority", "fast":
+	actualTier = strings.ToLower(strings.TrimSpace(actualTier))
+	if actualTier == "priority" || actualTier == "fast" {
 		return "priority"
-	default:
-		return requestedTier
 	}
+	if actualTier != "" {
+		return actualTier
+	}
+	return requestedTier
 }
 
 // 上游不支持的 JSON Schema 验证约束关键字
@@ -1881,6 +1919,11 @@ func sanitizeSchemaForUpstream(schema map[string]interface{}) {
 	stripUnsupportedSchemaKeys(schema)
 	normalizeSchemaRequiredFields(schema)
 	ensureArrayItems(schema)
+}
+
+func sanitizeStructuredOutputSchemaForUpstream(schema map[string]interface{}) {
+	sanitizeSchemaForUpstream(schema)
+	ensureObjectAdditionalPropertiesFalse(schema)
 }
 
 func normalizeResponsesStructuredOutputFormat(body map[string]any) bool {
@@ -2039,12 +2082,12 @@ func responsesTextFormatFromResponseFormat(responseFormat map[string]any) map[st
 func sanitizeStructuredOutputSchema(format map[string]any) bool {
 	modified := false
 	if schema, ok := format["schema"].(map[string]any); ok && schema != nil {
-		sanitizeSchemaForUpstream(schema)
+		sanitizeStructuredOutputSchemaForUpstream(schema)
 		modified = true
 	}
 	if jsonSchema, ok := format["json_schema"].(map[string]any); ok && jsonSchema != nil {
 		if schema, ok := jsonSchema["schema"].(map[string]any); ok && schema != nil {
-			sanitizeSchemaForUpstream(schema)
+			sanitizeStructuredOutputSchemaForUpstream(schema)
 			modified = true
 		}
 	}
@@ -2171,6 +2214,41 @@ func ensureArrayItems(schema map[string]interface{}) {
 	}
 }
 
+func ensureObjectAdditionalPropertiesFalse(schema map[string]interface{}) {
+	if schemaDeclaresObject(schema) {
+		schema["additionalProperties"] = false
+	}
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]interface{}); ok {
+				ensureObjectAdditionalPropertiesFalse(sub)
+			}
+		}
+	}
+	if items, ok := schema["items"].(map[string]interface{}); ok {
+		ensureObjectAdditionalPropertiesFalse(items)
+	}
+	for _, key := range []string{"allOf", "anyOf", "oneOf"} {
+		if arr, ok := schema[key].([]interface{}); ok {
+			for _, item := range arr {
+				if sub, ok := item.(map[string]interface{}); ok {
+					ensureObjectAdditionalPropertiesFalse(sub)
+				}
+			}
+		}
+	}
+	if addProps, ok := schema["additionalProperties"].(map[string]interface{}); ok {
+		ensureObjectAdditionalPropertiesFalse(addProps)
+	}
+	if defs, ok := schema["$defs"].(map[string]interface{}); ok {
+		for _, v := range defs {
+			if sub, ok := v.(map[string]interface{}); ok {
+				ensureObjectAdditionalPropertiesFalse(sub)
+			}
+		}
+	}
+}
+
 func schemaDeclaresArray(schema map[string]interface{}) bool {
 	switch t := schema["type"].(type) {
 	case string:
@@ -2178,6 +2256,20 @@ func schemaDeclaresArray(schema map[string]interface{}) bool {
 	case []interface{}:
 		for _, item := range t {
 			if s, ok := item.(string); ok && s == "array" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func schemaDeclaresObject(schema map[string]interface{}) bool {
+	switch t := schema["type"].(type) {
+	case string:
+		return t == "object"
+	case []interface{}:
+		for _, item := range t {
+			if s, ok := item.(string); ok && s == "object" {
 				return true
 			}
 		}
@@ -2235,13 +2327,17 @@ func newContentChunk(id, model string, created int64, content string) []byte {
 	return b
 }
 
-// newReasoningChunk 构建推理内容流式块
+// newReasoningChunk 构建推理内容流式块。
+// 同时填入 reasoning 与 reasoning_content,兼容 OpenAI/DeepSeek 两套客户端风格。
 func newReasoningChunk(id, model string, created int64, reasoning string) []byte {
 	chunk := openAIStreamChunk{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []streamChoice{{
 			Index: 0,
-			Delta: &streamDelta{ReasoningContent: &reasoning},
+			Delta: &streamDelta{
+				Reasoning:        &reasoning,
+				ReasoningContent: &reasoning,
+			},
 		}},
 	}
 	b, _ := json.Marshal(chunk)
@@ -2458,17 +2554,35 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 
 // TranslateCompactResponse 将 Codex 非流式响应转换为 OpenAI 格式
 func TranslateCompactResponse(responseData []byte, model string, id string) []byte {
-	var outputText string
+	var outputText, reasoningText string
 	output := gjson.GetBytes(responseData, "output")
 	if output.IsArray() {
 		output.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "message" {
+			switch item.Get("type").String() {
+			case "message":
 				content := item.Get("content")
 				if content.IsArray() {
 					content.ForEach(func(_, part gjson.Result) bool {
 						if part.Get("type").String() == "output_text" {
 							outputText += part.Get("text").String()
 						}
+						return true
+					})
+				}
+			case "reasoning":
+				// Codex 在 response.output 里把思考过程作为 reasoning item,
+				// content/summary 数组下每个元素是 {type, text} 形式。
+				summary := item.Get("summary")
+				if summary.IsArray() {
+					summary.ForEach(func(_, part gjson.Result) bool {
+						reasoningText += part.Get("text").String()
+						return true
+					})
+				}
+				content := item.Get("content")
+				if content.IsArray() {
+					content.ForEach(func(_, part gjson.Result) bool {
+						reasoningText += part.Get("text").String()
 						return true
 					})
 				}
@@ -2479,16 +2593,23 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 
 	usage := extractUsage(responseData)
 
+	msg := compactMessage{
+		Role:    "assistant",
+		Content: &outputText,
+	}
+	if reasoningText != "" {
+		r := reasoningText
+		msg.Reasoning = &r
+		msg.ReasoningContent = &r
+	}
+
 	resp := openAICompactResponse{
 		ID:     id,
 		Object: "chat.completion",
 		Model:  model,
 		Choices: []compactChoice{{
-			Index: 0,
-			Message: compactMessage{
-				Role:    "assistant",
-				Content: &outputText,
-			},
+			Index:        0,
+			Message:      msg,
 			FinishReason: "stop",
 		}},
 		Usage: usage,
@@ -2499,11 +2620,17 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 
 // BuildCompactResponse 构建非流式完整响应（供 handler.go 调用，替代内联 sjson）
 // 当有 toolCalls 且 content 为空时，content 输出为 JSON null
-func BuildCompactResponse(id, model string, created int64, content string, toolCalls []ToolCallResult, usage *UsageInfo) []byte {
+// reasoning 为思考过程拼接文本,空字符串时 reasoning / reasoning_content 字段被省略。
+func BuildCompactResponse(id, model string, created int64, content, reasoning string, toolCalls []ToolCallResult, usage *UsageInfo) []byte {
 	finishReason := "stop"
 	msg := compactMessage{
 		Role:    "assistant",
 		Content: &content,
+	}
+	if reasoning != "" {
+		r := reasoning
+		msg.Reasoning = &r
+		msg.ReasoningContent = &r
 	}
 
 	if len(toolCalls) > 0 {

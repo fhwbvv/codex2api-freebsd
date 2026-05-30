@@ -1,0 +1,31 @@
+name: 使用问题 / 提问
+description: 不确定算不算 bug、配置疑问、对接其他工具的方法、文档没看明白……
+title: "[Question] "
+labels: ["type/question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提问前可以先翻一下 [README](https://github.com/james-6-23/codex2api#documentation) 和 `docs/` 目录，
+        很多常见问题已经写过了。
+
+  - type: checkboxes
+    id: prechecks
+    attributes:
+      label: 提交前我已确认
+      options:
+        - label: 我看过 README 和 `docs/` 里相关章节，没找到答案
+          required: true
+        - label: 我搜过 [已有 issues](https://github.com/james-6-23/codex2api/issues?q=is%3Aissue)，没找到讨论过这个问题的
+          required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: 我想问什么？
+      placeholder: |
+        例如：我怎么让一个 API Key 只能调 /v1/messages？
+        round_robin 和 remaining_quota 我该怎么选？
+        我如何把已有账号池迁到新机器？
+    validations:
+      required: true

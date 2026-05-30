@@ -166,7 +166,7 @@ Notes:
 - Before switching deployment modes, replace `.env` with the matching example file.
 - The SQLite lightweight mode runs a single `codex2api` container and stores data at `/data/codex2api.db`.
 - **SQLite compose files bind to `127.0.0.1` by default for security.** To expose the SQLite service on all interfaces, set `BIND_HOST=0.0.0.0` in `.env` or override the port binding in the compose file. The standard compose files bind to `0.0.0.0` by default.
-- The image studio library is stored under `/data/images`; Docker configurations persist `/data`.
+- The image studio library is stored under `/data/images`; uploaded admin backgrounds are stored under `/data/backgrounds`; Docker configurations persist `/data`.
 - `docker compose down` does not delete named volumes by default. Data is removed only by commands such as `docker compose down -v`, `docker volume rm`, or `docker volume prune`.
 
 ---
@@ -238,6 +238,7 @@ Vite proxies `/api` and `/health` to the backend. During development, open `http
 | Variable | Description |
 | --- | --- |
 | `CODEX_PORT` | HTTP port, default `8080` |
+| `CODEX_MAX_REQUEST_BODY_SIZE_MB` | HTTP request body limit in MB, default `48` |
 | `ADMIN_SECRET` | Admin dashboard secret. When set, `/admin` prompts for authentication |
 | `DATABASE_DRIVER` | Database driver: `postgres` or `sqlite` |
 | `DATABASE_PATH` | SQLite database file path, used when `DATABASE_DRIVER=sqlite` |

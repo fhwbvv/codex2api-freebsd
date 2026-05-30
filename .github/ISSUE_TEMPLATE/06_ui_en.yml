@@ -1,0 +1,43 @@
+name: Admin UI Feedback (English)
+description: Admin console UI / interaction / visual issues — a screenshot is worth a thousand words
+title: "[UI] "
+labels: ["type/ui", "area/frontend"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For frontend issues, please attach a **screenshot or screen recording** — much faster than describing in words.
+
+  - type: checkboxes
+    id: prechecks
+    attributes:
+      label: Before I submit
+      options:
+        - label: I searched [existing issues](https://github.com/james-6-23/codex2api/issues?q=is%3Aissue) and didn't find a duplicate
+          required: true
+        - label: I'll attach a screenshot or recording below (just drag the image into the description box)
+          required: true
+
+  - type: textarea
+    id: detail
+    attributes:
+      label: What did I see / what should be improved?
+      description: Which page, which component, in what scenario.
+      placeholder: |
+        e.g. On a narrow screen, the columns of the accounts list table get squashed;
+        the chart colors are too low-contrast to read;
+        the hover state on a button looks broken…
+    validations:
+      required: true
+
+  - type: input
+    id: page
+    attributes:
+      label: Page involved (optional)
+      placeholder: e.g. /admin/accounts, /admin/usage, Image Studio…
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Browser / screen info (optional)
+      placeholder: e.g. Chrome 130 / macOS / 1920×1080; or mobile Safari, etc.

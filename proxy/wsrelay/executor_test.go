@@ -2,9 +2,13 @@ package wsrelay
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/codex2api/proxy"
+	"github.com/gorilla/websocket"
+	"github.com/tidwall/gjson"
 )
 
 func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing.T) {
@@ -84,5 +88,107 @@ func TestPrepareWebsocketHeadersOmitsUserAgentByDefault(t *testing.T) {
 	}
 	if got := headers.Get("Conversation_id"); got != "session-123" {
 		t.Fatalf("Conversation_id = %q", got)
+	}
+}
+
+func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
+	exec := NewExecutor()
+
+	got := exec.prepareWebsocketBody([]byte(`{"model":"gpt-5.4","previous_response_id":"resp_123","input":[{"role":"user","content":"continue"}]}`), "session-123")
+
+	if prev := gjson.GetBytes(got, "previous_response_id").String(); prev != "resp_123" {
+		t.Fatalf("previous_response_id = %q, want resp_123; body=%s", prev, got)
+	}
+	if cacheKey := gjson.GetBytes(got, "prompt_cache_key").String(); cacheKey != "session-123" {
+		t.Fatalf("prompt_cache_key = %q, want session-123; body=%s", cacheKey, got)
+	}
+	if typ := gjson.GetBytes(got, "type").String(); typ != "response.create" {
+		t.Fatalf("type = %q, want response.create; body=%s", typ, got)
+	}
+	if !gjson.GetBytes(got, "stream").Bool() {
+		t.Fatalf("stream should be true; body=%s", got)
+	}
+}
+
+func TestNormalizeWebsocketHandshakeResponse(t *testing.T) {
+	t.Run("switching protocols is successful websocket handshake", func(t *testing.T) {
+		statusCode, _, failed := normalizeWebsocketHandshakeResponse(&http.Response{
+			StatusCode: http.StatusSwitchingProtocols,
+		})
+		if failed {
+			t.Fatal("failed = true, want false")
+		}
+		if statusCode != http.StatusOK {
+			t.Fatalf("statusCode = %d, want %d", statusCode, http.StatusOK)
+		}
+	})
+
+	t.Run("http 2xx is normalized for downstream handler", func(t *testing.T) {
+		statusCode, _, failed := normalizeWebsocketHandshakeResponse(&http.Response{
+			StatusCode: http.StatusNoContent,
+		})
+		if failed {
+			t.Fatal("failed = true, want false")
+		}
+		if statusCode != http.StatusOK {
+			t.Fatalf("statusCode = %d, want %d", statusCode, http.StatusOK)
+		}
+	})
+
+	t.Run("non success status remains a handshake failure", func(t *testing.T) {
+		statusCode, _, failed := normalizeWebsocketHandshakeResponse(&http.Response{
+			StatusCode: http.StatusUnauthorized,
+		})
+		if !failed {
+			t.Fatal("failed = false, want true")
+		}
+		if statusCode != http.StatusUnauthorized {
+			t.Fatalf("statusCode = %d, want %d", statusCode, http.StatusUnauthorized)
+		}
+	})
+}
+
+func TestSendRequestWritesResponseCreatePayloadDirectly(t *testing.T) {
+	received := make(chan []byte, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer conn.Close()
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read websocket message: %v", err)
+			return
+		}
+		received <- payload
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer conn.Close()
+
+	exec := NewExecutor()
+	wc := NewWsConnection(conn, NewSession(1, nil), wsURL)
+	body := []byte(`{"type":"response.create","model":"gpt-5.4","input":"hi","stream":true}`)
+	if err := exec.sendRequest(wc, body, "request-1"); err != nil {
+		t.Fatalf("sendRequest: %v", err)
+	}
+
+	got := <-received
+	if string(got) != string(body) {
+		t.Fatalf("sent payload = %s, want %s", got, body)
+	}
+	if eventType := gjson.GetBytes(got, "type").String(); eventType != "response.create" {
+		t.Fatalf("sent type = %q, want response.create; payload=%s", eventType, got)
+	}
+	if gjson.GetBytes(got, "request_id").Exists() {
+		t.Fatalf("payload should not contain internal request_id wrapper: %s", got)
 	}
 }

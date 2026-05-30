@@ -1,0 +1,90 @@
+name: codex2api-pgredis-2004
+
+services:
+  codex2api:
+    build: .
+    container_name: codex2api-pgredis-2004
+    ports:
+      - "127.0.0.1:2004:2004"
+    environment:
+      CODEX_PORT: "2004"
+      CODEX_BIND: "0.0.0.0"
+      ADMIN_SECRET: "123456"
+      CODEX_UPSTREAM_TRANSPORT: "http"
+      CODEX_TRANSPORT_MODE: "standard"
+      IMAGE_ASSET_DIR: "/data/images"
+      LOG_DIR: "/app/logs"
+      DATABASE_DRIVER: "postgres"
+      DATABASE_HOST: "postgres"
+      DATABASE_PORT: "5432"
+      DATABASE_USER: "codex2api"
+      DATABASE_PASSWORD: "123456"
+      DATABASE_NAME: "codex2api"
+      CACHE_DRIVER: "redis"
+      REDIS_ADDR: "redis:6379"
+      REDIS_USERNAME: ""
+      REDIS_PASSWORD: "123456"
+      REDIS_DB: "0"
+      REDIS_TLS: "false"
+      REDIS_INSECURE_SKIP_VERIFY: "false"
+      TZ: "Asia/Shanghai"
+    volumes:
+      - pgredis2004-image-assets:/data
+      - ./logs/pgredis2004:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - codex2api-pgredis-2004-net
+
+  postgres:
+    image: postgres:18-alpine
+    container_name: codex2api-pgredis-2004-postgres
+    environment:
+      POSTGRES_USER: "codex2api"
+      POSTGRES_PASSWORD: "123456"
+      POSTGRES_DB: "codex2api"
+      PGDATA: "/var/lib/postgresql/data"
+      TZ: "Asia/Shanghai"
+    volumes:
+      - pgredis2004-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codex2api"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - codex2api-pgredis-2004-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: codex2api-pgredis-2004-redis
+    command: redis-server --appendonly yes --requirepass 123456
+    environment:
+      TZ: "Asia/Shanghai"
+    volumes:
+      - pgredis2004-redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a 123456 ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - codex2api-pgredis-2004-net
+
+networks:
+  codex2api-pgredis-2004-net:
+    driver: bridge
+
+volumes:
+  pgredis2004-pgdata:
+    name: codex2api-pgredis-2004_pgdata
+  pgredis2004-redisdata:
+    name: codex2api-pgredis-2004_redisdata
+  pgredis2004-image-assets:
+    name: codex2api-pgredis-2004_image-assets

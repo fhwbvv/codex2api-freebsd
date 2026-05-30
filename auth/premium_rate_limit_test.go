@@ -115,3 +115,51 @@ func TestCleanByRuntimeStatusSkipsPremium5hRateLimitedAccount(t *testing.T) {
 		t.Fatalf("AccountCount() = %d, want 1", store.AccountCount())
 	}
 }
+
+func TestCleanRateLimitedManualClearsAllRateLimitFlavors(t *testing.T) {
+	premium := newPremium5hTestAccount("plus", time.Now().Add(20*time.Minute))
+	premium.DBID = 1
+
+	// Free 7d 用尽 → RuntimeStatus = "usage_exhausted"
+	exhausted := &Account{
+		DBID:                2,
+		AccessToken:         "token-exhausted",
+		PlanType:            "free",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		UsagePercent7d:      100,
+		UsagePercent7dValid: true,
+		Reset7dAt:           time.Now().Add(48 * time.Hour),
+		UsageUpdatedAt:      time.Now().Add(-1 * time.Minute),
+	}
+
+	// 普通正常账号 → 不应被清理
+	healthy := &Account{
+		DBID:        3,
+		AccessToken: "token-healthy",
+		PlanType:    "plus",
+		Status:      StatusReady,
+		HealthTier:  HealthTierHealthy,
+	}
+
+	// 锁定的限流账号 → 不应被清理
+	lockedRL := newPremium5hTestAccount("plus", time.Now().Add(20*time.Minute))
+	lockedRL.DBID = 4
+	lockedRL.Locked = 1
+
+	store := &Store{accounts: []*Account{premium, exhausted, healthy, lockedRL}}
+
+	cleaned := store.CleanRateLimitedManual(context.Background())
+	if cleaned != 2 {
+		t.Fatalf("CleanRateLimitedManual() cleaned = %d, want 2 (premium + exhausted)", cleaned)
+	}
+	if store.AccountCount() != 2 {
+		t.Fatalf("AccountCount() = %d, want 2 (healthy + locked stay)", store.AccountCount())
+	}
+	if store.FindByID(3) == nil {
+		t.Fatal("healthy account should remain")
+	}
+	if store.FindByID(4) == nil {
+		t.Fatal("locked rate-limited account should remain")
+	}
+}

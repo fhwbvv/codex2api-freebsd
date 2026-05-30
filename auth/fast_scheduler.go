@@ -392,6 +392,24 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 			}
 			return usageI < usageJ
 		})
+	} else if s.schedulerMode == "round_robin" && tier == HealthTierHealthy {
+		// round_robin 模式下,healthy 桶按 7d 用量 ASC 排序后再走轮询。
+		// 这样同一个 round 里,用得少的账号被先轮到,自然把负载摊平到所有可用账号上,
+		// 避免出现"轮询模式仍然一直薅同一个号"的现象 (issue #150)。
+		sort.SliceStable(entries, func(i, j int) bool {
+			usageI := entries[i].acc.usagePercentForScheduling()
+			usageJ := entries[j].acc.usagePercentForScheduling()
+			if usageI == usageJ {
+				if entries[i].dispatchScore != entries[j].dispatchScore {
+					return entries[i].dispatchScore > entries[j].dispatchScore
+				}
+				if entries[i].proven != entries[j].proven {
+					return entries[i].proven
+				}
+				return entries[i].dbID < entries[j].dbID
+			}
+			return usageI < usageJ
+		})
 	} else {
 		sort.SliceStable(entries, func(i, j int) bool {
 			if entries[i].dispatchScore == entries[j].dispatchScore {

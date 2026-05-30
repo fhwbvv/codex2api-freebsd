@@ -12,6 +12,7 @@ interface StatCardProps {
 const iconColors: Record<string, string> = {
   blue: 'bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]',
   green: 'bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]',
+  amber: 'bg-amber-500/12 text-amber-600 dark:text-amber-400',
   red: 'bg-destructive/12 text-destructive',
   purple: 'bg-primary/12 text-primary',
 }

@@ -1,0 +1,50 @@
+name: Deploy / Config Help (English)
+description: Docker won't start, env vars unclear, SQLite/PG switch, deploy.sh errors, etc.
+title: "[Deploy] "
+labels: ["type/help", "area/deploy"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please redact **passwords, tokens, and API keys** from any docker-compose / env you paste.
+
+  - type: checkboxes
+    id: prechecks
+    attributes:
+      label: Before I submit
+      options:
+        - label: I read the deploy notes in [README](https://github.com/james-6-23/codex2api#documentation) and `docs/`
+          required: true
+        - label: I redacted secrets from the docker-compose / env / logs I'm pasting
+          required: true
+
+  - type: dropdown
+    id: shape
+    attributes:
+      label: Which deploy shape am I using?
+      options:
+        - Docker Compose (PostgreSQL + Redis)
+        - Docker Compose (SQLite + Memory)
+        - Running from source
+        - deploy.sh script
+        - Render / other cloud platform
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: trouble
+    attributes:
+      label: Where am I stuck / what error am I getting?
+      description: Paste the error block from startup logs — much more accurate than describing it from memory.
+      placeholder: |
+        e.g. After running docker compose up, the codex2api container keeps restarting,
+        and the log keeps showing "failed to connect to redis"…
+    validations:
+      required: true
+
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have I tried? (optional)
+      placeholder: e.g. env vars I've changed, docs I've checked.

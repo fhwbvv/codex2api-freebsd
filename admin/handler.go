@@ -13,9 +13,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
 	"mime/multipart"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -38,21 +41,22 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store          *auth.Store
-	cache          cache.TokenCache
-	db             *database.DB
-	rateLimiter    *proxy.RateLimiter
-	refreshAccount func(context.Context, int64) error
-	cpuSampler     *cpuSampler
-	startedAt      time.Time
-	pgMaxConns     int
-	redisPoolSize  int
-	databaseDriver string
-	databaseLabel  string
-	cacheDriver    string
-	cacheLabel     string
-	adminSecretEnv string
-	imageProxy     *proxy.Handler
+	store                  *auth.Store
+	cache                  cache.TokenCache
+	db                     *database.DB
+	rateLimiter            *proxy.RateLimiter
+	refreshAccount         func(context.Context, int64) error
+	syncAccountPlanOnReset func(context.Context, *auth.Account) error
+	cpuSampler             *cpuSampler
+	startedAt              time.Time
+	pgMaxConns             int
+	redisPoolSize          int
+	databaseDriver         string
+	databaseLabel          string
+	cacheDriver            string
+	cacheLabel             string
+	adminSecretEnv         string
+	imageProxy             *proxy.Handler
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -62,6 +66,10 @@ type Handler struct {
 	reqCountMu        sync.RWMutex
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
+
+	resetRadarHookMu     sync.Mutex
+	resetRadarHookState  resetRadarHookState
+	resetRadarHookRunner func(context.Context, string) resetRadarHookResult
 }
 
 type chartCacheEntry struct {
@@ -70,14 +78,15 @@ type chartCacheEntry struct {
 }
 
 const (
-	adminUsageStatsCacheNamespace = "admin:usage-stats"
-	adminChartCacheNamespace      = "admin:chart-data"
-	adminAPIKeyCacheNamespace     = "api-key"
-	adminAPIKeyCountNamespace     = "api-key-count"
-	adminUsageStatsCacheTTL       = 5 * time.Second
-	adminChartCacheTTL            = 10 * time.Second
-	importFileSizeLimitBytes      = 20 * 1024 * 1024
-	importFileSizeLimitLabel      = "20MB"
+	adminUsageStatsCacheNamespace  = "admin:usage-stats"
+	adminChartCacheNamespace       = "admin:chart-data"
+	adminAPIKeyCacheNamespace      = "api-key"
+	adminAPIKeyCountNamespace      = "api-key-count"
+	adminUsageStatsCacheTTL        = 5 * time.Second
+	adminChartCacheTTL             = 10 * time.Second
+	importFileSizeLimitBytes       = 20 * 1024 * 1024
+	importFileSizeLimitLabel       = "20MB"
+	accountRefreshBatchConcurrency = 4
 )
 
 func (h *Handler) getRuntimeJSON(ctx context.Context, namespace, key string, dest interface{}) bool {
@@ -136,16 +145,24 @@ func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey stri
 	}
 }
 
-func (h *Handler) getUsageStatsCached(ctx context.Context) (*database.UsageStats, error) {
-	var cached database.UsageStats
-	if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", &cached) {
-		return &cached, nil
+func (h *Handler) getUsageStatsCached(ctx context.Context, rangeStart, rangeEnd time.Time) (*database.UsageStats, error) {
+	// 只对"默认今日"区间走 5 秒缓存。
+	// 带显式区间的请求种类多、命中率低,且 ClearUsageLogs 现有的失效逻辑只清 "global" key,
+	// 给区间结果做缓存反而需要扩展失效接口,得不偿失,直接每次重算更简单。
+	useCache := rangeStart.IsZero() && rangeEnd.IsZero()
+	if useCache {
+		var cached database.UsageStats
+		if h.getRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", &cached) {
+			return &cached, nil
+		}
 	}
-	stats, err := h.db.GetUsageStats(ctx)
+	stats, err := h.db.GetUsageStats(ctx, rangeStart, rangeEnd)
 	if err != nil {
 		return nil, err
 	}
-	h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", stats, adminUsageStatsCacheTTL)
+	if useCache {
+		h.setRuntimeJSON(ctx, adminUsageStatsCacheNamespace, "global", stats, adminUsageStatsCacheTTL)
+	}
 	return stats, nil
 }
 
@@ -170,6 +187,8 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		handler.imageProxy.SetRuntimeCache(tc)
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
+	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
+	handler.resetRadarHookRunner = handler.runResetRadarSignalHook
 	if db != nil {
 		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
 			log.Printf("标记中断生图任务失败: %v", err)
@@ -187,6 +206,8 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/p/img/:id", h.GetSignedImageAssetFile)
+	r.GET("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
+	r.HEAD("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.GET("/api/branding", h.GetBranding)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
@@ -217,6 +238,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/:id/auth-json", h.GetAccountAuthJSON)
 	api.PATCH("/accounts/:id/credit", h.UpdateAccountCredit)
 	api.POST("/accounts/batch-test", h.BatchTest)
+	api.POST("/accounts/batch-refresh", h.BatchRefreshAccounts)
+	api.POST("/accounts/batch-delete", h.BatchDeleteAccounts)
 	api.POST("/accounts/batch-reset-status", h.BatchResetStatus)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
@@ -224,10 +247,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/export", h.ExportAccounts)
 	api.POST("/accounts/migrate", h.MigrateAccounts)
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
+	api.POST("/accounts/usage/probe", h.ForceUsageProbe)
 	api.GET("/usage/stats", h.GetUsageStats)
+	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
+	api.GET("/setup-hints", h.GetSetupHints)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
 	api.PATCH("/keys/:id", h.UpdateAPIKey)
@@ -237,12 +263,16 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/account-groups/:id", h.UpdateAccountGroup)
 	api.DELETE("/account-groups/:id", h.DeleteAccountGroup)
 	api.GET("/health", h.GetHealth)
+	api.GET("/runtime-status", h.GetRuntimeStatus)
 	api.GET("/ops/overview", h.GetOpsOverview)
+	api.GET("/ops/runtime-status", h.GetRuntimeStatus)
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
+	api.GET("/reset-radar", h.GetResetRadar)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
@@ -364,6 +394,16 @@ func (h *Handler) GetStats(c *gin.Context) {
 
 	total := len(accounts)
 	available := h.store.AvailableCount()
+	rateLimitedCount := 0
+	for _, acc := range h.store.Accounts() {
+		if acc == nil {
+			continue
+		}
+		switch acc.RuntimeStatus() {
+		case "rate_limited", "usage_exhausted":
+			rateLimitedCount++
+		}
+	}
 	errCount := 0
 	for _, acc := range accounts {
 		if acc.Status == "error" {
@@ -371,7 +411,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 		}
 	}
 
-	usageStats, _ := h.getUsageStatsCached(ctx)
+	usageStats, _ := h.getUsageStatsCached(ctx, time.Time{}, time.Time{})
 	todayReqs := int64(0)
 	if usageStats != nil {
 		todayReqs = usageStats.TodayRequests
@@ -380,6 +420,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 	c.JSON(http.StatusOK, statsResponse{
 		Total:         total,
 		Available:     available,
+		RateLimited:   rateLimitedCount,
 		Error:         errCount,
 		TodayRequests: todayReqs,
 	})
@@ -392,11 +433,13 @@ type accountResponse struct {
 	Name                     string                     `json:"name"`
 	Email                    string                     `json:"email"`
 	PlanType                 string                     `json:"plan_type"`
+	SubscriptionExpiresAt    string                     `json:"subscription_expires_at,omitempty"`
 	Status                   string                     `json:"status"`
 	ErrorMessage             string                     `json:"error_message,omitempty"`
 	ATOnly                   bool                       `json:"at_only"`
 	CreditEnabled            bool                       `json:"credit_enabled"`
 	CreditSkipUsageWindow    bool                       `json:"credit_skip_usage_window"`
+	SkipWarmTier             bool                       `json:"skip_warm_tier"`
 	AccountType              string                     `json:"account_type,omitempty"`
 	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
 	BaseURL                  string                     `json:"base_url,omitempty"`
@@ -472,6 +515,7 @@ type schedulerBreakdownResponse struct {
 	UsagePenalty7d      float64 `json:"usage_penalty_7d"`
 	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
 	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
+	ExpiryUrgencyBonus  float64 `json:"expiry_urgency_bonus"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
@@ -517,11 +561,13 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Name:                     row.Name,
 			Email:                    email,
 			PlanType:                 planType,
+			SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 			Status:                   row.Status,
 			ErrorMessage:             row.ErrorMessage,
 			ATOnly:                   !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			CreditEnabled:            row.CreditEnabled,
 			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
+			SkipWarmTier:             row.SkipWarmTier,
 			AccountType:              row.Type,
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			BaseURL:                  baseURL,
@@ -568,6 +614,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				UsagePenalty7d:      debug.Breakdown.UsagePenalty7d,
 				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
 				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
+				ExpiryUrgencyBonus:  debug.Breakdown.ExpiryUrgencyBonus,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}
@@ -673,6 +720,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 type updateAccountSchedulerReq struct {
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
+	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
 	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
 	Tags                    json.RawMessage `json:"tags"`
 	GroupIDs                json.RawMessage `json:"group_ids"`
@@ -744,6 +792,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -798,7 +851,7 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	if req.ProxyURL != nil {
 		proxyURL = database.OptionalString{Set: true, Value: *req.ProxyURL}
 	}
-	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL); err != nil {
+	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, skipWarmTier, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -807,10 +860,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
-		if scoreBiasOverride.Set || baseConcurrencyOverride.Set {
+		if scoreBiasOverride.Set || baseConcurrencyOverride.Set || skipWarmTier.Set {
 			current := h.store.FindByID(id)
 			var score *int64
 			var concurrency *int64
+			var skipWarm *bool
 			if current != nil {
 				current.Mu().RLock()
 				if current.ScoreBiasOverride != nil {
@@ -821,6 +875,8 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 					value := *current.BaseConcurrencyOverride
 					concurrency = &value
 				}
+				skipValue := current.SkipWarmTier
+				skipWarm = &skipValue
 				current.Mu().RUnlock()
 			}
 			if scoreBiasOverride.Set {
@@ -829,7 +885,10 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			if baseConcurrencyOverride.Set {
 				concurrency = nullableInt64Pointer(baseConcurrencyOverride.Value)
 			}
-			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency)
+			if skipWarmTier.Set {
+				skipWarm = &skipWarmTier.Value
+			}
+			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency, skipWarm)
 		}
 		if allowedAPIKeyIDs.Set {
 			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
@@ -907,6 +966,21 @@ func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxV
 		return database.OptionalNullInt64{}, fmt.Errorf("%s 超出范围，必须在 %d..%d 之间", field, minValue, maxValue)
 	}
 	return database.OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: value, Valid: true}}, nil
+}
+
+func parseOptionalBoolField(raw json.RawMessage, field string) (database.OptionalBool, error) {
+	if len(raw) == 0 {
+		return database.OptionalBool{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalBool{Set: true, Value: false}, nil
+	}
+
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return database.OptionalBool{}, fmt.Errorf("%s 必须是布尔值或 null", field)
+	}
+	return database.OptionalBool{Set: true, Value: value}, nil
 }
 
 func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
@@ -1352,6 +1426,9 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			if !atInfo.ExpiresAt.IsZero() {
 				newAcc.ExpiresAt = atInfo.ExpiresAt
 			}
+			if !atInfo.SubscriptionExpiresAt.IsZero() {
+				newAcc.SubscriptionExpiresAt = atInfo.SubscriptionExpiresAt
+			}
 		}
 		h.store.AddAccount(newAcc)
 
@@ -1362,6 +1439,9 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 				"account_id": atInfo.ChatGPTAccountID,
 				"plan_type":  atInfo.PlanType,
 				"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
+			}
+			if !atInfo.SubscriptionExpiresAt.IsZero() {
+				creds["subscription_expires_at"] = atInfo.SubscriptionExpiresAt.Format(time.RFC3339)
 			}
 			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
 				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
@@ -2127,9 +2207,7 @@ type importEvent struct {
 }
 
 func sendImportEvent(c *gin.Context, e importEvent) {
-	data, _ := json.Marshal(e)
-	fmt.Fprintf(c.Writer, "data: %s\n\n", data)
-	c.Writer.Flush()
+	sendSSEJSON(c, e)
 }
 
 func setupSSE(c *gin.Context) {
@@ -2137,6 +2215,19 @@ func setupSSE(c *gin.Context) {
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
+	c.Writer.Flush()
+}
+
+func sendSSEJSON(c *gin.Context, event any) {
+	data, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("序列化 SSE 事件失败: %v", err)
+		return
+	}
+	if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
+		log.Printf("写入 SSE 事件失败: %v", err)
+		return
+	}
 	c.Writer.Flush()
 }
 
@@ -2516,6 +2607,10 @@ func (h *Handler) GetAccountUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, detail)
 }
 
+type batchAccountIDsRequest struct {
+	IDs []int64 `json:"ids"`
+}
+
 // DeleteAccount 删除账号
 func (h *Handler) DeleteAccount(c *gin.Context) {
 	idStr := c.Param("id")
@@ -2529,7 +2624,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 	defer cancel()
 
 	// 软删除：保留账号数据与事件记录，但从运行时池和 active 列表中移除。
-	if err := h.db.SoftDeleteAccount(ctx, id); err != nil {
+	if err := h.deleteAccountByID(ctx, id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -2538,11 +2633,123 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		return
 	}
 
-	// 从内存池移除
+	writeMessage(c, http.StatusOK, "账号已删除")
+}
+
+func (h *Handler) deleteAccountByID(ctx context.Context, id int64) error {
+	if err := h.db.SoftDeleteAccount(ctx, id); err != nil {
+		return err
+	}
 	h.store.RemoveAccount(id)
 	h.db.InsertAccountEventAsync(id, "deleted", "manual")
+	return nil
+}
 
-	writeMessage(c, http.StatusOK, "账号已删除")
+// BatchDeleteAccounts 批量删除账号；stream=true 时以 SSE 返回实时进度。
+// POST /api/admin/accounts/batch-delete
+func (h *Handler) BatchDeleteAccounts(c *gin.Context) {
+	var req batchAccountIDsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	ids := uniqueAccountIDs(req.IDs)
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要删除的账号 ID 列表")
+		return
+	}
+
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamBatchDeleteAccounts(c, ids)
+		return
+	}
+
+	success, fail := h.runBatchDeleteAccounts(c.Request.Context(), ids, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已删除 %d 个账号，失败 %d 个", success, fail),
+		"deleted": success,
+		"success": success,
+		"failed":  fail,
+	})
+}
+
+func uniqueAccountIDs(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	result := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result
+}
+
+func (h *Handler) streamBatchDeleteAccounts(c *gin.Context, ids []int64) {
+	setupSSE(c)
+	total := len(ids)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "batch_delete", Total: total})
+	if total == 0 {
+		sendSSEJSON(c, batchOperationEvent{Type: "complete", Action: "batch_delete"})
+		return
+	}
+
+	success, fail := h.runBatchDeleteAccounts(c.Request.Context(), ids, func(event batchOperationEvent) {
+		sendSSEJSON(c, event)
+	})
+	sendSSEJSON(c, batchOperationEvent{
+		Type:    "complete",
+		Action:  "batch_delete",
+		Current: total,
+		Total:   total,
+		Success: success,
+		Failed:  fail,
+		Deleted: success,
+	})
+}
+
+func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(ids)
+	var success int64
+	var fail int64
+
+	for i, id := range ids {
+		if ctx.Err() != nil {
+			fail += int64(total - i)
+			break
+		}
+
+		err := h.deleteAccountByID(ctx, id)
+		event := batchOperationEvent{
+			Type:      "progress",
+			Action:    "batch_delete",
+			Current:   i + 1,
+			Total:     total,
+			AccountID: id,
+		}
+		if err != nil {
+			fail++
+			event.Error = err.Error()
+			if errors.Is(err, sql.ErrNoRows) {
+				event.Error = "账号不存在"
+			}
+		} else {
+			success++
+			event.Deleted = success
+			event.Message = "账号已删除"
+		}
+		event.Success = success
+		event.Failed = fail
+		if onProgress != nil {
+			onProgress(event)
+		}
+	}
+
+	return success, fail
 }
 
 // RefreshAccount 手动刷新账号 AT
@@ -2554,14 +2761,7 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	refreshFn := h.refreshAccount
-	if refreshFn == nil {
-		refreshFn = h.refreshSingleAccount
-	}
-	if err := refreshFn(ctx, id); err != nil {
+	if err := h.refreshAccountByID(c.Request.Context(), id); err != nil {
 		if strings.Contains(err.Error(), "不存在") {
 			writeError(c, http.StatusNotFound, err.Error())
 			return
@@ -2571,6 +2771,150 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 	}
 
 	writeMessage(c, http.StatusOK, "账号刷新成功")
+}
+
+// BatchRefreshAccounts 批量刷新账号 AT；stream=true 时以 SSE 返回实时进度。
+// POST /api/admin/accounts/batch-refresh
+func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
+	var req batchAccountIDsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	ids := uniqueAccountIDs(req.IDs)
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要刷新的账号 ID 列表")
+		return
+	}
+
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamBatchRefreshAccounts(c, ids)
+		return
+	}
+
+	success, fail := h.runBatchRefreshAccounts(c.Request.Context(), ids, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已刷新 %d 个账号，失败 %d 个", success, fail),
+		"success": success,
+		"failed":  fail,
+	})
+}
+
+func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	refreshFn := h.refreshAccount
+	if refreshFn == nil {
+		refreshFn = h.refreshSingleAccount
+	}
+	return refreshFn(refreshCtx, id)
+}
+
+func (h *Handler) streamBatchRefreshAccounts(c *gin.Context, ids []int64) {
+	setupSSE(c)
+	total := len(ids)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "batch_refresh", Total: total})
+	if total == 0 {
+		sendSSEJSON(c, batchOperationEvent{Type: "complete", Action: "batch_refresh"})
+		return
+	}
+
+	events := make(chan batchOperationEvent, len(ids)+1)
+	ctx := c.Request.Context()
+	go func() {
+		success, fail := h.runBatchRefreshAccounts(ctx, ids, func(event batchOperationEvent) {
+			select {
+			case events <- event:
+			case <-ctx.Done():
+			}
+		})
+		select {
+		case events <- batchOperationEvent{
+			Type:    "complete",
+			Action:  "batch_refresh",
+			Current: total,
+			Total:   total,
+			Success: success,
+			Failed:  fail,
+		}:
+		case <-ctx.Done():
+		}
+		close(events)
+	}()
+
+	for event := range events {
+		sendSSEJSON(c, event)
+	}
+}
+
+func (h *Handler) runBatchRefreshAccounts(ctx context.Context, ids []int64, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(ids)
+	var (
+		success   int64
+		fail      int64
+		completed int64
+		wg        sync.WaitGroup
+		sem       = make(chan struct{}, accountRefreshBatchConcurrency)
+	)
+
+	for _, id := range ids {
+		id := id
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				atomic.AddInt64(&fail, 1)
+				emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, "刷新已取消", true)
+				return
+			}
+			defer func() { <-sem }()
+
+			if err := h.refreshAccountByID(ctx, id); err != nil {
+				atomic.AddInt64(&fail, 1)
+				emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, err.Error(), true)
+				return
+			}
+
+			atomic.AddInt64(&success, 1)
+			emitBatchRefreshProgress(onProgress, id, total, &completed, &success, &fail, "账号刷新成功", false)
+		}()
+	}
+
+	wg.Wait()
+	return atomic.LoadInt64(&success), atomic.LoadInt64(&fail)
+}
+
+func emitBatchRefreshProgress(
+	onProgress func(batchOperationEvent),
+	accountID int64,
+	total int,
+	completedCount *int64,
+	successCount *int64,
+	failedCount *int64,
+	message string,
+	failed bool,
+) {
+	if onProgress == nil {
+		return
+	}
+	current := int(atomic.AddInt64(completedCount, 1))
+	event := batchOperationEvent{
+		Type:      "progress",
+		Action:    "batch_refresh",
+		Current:   current,
+		Total:     total,
+		Success:   atomic.LoadInt64(successCount),
+		Failed:    atomic.LoadInt64(failedCount),
+		AccountID: accountID,
+		Message:   message,
+	}
+	if failed {
+		event.Error = message
+	}
+	onProgress(event)
 }
 
 // ToggleAccountEnabled 切换账号是否参与调度选择
@@ -2668,6 +3012,7 @@ func (h *Handler) ResetAccountStatus(c *gin.Context) {
 
 	h.store.ClearCooldown(acc)
 	acc.ClearUsageCache()
+	h.syncAccountPlanAfterReset(c.Request.Context(), acc)
 	writeMessage(c, http.StatusOK, "账号状态已重置")
 }
 
@@ -2691,6 +3036,7 @@ func (h *Handler) BatchResetStatus(c *gin.Context) {
 		}
 		h.store.ClearCooldown(acc)
 		acc.ClearUsageCache()
+		h.syncAccountPlanAfterReset(c.Request.Context(), acc)
 		success++
 	}
 
@@ -2699,6 +3045,37 @@ func (h *Handler) BatchResetStatus(c *gin.Context) {
 		"success": success,
 		"failed":  fail,
 	})
+}
+
+func (h *Handler) syncAccountPlanAfterReset(_ context.Context, acc *auth.Account) {
+	if h == nil || h.syncAccountPlanOnReset == nil || acc == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := h.syncAccountPlanOnReset(ctx, acc); err != nil {
+			log.Printf("[账号 %d] 重置后同步 Codex plan type 失败: %v", acc.DBID, err)
+		}
+	}()
+}
+
+func (h *Handler) syncSingleAccountPlanOnReset(ctx context.Context, acc *auth.Account) error {
+	if h == nil || h.store == nil || acc == nil || acc.IsOpenAIResponsesAPI() || acc.GetAccessToken() == "" {
+		return nil
+	}
+	model, err := h.connectionTestModelForAccount(ctx, acc, "")
+	if err != nil {
+		return err
+	}
+	resp, err := proxy.ExecuteRequest(ctx, acc, buildTestPayload(model), "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	proxy.SyncCodexUsageState(h.store, acc, resp)
+	return nil
 }
 
 func (h *Handler) refreshSingleAccount(ctx context.Context, id int64) error {
@@ -2721,17 +3098,74 @@ func (h *Handler) GetHealth(c *gin.Context) {
 
 // ==================== Usage ====================
 
-// GetUsageStats 获取使用统计
+// GetUsageStats 获取使用统计。
+// 支持可选 query 参数 start/end (RFC3339);未传时回落"今日"行为。
 func (h *Handler) GetUsageStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	stats, err := h.getUsageStatsCached(ctx)
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	stats, err := h.getUsageStatsCached(ctx, rangeStart, rangeEnd)
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, stats)
+}
+
+// parseUsageStatsRange 解析 /usage/stats 的可选 start/end query。
+// 任一为空则当作零值由调用方决定回退行为(默认"今日");两者都填则要求均合法。
+func parseUsageStatsRange(startStr, endStr string) (time.Time, time.Time, error) {
+	startStr = strings.TrimSpace(startStr)
+	endStr = strings.TrimSpace(endStr)
+	var start, end time.Time
+	if startStr != "" {
+		t, err := time.Parse(time.RFC3339, startStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("start 参数格式错误，需要 RFC3339")
+		}
+		start = t
+	}
+	if endStr != "" {
+		t, err := time.Parse(time.RFC3339, endStr)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("end 参数格式错误，需要 RFC3339")
+		}
+		end = t
+	}
+	if !start.IsZero() && !end.IsZero() && !end.After(start) {
+		return time.Time{}, time.Time{}, fmt.Errorf("end 必须晚于 start")
+	}
+	return start, end, nil
+}
+
+// GetAPIKeyTokenStats 返回按 API Key 聚合的 token 用量列表（issue #162）。
+// 支持可选 query 参数 start/end (RFC3339)；缺省回落到"今日"。
+// 不分页/不限条数：前端做排序、搜索、分页。
+func (h *Handler) GetAPIKeyTokenStats(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer cancel()
+
+	rangeStart, rangeEnd, err := parseUsageStatsRange(c.Query("start"), c.Query("end"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	items, err := h.db.ListAPIKeyTokenStats(ctx, rangeStart, rangeEnd)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if items == nil {
+		items = []database.APIKeyTokenStat{}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
 // GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）
@@ -3347,13 +3781,14 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 }
 
 type createKeyReq struct {
-	Name            string          `json:"name"`
-	Key             string          `json:"key"`
-	QuotaLimit      *float64        `json:"quota_limit"`
-	Quota           *float64        `json:"quota"`
-	ExpiresAt       string          `json:"expires_at"`
-	ExpiresInDays   *int            `json:"expires_in_days"`
-	AllowedGroupIDs json.RawMessage `json:"allowed_group_ids"`
+	Name            string                 `json:"name"`
+	Key             string                 `json:"key"`
+	QuotaLimit      *float64               `json:"quota_limit"`
+	Quota           *float64               `json:"quota"`
+	ExpiresAt       string                 `json:"expires_at"`
+	ExpiresInDays   *int                   `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
+	Limits          *database.APIKeyLimits `json:"limits"`
 }
 
 // generateKey 生成随机 API Key
@@ -3445,12 +3880,18 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 		}
 	}
 
+	var limits database.APIKeyLimits
+	if req.Limits != nil {
+		limits = sanitizeAPIKeyLimits(*req.Limits)
+	}
+
 	id, err := h.db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
 		Name:            req.Name,
 		Key:             key,
 		QuotaLimit:      quotaLimit,
 		ExpiresAt:       expiresAt,
 		AllowedGroupIDs: allowedGroupIDs.Values,
+		Limits:          limits,
 	})
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "创建失败: "+err.Error())
@@ -3484,12 +3925,13 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 }
 
 type updateAPIKeyReq struct {
-	Name            *string         `json:"name"`
-	QuotaLimit      json.RawMessage `json:"quota_limit"`
-	Quota           json.RawMessage `json:"quota"`
-	ExpiresAt       json.RawMessage `json:"expires_at"`
-	ExpiresInDays   *int            `json:"expires_in_days"`
-	AllowedGroupIDs json.RawMessage `json:"allowed_group_ids"`
+	Name            *string                `json:"name"`
+	QuotaLimit      json.RawMessage        `json:"quota_limit"`
+	Quota           json.RawMessage        `json:"quota"`
+	ExpiresAt       json.RawMessage        `json:"expires_at"`
+	ExpiresInDays   *int                   `json:"expires_in_days"`
+	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
+	Limits          *database.APIKeyLimits `json:"limits"`
 }
 
 func (h *Handler) UpdateAPIKey(c *gin.Context) {
@@ -3582,6 +4024,10 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 		update.Name = *req.Name
 		update.NameSet = true
 	}
+	if req.Limits != nil {
+		update.Limits = sanitizeAPIKeyLimits(*req.Limits)
+		update.LimitsSet = true
+	}
 	if err := h.db.UpdateAPIKey(ctx, id, update); err != nil {
 		writeInternalError(c, err)
 		return
@@ -3591,6 +4037,63 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
 	writeMessage(c, http.StatusOK, "API Key 已更新")
+}
+
+// sanitizeAPIKeyLimits 把请求体里来的 limits 归一:负值置 0,空白模型名过滤,字符串小写。
+// 同时配置 ModelAllow + ModelDeny 时白名单优先(在 enforce 时已生效),这里不强制清空黑名单。
+func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
+	clean := func(items []string) []string {
+		if len(items) == 0 {
+			return nil
+		}
+		seen := make(map[string]struct{}, len(items))
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			lower := strings.ToLower(item)
+			if _, ok := seen[lower]; ok {
+				continue
+			}
+			seen[lower] = struct{}{}
+			out = append(out, item)
+		}
+		return out
+	}
+	out := database.APIKeyLimits{
+		ModelAllow:   clean(in.ModelAllow),
+		ModelDeny:    clean(in.ModelDeny),
+		RPM:          maxInt(in.RPM, 0),
+		RPD:          maxInt(in.RPD, 0),
+		CostLimit5h:  maxFloat(in.CostLimit5h, 0),
+		CostLimit7d:  maxFloat(in.CostLimit7d, 0),
+		TokenLimit5h: maxInt64(in.TokenLimit5h, 0),
+		TokenLimit7d: maxInt64(in.TokenLimit7d, 0),
+	}
+	return out
+}
+
+func maxInt(v, lo int) int {
+	if v < lo {
+		return lo
+	}
+	return v
+}
+
+func maxInt64(v, lo int64) int64 {
+	if v < lo {
+		return lo
+	}
+	return v
+}
+
+func maxFloat(v, lo float64) float64 {
+	if v < lo {
+		return lo
+	}
+	return v
 }
 
 func parseOptionalAPIKeyQuota(quotaLimitRaw, quotaRaw json.RawMessage) (float64, bool, error) {
@@ -3702,12 +4205,18 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 type settingsResponse struct {
 	SiteName                         string `json:"site_name"`
 	SiteLogo                         string `json:"site_logo"`
+	BackgroundImage                  string `json:"background_image"`
+	BackgroundOpacity                int    `json:"background_opacity"`
+	BackgroundBlur                   int    `json:"background_blur"`
+	BackgroundGlassOpacity           int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur              int    `json:"background_glass_blur"`
 	MaxConcurrency                   int    `json:"max_concurrency"`
 	GlobalRPM                        int    `json:"global_rpm"`
 	TestModel                        string `json:"test_model"`
 	TestConcurrency                  int    `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes int    `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes          int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency            int    `json:"usage_probe_concurrency"`
 	RecoveryProbeIntervalMinutes     int    `json:"recovery_probe_interval_minutes"`
 	LazyMode                         bool   `json:"lazy_mode"`
 	ProxyURL                         string `json:"proxy_url"`
@@ -3723,6 +4232,7 @@ type settingsResponse struct {
 	ProxyPoolEnabled                 bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             bool   `json:"fast_scheduler_enabled"`
 	SchedulerMode                    string `json:"scheduler_mode"`
+	AffinityMode                     string `json:"affinity_mode"`
 	MaxRetries                       int    `json:"max_retries"`
 	MaxRateLimitRetries              int    `json:"max_rate_limit_retries"`
 	AllowRemoteMigration             bool   `json:"allow_remote_migration"`
@@ -3750,6 +4260,8 @@ type settingsResponse struct {
 	UsageLogFlushIntervalSeconds     int    `json:"usage_log_flush_interval_seconds"`
 	StreamFlushPolicy                string `json:"stream_flush_policy"`
 	StreamFlushIntervalMS            int    `json:"stream_flush_interval_ms"`
+	FirstTokenTimeoutSeconds         int    `json:"first_token_timeout_seconds"`
+	ShowFullUsageNumbers             bool   `json:"show_full_usage_numbers"`
 	ImageStorageBackend              string `json:"image_storage_backend"`
 	ImageS3Endpoint                  string `json:"image_s3_endpoint"`
 	ImageS3Region                    string `json:"image_s3_region"`
@@ -3763,12 +4275,18 @@ type settingsResponse struct {
 type updateSettingsReq struct {
 	SiteName                         *string `json:"site_name"`
 	SiteLogo                         *string `json:"site_logo"`
+	BackgroundImage                  *string `json:"background_image"`
+	BackgroundOpacity                *int    `json:"background_opacity"`
+	BackgroundBlur                   *int    `json:"background_blur"`
+	BackgroundGlassOpacity           *int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur              *int    `json:"background_glass_blur"`
 	MaxConcurrency                   *int    `json:"max_concurrency"`
 	GlobalRPM                        *int    `json:"global_rpm"`
 	TestModel                        *string `json:"test_model"`
 	TestConcurrency                  *int    `json:"test_concurrency"`
 	BackgroundRefreshIntervalMinutes *int    `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes          *int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency            *int    `json:"usage_probe_concurrency"`
 	RecoveryProbeIntervalMinutes     *int    `json:"recovery_probe_interval_minutes"`
 	LazyMode                         *bool   `json:"lazy_mode"`
 	ProxyURL                         *string `json:"proxy_url"`
@@ -3783,6 +4301,7 @@ type updateSettingsReq struct {
 	ProxyPoolEnabled                 *bool   `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled             *bool   `json:"fast_scheduler_enabled"`
 	SchedulerMode                    *string `json:"scheduler_mode"`
+	AffinityMode                     *string `json:"affinity_mode"`
 	MaxRetries                       *int    `json:"max_retries"`
 	MaxRateLimitRetries              *int    `json:"max_rate_limit_retries"`
 	AllowRemoteMigration             *bool   `json:"allow_remote_migration"`
@@ -3805,6 +4324,8 @@ type updateSettingsReq struct {
 	UsageLogFlushIntervalSeconds     *int    `json:"usage_log_flush_interval_seconds"`
 	StreamFlushPolicy                *string `json:"stream_flush_policy"`
 	StreamFlushIntervalMS            *int    `json:"stream_flush_interval_ms"`
+	FirstTokenTimeoutSeconds         *int    `json:"first_token_timeout_seconds"`
+	ShowFullUsageNumbers             *bool   `json:"show_full_usage_numbers"`
 	ImageStorageBackend              *string `json:"image_storage_backend"`
 	ImageS3Endpoint                  *string `json:"image_s3_endpoint"`
 	ImageS3Region                    *string `json:"image_s3_region"`
@@ -3816,12 +4337,45 @@ type updateSettingsReq struct {
 }
 
 type brandingResponse struct {
-	SiteName string `json:"site_name"`
-	SiteLogo string `json:"site_logo"`
+	SiteName               string `json:"site_name"`
+	SiteLogo               string `json:"site_logo"`
+	BackgroundImage        string `json:"background_image"`
+	BackgroundOpacity      int    `json:"background_opacity"`
+	BackgroundBlur         int    `json:"background_blur"`
+	BackgroundGlassOpacity int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur    int    `json:"background_glass_blur"`
 }
 
 const maxSiteLogoBytes = 600 * 1024
+const maxBackgroundImageBytes = 2 * 1024 * 1024
+const maxBackgroundVideoBytes = 40 * 1024 * 1024
+const maxBackgroundImageAssetUploadBytes = 20 * 1024 * 1024
+const maxBackgroundVideoAssetUploadBytes = 40 * 1024 * 1024
+const maxBackgroundAssetUploadBytes = maxBackgroundVideoAssetUploadBytes
 const maxSiteLogoURLChars = 4096
+const maxBackgroundImageURLChars = 20000
+const defaultBackgroundOpacity = 18
+const maxBackgroundBlur = 24
+const defaultBackgroundGlassOpacity = 58
+const defaultBackgroundGlassBlur = 5
+const maxBackgroundGlassBlur = 20
+const defaultBackgroundAssetDir = "/data/backgrounds"
+const backgroundAssetURLPrefix = "/p/backgrounds/"
+
+type brandingBackgroundConfig struct {
+	Image        string `json:"image"`
+	Opacity      int    `json:"opacity"`
+	Blur         int    `json:"blur"`
+	GlassOpacity int    `json:"glass_opacity"`
+	GlassBlur    int    `json:"glass_blur"`
+}
+
+type backgroundAssetUploadResponse struct {
+	URL      string `json:"url"`
+	Filename string `json:"filename"`
+	MimeType string `json:"mime_type"`
+	Bytes    int    `json:"bytes"`
+}
 
 func normalizeSiteLogo(value string) (string, error) {
 	value = strings.TrimSpace(value)
@@ -3858,13 +4412,376 @@ func normalizeSiteLogo(value string) (string, error) {
 	}
 }
 
+func normalizeBackgroundImage(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	lower := strings.ToLower(value)
+	switch {
+	case strings.HasPrefix(lower, "data:image/") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("背景图 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("背景图 base64 数据无效")
+		}
+		if len(decoded) > maxBackgroundImageBytes {
+			return "", fmt.Errorf("背景图不能超过 2MB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "data:video/mp4") && strings.Contains(lower, ";base64,"):
+		commaIndex := strings.Index(value, ",")
+		if commaIndex < 0 {
+			return "", fmt.Errorf("动态壁纸 data URL 格式无效")
+		}
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value[commaIndex+1:]))
+		if err != nil {
+			return "", fmt.Errorf("动态壁纸 base64 数据无效")
+		}
+		if len(decoded) > maxBackgroundVideoBytes {
+			return "", fmt.Errorf("动态壁纸不能超过 40MB")
+		}
+		return value, nil
+	case strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://"):
+		if len(value) > maxBackgroundImageURLChars {
+			return "", fmt.Errorf("背景图 URL 过长")
+		}
+		return value, nil
+	case strings.HasPrefix(value, "/") && !strings.HasPrefix(value, "//"):
+		if len(value) > maxBackgroundImageURLChars {
+			return "", fmt.Errorf("背景图路径过长")
+		}
+		return value, nil
+	default:
+		return "", fmt.Errorf("背景仅支持 http(s) URL、站内路径、data:image base64 或 data:video/mp4 base64")
+	}
+}
+
+func backgroundAssetDir() string {
+	if dir := strings.TrimSpace(os.Getenv("BACKGROUND_ASSET_DIR")); dir != "" {
+		return dir
+	}
+	if dir := strings.TrimSpace(os.Getenv("IMAGE_ASSET_DIR")); dir != "" {
+		clean := filepath.Clean(dir)
+		parent := filepath.Dir(clean)
+		if parent != "." && parent != string(os.PathSeparator) {
+			return filepath.Join(parent, "backgrounds")
+		}
+		return filepath.Join(clean, "backgrounds")
+	}
+	if dbPath := strings.TrimSpace(os.Getenv("DATABASE_PATH")); dbPath != "" {
+		return filepath.Join(filepath.Dir(dbPath), "backgrounds")
+	}
+	return defaultBackgroundAssetDir
+}
+
+func backgroundAssetPath(filename string) (string, bool) {
+	name := filepath.Base(strings.TrimSpace(filename))
+	if name == "" || name == "." || name != strings.TrimSpace(filename) {
+		return "", false
+	}
+	dir, err := filepath.Abs(backgroundAssetDir())
+	if err != nil {
+		return "", false
+	}
+	full, err := filepath.Abs(filepath.Join(dir, name))
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(dir, full)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+	return full, true
+}
+
+func backgroundAssetURL(filename string) string {
+	return backgroundAssetURLPrefix + filename
+}
+
+func randomBackgroundAssetFilename(ext string) string {
+	ext = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(ext)), ".")
+	if ext == "" {
+		ext = "bin"
+	}
+	b := make([]byte, 10)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d.%s", time.Now().UnixNano(), ext)
+	}
+	return fmt.Sprintf("%d-%s.%s", time.Now().UnixNano(), hex.EncodeToString(b), ext)
+}
+
+func declaredBackgroundMediaType(filename, contentType string) string {
+	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	switch contentType {
+	case "image/png", "image/jpeg", "image/jpg", "image/webp", "image/svg+xml", "video/mp4":
+		if contentType == "image/jpg" {
+			return "image/jpeg"
+		}
+		return contentType
+	}
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".svg":
+		return "image/svg+xml"
+	case ".mp4":
+		return "video/mp4"
+	default:
+		if byExt := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename))); byExt != "" {
+			return strings.ToLower(strings.TrimSpace(strings.Split(byExt, ";")[0]))
+		}
+		return ""
+	}
+}
+
+func looksLikeSVG(data []byte) bool {
+	sample := strings.ToLower(string(data))
+	return strings.Contains(sample, "<svg") && !strings.Contains(sample, "<script")
+}
+
+func looksLikeWebP(data []byte) bool {
+	return len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP"
+}
+
+func looksLikeMP4(data []byte) bool {
+	return len(data) >= 12 && string(data[4:8]) == "ftyp"
+}
+
+func normalizeBackgroundUploadMedia(filename, contentType string, data []byte) (string, string, error) {
+	if len(data) == 0 {
+		return "", "", fmt.Errorf("背景文件为空")
+	}
+	declared := declaredBackgroundMediaType(filename, contentType)
+	detected := strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0]))
+	switch detected {
+	case "image/png":
+		return "image/png", "png", nil
+	case "image/jpeg":
+		return "image/jpeg", "jpg", nil
+	case "image/webp":
+		return "image/webp", "webp", nil
+	}
+	switch declared {
+	case "image/webp":
+		if looksLikeWebP(data) {
+			return "image/webp", "webp", nil
+		}
+	case "image/svg+xml":
+		if looksLikeSVG(data) {
+			return "image/svg+xml", "svg", nil
+		}
+	case "video/mp4":
+		if looksLikeMP4(data) {
+			return "video/mp4", "mp4", nil
+		}
+	}
+	return "", "", fmt.Errorf("背景仅支持 PNG、JPG、WebP、SVG 或 MP4")
+}
+
+func backgroundUploadLimitBytes(mimeType string) int {
+	if mimeType == "video/mp4" {
+		return maxBackgroundVideoAssetUploadBytes
+	}
+	return maxBackgroundImageAssetUploadBytes
+}
+
+func backgroundUploadTooLargeMessage(mimeType string) string {
+	if mimeType == "video/mp4" {
+		return "MP4 动态壁纸不能超过 40MB"
+	}
+	return "背景图片不能超过 20MB"
+}
+
+func (h *Handler) UploadBackgroundAsset(c *gin.Context) {
+	fh, err := c.FormFile("file")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "请选择背景文件")
+		return
+	}
+	if fh.Size <= 0 {
+		writeError(c, http.StatusBadRequest, "背景文件为空")
+		return
+	}
+	if fh.Size > maxBackgroundAssetUploadBytes {
+		writeError(c, http.StatusBadRequest, "背景文件不能超过 40MB")
+		return
+	}
+	file, err := fh.Open()
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxBackgroundAssetUploadBytes+1))
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if len(data) > maxBackgroundAssetUploadBytes {
+		writeError(c, http.StatusBadRequest, "背景文件不能超过 40MB")
+		return
+	}
+	mimeType, ext, err := normalizeBackgroundUploadMedia(fh.Filename, fh.Header.Get("Content-Type"), data)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(data) > backgroundUploadLimitBytes(mimeType) {
+		writeError(c, http.StatusBadRequest, backgroundUploadTooLargeMessage(mimeType))
+		return
+	}
+
+	if err := os.MkdirAll(backgroundAssetDir(), 0o755); err != nil {
+		writeInternalError(c, fmt.Errorf("创建背景目录失败: %w", err))
+		return
+	}
+	filename := randomBackgroundAssetFilename(ext)
+	fullPath, ok := backgroundAssetPath(filename)
+	if !ok {
+		writeInternalError(c, fmt.Errorf("背景文件路径无效"))
+		return
+	}
+	if err := os.WriteFile(fullPath, data, 0o644); err != nil {
+		writeInternalError(c, fmt.Errorf("保存背景文件失败: %w", err))
+		return
+	}
+
+	c.JSON(http.StatusOK, backgroundAssetUploadResponse{
+		URL:      backgroundAssetURL(filename),
+		Filename: filename,
+		MimeType: mimeType,
+		Bytes:    len(data),
+	})
+}
+
+func (h *Handler) GetBackgroundAssetFile(c *gin.Context) {
+	fullPath, ok := backgroundAssetPath(c.Param("filename"))
+	if !ok {
+		writeError(c, http.StatusNotFound, "背景文件不存在")
+		return
+	}
+	info, err := os.Stat(fullPath)
+	if err != nil || info.IsDir() {
+		writeError(c, http.StatusNotFound, "背景文件不存在")
+		return
+	}
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	c.File(fullPath)
+}
+
+func normalizeBackgroundOpacity(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func normalizeBackgroundBlur(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > maxBackgroundBlur {
+		return maxBackgroundBlur
+	}
+	return value
+}
+
+func normalizeBackgroundGlassOpacity(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func normalizeBackgroundGlassBlur(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > maxBackgroundGlassBlur {
+		return maxBackgroundGlassBlur
+	}
+	return value
+}
+
+func normalizeBackgroundConfig(cfg brandingBackgroundConfig) brandingBackgroundConfig {
+	image, err := normalizeBackgroundImage(cfg.Image)
+	if err != nil {
+		image = ""
+	}
+	opacity := normalizeBackgroundOpacity(cfg.Opacity)
+	if opacity == 0 && strings.TrimSpace(image) != "" && cfg.Opacity == 0 {
+		opacity = 0
+	}
+	return brandingBackgroundConfig{
+		Image:        image,
+		Opacity:      opacity,
+		Blur:         normalizeBackgroundBlur(cfg.Blur),
+		GlassOpacity: normalizeBackgroundGlassOpacity(cfg.GlassOpacity),
+		GlassBlur:    normalizeBackgroundGlassBlur(cfg.GlassBlur),
+	}
+}
+
+func defaultBackgroundConfig() brandingBackgroundConfig {
+	return brandingBackgroundConfig{
+		Opacity:      defaultBackgroundOpacity,
+		GlassOpacity: defaultBackgroundGlassOpacity,
+		GlassBlur:    defaultBackgroundGlassBlur,
+	}
+}
+
+func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
+	cfg := defaultBackgroundConfig()
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return cfg
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return defaultBackgroundConfig()
+	}
+	return normalizeBackgroundConfig(cfg)
+}
+
+func encodeBackgroundConfig(cfg brandingBackgroundConfig) string {
+	cfg = normalizeBackgroundConfig(cfg)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
 func brandingFromSettings(settings *database.SystemSettings) brandingResponse {
 	resp := brandingResponse{SiteName: database.DefaultSiteName}
+	bg := defaultBackgroundConfig()
 	if settings == nil {
+		resp.BackgroundOpacity = bg.Opacity
+		resp.BackgroundGlassOpacity = bg.GlassOpacity
+		resp.BackgroundGlassBlur = bg.GlassBlur
 		return resp
 	}
 	resp.SiteName = database.NormalizeSiteName(settings.SiteName)
 	resp.SiteLogo = strings.TrimSpace(settings.SiteLogo)
+	bg = decodeBackgroundConfig(settings.BackgroundConfig)
+	resp.BackgroundImage = bg.Image
+	resp.BackgroundOpacity = bg.Opacity
+	resp.BackgroundBlur = bg.Blur
+	resp.BackgroundGlassOpacity = bg.GlassOpacity
+	resp.BackgroundGlassBlur = bg.GlassBlur
 	return resp
 }
 
@@ -3890,26 +4807,38 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	adminSecret := ""
 	var resinURL, resinPlatformName string
 	branding := brandingFromSettings(dbSettings)
+	showFullUsageNumbers := false
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
 	if dbSettings != nil {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
+		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
 	imgCfg := imagestore.CurrentConfig()
 	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
+	bgCfg := defaultBackgroundConfig()
+	if dbSettings != nil {
+		bgCfg = decodeBackgroundConfig(dbSettings.BackgroundConfig)
+	}
 	c.JSON(http.StatusOK, settingsResponse{
 		SiteName:                         branding.SiteName,
 		SiteLogo:                         branding.SiteLogo,
+		BackgroundImage:                  bgCfg.Image,
+		BackgroundOpacity:                bgCfg.Opacity,
+		BackgroundBlur:                   bgCfg.Blur,
+		BackgroundGlassOpacity:           bgCfg.GlassOpacity,
+		BackgroundGlassBlur:              bgCfg.GlassBlur,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),
@@ -3925,6 +4854,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		SchedulerMode:                    h.store.GetSchedulerMode(),
+		AffinityMode:                     h.store.GetAffinityMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
@@ -3951,6 +4881,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     h.db.GetUsageLogFlushIntervalSeconds(),
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenTimeoutSeconds:         runtimeCfg.FirstTokenTimeoutSec,
+		ShowFullUsageNumbers:             showFullUsageNumbers,
 		ImageStorageBackend:              imgCfg.Backend,
 		ImageS3Endpoint:                  imgCfg.Endpoint,
 		ImageS3Region:                    imgCfg.Region,
@@ -3973,11 +4905,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	currentAdminSecret := ""
 	siteName := database.DefaultSiteName
 	siteLogo := ""
+	bgCfg := defaultBackgroundConfig()
+	showFullUsageNumbers := false
 	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
 		siteName = database.NormalizeSiteName(existingSettings.SiteName)
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
+		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
+		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -3999,6 +4935,31 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		siteLogo = normalized
 		log.Printf("设置已更新: site_logo (长度=%d)", len(siteLogo))
+	}
+	if req.BackgroundImage != nil {
+		normalized, err := normalizeBackgroundImage(*req.BackgroundImage)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		bgCfg.Image = normalized
+		log.Printf("设置已更新: background_image (长度=%d)", len(bgCfg.Image))
+	}
+	if req.BackgroundOpacity != nil {
+		bgCfg.Opacity = normalizeBackgroundOpacity(*req.BackgroundOpacity)
+		log.Printf("设置已更新: background_opacity = %d", bgCfg.Opacity)
+	}
+	if req.BackgroundBlur != nil {
+		bgCfg.Blur = normalizeBackgroundBlur(*req.BackgroundBlur)
+		log.Printf("设置已更新: background_blur = %d", bgCfg.Blur)
+	}
+	if req.BackgroundGlassOpacity != nil {
+		bgCfg.GlassOpacity = normalizeBackgroundGlassOpacity(*req.BackgroundGlassOpacity)
+		log.Printf("设置已更新: background_glass_opacity = %d", bgCfg.GlassOpacity)
+	}
+	if req.BackgroundGlassBlur != nil {
+		bgCfg.GlassBlur = normalizeBackgroundGlassBlur(*req.BackgroundGlassBlur)
+		log.Printf("设置已更新: background_glass_blur = %d", bgCfg.GlassBlur)
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -4066,6 +5027,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetUsageProbeMaxAge(time.Duration(v) * time.Minute)
 		log.Printf("设置已更新: usage_probe_max_age_minutes = %d", v)
+	}
+
+	if req.UsageProbeConcurrency != nil {
+		v := *req.UsageProbeConcurrency
+		if v < 1 {
+			v = 1
+		}
+		if v > 128 {
+			v = 128
+		}
+		h.store.SetUsageProbeConcurrency(v)
+		log.Printf("设置已更新: usage_probe_concurrency = %d", v)
 	}
 
 	if req.RecoveryProbeIntervalMinutes != nil {
@@ -4167,6 +5140,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: scheduler_mode = %s", *req.SchedulerMode)
 	}
 
+	if req.AffinityMode != nil {
+		h.store.SetAffinityMode(*req.AffinityMode)
+		log.Printf("设置已更新: affinity_mode = %s", *req.AffinityMode)
+	}
+
 	if req.MaxRetries != nil {
 		v := *req.MaxRetries
 		if v < 0 {
@@ -4222,6 +5200,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.StreamFlushIntervalMS != nil {
 		runtimeCfg.StreamFlushIntervalMS = *req.StreamFlushIntervalMS
 		log.Printf("设置已更新: stream_flush_interval_ms = %d", runtimeCfg.StreamFlushIntervalMS)
+	}
+	if req.FirstTokenTimeoutSeconds != nil {
+		runtimeCfg.FirstTokenTimeoutSec = *req.FirstTokenTimeoutSeconds
+		log.Printf("设置已更新: first_token_timeout_seconds = %d", runtimeCfg.FirstTokenTimeoutSec)
+	}
+	if req.ShowFullUsageNumbers != nil {
+		showFullUsageNumbers = *req.ShowFullUsageNumbers
+		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
 	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
@@ -4396,6 +5382,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),
@@ -4410,6 +5397,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		SchedulerMode:                    h.store.GetSchedulerMode(),
+		AffinityMode:                     h.store.GetAffinityMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && hasAdminSecret,
@@ -4432,7 +5420,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     usageLogFlushIntervalSeconds,
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenTimeoutSeconds:         runtimeCfg.FirstTokenTimeoutSec,
+		ShowFullUsageNumbers:             showFullUsageNumbers,
 		ImageStorageConfig:               imgConfigJSON,
+		BackgroundConfig:                 encodeBackgroundConfig(bgCfg),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -4454,12 +5445,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, settingsResponse{
 		SiteName:                         siteName,
 		SiteLogo:                         siteLogo,
+		BackgroundImage:                  bgCfg.Image,
+		BackgroundOpacity:                bgCfg.Opacity,
+		BackgroundBlur:                   bgCfg.Blur,
+		BackgroundGlassOpacity:           bgCfg.GlassOpacity,
+		BackgroundGlassBlur:              bgCfg.GlassBlur,
 		MaxConcurrency:                   h.store.GetMaxConcurrency(),
 		GlobalRPM:                        h.rateLimiter.GetRPM(),
 		TestModel:                        h.store.GetTestModel(),
 		TestConcurrency:                  h.store.GetTestConcurrency(),
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
+		UsageProbeConcurrency:            h.store.GetUsageProbeConcurrency(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
 		LazyMode:                         h.store.GetLazyMode(),
 		ProxyURL:                         h.store.GetProxyURL(),
@@ -4475,6 +5472,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ProxyPoolEnabled:                 h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:             h.store.FastSchedulerEnabled(),
 		SchedulerMode:                    h.store.GetSchedulerMode(),
+		AffinityMode:                     h.store.GetAffinityMode(),
 		MaxRetries:                       h.store.GetMaxRetries(),
 		MaxRateLimitRetries:              h.store.GetMaxRateLimitRetries(),
 		AllowRemoteMigration:             h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
@@ -4502,6 +5500,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:     usageLogFlushIntervalSeconds,
 		StreamFlushPolicy:                runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:            runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenTimeoutSeconds:         runtimeCfg.FirstTokenTimeoutSec,
+		ShowFullUsageNumbers:             showFullUsageNumbers,
 		ImageStorageBackend:              imgCfg.Backend,
 		ImageS3Endpoint:                  imgCfg.Endpoint,
 		ImageS3Region:                    imgCfg.Region,
@@ -4718,6 +5718,11 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 		if rt == "" && at == "" {
 			continue
 		}
+		// account_id 在凭据中存储为 chatgpt_account_id（新字段）或 account_id（历史字段）
+		accountID := row.GetCredential("chatgpt_account_id")
+		if accountID == "" {
+			accountID = row.GetCredential("account_id")
+		}
 		entries = append(entries, cpaExportEntry{
 			Type:                "codex",
 			Email:               row.GetCredential("email"),
@@ -4729,7 +5734,7 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 			CodexUsageUpdatedAt: row.GetCredential("codex_usage_updated_at"),
 			Expired:             row.GetCredential("expires_at"),
 			IDToken:             row.GetCredential("id_token"),
-			AccountID:           row.GetCredential("account_id"),
+			AccountID:           accountID,
 			AccessToken:         at,
 			LastRefresh:         row.UpdatedAt.Format(time.RFC3339),
 			RefreshToken:        rt,
@@ -4904,9 +5909,14 @@ func (h *Handler) CleanBanned(c *gin.Context) {
 	h.cleanByStatus(c, "unauthorized")
 }
 
-// CleanRateLimited 清理限流（rate_limited）账号
+// CleanRateLimited 一键清理所有限流账号（含 premium 5h、free 7d、usage_exhausted）
 func (h *Handler) CleanRateLimited(c *gin.Context) {
-	h.cleanByStatus(c, "rate_limited")
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	cleaned := h.store.CleanRateLimitedManual(ctx)
+
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
 }
 
 // CleanError 清理错误（error）账号

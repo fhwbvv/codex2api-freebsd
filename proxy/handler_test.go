@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -16,8 +17,10 @@ import (
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 )
 
@@ -109,10 +112,14 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 
 	handler.RegisterRoutes(router)
 
-	routes := make(map[string]bool)
+	postRoutes := make(map[string]bool)
+	getRoutes := make(map[string]bool)
 	for _, route := range router.Routes() {
 		if route.Method == http.MethodPost {
-			routes[route.Path] = true
+			postRoutes[route.Path] = true
+		}
+		if route.Method == http.MethodGet {
+			getRoutes[route.Path] = true
 		}
 	}
 
@@ -120,9 +127,134 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 		"/backend-api/codex/responses",
 		"/backend-api/codex/responses/*subpath",
 	} {
-		if !routes[path] {
-			t.Fatalf("expected POST route %s to be registered; routes=%v", path, routes)
+		if !postRoutes[path] {
+			t.Fatalf("expected POST route %s to be registered; routes=%v", path, postRoutes)
 		}
+	}
+	for _, path := range []string{
+		"/v1/responses",
+		"/responses",
+		"/backend-api/codex/responses",
+	} {
+		if !getRoutes[path] {
+			t.Fatalf("expected GET route %s to be registered; routes=%v", path, getRoutes)
+		}
+	}
+}
+
+func TestNormalizeResponsesWebSocketClientPayload(t *testing.T) {
+	t.Run("defaults response create type", func(t *testing.T) {
+		got, model, apiErr := normalizeResponsesWebSocketClientPayload([]byte(`{"model":"gpt-5.4","input":"hi"}`))
+		if apiErr != nil {
+			t.Fatalf("unexpected error: %v", apiErr)
+		}
+		if model != "gpt-5.4" {
+			t.Fatalf("model = %q, want gpt-5.4", model)
+		}
+		if eventType := gjson.GetBytes(got, "type").String(); eventType != "response.create" {
+			t.Fatalf("type = %q, want response.create; body=%s", eventType, got)
+		}
+	})
+
+	t.Run("rejects append", func(t *testing.T) {
+		_, _, apiErr := normalizeResponsesWebSocketClientPayload([]byte(`{"type":"response.append","model":"gpt-5.4"}`))
+		if apiErr == nil || !strings.Contains(apiErr.Message, "response.append") {
+			t.Fatalf("error = %#v, want response.append rejection", apiErr)
+		}
+	})
+
+	t.Run("rejects message previous response id", func(t *testing.T) {
+		_, _, apiErr := normalizeResponsesWebSocketClientPayload([]byte(`{"type":"response.create","model":"gpt-5.4","previous_response_id":"msg_123"}`))
+		if apiErr == nil || !strings.Contains(apiErr.Message, "response.id") {
+			t.Fatalf("error = %#v, want previous_response_id rejection", apiErr)
+		}
+	})
+}
+
+func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+	})
+
+	bodyCh := make(chan []byte, 2)
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+		bodyCh <- append([]byte(nil), requestBody...)
+		sse := "" +
+			`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n" +
+			`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"service_tier":"default"}}` + "\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"model":"gpt-5.4","previous_response_id":"resp_prev","input":"hello"}`)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case gotBody := <-bodyCh:
+		if gjson.GetBytes(gotBody, "type").String() != "response.create" {
+			t.Fatalf("upstream type missing: %s", gotBody)
+		}
+		if prev := gjson.GetBytes(gotBody, "previous_response_id").String(); prev != "resp_prev" {
+			t.Fatalf("previous_response_id = %q, want resp_prev; body=%s", prev, gotBody)
+		}
+		if store := gjson.GetBytes(gotBody, "store"); store.Exists() {
+			t.Fatalf("websocket ingress should not force store=false, got %s; body=%s", store.Raw, gotBody)
+		}
+		if !gjson.GetBytes(gotBody, "stream").Bool() {
+			t.Fatalf("upstream stream should be true: %s", gotBody)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream request")
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, first, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read first event: %v", err)
+	}
+	if eventType := gjson.GetBytes(first, "type").String(); eventType != "response.output_text.delta" {
+		t.Fatalf("first event type = %q body=%s", eventType, first)
+	}
+	_, second, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read terminal event: %v", err)
+	}
+	if eventType := gjson.GetBytes(second, "type").String(); eventType != "response.completed" {
+		t.Fatalf("terminal event type = %q body=%s", eventType, second)
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-5.4","input":"again"}`)); err != nil {
+		t.Fatalf("write second request: %v", err)
+	}
+	select {
+	case <-bodyCh:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second upstream request")
 	}
 }
 
@@ -766,6 +898,50 @@ func TestApply429CooldownUsageLimitUpdatesFreePlanMetadata(t *testing.T) {
 	}
 	if got := row.GetCredential("codex_7d_reset_at"); got == "" {
 		t.Fatal("persisted codex_7d_reset_at is empty")
+	}
+}
+
+func TestSyncCodexUsageStateUpdatesPlanTypeFromHeader(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New returned error: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "plan-header-account", map[string]interface{}{
+		"plan_type": "free",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials returned error: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "free"}
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-plan-type", "Enterprise")
+	resp.Header.Set("x-codex-primary-used-percent", "12")
+	resp.Header.Set("x-codex-primary-window-minutes", "300")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "1200")
+	resp.Header.Set("x-codex-secondary-used-percent", "3")
+	resp.Header.Set("x-codex-secondary-window-minutes", "10080")
+	resp.Header.Set("x-codex-secondary-reset-after-seconds", "600000")
+
+	result := SyncCodexUsageState(store, account, resp)
+
+	if got := account.GetPlanType(); got != "enterprise" {
+		t.Fatalf("account plan_type = %q, want enterprise", got)
+	}
+	if !result.Used5hHeaders || !result.HasUsage5h || !result.HasUsage7d {
+		t.Fatalf("usage sync result = %#v, want 5h and 7d headers detected", result)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID returned error: %v", err)
+	}
+	if got := row.GetCredential("plan_type"); got != "enterprise" {
+		t.Fatalf("persisted plan_type = %q, want enterprise", got)
 	}
 }
 

@@ -32,6 +32,7 @@ type AccountRow struct {
 	Locked                  bool
 	CreditEnabled           bool
 	CreditSkipUsageWindow   bool
+	SkipWarmTier            bool
 	ScoreBiasOverride       sql.NullInt64
 	BaseConcurrencyOverride sql.NullInt64
 	Tags                    []string
@@ -60,6 +61,11 @@ type OptionalStringSlice struct {
 type OptionalString struct {
 	Set   bool
 	Value string
+}
+
+type OptionalBool struct {
+	Set   bool
+	Value bool
 }
 
 type OptionalNullInt64 struct {
@@ -419,6 +425,41 @@ func (db *DB) GetUsageLogFlushIntervalSeconds() int {
 	return NormalizeUsageLogFlushIntervalSeconds(int(d / time.Second))
 }
 
+// UsageLogRuntimeStats 描述 usage_logs 写入器当前的运行态。
+type UsageLogRuntimeStats struct {
+	Mode                 string
+	Enabled              bool
+	BatchSize            int
+	FlushIntervalSeconds int
+	BufferLength         int
+	BufferCapacity       int
+}
+
+// GetUsageLogRuntimeStats 返回 usage_logs 配置和当前内存缓冲长度。
+func (db *DB) GetUsageLogRuntimeStats() UsageLogRuntimeStats {
+	stats := UsageLogRuntimeStats{
+		Mode:                 defaultUsageLogMode,
+		Enabled:              true,
+		BatchSize:            defaultUsageLogBatchSize,
+		FlushIntervalSeconds: defaultUsageLogFlushIntervalSeconds,
+	}
+	if db == nil {
+		return stats
+	}
+
+	stats.Mode = db.GetUsageLogMode()
+	stats.Enabled = stats.Mode != UsageLogModeOff
+	stats.BatchSize = db.GetUsageLogBatchSize()
+	stats.FlushIntervalSeconds = db.GetUsageLogFlushIntervalSeconds()
+
+	db.logMu.Lock()
+	stats.BufferLength = len(db.logBuf)
+	stats.BufferCapacity = cap(db.logBuf)
+	db.logMu.Unlock()
+
+	return stats
+}
+
 func (db *DB) getUsageLogFlushInterval() time.Duration {
 	if db == nil {
 		return time.Duration(defaultUsageLogFlushIntervalSeconds) * time.Second
@@ -485,6 +526,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]'::jsonb;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credit_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credit_skip_usage_window BOOLEAN DEFAULT FALSE;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS skip_warm_tier BOOLEAN DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS account_groups (
 		id          SERIAL PRIMARY KEY,
@@ -585,11 +627,13 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);
 
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS allowed_group_ids JSONB DEFAULT '[]'::jsonb;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS limits JSONB DEFAULT '{}'::jsonb;
 
 			CREATE TABLE IF NOT EXISTS system_settings (
 				id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 				site_name          TEXT DEFAULT 'CodexProxy',
 				site_logo          TEXT DEFAULT '',
+				background_config  TEXT DEFAULT '{}',
 				max_concurrency    INT DEFAULT 2,
 			global_rpm         INT DEFAULT 0,
 			test_model         VARCHAR(100) DEFAULT 'gpt-5.4',
@@ -601,6 +645,7 @@ func (db *DB) migrate(ctx context.Context) error {
 			auto_clean_rate_limited BOOLEAN DEFAULT FALSE,
 			background_refresh_interval_minutes INT DEFAULT 2,
 			usage_probe_max_age_minutes INT DEFAULT 10,
+			usage_probe_concurrency INT DEFAULT 16,
 			recovery_probe_interval_minutes INT DEFAULT 30,
 			scheduler_mode VARCHAR(20) DEFAULT 'round_robin'
 		);
@@ -615,6 +660,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_account_model_cooldowns_reset_at ON account_model_cooldowns(reset_at);
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_name TEXT DEFAULT 'CodexProxy';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS site_logo TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS pg_max_conns INT DEFAULT 50;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS redis_pool_size INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_unauthorized BOOLEAN DEFAULT FALSE;
@@ -632,8 +678,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_mapping TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_concurrency INT DEFAULT 16;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_enabled BOOLEAN DEFAULT FALSE;
@@ -652,7 +700,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_flush_interval_seconds INT DEFAULT 5;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS stream_flush_policy VARCHAR(20) DEFAULT 'immediate';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS stream_flush_interval_ms INT DEFAULT 20;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS first_token_timeout_seconds INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS image_storage_config TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS show_full_usage_numbers BOOLEAN DEFAULT FALSE;
 
 			CREATE TABLE IF NOT EXISTS prompt_filter_logs (
 				id               SERIAL PRIMARY KEY,
@@ -815,7 +865,35 @@ type APIKeyRow struct {
 	QuotaUsed       float64      `json:"quota_used"`
 	ExpiresAt       sql.NullTime `json:"expires_at"`
 	AllowedGroupIDs []int64      `json:"allowed_group_ids"`
+	Limits          APIKeyLimits `json:"limits"`
 	CreatedAt       time.Time    `json:"created_at"`
+}
+
+// APIKeyLimits 是 API Key 级别的细粒度限流/配额配置。
+// 0 或空字段表示该项不限。落库为 JSON,允许平滑扩展字段。
+//
+// - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
+// - RPM: 每分钟请求数 (滑动 60s 窗口)。
+// - RPD: 每天请求数 (滑动 24h 窗口)。
+// - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
+// - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+type APIKeyLimits struct {
+	ModelAllow   []string `json:"model_allow,omitempty"`
+	ModelDeny    []string `json:"model_deny,omitempty"`
+	RPM          int      `json:"rpm,omitempty"`
+	RPD          int      `json:"rpd,omitempty"`
+	CostLimit5h  float64  `json:"cost_limit_5h,omitempty"`
+	CostLimit7d  float64  `json:"cost_limit_7d,omitempty"`
+	TokenLimit5h int64    `json:"token_limit_5h,omitempty"`
+	TokenLimit7d int64    `json:"token_limit_7d,omitempty"`
+}
+
+// IsZero 判断是否为空 limits(全部字段都未配置)
+func (l APIKeyLimits) IsZero() bool {
+	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
+		l.RPM == 0 && l.RPD == 0 &&
+		l.CostLimit5h == 0 && l.CostLimit7d == 0 &&
+		l.TokenLimit5h == 0 && l.TokenLimit7d == 0
 }
 
 type APIKeyInput struct {
@@ -825,6 +903,7 @@ type APIKeyInput struct {
 	QuotaUsed       float64
 	ExpiresAt       sql.NullTime
 	AllowedGroupIDs []int64
+	Limits          APIKeyLimits
 }
 
 type APIKeyUpdate struct {
@@ -836,9 +915,11 @@ type APIKeyUpdate struct {
 	ExpiresAtSet       bool
 	AllowedGroupIDs    []int64
 	AllowedGroupIDsSet bool
+	Limits             APIKeyLimits
+	LimitsSet          bool
 }
 
-const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), expires_at, COALESCE(allowed_group_ids, '[]')`
+const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}')`
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
@@ -894,9 +975,9 @@ func (db *DB) InsertAPIKeyWithOptions(ctx context.Context, input APIKeyInput) (i
 		input.QuotaUsed = 0
 	}
 	return db.insertRowID(ctx,
-		`INSERT INTO api_keys (name, key, quota_limit, quota_used, expires_at, allowed_group_ids) VALUES ($1, $2, $3, $4, $5, $6::jsonb) RETURNING id`,
-		`INSERT INTO api_keys (name, key, quota_limit, quota_used, expires_at, allowed_group_ids) VALUES ($1, $2, $3, $4, $5, $6)`,
-		input.Name, input.Key, input.QuotaLimit, input.QuotaUsed, nullableTimeArg(input.ExpiresAt), encodeInt64SliceJSON(input.AllowedGroupIDs),
+		`INSERT INTO api_keys (name, key, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb) RETURNING id`,
+		`INSERT INTO api_keys (name, key, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		input.Name, input.Key, input.QuotaLimit, input.QuotaUsed, nullableTimeArg(input.ExpiresAt), encodeInt64SliceJSON(input.AllowedGroupIDs), encodeAPIKeyLimits(input.Limits),
 	)
 }
 
@@ -916,7 +997,7 @@ func (row *APIKeyRow) IsQuotaExhausted() bool {
 }
 
 func (row *APIKeyRow) HasAccessConstraints() bool {
-	return row != nil && (row.QuotaLimit > 0 || row.ExpiresAt.Valid || len(row.AllowedGroupIDs) > 0)
+	return row != nil && (row.QuotaLimit > 0 || row.ExpiresAt.Valid || len(row.AllowedGroupIDs) > 0 || !row.Limits.IsZero())
 }
 
 // UpdateAPIKeyName updates the display name of an API key without changing the key value.
@@ -1000,6 +1081,32 @@ func (db *DB) UpdateAPIKeyAllowedGroupIDs(ctx context.Context, id int64, groupID
 	return db.UpdateAPIKeyAllowedGroups(ctx, id, groupIDs)
 }
 
+// UpdateAPIKeyLimits persists the per-key rate / quota / model limit configuration.
+// 空 APIKeyLimits 等价于"清除所有限制",对应数据库列为 '{}'。
+func (db *DB) UpdateAPIKeyLimits(ctx context.Context, id int64, limits APIKeyLimits) error {
+	payload := encodeAPIKeyLimits(limits)
+	var (
+		res sql.Result
+		err error
+	)
+	if db.isSQLite() {
+		res, err = db.conn.ExecContext(ctx, `UPDATE api_keys SET limits = $1 WHERE id = $2`, payload, id)
+	} else {
+		res, err = db.conn.ExecContext(ctx, `UPDATE api_keys SET limits = $1::jsonb WHERE id = $2`, payload, id)
+	}
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // UpdateAPIKey applies multiple editable fields in one transaction.
 // Omitted fields keep their existing values.
 func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) error {
@@ -1037,6 +1144,15 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 			sets = append(sets, "allowed_group_ids = "+ph)
 		} else {
 			sets = append(sets, "allowed_group_ids = "+ph+"::jsonb")
+		}
+	}
+	if update.LimitsSet {
+		payload := encodeAPIKeyLimits(update.Limits)
+		ph := setArg(payload)
+		if db.isSQLite() {
+			sets = append(sets, "limits = "+ph)
+		} else {
+			sets = append(sets, "limits = "+ph+"::jsonb")
 		}
 	}
 	if len(sets) == 0 {
@@ -1078,6 +1194,7 @@ func NormalizeSiteName(value string) string {
 type SystemSettings struct {
 	SiteName                         string
 	SiteLogo                         string
+	BackgroundConfig                 string // JSON: {"image":"...","opacity":18,"blur":0}
 	MaxConcurrency                   int
 	GlobalRPM                        int
 	TestModel                        string
@@ -1100,8 +1217,10 @@ type SystemSettings struct {
 	ModelMapping                     string // JSON: {"anthropic_model": "codex_model", ...}
 	BackgroundRefreshIntervalMinutes int
 	UsageProbeMaxAgeMinutes          int
+	UsageProbeConcurrency            int
 	RecoveryProbeIntervalMinutes     int
 	SchedulerMode                    string
+	AffinityMode                     string // session 粘性模式: bounded / off / strict
 	ResinURL                         string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
 	ResinPlatformName                string // Resin 平台标识，例如 codex2api
 	PromptFilterEnabled              bool
@@ -1120,7 +1239,9 @@ type SystemSettings struct {
 	UsageLogFlushIntervalSeconds     int
 	StreamFlushPolicy                string
 	StreamFlushIntervalMS            int
+	FirstTokenTimeoutSeconds         int
 	ImageStorageConfig               string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
+	ShowFullUsageNumbers             bool
 }
 
 // GetSystemSettings 加载全局设置
@@ -1141,8 +1262,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(model_mapping, '{}'),
 		       COALESCE(background_refresh_interval_minutes, 2),
 		       COALESCE(usage_probe_max_age_minutes, 10),
+		       COALESCE(usage_probe_concurrency, 16),
 		       COALESCE(recovery_probe_interval_minutes, 30),
 		       COALESCE(scheduler_mode, 'round_robin'),
+		       COALESCE(affinity_mode, 'bounded'),
 		       COALESCE(resin_url, ''),
 		       COALESCE(resin_platform_name, ''),
 		       COALESCE(prompt_filter_enabled, false),
@@ -1161,7 +1284,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(usage_log_flush_interval_seconds, 5),
 		       COALESCE(stream_flush_policy, 'immediate'),
 		       COALESCE(stream_flush_interval_ms, 20),
-		       COALESCE(image_storage_config, '{}')
+		       COALESCE(first_token_timeout_seconds, 0),
+		       COALESCE(image_storage_config, '{}'),
+		       COALESCE(background_config, '{}'),
+		       COALESCE(show_full_usage_numbers, false)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1169,15 +1295,19 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping,
-		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
+		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.RecoveryProbeIntervalMinutes,
 		&s.SchedulerMode,
+		&s.AffinityMode,
 		&s.ResinURL, &s.ResinPlatformName,
 		&s.PromptFilterEnabled, &s.PromptFilterMode, &s.PromptFilterThreshold, &s.PromptFilterStrictThreshold,
 		&s.PromptFilterLogMatches, &s.PromptFilterMaxTextLength, &s.PromptFilterSensitiveWords,
 		&s.PromptFilterCustomPatterns, &s.PromptFilterDisabledPatterns,
 		&s.ClientCompatMode, &s.CodexMinCLIVersion, &s.UsageLogMode, &s.UsageLogBatchSize,
 		&s.UsageLogFlushIntervalSeconds, &s.StreamFlushPolicy, &s.StreamFlushIntervalMS,
+		&s.FirstTokenTimeoutSeconds,
 		&s.ImageStorageConfig,
+		&s.BackgroundConfig,
+		&s.ShowFullUsageNumbers,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1195,15 +1325,20 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, lazy_mode, model_mapping,
 				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
+				usage_probe_concurrency,
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
 				client_compat_mode, codex_min_cli_version, usage_log_mode, usage_log_batch_size,
 				usage_log_flush_interval_seconds, stream_flush_policy, stream_flush_interval_ms,
+				first_token_timeout_seconds,
 				image_storage_config,
-				scheduler_mode
+				scheduler_mode,
+				affinity_mode,
+				background_config,
+				show_full_usage_numbers
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50)
 			ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1229,6 +1364,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				model_mapping           = EXCLUDED.model_mapping,
 				background_refresh_interval_minutes = EXCLUDED.background_refresh_interval_minutes,
 				usage_probe_max_age_minutes = EXCLUDED.usage_probe_max_age_minutes,
+				usage_probe_concurrency = EXCLUDED.usage_probe_concurrency,
 				recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
 				resin_url               = EXCLUDED.resin_url,
 				resin_platform_name     = EXCLUDED.resin_platform_name,
@@ -1248,20 +1384,35 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				usage_log_flush_interval_seconds = EXCLUDED.usage_log_flush_interval_seconds,
 				stream_flush_policy = EXCLUDED.stream_flush_policy,
 				stream_flush_interval_ms = EXCLUDED.stream_flush_interval_ms,
+				first_token_timeout_seconds = EXCLUDED.first_token_timeout_seconds,
 				image_storage_config = EXCLUDED.image_storage_config,
-				scheduler_mode = EXCLUDED.scheduler_mode
+				scheduler_mode = EXCLUDED.scheduler_mode,
+				affinity_mode = EXCLUDED.affinity_mode,
+				background_config = EXCLUDED.background_config,
+				show_full_usage_numbers = EXCLUDED.show_full_usage_numbers
 		`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
+		s.UsageProbeConcurrency,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,
 		s.ClientCompatMode, s.CodexMinCLIVersion, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
-		s.ImageStorageConfig, s.SchedulerMode)
+		s.FirstTokenTimeoutSeconds, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig, s.ShowFullUsageNumbers)
 	return err
+}
+
+// normalizeAffinityMode 把 SystemSettings.AffinityMode 落库前归一,空字符串 → "bounded"。
+func normalizeAffinityMode(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case "bounded", "off", "strict":
+		return strings.TrimSpace(mode)
+	default:
+		return "bounded"
+	}
 }
 
 // DeleteAPIKey 删除 API 密钥
@@ -1487,51 +1638,53 @@ func (db *DB) UpdateProxyTestResult(ctx context.Context, id int64, ip, location 
 
 // UsageLog 请求日志行
 type UsageLog struct {
-	ID                int64     `json:"id"`
-	AccountID         int64     `json:"account_id"`
-	Endpoint          string    `json:"endpoint"`
-	Model             string    `json:"model"`
-	EffectiveModel    string    `json:"effective_model"`
-	PromptTokens      int       `json:"prompt_tokens"`
-	CompletionTokens  int       `json:"completion_tokens"`
-	TotalTokens       int       `json:"total_tokens"`
-	StatusCode        int       `json:"status_code"`
-	DurationMs        int       `json:"duration_ms"`
-	InputTokens       int       `json:"input_tokens"`
-	OutputTokens      int       `json:"output_tokens"`
-	ReasoningTokens   int       `json:"reasoning_tokens"`
-	FirstTokenMs      int       `json:"first_token_ms"`
-	ReasoningEffort   string    `json:"reasoning_effort"`
-	InboundEndpoint   string    `json:"inbound_endpoint"`
-	UpstreamEndpoint  string    `json:"upstream_endpoint"`
-	Stream            bool      `json:"stream"`
-	CachedTokens      int       `json:"cached_tokens"`
-	ServiceTier       string    `json:"service_tier"`
-	APIKeyID          int64     `json:"api_key_id"`
-	APIKeyName        string    `json:"api_key_name"`
-	APIKeyMasked      string    `json:"api_key_masked"`
-	ImageCount        int       `json:"image_count"`
-	ImageWidth        int       `json:"image_width"`
-	ImageHeight       int       `json:"image_height"`
-	ImageBytes        int       `json:"image_bytes"`
-	ImageFormat       string    `json:"image_format"`
-	ImageSize         string    `json:"image_size"`
-	AccountEmail      string    `json:"account_email"`
-	CreatedAt         time.Time `json:"created_at"`
-	AccountBilled     float64   `json:"account_billed"`
-	UserBilled        float64   `json:"user_billed"`
-	InputCost         float64   `json:"input_cost"`
-	OutputCost        float64   `json:"output_cost"`
-	CacheReadCost     float64   `json:"cache_read_cost"`
-	TotalCost         float64   `json:"total_cost"`
-	InputPrice        float64   `json:"input_price_per_mtoken"`
-	OutputPrice       float64   `json:"output_price_per_mtoken"`
-	CacheReadPrice    float64   `json:"cache_read_price_per_mtoken"`
-	RateMultiplier    float64   `json:"rate_multiplier"`
-	IsRetryAttempt    bool      `json:"is_retry_attempt"`
-	AttemptIndex      int       `json:"attempt_index"`
-	UpstreamErrorKind string    `json:"upstream_error_kind"`
-	ErrorMessage      string    `json:"error_message"`
+	ID                   int64     `json:"id"`
+	AccountID            int64     `json:"account_id"`
+	Endpoint             string    `json:"endpoint"`
+	Model                string    `json:"model"`
+	EffectiveModel       string    `json:"effective_model"`
+	PromptTokens         int       `json:"prompt_tokens"`
+	CompletionTokens     int       `json:"completion_tokens"`
+	TotalTokens          int       `json:"total_tokens"`
+	StatusCode           int       `json:"status_code"`
+	DurationMs           int       `json:"duration_ms"`
+	InputTokens          int       `json:"input_tokens"`
+	OutputTokens         int       `json:"output_tokens"`
+	ReasoningTokens      int       `json:"reasoning_tokens"`
+	FirstTokenMs         int       `json:"first_token_ms"`
+	ReasoningEffort      string    `json:"reasoning_effort"`
+	InboundEndpoint      string    `json:"inbound_endpoint"`
+	UpstreamEndpoint     string    `json:"upstream_endpoint"`
+	Stream               bool      `json:"stream"`
+	CachedTokens         int       `json:"cached_tokens"`
+	ServiceTier          string    `json:"service_tier"`
+	APIKeyID             int64     `json:"api_key_id"`
+	APIKeyName           string    `json:"api_key_name"`
+	APIKeyMasked         string    `json:"api_key_masked"`
+	ImageCount           int       `json:"image_count"`
+	ImageWidth           int       `json:"image_width"`
+	ImageHeight          int       `json:"image_height"`
+	ImageBytes           int       `json:"image_bytes"`
+	ImageFormat          string    `json:"image_format"`
+	ImageSize            string    `json:"image_size"`
+	AccountEmail         string    `json:"account_email"`
+	CreatedAt            time.Time `json:"created_at"`
+	AccountBilled        float64   `json:"account_billed"`
+	UserBilled           float64   `json:"user_billed"`
+	InputCost            float64   `json:"input_cost"`
+	OutputCost           float64   `json:"output_cost"`
+	CacheReadCost        float64   `json:"cache_read_cost"`
+	TotalCost            float64   `json:"total_cost"`
+	InputPrice           float64   `json:"input_price_per_mtoken"`
+	OutputPrice          float64   `json:"output_price_per_mtoken"`
+	CacheReadPrice       float64   `json:"cache_read_price_per_mtoken"`
+	RateMultiplier       float64   `json:"rate_multiplier"`
+	LongContext          bool      `json:"long_context"`
+	LongContextThreshold int       `json:"long_context_threshold"`
+	IsRetryAttempt       bool      `json:"is_retry_attempt"`
+	AttemptIndex         int       `json:"attempt_index"`
+	UpstreamErrorKind    string    `json:"upstream_error_kind"`
+	ErrorMessage         string    `json:"error_message"`
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
@@ -1656,6 +1809,8 @@ func (l *UsageLog) populateBillingBreakdown() {
 	l.OutputPrice = breakdown.OutputPricePerMToken
 	l.CacheReadPrice = breakdown.CacheReadPricePerMToken
 	l.RateMultiplier = breakdown.ServiceTierCostMultiplier
+	l.LongContext = breakdown.LongContext
+	l.LongContextThreshold = breakdown.LongContextThreshold
 
 	displayTotal := l.UserBilled
 	if displayTotal <= 0 {
@@ -1937,16 +2092,27 @@ type TrafficSnapshot struct {
 	TPSPeak float64 `json:"tps_peak"`
 }
 
-// GetUsageStats 获取使用统计（基线 + 当前日志）
-func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
+// GetUsageStats 获取使用统计（基线 + 当前日志）。
+// 当 rangeStart 为零值时回落到"今日"(本地 0 点起),与历史行为一致;
+// 当传入显式区间时,today_* 字段语义变为"该区间内的统计",total_* 字段始终是全量累计。
+// rangeEnd 为零值表示"至今"。
+func (db *DB) GetUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time) (*UsageStats, error) {
 	if db.isSQLite() {
-		return db.getUsageStatsSQLite(ctx)
+		return db.getUsageStatsSQLite(ctx, rangeStart, rangeEnd)
 	}
 
 	stats := &UsageStats{}
 	now := time.Now()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	if rangeStart.IsZero() {
+		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	}
 	minuteAgo := now.Add(-1 * time.Minute)
+	endClause := ""
+	args := []interface{}{rangeStart, minuteAgo}
+	if !rangeEnd.IsZero() {
+		endClause = " AND created_at < $3"
+		args = append(args, rangeEnd)
+	}
 
 	todayQuery := `
 	SELECT
@@ -1964,14 +2130,14 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS today_cache_hit_requests,
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
 	FROM usage_logs
-	WHERE created_at >= $1
+	WHERE created_at >= $1` + endClause + `
 	  AND status_code <> 499
 	`
 
 	var todayErrors int64
 	var todayCacheHitRequests int64
 	var todayPrompt, todayCompletion, todayCached int64
-	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
+	err := db.conn.QueryRowContext(ctx, todayQuery, args...).Scan(
 		&stats.TodayRequests, &stats.TodayTokens, &todayPrompt, &todayCompletion, &todayCached,
 		&stats.TodayAccountBilled, &stats.TodayUserBilled,
 		&stats.RPM, &stats.TPM,
@@ -2963,7 +3129,7 @@ func (db *DB) GetAccountBilledSince(ctx context.Context, accountID int64, since 
 // ListActive 获取所有未删除账号。
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
 		FROM accounts
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		ORDER BY id
@@ -2997,6 +3163,7 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.Locked,
 			&a.CreditEnabled,
 			&a.CreditSkipUsageWindow,
+			&a.SkipWarmTier,
 			&a.ScoreBiasOverride,
 			&a.BaseConcurrencyOverride,
 			&tagsRaw,
@@ -3106,7 +3273,7 @@ func (db *DB) ClearExpiredModelCooldowns(ctx context.Context) error {
 // GetAccountByID 获取未删除账号的完整数据库行。
 func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
 		FROM accounts
 		WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		LIMIT 1
@@ -3132,6 +3299,7 @@ func (db *DB) GetAccountByID(ctx context.Context, id int64) (*AccountRow, error)
 		&a.Locked,
 		&a.CreditEnabled,
 		&a.CreditSkipUsageWindow,
+		&a.SkipWarmTier,
 		&a.ScoreBiasOverride,
 		&a.BaseConcurrencyOverride,
 		&tagsRaw,
@@ -3252,7 +3420,7 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 
 // UpdateAccountSchedulerMetadata applies scheduler overrides and UI metadata in
 // one transaction. Runtime store updates should happen only after this returns.
-func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scoreBiasOverride OptionalNullInt64, baseConcurrencyOverride OptionalNullInt64, allowedAPIKeyIDs OptionalInt64Slice, tags OptionalStringSlice, groupIDs OptionalInt64Slice, proxyURL OptionalString) error {
+func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scoreBiasOverride OptionalNullInt64, baseConcurrencyOverride OptionalNullInt64, skipWarmTier OptionalBool, allowedAPIKeyIDs OptionalInt64Slice, tags OptionalStringSlice, groupIDs OptionalInt64Slice, proxyURL OptionalString) error {
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -3288,6 +3456,9 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 	}
 	if baseConcurrencyOverride.Set {
 		add("base_concurrency_override", nullableInt64Value(baseConcurrencyOverride.Value))
+	}
+	if skipWarmTier.Set {
+		add("skip_warm_tier", skipWarmTier.Value)
 	}
 	if tags.Set {
 		if db.isSQLite() {
@@ -3663,6 +3834,13 @@ func (db *DB) ClearError(ctx context.Context, id int64) error {
 func (db *DB) SetCooldown(ctx context.Context, id int64, reason string, until time.Time) error {
 	query := `UPDATE accounts SET cooldown_reason = $1, cooldown_until = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3`
 	_, err := db.conn.ExecContext(ctx, query, reason, until, id)
+	return err
+}
+
+// SetCooldownWithError 持久化账号冷却状态，并保留本次错误详情。
+func (db *DB) SetCooldownWithError(ctx context.Context, id int64, reason string, until time.Time, errorMsg string) error {
+	query := `UPDATE accounts SET cooldown_reason = $1, cooldown_until = $2, error_message = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4`
+	_, err := db.conn.ExecContext(ctx, query, reason, until, errorMsg, id)
 	return err
 }
 

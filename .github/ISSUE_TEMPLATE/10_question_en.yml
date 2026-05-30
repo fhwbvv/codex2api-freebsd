@@ -1,0 +1,31 @@
+name: Question / How-to (English)
+description: Not sure if it's a bug, a config question, integrating with other tools, docs unclear, etc.
+title: "[Question] "
+labels: ["type/question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before asking, take a look at the [README](https://github.com/james-6-23/codex2api#documentation) and the `docs/` directory —
+        many common questions are already answered there.
+
+  - type: checkboxes
+    id: prechecks
+    attributes:
+      label: Before I submit
+      options:
+        - label: I checked the relevant sections of README and `docs/` and couldn't find the answer
+          required: true
+        - label: I searched [existing issues](https://github.com/james-6-23/codex2api/issues?q=is%3Aissue) and didn't find a discussion
+          required: true
+
+  - type: textarea
+    id: question
+    attributes:
+      label: What's my question?
+      placeholder: |
+        e.g. How do I restrict an API key to only call /v1/messages?
+        How should I choose between round_robin and remaining_quota?
+        How do I migrate an existing account pool to a new machine?
+    validations:
+      required: true

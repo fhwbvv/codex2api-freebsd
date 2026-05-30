@@ -551,6 +551,70 @@ func TestSQLiteUsageStatsBaselineHasBillingColumns(t *testing.T) {
 	}
 }
 
+func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.UpdateSystemSettings(ctx, &SystemSettings{
+		SiteName:                         "CodexProxy",
+		MaxConcurrency:                   2,
+		GlobalRPM:                        0,
+		TestModel:                        "gpt-5.4",
+		TestConcurrency:                  50,
+		BackgroundRefreshIntervalMinutes: 2,
+		UsageProbeMaxAgeMinutes:          10,
+		UsageProbeConcurrency:            16,
+		RecoveryProbeIntervalMinutes:     30,
+		PgMaxConns:                       50,
+		RedisPoolSize:                    30,
+		MaxRetries:                       2,
+		MaxRateLimitRetries:              1,
+		ModelMapping:                     "{}",
+		PromptFilterMode:                 "monitor",
+		PromptFilterThreshold:            50,
+		PromptFilterStrictThreshold:      90,
+		PromptFilterLogMatches:           true,
+		PromptFilterMaxTextLength:        81920,
+		PromptFilterCustomPatterns:       "[]",
+		PromptFilterDisabledPatterns:     "[]",
+		ClientCompatMode:                 "preserve",
+		CodexMinCLIVersion:               "0.118.0",
+		UsageLogMode:                     "full",
+		UsageLogBatchSize:                200,
+		UsageLogFlushIntervalSeconds:     5,
+		StreamFlushPolicy:                "immediate",
+		StreamFlushIntervalMS:            20,
+		FirstTokenTimeoutSeconds:         17,
+		ImageStorageConfig:               "{}",
+		SchedulerMode:                    "round_robin",
+		AffinityMode:                     "bounded",
+		BackgroundConfig:                 "{}",
+		ShowFullUsageNumbers:             true,
+	}); err != nil {
+		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
+	}
+
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings 返回错误: %v", err)
+	}
+	if settings == nil {
+		t.Fatal("GetSystemSettings 返回 nil")
+	}
+	if settings.FirstTokenTimeoutSeconds != 17 {
+		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
+	}
+	if !settings.ShowFullUsageNumbers {
+		t.Fatal("ShowFullUsageNumbers = false, want true")
+	}
+}
+
 func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -874,7 +938,7 @@ func TestUsageStatsIncludeBillingTotals(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx)
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -973,7 +1037,7 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx)
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -1062,7 +1126,7 @@ func TestUsageStatsBaselinePreservesCacheRateAndFirstTokenAfterClear(t *testing.
 		t.Fatalf("ClearUsageLogs 返回错误: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx)
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -1195,6 +1259,42 @@ func TestListActiveIncludesErrorAccounts(t *testing.T) {
 	}
 	if rows[0].ErrorMessage != "batch test failed" {
 		t.Fatalf("error_message = %q, want batch test failed", rows[0].ErrorMessage)
+	}
+}
+
+func TestSetCooldownWithErrorPersistsMessage(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "cooldown-account", "rt-cooldown", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+	until := time.Now().Add(time.Hour)
+	if err := db.SetCooldownWithError(ctx, id, "unauthorized", until, "上游返回 401: token_invalidated"); err != nil {
+		t.Fatalf("SetCooldownWithError 返回错误: %v", err)
+	}
+
+	var reason string
+	var errorMessage string
+	var cooldownUntil sql.NullTime
+	if err := db.conn.QueryRowContext(ctx, `SELECT cooldown_reason, error_message, cooldown_until FROM accounts WHERE id = $1`, id).Scan(&reason, &errorMessage, &cooldownUntil); err != nil {
+		t.Fatalf("查询账号冷却状态返回错误: %v", err)
+	}
+	if reason != "unauthorized" {
+		t.Fatalf("cooldown_reason = %q, want unauthorized", reason)
+	}
+	if errorMessage != "上游返回 401: token_invalidated" {
+		t.Fatalf("error_message = %q, want recorded upstream error", errorMessage)
+	}
+	if !cooldownUntil.Valid {
+		t.Fatal("cooldown_until 未写入")
 	}
 }
 

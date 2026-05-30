@@ -62,6 +62,9 @@ func TestTranslateAnthropicToCodex_DefaultsReasoningHighWithSummary(t *testing.T
 	if summary := gjson.GetBytes(got, "reasoning.summary").String(); summary != "auto" {
 		t.Fatalf("reasoning.summary = %q, want auto; body=%s", summary, got)
 	}
+	if tier := gjson.GetBytes(got, "service_tier"); tier.Exists() {
+		t.Fatalf("service_tier should be omitted when speed is absent; body=%s", got)
+	}
 }
 
 func TestTranslateAnthropicToCodex_ThinkingBudgetDoesNotControlEffort(t *testing.T) {
@@ -78,6 +81,78 @@ func TestTranslateAnthropicToCodex_ThinkingBudgetDoesNotControlEffort(t *testing
 
 	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "high" {
 		t.Fatalf("reasoning.effort = %q, want high; body=%s", effort, got)
+	}
+}
+
+func TestTranslateAnthropicToCodex_SpeedFastMapsToCodexPriority(t *testing.T) {
+	cases := []struct {
+		name     string
+		field    string
+		wantTier bool
+	}{
+		{"absent omits priority", "", false},
+		{"speed fast maps to priority", `,"speed":"fast"`, true},
+		{"speed standard omits priority", `,"speed":"standard"`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`{
+				"model":"claude-sonnet-4-5",
+				"messages":[{"role":"user","content":"hello"}]` + tc.field + `
+			}`)
+
+			got, _, err := TranslateAnthropicToCodexWithModels(raw, "", []string{"gpt-5.4"})
+			if err != nil {
+				t.Fatalf("TranslateAnthropicToCodexWithModels returned error: %v", err)
+			}
+
+			tier := gjson.GetBytes(got, "service_tier")
+			if tc.wantTier {
+				if tier.String() != "priority" {
+					t.Fatalf("service_tier = %q, want priority; body=%s", tier.String(), got)
+				}
+				if speed := gjson.GetBytes(got, "speed"); speed.Exists() {
+					t.Fatalf("speed should not be forwarded to Codex body; body=%s", got)
+				}
+				return
+			}
+			if tier.Exists() {
+				t.Fatalf("service_tier should be omitted; body=%s", got)
+			}
+			if speed := gjson.GetBytes(got, "speed"); speed.Exists() {
+				t.Fatalf("speed should not be forwarded to Codex body; body=%s", got)
+			}
+		})
+	}
+}
+
+func TestAnthropicUsageServiceTierResolution(t *testing.T) {
+	cases := []struct {
+		name   string
+		speed  string
+		actual string
+		want   string
+	}{
+		{"no fast intent", "", "default", "default"},
+		{"fast intent upstream default", "fast", "default", "fast"},
+		{"fast intent upstream priority", "fast", "priority", "fast"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			field := ""
+			if tc.speed != "" {
+				field = `,"speed":"` + tc.speed + `"`
+			}
+			raw := []byte(`{"model":"claude-opus-4-7","messages":[{"role":"user","content":"hi"}]` + field + `}`)
+			codexBody, _, err := TranslateAnthropicToCodexWithModels(raw, "", []string{"gpt-5.5"})
+			if err != nil {
+				t.Fatalf("TranslateAnthropicToCodexWithModels returned error: %v", err)
+			}
+			got := resolveServiceTier(tc.actual, extractServiceTier(codexBody))
+			if got != tc.want {
+				t.Fatalf("resolveServiceTier(%q, %q) = %q, want %q", tc.actual, extractServiceTier(codexBody), got, tc.want)
+			}
+		})
 	}
 }
 
@@ -272,6 +347,54 @@ func TestAnthropicStreamTranslator_ToolInputBufferedAndCleaned(t *testing.T) {
 	}
 	if !sawStop {
 		t.Fatalf("expected content_block_stop on close")
+	}
+}
+
+func TestAnthropicResponseAccumulatorUsesStreamDeltasWhenCompletedOutputIsEmpty(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+	acc := newAnthropicResponseAccumulator("claude-sonnet-4-5")
+
+	events := [][]byte{
+		[]byte(`{"type":"response.created"}`),
+		[]byte(`{"type":"response.output_item.added","item":{"type":"reasoning"}}`),
+		[]byte(`{"type":"response.output_item.done"}`),
+		[]byte(`{"type":"response.output_item.added","item":{"type":"message"}}`),
+		[]byte(`{"type":"response.output_text.delta","delta":"O"}`),
+		[]byte(`{"type":"response.output_text.delta","delta":"K"}`),
+		[]byte(`{"type":"response.output_text.done"}`),
+	}
+	for _, event := range events {
+		acc.apply(tr.translateEvent(event))
+	}
+
+	completed := []byte(`{
+		"type":"response.completed",
+		"response":{
+			"status":"completed",
+			"usage":{
+				"input_tokens":10,
+				"output_tokens":2,
+				"input_tokens_details":{"cached_tokens":3}
+			}
+		}
+	}`)
+	acc.apply(tr.translateEvent(completed))
+
+	resp := acc.build(completed)
+	if len(resp.Content) != 1 {
+		t.Fatalf("len(content) = %d, want 1: %+v", len(resp.Content), resp.Content)
+	}
+	if got := resp.Content[0].Text; got != "OK" {
+		t.Fatalf("content text = %q, want OK", got)
+	}
+	if resp.Content[0].Type != "text" {
+		t.Fatalf("content type = %q, want text", resp.Content[0].Type)
+	}
+	if resp.StopReason != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn", resp.StopReason)
+	}
+	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 2 || resp.Usage.CacheReadInputTokens != 3 {
+		t.Fatalf("usage = %+v, want input=10 output=2 cache_read=3", resp.Usage)
 	}
 }
 

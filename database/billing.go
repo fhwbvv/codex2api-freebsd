@@ -34,6 +34,8 @@ type CostBreakdown struct {
 	OutputPricePerMToken      float64 `json:"output_price_per_mtoken"`
 	CacheReadPricePerMToken   float64 `json:"cache_read_price_per_mtoken"`
 	ServiceTierCostMultiplier float64 `json:"service_tier_cost_multiplier"`
+	LongContext               bool    `json:"long_context"`
+	LongContextThreshold      int     `json:"long_context_threshold"`
 }
 
 var (
@@ -146,12 +148,14 @@ func CalculateCost(inputTokens, outputTokens, cachedTokens int, model string, se
 func CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model string, serviceTier string) CostBreakdown {
 	pricing := GetModelPricing(model)
 	isLong := inputTokens > longContextThreshold
+	longContextApplied := false
 
 	inputPrice := pricing.InputPricePerMToken
 	outputPrice := pricing.OutputPricePerMToken
 	cacheReadPrice := pricing.CacheReadPricePerMToken
 
 	if isLong && pricing.LongInputPricePerMToken > 0 {
+		longContextApplied = true
 		inputPrice = pricing.LongInputPricePerMToken
 		outputPrice = pricing.LongOutputPricePerMToken
 		if pricing.LongCacheReadPricePerMToken > 0 {
@@ -204,6 +208,8 @@ func CalculateCostBreakdown(inputTokens, outputTokens, cachedTokens int, model s
 		OutputPricePerMToken:      outputPrice * tierMultiplier,
 		CacheReadPricePerMToken:   cacheReadPrice * tierMultiplier,
 		ServiceTierCostMultiplier: tierMultiplier,
+		LongContext:               longContextApplied,
+		LongContextThreshold:      longContextThreshold,
 	}
 }
 
@@ -337,6 +343,8 @@ func usePriorityPricing(serviceTier string, pricing *ModelPricing) bool {
 
 func serviceTierCostMultiplier(serviceTier string) float64 {
 	switch normalizeServiceTier(serviceTier) {
+	case "priority", "fast":
+		return 2.0
 	case "flex":
 		return 0.5
 	default:

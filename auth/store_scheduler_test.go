@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -119,6 +120,101 @@ func TestAccountBaseConcurrencyOverrideControlsDynamicLimit(t *testing.T) {
 	}
 	if acc.DynamicConcurrencyLimit != 1 {
 		t.Fatalf("risky DynamicConcurrencyLimit = %d, want 1", acc.DynamicConcurrencyLimit)
+	}
+}
+
+func TestAccountSkipWarmTierPromotesWarmScoreToHealthy(t *testing.T) {
+	acc := &Account{
+		AccessToken:   "token",
+		Status:        StatusReady,
+		PlanType:      "pro",
+		SkipWarmTier:  true,
+		LastTimeoutAt: time.Now(),
+	}
+
+	recomputeTestAccount(acc, 6)
+
+	if acc.SchedulerScore >= 85 || acc.SchedulerScore < 60 {
+		t.Fatalf("SchedulerScore = %v, want warm score range", acc.SchedulerScore)
+	}
+	if acc.HealthTier != HealthTierHealthy {
+		t.Fatalf("HealthTier = %s, want %s", acc.HealthTier, HealthTierHealthy)
+	}
+	if acc.DynamicConcurrencyLimit != 6 {
+		t.Fatalf("DynamicConcurrencyLimit = %d, want full healthy limit 6", acc.DynamicConcurrencyLimit)
+	}
+}
+
+func TestAccountSkipWarmTierPromotesRecentFailureWarmToHealthy(t *testing.T) {
+	acc := &Account{
+		AccessToken:   "token",
+		Status:        StatusReady,
+		PlanType:      "pro",
+		SkipWarmTier:  true,
+		LastFailureAt: time.Now(),
+	}
+
+	recomputeTestAccount(acc, 4)
+
+	if acc.HealthTier != HealthTierHealthy {
+		t.Fatalf("HealthTier = %s, want %s", acc.HealthTier, HealthTierHealthy)
+	}
+	if acc.DynamicConcurrencyLimit != 4 {
+		t.Fatalf("DynamicConcurrencyLimit = %d, want full healthy limit 4", acc.DynamicConcurrencyLimit)
+	}
+}
+
+func TestAccountSkipWarmTierDoesNotPromoteRiskyOrBanned(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name string
+		acc  *Account
+		want AccountHealthTier
+	}{
+		{
+			name: "low score remains risky",
+			acc: &Account{
+				AccessToken:        "token",
+				Status:             StatusReady,
+				PlanType:           "pro",
+				SkipWarmTier:       true,
+				LastUnauthorizedAt: now,
+			},
+			want: HealthTierRisky,
+		},
+		{
+			name: "banned remains banned",
+			acc: &Account{
+				AccessToken:  "token",
+				Status:       StatusReady,
+				PlanType:     "pro",
+				HealthTier:   HealthTierBanned,
+				SkipWarmTier: true,
+			},
+			want: HealthTierBanned,
+		},
+		{
+			name: "premium 5h limit remains risky",
+			acc: &Account{
+				AccessToken:         "token",
+				Status:              StatusReady,
+				PlanType:            "plus",
+				SkipWarmTier:        true,
+				UsagePercent5h:      100,
+				UsagePercent5hValid: true,
+				Reset5hAt:           now.Add(time.Hour),
+			},
+			want: HealthTierRisky,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recomputeTestAccount(tc.acc, 6)
+			if tc.acc.HealthTier != tc.want {
+				t.Fatalf("HealthTier = %s, want %s", tc.acc.HealthTier, tc.want)
+			}
+		})
 	}
 }
 
@@ -278,6 +374,77 @@ func TestStoreNextPrefersHigherDispatchScoreWithinTier(t *testing.T) {
 	if got.DBID != premium.DBID {
 		t.Fatalf("Next() picked dbID=%d, want premium account %d", got.DBID, premium.DBID)
 	}
+}
+
+func TestStoreNextConcurrentAcquireDoesNotExceedDynamicLimit(t *testing.T) {
+	acc := &Account{
+		DBID:        1,
+		AccessToken: "token",
+		Status:      StatusReady,
+		PlanType:    "pro",
+	}
+	store := &Store{
+		accounts:       []*Account{acc},
+		maxConcurrency: 1,
+	}
+
+	const workers = 32
+	var entered int64
+	start := make(chan struct{})
+	filterGate := make(chan struct{})
+	results := make(chan *Account, workers)
+
+	filter := func(candidate *Account) bool {
+		if candidate != nil && candidate.DBID == acc.DBID {
+			atomic.AddInt64(&entered, 1)
+		}
+		<-filterGate
+		return true
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- store.NextExcludingWithFilter(0, nil, filter)
+		}()
+	}
+	close(start)
+
+	deadline := time.After(2 * time.Second)
+	for atomic.LoadInt64(&entered) < workers {
+		select {
+		case <-deadline:
+			close(filterGate)
+			t.Fatalf("only %d/%d workers reached the scheduler filter", atomic.LoadInt64(&entered), workers)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	acc.mu.Lock()
+	close(filterGate)
+	time.Sleep(20 * time.Millisecond)
+	acc.mu.Unlock()
+
+	wg.Wait()
+	close(results)
+
+	acquired := 0
+	for got := range results {
+		if got != nil {
+			acquired++
+		}
+	}
+	if acquired != 1 {
+		t.Fatalf("acquired accounts = %d, want 1", acquired)
+	}
+	if got := atomic.LoadInt64(&acc.ActiveRequests); got != 1 {
+		t.Fatalf("ActiveRequests = %d, want 1", got)
+	}
+	store.Release(acc)
 }
 
 func TestAccountPremium5hUrgencyBonusOnlyAffectsDispatchScore(t *testing.T) {

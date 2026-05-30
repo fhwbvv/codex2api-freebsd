@@ -207,7 +207,7 @@ export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0
     })
 
   return (
-    <Card className={`${compact ? 'h-[430px]' : 'mb-4'} py-0 ${className}`}>
+    <Card className={`${compact ? 'lg:h-[430px]' : 'mb-4'} py-0 ${className}`}>
       <CardContent className={compact ? 'flex h-full flex-col p-4' : 'p-4 sm:p-5'}>
         <div className="mb-2 flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
@@ -281,7 +281,7 @@ export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0
           )}
         </div>
 
-        <div className={compact ? 'grid min-h-0 flex-1 grid-rows-[minmax(116px,1fr)_94px] gap-3' : 'grid gap-3'}>
+        <div className={compact ? 'grid min-h-0 flex-1 grid-rows-[200px_auto] gap-3 lg:grid-rows-[minmax(116px,1fr)_94px]' : 'grid gap-3'}>
           <div className={compact ? 'min-h-0' : 'h-[260px]'}>
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart data={chartPoints} margin={viewMode === 'reset' ? resetChartMargin : chartMargin}>

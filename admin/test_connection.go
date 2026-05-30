@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,8 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+var batchTestAccountTimeout = 30 * time.Second
 
 // testEvent SSE 测试事件
 type testEvent struct {
@@ -91,9 +94,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			proxy.SyncCodexUsageState(h.store, account, resp)
 		}
 		errBody, _ := io.ReadAll(resp.Body)
+		errMsg := fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
-			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
+			h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
 		case http.StatusTooManyRequests:
 			if isOpenAIResponsesAccount {
 				h.store.MarkCooldown(account, time.Minute, "rate_limited")
@@ -101,7 +105,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
 			}
 		}
-		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
+		sendTestEvent(c, testEvent{Type: "error", Error: errMsg})
 		return
 	}
 
@@ -173,9 +177,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				sendTestEvent(c, testEvent{Type: "error", Error: formatNoOutputUpstreamError(data)})
 				return false
 			}
-			// 测试成功即重置冷却状态，用量限制由调度器自行判断
+			// 测试成功即重置失败/冷却状态，用量限制由调度器自行判断
 			if isOpenAIResponsesAccount || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100)) {
-				h.store.ClearCooldown(account)
+				h.store.RecordManualTestSuccess(account, time.Since(start))
 			}
 			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
 			if !isOpenAIResponsesAccount && !usageState.HasUsage7d && !usageState.HasUsage5h {
@@ -454,6 +458,29 @@ type batchTestRequest struct {
 	IDs *[]int64 `json:"ids"`
 }
 
+type batchOperationEvent struct {
+	Type        string `json:"type"` // start | progress | complete
+	Action      string `json:"action"`
+	Current     int    `json:"current"`
+	Total       int    `json:"total"`
+	Success     int64  `json:"success"`
+	Failed      int64  `json:"failed"`
+	Banned      int64  `json:"banned,omitempty"`
+	RateLimited int64  `json:"rate_limited,omitempty"`
+	Deleted     int64  `json:"deleted,omitempty"`
+	AccountID   int64  `json:"account_id,omitempty"`
+	Message     string `json:"message,omitempty"`
+	Error       string `json:"error,omitempty"`
+}
+
+type batchTestCounts struct {
+	Total       int
+	Success     int64
+	Failed      int64
+	Banned      int64
+	RateLimited int64
+}
+
 func resolveBatchTestAccounts(store *auth.Store, ids *[]int64) ([]*auth.Account, int) {
 	if store == nil {
 		return nil, 0
@@ -496,107 +523,265 @@ func (h *Handler) BatchTest(c *gin.Context) {
 	}
 
 	accounts, missingCount := resolveBatchTestAccounts(h.store, req.IDs)
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamBatchTest(c, accounts, missingCount)
+		return
+	}
+
 	if len(accounts) == 0 && missingCount == 0 {
 		c.JSON(http.StatusOK, gin.H{"total": 0, "success": 0, "failed": 0, "banned": 0, "rate_limited": 0})
 		return
 	}
 
+	counts := h.runBatchTest(c.Request.Context(), accounts, missingCount, nil)
+	c.JSON(http.StatusOK, gin.H{
+		"total":        counts.Total,
+		"success":      counts.Success,
+		"failed":       counts.Failed,
+		"banned":       counts.Banned,
+		"rate_limited": counts.RateLimited,
+	})
+}
+
+func (h *Handler) streamBatchTest(c *gin.Context, accounts []*auth.Account, missingCount int) {
+	total := len(accounts) + missingCount
+	setupSSE(c)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "batch_test", Total: total})
+	if total == 0 {
+		sendSSEJSON(c, batchOperationEvent{Type: "complete", Action: "batch_test"})
+		return
+	}
+
+	events := make(chan batchOperationEvent, len(accounts)+2)
+	ctx := c.Request.Context()
+	go func() {
+		counts := h.runBatchTest(ctx, accounts, missingCount, func(event batchOperationEvent) {
+			select {
+			case events <- event:
+			case <-ctx.Done():
+			}
+		})
+		select {
+		case events <- batchOperationEvent{
+			Type:        "complete",
+			Action:      "batch_test",
+			Current:     counts.Total,
+			Total:       counts.Total,
+			Success:     counts.Success,
+			Failed:      counts.Failed,
+			Banned:      counts.Banned,
+			RateLimited: counts.RateLimited,
+		}:
+		case <-ctx.Done():
+		}
+		close(events)
+	}()
+
+	for event := range events {
+		sendSSEJSON(c, event)
+	}
+}
+
+func (h *Handler) runBatchTest(ctx context.Context, accounts []*auth.Account, missingCount int, onProgress func(batchOperationEvent)) batchTestCounts {
+	total := len(accounts) + missingCount
 	concurrency := h.store.GetTestConcurrency()
+	if concurrency <= 0 {
+		concurrency = 1
+	}
 
 	var (
 		successCount   int64
 		failedCount    = int64(missingCount)
 		bannedCount    int64
 		rateLimitCount int64
+		completedCount = int64(missingCount)
 		wg             sync.WaitGroup
 		sem            = make(chan struct{}, concurrency)
 	)
 
-	for _, account := range accounts {
-		if !account.IsOpenAIResponsesAPI() && account.GetAccessToken() == "" {
-			account.Mu().RLock()
-			hasRefreshToken := account.RefreshToken != ""
-			account.Mu().RUnlock()
-			if !hasRefreshToken {
-				h.store.MarkError(account, "批量测试失败: 账号缺少 access_token 和 refresh_token")
-			}
-			atomic.AddInt64(&failedCount, 1)
-			continue
-		}
+	if missingCount > 0 && onProgress != nil {
+		onProgress(batchOperationEvent{
+			Type:    "progress",
+			Action:  "batch_test",
+			Current: missingCount,
+			Total:   total,
+			Failed:  failedCount,
+			Error:   fmt.Sprintf("%d 个账号不在运行时池中", missingCount),
+		})
+	}
 
+	for _, account := range accounts {
 		wg.Add(1)
 		go func(acc *auth.Account) {
 			defer wg.Done()
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				atomic.AddInt64(&failedCount, 1)
+				h.emitBatchTestProgress(onProgress, acc.DBID, total, &completedCount, &successCount, &failedCount, &bannedCount, &rateLimitCount, "failed", "测试已取消")
+				return
+			}
 			defer func() { <-sem }()
 
-			testModel, modelErr := h.connectionTestModelForAccount(context.Background(), acc, "")
-			if modelErr != nil {
-				h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
-				atomic.AddInt64(&failedCount, 1)
-				return
-			}
-			payload := buildTestPayload(testModel)
-
-			var resp *http.Response
-			var err error
-			if acc.IsOpenAIResponsesAPI() {
-				resp, err = proxy.ExecuteOpenAIResponsesRequest(context.Background(), acc, payload, h.store.ResolveProxyForAccount(acc), nil)
-			} else {
-				resp, err = proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
-			}
-			if err != nil {
-				h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
-				atomic.AddInt64(&failedCount, 1)
-				return
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(resp.Body)
-
-			switch resp.StatusCode {
-			case http.StatusOK:
-				if !acc.IsOpenAIResponsesAPI() {
-					usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
-					if _, limited := formatUsageLimitedTestError(usageState); limited {
-						atomic.AddInt64(&rateLimitCount, 1)
-						return
-					}
-				}
-				// 测试成功即重置冷却状态，用量限制由调度器自行判断
-				h.store.ClearCooldown(acc)
+			status, message := h.runSingleBatchTest(ctx, acc)
+			switch status {
+			case "success":
 				atomic.AddInt64(&successCount, 1)
-			case http.StatusUnauthorized:
-				if !acc.IsOpenAIResponsesAPI() {
-					proxy.SyncCodexUsageState(h.store, acc, resp)
-				}
-				h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
+			case "banned":
 				atomic.AddInt64(&bannedCount, 1)
-			case http.StatusTooManyRequests:
-				if acc.IsOpenAIResponsesAPI() {
-					h.store.MarkCooldown(acc, time.Minute, "rate_limited")
-				} else {
-					proxy.SyncCodexUsageState(h.store, acc, resp)
-					proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
-				}
+			case "rate_limited":
 				atomic.AddInt64(&rateLimitCount, 1)
 			default:
-				if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
-					h.store.MarkError(acc, fmt.Sprintf("批量测试上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
-				}
 				atomic.AddInt64(&failedCount, 1)
 			}
+			h.emitBatchTestProgress(onProgress, acc.DBID, total, &completedCount, &successCount, &failedCount, &bannedCount, &rateLimitCount, status, message)
 		}(account)
 	}
 
 	wg.Wait()
+	return batchTestCounts{
+		Total:       total,
+		Success:     atomic.LoadInt64(&successCount),
+		Failed:      atomic.LoadInt64(&failedCount),
+		Banned:      atomic.LoadInt64(&bannedCount),
+		RateLimited: atomic.LoadInt64(&rateLimitCount),
+	}
+}
 
-	c.JSON(http.StatusOK, gin.H{
-		"total":        len(accounts) + missingCount,
-		"success":      successCount,
-		"failed":       failedCount,
-		"banned":       bannedCount,
-		"rate_limited": rateLimitCount,
-	})
+func (h *Handler) emitBatchTestProgress(
+	onProgress func(batchOperationEvent),
+	accountID int64,
+	total int,
+	completedCount *int64,
+	successCount *int64,
+	failedCount *int64,
+	bannedCount *int64,
+	rateLimitCount *int64,
+	status string,
+	message string,
+) {
+	if onProgress == nil {
+		return
+	}
+	current := int(atomic.AddInt64(completedCount, 1))
+	event := batchOperationEvent{
+		Type:        "progress",
+		Action:      "batch_test",
+		Current:     current,
+		Total:       total,
+		Success:     atomic.LoadInt64(successCount),
+		Failed:      atomic.LoadInt64(failedCount),
+		Banned:      atomic.LoadInt64(bannedCount),
+		RateLimited: atomic.LoadInt64(rateLimitCount),
+		AccountID:   accountID,
+		Message:     message,
+	}
+	if status == "failed" {
+		event.Error = message
+	}
+	onProgress(event)
+}
+
+func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (string, string) {
+	testCtx, cancel := context.WithTimeout(ctx, batchTestAccountTimeout)
+	defer cancel()
+
+	if !acc.IsOpenAIResponsesAPI() && acc.GetAccessToken() == "" {
+		acc.Mu().RLock()
+		hasRefreshToken := acc.RefreshToken != ""
+		acc.Mu().RUnlock()
+		if !hasRefreshToken {
+			h.store.MarkError(acc, "批量测试失败: 账号缺少 access_token 和 refresh_token")
+		}
+		return "failed", "账号缺少 access_token 和 refresh_token"
+	}
+
+	testModel, modelErr := h.connectionTestModelForAccount(testCtx, acc, "")
+	if modelErr != nil {
+		if msg, ok := batchTestContextFailure(testCtx, modelErr); ok {
+			return "failed", msg
+		}
+		h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+		return "failed", modelErr.Error()
+	}
+	payload := buildTestPayload(testModel)
+	start := time.Now()
+
+	var resp *http.Response
+	var err error
+	if acc.IsOpenAIResponsesAPI() {
+		resp, err = proxy.ExecuteOpenAIResponsesRequest(testCtx, acc, payload, h.store.ResolveProxyForAccount(acc), nil)
+	} else {
+		resp, err = proxy.ExecuteRequest(testCtx, acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+	}
+	if err != nil {
+		if msg, ok := batchTestContextFailure(testCtx, err); ok {
+			if errors.Is(testCtx.Err(), context.DeadlineExceeded) {
+				h.store.ReportRequestFailure(acc, "timeout", batchTestAccountTimeout)
+			}
+			return "failed", msg
+		}
+		h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
+		return "failed", err.Error()
+	}
+	defer resp.Body.Close()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		if msg, ok := batchTestContextFailure(testCtx, readErr); ok {
+			if errors.Is(testCtx.Err(), context.DeadlineExceeded) {
+				h.store.ReportRequestFailure(acc, "timeout", batchTestAccountTimeout)
+			}
+			return "failed", msg
+		}
+		h.store.MarkError(acc, "批量测试读取响应失败: "+readErr.Error())
+		return "failed", readErr.Error()
+	}
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		if !acc.IsOpenAIResponsesAPI() {
+			usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
+			if msg, limited := formatUsageLimitedTestError(usageState); limited {
+				return "rate_limited", msg
+			}
+			if !usageState.HasUsage7d && !usageState.HasUsage5h {
+				acc.ClearUsageCache()
+			}
+		}
+		// 测试成功即重置失败/冷却状态，用量限制由调度器自行判断
+		h.store.RecordManualTestSuccess(acc, time.Since(start))
+		return "success", "测试通过"
+	case http.StatusUnauthorized:
+		if !acc.IsOpenAIResponsesAPI() {
+			proxy.SyncCodexUsageState(h.store, acc, resp)
+		}
+		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+		return "banned", "账号授权失败"
+	case http.StatusTooManyRequests:
+		if acc.IsOpenAIResponsesAPI() {
+			h.store.MarkCooldown(acc, time.Minute, "rate_limited")
+		} else {
+			proxy.SyncCodexUsageState(h.store, acc, resp)
+			proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
+		}
+		return "rate_limited", "账号触发 429 限流"
+	default:
+		msg := fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
+		if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
+			h.store.MarkError(acc, "批量测试"+msg)
+		}
+		return "failed", msg
+	}
+}
+
+func batchTestContextFailure(ctx context.Context, err error) (string, bool) {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("测试超时: %s 内未完成", batchTestAccountTimeout), true
+	}
+	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+		return "测试已取消", true
+	}
+	return "", false
 }
 
 func shouldMarkBatchTestAccountError(statusCode int, body []byte) bool {

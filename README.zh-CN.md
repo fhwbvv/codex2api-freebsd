@@ -211,7 +211,7 @@ docker compose -f docker-compose.sqlite.local.yml logs -f codex2api
 - SQLite 本地构建版容器名：`codex2api-sqlite-local`
 - SQLite 轻量版只启动 `codex2api` 单容器，数据保存在 `/data/codex2api.db`
 - **SQLite compose 文件默认绑定 `127.0.0.1`，仅本机可访问。** 如需暴露给外部，请在 `.env` 中设置 `BIND_HOST=0.0.0.0` 或修改 compose 文件中的端口绑定。标准版 compose 文件默认绑定 `0.0.0.0`（所有网络接口）。
-- 生图工作台图库默认保存在 `/data/images`，标准版和 SQLite 版 Docker 配置都会持久化 `/data`
+- 生图工作台图库默认保存在 `/data/images`，上传的后台背景默认保存在 `/data/backgrounds`，标准版和 SQLite 版 Docker 配置都会持久化 `/data`
 - `docker compose down` 默认不会删除命名卷；只有 `docker compose down -v`、`docker volume rm` 或 `docker volume prune` 才会删除持久化数据
 - 不同部署模式的数据卷彼此隔离；切换 compose 文件后看到空数据，通常是切到了另一组卷，而不是原卷被自动删除
 
@@ -289,6 +289,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | 变量 | 说明 |
 | --- | --- |
 | `CODEX_PORT` | HTTP 端口，默认 `8080` |
+| `CODEX_MAX_REQUEST_BODY_SIZE_MB` | HTTP 请求体上限，单位 MB，默认 `48` |
 | `ADMIN_SECRET` | 管理后台登录密钥；设置后首次访问 `/admin` 会弹出密码输入框 |
 | `DATABASE_DRIVER` | 数据库驱动，支持 `postgres` / `sqlite` |
 | `DATABASE_PATH` | SQLite 数据文件路径，`DATABASE_DRIVER=sqlite` 时生效 |

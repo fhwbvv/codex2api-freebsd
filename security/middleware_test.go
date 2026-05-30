@@ -38,6 +38,9 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "img-src 'self' data: blob: https: http:") {
 		t.Errorf("Content-Security-Policy = %q, expected local, inline, and remote images to be allowed", csp)
 	}
+	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "media-src 'self' data: blob: https: http:") {
+		t.Errorf("Content-Security-Policy = %q, expected local, inline, and remote media to be allowed", csp)
+	}
 	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "connect-src 'self' https://api.github.com") {
 		t.Errorf("Content-Security-Policy = %q, expected GitHub release API to be allowed for update checks", csp)
 	}

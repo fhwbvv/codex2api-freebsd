@@ -82,6 +82,7 @@ func TestStatsResponse(t *testing.T) {
 	resp := statsResponse{
 		Total:         10,
 		Available:     8,
+		RateLimited:   1,
 		Error:         2,
 		TodayRequests: 1000,
 	}
@@ -103,6 +104,9 @@ func TestStatsResponse(t *testing.T) {
 	}
 	if available, ok := decoded["available"]; !ok || available != float64(8) {
 		t.Errorf("expected JSON to contain \"available\" field = 8, got %v", available)
+	}
+	if rateLimited, ok := decoded["rate_limited"]; !ok || rateLimited != float64(1) {
+		t.Errorf("expected JSON to contain \"rate_limited\" field = 1, got %v", rateLimited)
 	}
 	if errorField, ok := decoded["error"]; !ok || errorField != float64(2) {
 		t.Errorf("expected JSON to contain \"error\" field = 2, got %v", errorField)
@@ -307,6 +311,7 @@ func TestStatsResponseJSON(t *testing.T) {
 	resp := statsResponse{
 		Total:         10,
 		Available:     8,
+		RateLimited:   1,
 		Error:         2,
 		TodayRequests: 1000,
 	}

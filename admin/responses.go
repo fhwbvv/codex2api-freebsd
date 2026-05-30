@@ -20,6 +20,7 @@ type messageResponse struct {
 type statsResponse struct {
 	Total         int   `json:"total"`
 	Available     int   `json:"available"`
+	RateLimited   int   `json:"rate_limited"`
 	Error         int   `json:"error"`
 	TodayRequests int64 `json:"today_requests"`
 }
@@ -49,16 +50,17 @@ type apiKeysResponse struct {
 
 // MaskedAPIKeyRow API Key 响应（含脱敏和完整 key）
 type MaskedAPIKeyRow struct {
-	ID              int64   `json:"id"`
-	Name            string  `json:"name"`
-	Key             string  `json:"key"`
-	RawKey          string  `json:"raw_key"`
-	QuotaLimit      float64 `json:"quota_limit"`
-	QuotaUsed       float64 `json:"quota_used"`
-	ExpiresAt       *string `json:"expires_at"`
-	AllowedGroupIDs []int64 `json:"allowed_group_ids"`
-	Status          string  `json:"status"`
-	CreatedAt       string  `json:"created_at"`
+	ID              int64                 `json:"id"`
+	Name            string                `json:"name"`
+	Key             string                `json:"key"`
+	RawKey          string                `json:"raw_key"`
+	QuotaLimit      float64               `json:"quota_limit"`
+	QuotaUsed       float64               `json:"quota_used"`
+	ExpiresAt       *string               `json:"expires_at"`
+	AllowedGroupIDs []int64               `json:"allowed_group_ids"`
+	Limits          database.APIKeyLimits `json:"limits"`
+	Status          string                `json:"status"`
+	CreatedAt       string                `json:"created_at"`
 }
 
 // NewMaskedAPIKeyRow 创建 API Key 响应
@@ -83,6 +85,7 @@ func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
 		QuotaUsed:       row.QuotaUsed,
 		ExpiresAt:       expiresAt,
 		AllowedGroupIDs: append([]int64(nil), row.AllowedGroupIDs...),
+		Limits:          row.Limits,
 		Status:          status,
 		CreatedAt:       row.CreatedAt.Format(time.RFC3339),
 	}
@@ -168,6 +171,115 @@ type opsTrafficResponse struct {
 	TodayTokens   int64   `json:"today_tokens"`
 	RPMLimit      int     `json:"rpm_limit"`
 	AvgDurationMs float64 `json:"avg_duration_ms"`
+}
+
+type runtimeStatusResponse struct {
+	UpdatedAt    string                       `json:"updated_at"`
+	Status       string                       `json:"status"`
+	Service      runtimeServiceStatusResponse `json:"service"`
+	Database     runtimeDatabaseResponse      `json:"database"`
+	Cache        runtimeCacheResponse         `json:"cache"`
+	UsageLog     runtimeUsageLogResponse      `json:"usage_log"`
+	Probes       runtimeProbesResponse        `json:"probes"`
+	Accounts     runtimeAccountsResponse      `json:"accounts"`
+	ImageStorage runtimeImageStorageResponse  `json:"image_storage"`
+	AdminAuth    runtimeAdminAuthResponse     `json:"admin_auth"`
+	Checks       []runtimeCheckResponse       `json:"checks"`
+}
+
+type runtimeCheckResponse struct {
+	Component string `json:"component"`
+	Status    string `json:"status"`
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+}
+
+type runtimeServiceStatusResponse struct {
+	Status        string `json:"status"`
+	ServiceURL    string `json:"service_url"`
+	AdminURL      string `json:"admin_url"`
+	APIBaseURL    string `json:"api_base_url"`
+	UptimeSeconds int64  `json:"uptime_seconds"`
+	Goroutines    int    `json:"goroutines"`
+	GoVersion     string `json:"go_version"`
+	OS            string `json:"os"`
+	Arch          string `json:"arch"`
+	PID           int    `json:"pid"`
+}
+
+type runtimeDatabaseResponse struct {
+	Status       string  `json:"status"`
+	Driver       string  `json:"driver"`
+	Label        string  `json:"label"`
+	Location     string  `json:"location"`
+	Healthy      bool    `json:"healthy"`
+	Error        string  `json:"error,omitempty"`
+	Open         int     `json:"open"`
+	InUse        int     `json:"in_use"`
+	Idle         int     `json:"idle"`
+	MaxOpen      int     `json:"max_open"`
+	WaitCount    int64   `json:"wait_count"`
+	UsagePercent float64 `json:"usage_percent"`
+}
+
+type runtimeCacheResponse struct {
+	Status       string  `json:"status"`
+	Driver       string  `json:"driver"`
+	Label        string  `json:"label"`
+	Healthy      bool    `json:"healthy"`
+	Error        string  `json:"error,omitempty"`
+	TotalConns   uint32  `json:"total_conns"`
+	IdleConns    uint32  `json:"idle_conns"`
+	StaleConns   uint32  `json:"stale_conns"`
+	PoolSize     int     `json:"pool_size"`
+	UsagePercent float64 `json:"usage_percent"`
+}
+
+type runtimeUsageLogResponse struct {
+	Status               string `json:"status"`
+	Mode                 string `json:"mode"`
+	Enabled              bool   `json:"enabled"`
+	BatchSize            int    `json:"batch_size"`
+	FlushIntervalSeconds int    `json:"flush_interval_seconds"`
+	BufferLength         int    `json:"buffer_length"`
+	BufferCapacity       int    `json:"buffer_capacity"`
+}
+
+type runtimeProbesResponse struct {
+	Status                           string `json:"status"`
+	LazyMode                         bool   `json:"lazy_mode"`
+	BackgroundRefreshIntervalMinutes int    `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes          int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency            int    `json:"usage_probe_concurrency"`
+	RecoveryProbeIntervalMinutes     int    `json:"recovery_probe_interval_minutes"`
+	UsageProbeRunning                bool   `json:"usage_probe_running"`
+	RecoveryProbeRunning             bool   `json:"recovery_probe_running"`
+	AutoCleanupRunning               bool   `json:"auto_cleanup_running"`
+}
+
+type runtimeAccountsResponse struct {
+	Status         string         `json:"status"`
+	Total          int            `json:"total"`
+	Available      int            `json:"available"`
+	ActiveRequests int64          `json:"active_requests"`
+	TotalRequests  int64          `json:"total_requests"`
+	StatusCounts   map[string]int `json:"status_counts"`
+}
+
+type runtimeImageStorageResponse struct {
+	Status   string `json:"status"`
+	Backend  string `json:"backend"`
+	LocalDir string `json:"local_dir,omitempty"`
+	Bucket   string `json:"bucket,omitempty"`
+	Prefix   string `json:"prefix,omitempty"`
+	Healthy  bool   `json:"healthy"`
+	Error    string `json:"error,omitempty"`
+}
+
+type runtimeAdminAuthResponse struct {
+	Status     string `json:"status"`
+	Source     string `json:"source"`
+	Configured bool   `json:"configured"`
 }
 
 func writeError(c *gin.Context, statusCode int, message string) {

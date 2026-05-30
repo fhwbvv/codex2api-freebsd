@@ -33,6 +33,8 @@
 
 Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理后台 API。
 
+Anthropic `/v1/messages` 仅将官方 `speed:"fast"` 映射为上游 Codex `service_tier:"priority"`；Anthropic 请求侧 `service_tier`（Priority Tier）不在此映射范围内。用量日志的 `service_tier` / `fast` 过滤反映该解析结果。
+
 **Base URL:** `http://localhost:8080` (默认端口)
 
 **请求格式:**
@@ -375,6 +377,7 @@ data: [DONE]
       "score_bias_effective": 50,
       "base_concurrency_override": null,
       "base_concurrency_effective": 2,
+      "skip_warm_tier": false,
       "dynamic_concurrency_limit": 2,
       "allowed_api_key_ids": [1, 3],
       "proxy_url": "http://proxy.example.com:8080",
@@ -420,6 +423,7 @@ data: [DONE]
 | score_bias_effective       | integer      | 当前生效的加权分                                                  |
 | base_concurrency_override  | integer/null | 手工配置的基础并发覆盖值，`null` 表示跟随全局 `max_concurrency`   |
 | base_concurrency_effective | integer      | 当前生效的基础并发值                                              |
+| skip_warm_tier             | bool         | 是否跳过 warm 层级；仅把 warm 提升为 healthy，不覆盖 risky/banned |
 | allowed_api_key_ids        | integer[]    | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
 | credit_enabled             | bool         | 是否为信用计费模式账号                                            |
 | credit_skip_usage_window   | bool         | 是否跳过 7 天/5 小时用量窗口惩罚                                  |
@@ -436,6 +440,7 @@ data: [DONE]
 {
   "score_bias_override": 80,
   "base_concurrency_override": 6,
+  "skip_warm_tier": true,
   "allowed_api_key_ids": [1, 3]
 }
 ```
@@ -456,6 +461,7 @@ data: [DONE]
 | ------------------------- | -------------- | ---- | ---------------------------------------------------------------------------------------------------------- |
 | score_bias_override       | integer/null   | 否   | 总加权分覆盖值，范围 `-200..200`，`null` 表示恢复套餐默认                                                  |
 | base_concurrency_override | integer/null   | 否   | 基础并发覆盖值，范围 `1..50`，`null` 表示恢复全局默认                                                      |
+| skip_warm_tier            | boolean/null   | 否   | 是否跳过 warm 层级；`null` 等同 `false`，字段省略时保持原值                                                |
 | allowed_api_key_ids       | integer[]/null | 否   | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
 
 **响应:**

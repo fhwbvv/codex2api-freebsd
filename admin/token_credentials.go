@@ -9,21 +9,22 @@ import (
 )
 
 type tokenCredentialSeed struct {
-	refreshToken        string
-	sessionToken        string
-	accessToken         string
-	idToken             string
-	accountID           string
-	email               string
-	planType            string
-	expiresAt           time.Time
-	expiresAtRaw        string
-	expiresIn           int64
-	codex7DUsedPercent  string
-	codex7DResetAt      string
-	codex5HUsedPercent  string
-	codex5HResetAt      string
-	codexUsageUpdatedAt string
+	refreshToken          string
+	sessionToken          string
+	accessToken           string
+	idToken               string
+	accountID             string
+	email                 string
+	planType              string
+	expiresAt             time.Time
+	expiresAtRaw          string
+	expiresIn             int64
+	subscriptionExpiresAt time.Time
+	codex7DUsedPercent    string
+	codex7DResetAt        string
+	codex5HUsedPercent    string
+	codex5HResetAt        string
+	codexUsageUpdatedAt   string
 }
 
 func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed {
@@ -50,6 +51,9 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 		}
 		if seed.planType == "" {
 			seed.planType = info.PlanType
+		}
+		if seed.subscriptionExpiresAt.IsZero() && !info.SubscriptionExpiresAt.IsZero() {
+			seed.subscriptionExpiresAt = info.SubscriptionExpiresAt
 		}
 	}
 
@@ -86,6 +90,9 @@ func accountInfoFromTokens(idToken, accessToken string) *auth.AccountInfo {
 		if info.PlanType == "" {
 			info.PlanType = atInfo.PlanType
 		}
+		if info.SubscriptionExpiresAt.IsZero() && !atInfo.SubscriptionExpiresAt.IsZero() {
+			info.SubscriptionExpiresAt = atInfo.SubscriptionExpiresAt
+		}
 	}
 	return info
 }
@@ -117,6 +124,9 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	if seed.planType != "" {
 		credentials["plan_type"] = seed.planType
 	}
+	if !seed.subscriptionExpiresAt.IsZero() {
+		credentials["subscription_expires_at"] = seed.subscriptionExpiresAt.Format(time.RFC3339)
+	}
 	if seed.codex7DUsedPercent != "" {
 		credentials["codex_7d_used_percent"] = seed.codex7DUsedPercent
 	}
@@ -138,16 +148,17 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSeed) *auth.Account {
 	seed = normalizeTokenCredentialSeed(seed)
 	account := &auth.Account{
-		DBID:         id,
-		RefreshToken: seed.refreshToken,
-		SessionToken: seed.sessionToken,
-		AccessToken:  seed.accessToken,
-		ExpiresAt:    seed.expiresAt,
-		AccountID:    seed.accountID,
-		Email:        seed.email,
-		PlanType:     seed.planType,
-		ProxyURL:     proxyURL,
-		Status:       auth.StatusReady,
+		DBID:                  id,
+		RefreshToken:          seed.refreshToken,
+		SessionToken:          seed.sessionToken,
+		AccessToken:           seed.accessToken,
+		ExpiresAt:             seed.expiresAt,
+		AccountID:             seed.accountID,
+		Email:                 seed.email,
+		PlanType:              seed.planType,
+		ProxyURL:              proxyURL,
+		Status:                auth.StatusReady,
+		SubscriptionExpiresAt: seed.subscriptionExpiresAt,
 	}
 	if pct, ok := parseSeedUsagePercent(seed.codex7DUsedPercent); ok {
 		updatedAt := parseSeedRFC3339(seed.codexUsageUpdatedAt)

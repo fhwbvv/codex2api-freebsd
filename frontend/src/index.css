@@ -78,6 +78,767 @@
     --sidebar-background: 222 15% 13%;
   }
 
+  /* ===== Rich Theme Style Classes ===== */
+
+  /* Claude (Warm paper / charcoal palette) */
+  .theme-claude {
+    --color-background: hsl(30 20% 97%);
+    --color-card: hsl(30 17% 95%);
+    --color-popover: hsl(30 17% 95%);
+    --color-primary: hsl(16 76% 50%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(30 12% 91%);
+    --color-muted: hsl(30 12% 91%);
+    --color-muted-foreground: hsl(30 10% 45%);
+    --color-border: hsl(30 12% 87%);
+    --color-ring: hsl(16 76% 50%);
+    --sidebar-background: 30 17% 95%;
+  }
+  .dark.theme-claude,
+  .dark [class*="theme-claude"] {
+    --color-background: hsl(30 12% 10%);
+    --color-card: hsl(30 10% 13%);
+    --color-popover: hsl(30 10% 13%);
+    --color-primary: hsl(16 80% 55%);
+    --color-primary-foreground: hsl(30 20% 98%);
+    --color-secondary: hsl(30 8% 18%);
+    --color-muted: hsl(30 8% 18%);
+    --color-muted-foreground: hsl(30 6% 55%);
+    --color-border: hsl(30 8% 22%);
+    --color-ring: hsl(16 80% 55%);
+    --sidebar-background: 30 10% 13%;
+  }
+
+  /* ChatGPT (Pure white / dark slate green palette) */
+  .theme-chatgpt {
+    --color-background: hsl(0 0% 100%);
+    --color-card: hsl(0 0% 97%);
+    --color-popover: hsl(0 0% 97%);
+    --color-primary: hsl(160 84% 33%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(0 0% 93%);
+    --color-muted: hsl(0 0% 93%);
+    --color-muted-foreground: hsl(0 0% 45%);
+    --color-border: hsl(0 0% 88%);
+    --color-ring: hsl(160 84% 33%);
+    --sidebar-background: 0 0% 97%;
+  }
+  .dark.theme-chatgpt,
+  .dark [class*="theme-chatgpt"] {
+    --color-background: hsl(0 0% 13%);
+    --color-card: hsl(0 0% 9%);
+    --color-popover: hsl(0 0% 9%);
+    --color-primary: hsl(160 84% 35%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(0 0% 18%);
+    --color-muted: hsl(0 0% 18%);
+    --color-muted-foreground: hsl(0 0% 60%);
+    --color-border: hsl(0 0% 22%);
+    --color-ring: hsl(160 84% 35%);
+    --sidebar-background: 0 0% 9%;
+  }
+
+  /* DeepSeek (Light gray-blue / dark tech-blue navy palette) */
+  .theme-deepseek {
+    --color-background: hsl(214 30% 97%);
+    --color-card: hsl(0 0% 100%);
+    --color-popover: hsl(0 0% 100%);
+    --color-primary: hsl(220 100% 50%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(214 20% 92%);
+    --color-muted: hsl(214 20% 92%);
+    --color-muted-foreground: hsl(214 12% 45%);
+    --color-border: hsl(214 16% 88%);
+    --color-ring: hsl(220 100% 50%);
+    --sidebar-background: 0 0% 100%;
+  }
+  .dark.theme-deepseek,
+  .dark [class*="theme-deepseek"] {
+    --color-background: hsl(222 47% 7%);
+    --color-card: hsl(222 33% 13%);
+    --color-popover: hsl(222 33% 13%);
+    --color-primary: hsl(217 91% 60%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(222 25% 20%);
+    --color-muted: hsl(222 25% 20%);
+    --color-muted-foreground: hsl(217 12% 65%);
+    --color-border: hsl(222 20% 25%);
+    --color-ring: hsl(217 91% 60%);
+    --sidebar-background: 222 33% 12%;
+  }
+
+  /* Graphite (neutral operations palette with cool cyan accents) */
+  .theme-graphite {
+    --color-background: hsl(216 18% 96%);
+    --color-foreground: hsl(220 19% 13%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(220 19% 13%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(220 19% 13%);
+    --color-primary: hsl(194 72% 38%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(216 12% 90%);
+    --color-secondary-foreground: hsl(220 16% 28%);
+    --color-muted: hsl(216 12% 90%);
+    --color-muted-foreground: hsl(220 8% 42%);
+    --color-accent: hsl(187 30% 88%);
+    --color-accent-foreground: hsl(220 19% 13%);
+    --color-border: hsl(216 12% 84%);
+    --color-input: hsl(216 12% 84%);
+    --color-ring: hsl(194 72% 38%);
+    --sidebar-background: 220 16% 94%;
+  }
+  .dark.theme-graphite {
+    --color-background: hsl(220 13% 10%);
+    --color-foreground: hsl(220 13% 84%);
+    --color-card: hsl(220 12% 14%);
+    --color-card-foreground: hsl(220 13% 84%);
+    --color-popover: hsl(220 12% 14%);
+    --color-popover-foreground: hsl(220 13% 84%);
+    --color-primary: hsl(190 72% 48%);
+    --color-primary-foreground: hsl(220 20% 8%);
+    --color-secondary: hsl(220 10% 21%);
+    --color-secondary-foreground: hsl(220 10% 78%);
+    --color-muted: hsl(220 10% 21%);
+    --color-muted-foreground: hsl(220 8% 60%);
+    --color-accent: hsl(190 22% 20%);
+    --color-accent-foreground: hsl(220 13% 84%);
+    --color-border: hsl(220 9% 26%);
+    --color-input: hsl(220 9% 26%);
+    --color-ring: hsl(190 72% 48%);
+    --sidebar-background: 220 13% 9%;
+  }
+
+  /* Aurora (fresh green-cyan palette) */
+  .theme-aurora {
+    --color-background: hsl(166 33% 96%);
+    --color-foreground: hsl(190 35% 13%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(190 35% 13%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(190 35% 13%);
+    --color-primary: hsl(173 78% 32%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(190 36% 91%);
+    --color-secondary-foreground: hsl(190 26% 24%);
+    --color-muted: hsl(160 28% 91%);
+    --color-muted-foreground: hsl(184 12% 42%);
+    --color-accent: hsl(144 42% 88%);
+    --color-accent-foreground: hsl(190 35% 13%);
+    --color-border: hsl(176 24% 84%);
+    --color-input: hsl(176 24% 84%);
+    --color-ring: hsl(173 78% 32%);
+    --sidebar-background: 170 36% 94%;
+  }
+  .dark.theme-aurora {
+    --color-background: hsl(198 42% 8%);
+    --color-foreground: hsl(176 22% 84%);
+    --color-card: hsl(198 31% 12%);
+    --color-card-foreground: hsl(176 22% 84%);
+    --color-popover: hsl(198 31% 12%);
+    --color-popover-foreground: hsl(176 22% 84%);
+    --color-primary: hsl(168 78% 46%);
+    --color-primary-foreground: hsl(198 45% 8%);
+    --color-secondary: hsl(198 24% 18%);
+    --color-secondary-foreground: hsl(176 18% 78%);
+    --color-muted: hsl(198 24% 18%);
+    --color-muted-foreground: hsl(178 14% 64%);
+    --color-accent: hsl(166 30% 20%);
+    --color-accent-foreground: hsl(176 22% 84%);
+    --color-border: hsl(198 22% 25%);
+    --color-input: hsl(198 22% 25%);
+    --color-ring: hsl(168 78% 46%);
+    --sidebar-background: 198 40% 9%;
+  }
+
+  /* Rose (soft red palette with warm neutral surfaces) */
+  .theme-rose {
+    --color-background: hsl(350 35% 97%);
+    --color-foreground: hsl(340 28% 14%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(340 28% 14%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(340 28% 14%);
+    --color-primary: hsl(347 70% 48%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(342 28% 91%);
+    --color-secondary-foreground: hsl(340 22% 24%);
+    --color-muted: hsl(342 28% 91%);
+    --color-muted-foreground: hsl(340 11% 45%);
+    --color-accent: hsl(16 35% 90%);
+    --color-accent-foreground: hsl(340 28% 14%);
+    --color-border: hsl(342 22% 85%);
+    --color-input: hsl(342 22% 85%);
+    --color-ring: hsl(347 70% 48%);
+    --sidebar-background: 350 35% 95%;
+  }
+  .dark.theme-rose {
+    --color-background: hsl(345 20% 10%);
+    --color-foreground: hsl(340 18% 84%);
+    --color-card: hsl(345 18% 13%);
+    --color-card-foreground: hsl(340 18% 84%);
+    --color-popover: hsl(345 18% 13%);
+    --color-popover-foreground: hsl(340 18% 84%);
+    --color-primary: hsl(346 74% 61%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(345 15% 20%);
+    --color-secondary-foreground: hsl(340 14% 78%);
+    --color-muted: hsl(345 15% 20%);
+    --color-muted-foreground: hsl(340 10% 62%);
+    --color-accent: hsl(16 25% 20%);
+    --color-accent-foreground: hsl(340 18% 84%);
+    --color-border: hsl(345 13% 25%);
+    --color-input: hsl(345 13% 25%);
+    --color-ring: hsl(346 74% 61%);
+    --sidebar-background: 345 20% 10%;
+  }
+
+  /* Mono (high-contrast grayscale palette) */
+  .theme-mono {
+    --color-background: hsl(0 0% 98%);
+    --color-foreground: hsl(222 10% 14%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(222 10% 14%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(222 10% 14%);
+    --color-primary: hsl(222 10% 18%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(0 0% 91%);
+    --color-secondary-foreground: hsl(222 8% 22%);
+    --color-muted: hsl(0 0% 91%);
+    --color-muted-foreground: hsl(0 0% 42%);
+    --color-accent: hsl(210 10% 90%);
+    --color-accent-foreground: hsl(222 10% 14%);
+    --color-border: hsl(0 0% 85%);
+    --color-input: hsl(0 0% 85%);
+    --color-ring: hsl(222 10% 18%);
+    --sidebar-background: 0 0% 96%;
+  }
+  .dark.theme-mono {
+    --color-background: hsl(0 0% 8%);
+    --color-foreground: hsl(0 0% 86%);
+    --color-card: hsl(0 0% 12%);
+    --color-card-foreground: hsl(0 0% 86%);
+    --color-popover: hsl(0 0% 12%);
+    --color-popover-foreground: hsl(0 0% 86%);
+    --color-primary: hsl(0 0% 92%);
+    --color-primary-foreground: hsl(0 0% 8%);
+    --color-secondary: hsl(0 0% 19%);
+    --color-secondary-foreground: hsl(0 0% 82%);
+    --color-muted: hsl(0 0% 19%);
+    --color-muted-foreground: hsl(0 0% 62%);
+    --color-accent: hsl(0 0% 22%);
+    --color-accent-foreground: hsl(0 0% 86%);
+    --color-border: hsl(0 0% 25%);
+    --color-input: hsl(0 0% 25%);
+    --color-ring: hsl(0 0% 92%);
+    --sidebar-background: 0 0% 7%;
+  }
+
+  /* One Dark Pro (Atom-flavored editor palette) */
+  .theme-one-dark-pro {
+    --color-background: hsl(0 0% 98%);
+    --color-foreground: hsl(230 6% 24%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(230 6% 24%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(230 6% 24%);
+    --color-primary: hsl(221 87% 60%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(240 7% 92%);
+    --color-secondary-foreground: hsl(230 6% 24%);
+    --color-muted: hsl(240 7% 92%);
+    --color-muted-foreground: hsl(230 6% 46%);
+    --color-accent: hsl(240 7% 92%);
+    --color-accent-foreground: hsl(230 6% 24%);
+    --color-border: hsl(240 3% 84%);
+    --color-input: hsl(240 3% 84%);
+    --color-ring: hsl(221 87% 60%);
+    --sidebar-background: 240 7% 96%;
+  }
+  .dark.theme-one-dark-pro {
+    --color-background: hsl(220 13% 18%);
+    --color-foreground: hsl(220 14% 71%);
+    --color-card: hsl(220 12% 15%);
+    --color-card-foreground: hsl(220 14% 71%);
+    --color-popover: hsl(220 12% 15%);
+    --color-popover-foreground: hsl(220 14% 71%);
+    --color-primary: hsl(207 82% 66%);
+    --color-primary-foreground: hsl(220 13% 12%);
+    --color-secondary: hsl(220 11% 22%);
+    --color-secondary-foreground: hsl(220 14% 75%);
+    --color-muted: hsl(220 11% 22%);
+    --color-muted-foreground: hsl(220 10% 55%);
+    --color-accent: hsl(220 11% 25%);
+    --color-accent-foreground: hsl(220 14% 75%);
+    --color-border: hsl(220 13% 28%);
+    --color-input: hsl(220 13% 28%);
+    --color-ring: hsl(207 82% 66%);
+    --sidebar-background: 220 12% 14%;
+  }
+
+  /* GitHub Dark Dimmed (softened GitHub palette) */
+  .theme-github-dimmed {
+    --color-background: hsl(0 0% 100%);
+    --color-foreground: hsl(213 13% 16%);
+    --color-card: hsl(210 29% 97%);
+    --color-card-foreground: hsl(213 13% 16%);
+    --color-popover: hsl(210 29% 97%);
+    --color-popover-foreground: hsl(213 13% 16%);
+    --color-primary: hsl(212 92% 45%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(210 24% 93%);
+    --color-secondary-foreground: hsl(213 13% 25%);
+    --color-muted: hsl(210 24% 93%);
+    --color-muted-foreground: hsl(215 14% 40%);
+    --color-accent: hsl(210 24% 93%);
+    --color-accent-foreground: hsl(213 13% 16%);
+    --color-border: hsl(210 18% 84%);
+    --color-input: hsl(210 18% 84%);
+    --color-ring: hsl(212 92% 45%);
+    --sidebar-background: 210 29% 97%;
+  }
+  .dark.theme-github-dimmed {
+    --color-background: hsl(213 13% 16%);
+    --color-foreground: hsl(214 16% 73%);
+    --color-card: hsl(216 13% 20%);
+    --color-card-foreground: hsl(214 16% 73%);
+    --color-popover: hsl(216 13% 20%);
+    --color-popover-foreground: hsl(214 16% 73%);
+    --color-primary: hsl(212 89% 64%);
+    --color-primary-foreground: hsl(213 13% 12%);
+    --color-secondary: hsl(213 11% 25%);
+    --color-secondary-foreground: hsl(214 16% 78%);
+    --color-muted: hsl(213 11% 25%);
+    --color-muted-foreground: hsl(214 12% 55%);
+    --color-accent: hsl(213 11% 28%);
+    --color-accent-foreground: hsl(214 16% 78%);
+    --color-border: hsl(213 12% 30%);
+    --color-input: hsl(213 12% 30%);
+    --color-ring: hsl(212 89% 64%);
+    --sidebar-background: 216 13% 18%;
+  }
+
+  /* Tokyo Night (storm/day palette) */
+  .theme-tokyo-night {
+    --color-background: hsl(229 11% 95%);
+    --color-foreground: hsl(232 28% 20%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(232 28% 20%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(232 28% 20%);
+    --color-primary: hsl(214 82% 55%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(225 19% 88%);
+    --color-secondary-foreground: hsl(232 28% 28%);
+    --color-muted: hsl(225 19% 88%);
+    --color-muted-foreground: hsl(228 15% 46%);
+    --color-accent: hsl(225 19% 88%);
+    --color-accent-foreground: hsl(232 28% 20%);
+    --color-border: hsl(225 19% 81%);
+    --color-input: hsl(225 19% 81%);
+    --color-ring: hsl(214 82% 55%);
+    --sidebar-background: 229 11% 92%;
+  }
+  .dark.theme-tokyo-night {
+    --color-background: hsl(230 24% 19%);
+    --color-foreground: hsl(228 78% 86%);
+    --color-card: hsl(232 26% 17%);
+    --color-card-foreground: hsl(228 78% 86%);
+    --color-popover: hsl(232 26% 17%);
+    --color-popover-foreground: hsl(228 78% 86%);
+    --color-primary: hsl(217 92% 73%);
+    --color-primary-foreground: hsl(230 24% 14%);
+    --color-secondary: hsl(230 21% 25%);
+    --color-secondary-foreground: hsl(228 60% 82%);
+    --color-muted: hsl(230 21% 25%);
+    --color-muted-foreground: hsl(228 22% 60%);
+    --color-accent: hsl(230 21% 28%);
+    --color-accent-foreground: hsl(228 78% 86%);
+    --color-border: hsl(226 23% 30%);
+    --color-input: hsl(226 23% 30%);
+    --color-ring: hsl(217 92% 73%);
+    --sidebar-background: 232 26% 15%;
+  }
+
+  /* Dracula (violet/magenta editor palette) */
+  .theme-dracula {
+    --color-background: hsl(60 30% 96%);
+    --color-foreground: hsl(231 15% 22%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(231 15% 22%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(231 15% 22%);
+    --color-primary: hsl(265 60% 55%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(264 14% 92%);
+    --color-secondary-foreground: hsl(231 15% 28%);
+    --color-muted: hsl(264 14% 92%);
+    --color-muted-foreground: hsl(231 12% 46%);
+    --color-accent: hsl(264 14% 92%);
+    --color-accent-foreground: hsl(231 15% 22%);
+    --color-border: hsl(60 5% 82%);
+    --color-input: hsl(60 5% 82%);
+    --color-ring: hsl(265 60% 55%);
+    --sidebar-background: 60 25% 94%;
+  }
+  .dark.theme-dracula {
+    --color-background: hsl(231 15% 18%);
+    --color-foreground: hsl(60 30% 96%);
+    --color-card: hsl(229 15% 15%);
+    --color-card-foreground: hsl(60 30% 96%);
+    --color-popover: hsl(229 15% 15%);
+    --color-popover-foreground: hsl(60 30% 96%);
+    --color-primary: hsl(265 89% 78%);
+    --color-primary-foreground: hsl(231 15% 14%);
+    --color-secondary: hsl(232 14% 25%);
+    --color-secondary-foreground: hsl(60 30% 92%);
+    --color-muted: hsl(232 14% 25%);
+    --color-muted-foreground: hsl(225 16% 65%);
+    --color-accent: hsl(232 14% 28%);
+    --color-accent-foreground: hsl(60 30% 96%);
+    --color-border: hsl(232 14% 31%);
+    --color-input: hsl(232 14% 31%);
+    --color-ring: hsl(265 89% 78%);
+    --sidebar-background: 229 15% 14%;
+  }
+
+  /* Monokai Pro (warm pink-on-charcoal editor palette) */
+  .theme-monokai-pro {
+    --color-background: hsl(13 33% 96%);
+    --color-foreground: hsl(285 6% 18%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(285 6% 18%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(285 6% 18%);
+    --color-primary: hsl(341 75% 58%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(20 28% 92%);
+    --color-secondary-foreground: hsl(285 6% 25%);
+    --color-muted: hsl(20 28% 92%);
+    --color-muted-foreground: hsl(285 5% 44%);
+    --color-accent: hsl(20 28% 92%);
+    --color-accent-foreground: hsl(285 6% 18%);
+    --color-border: hsl(15 26% 82%);
+    --color-input: hsl(15 26% 82%);
+    --color-ring: hsl(341 75% 58%);
+    --sidebar-background: 13 33% 94%;
+  }
+  .dark.theme-monokai-pro {
+    --color-background: hsl(290 6% 17%);
+    --color-foreground: hsl(60 33% 99%);
+    --color-card: hsl(285 5% 13%);
+    --color-card-foreground: hsl(60 33% 99%);
+    --color-popover: hsl(285 5% 13%);
+    --color-popover-foreground: hsl(60 33% 99%);
+    --color-primary: hsl(349 100% 70%);
+    --color-primary-foreground: hsl(290 6% 13%);
+    --color-secondary: hsl(285 4% 22%);
+    --color-secondary-foreground: hsl(60 25% 96%);
+    --color-muted: hsl(285 4% 22%);
+    --color-muted-foreground: hsl(285 5% 60%);
+    --color-accent: hsl(285 4% 26%);
+    --color-accent-foreground: hsl(60 33% 99%);
+    --color-border: hsl(285 3% 32%);
+    --color-input: hsl(285 3% 32%);
+    --color-ring: hsl(349 100% 70%);
+    --sidebar-background: 285 5% 12%;
+  }
+
+  /* Nord (frost/polar arctic palette) */
+  .theme-nord {
+    --color-background: hsl(218 27% 94%);
+    --color-foreground: hsl(220 16% 22%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(220 16% 22%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(220 16% 22%);
+    --color-primary: hsl(213 32% 52%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(218 27% 88%);
+    --color-secondary-foreground: hsl(220 16% 28%);
+    --color-muted: hsl(218 27% 88%);
+    --color-muted-foreground: hsl(220 14% 46%);
+    --color-accent: hsl(218 27% 88%);
+    --color-accent-foreground: hsl(220 16% 22%);
+    --color-border: hsl(218 27% 84%);
+    --color-input: hsl(218 27% 84%);
+    --color-ring: hsl(213 32% 52%);
+    --sidebar-background: 218 27% 92%;
+  }
+  .dark.theme-nord {
+    --color-background: hsl(220 16% 22%);
+    --color-foreground: hsl(218 27% 88%);
+    --color-card: hsl(222 16% 28%);
+    --color-card-foreground: hsl(218 27% 88%);
+    --color-popover: hsl(222 16% 28%);
+    --color-popover-foreground: hsl(218 27% 88%);
+    --color-primary: hsl(193 43% 67%);
+    --color-primary-foreground: hsl(220 16% 16%);
+    --color-secondary: hsl(222 14% 31%);
+    --color-secondary-foreground: hsl(218 27% 84%);
+    --color-muted: hsl(222 14% 31%);
+    --color-muted-foreground: hsl(220 14% 64%);
+    --color-accent: hsl(222 14% 34%);
+    --color-accent-foreground: hsl(218 27% 88%);
+    --color-border: hsl(220 16% 36%);
+    --color-input: hsl(220 16% 36%);
+    --color-ring: hsl(193 43% 67%);
+    --sidebar-background: 222 16% 26%;
+  }
+
+  /* Catppuccin (Latte / Mocha pastel palette) */
+  .theme-catppuccin {
+    --color-background: hsl(220 23% 95%);
+    --color-foreground: hsl(234 16% 35%);
+    --color-card: hsl(0 0% 100%);
+    --color-card-foreground: hsl(234 16% 35%);
+    --color-popover: hsl(0 0% 100%);
+    --color-popover-foreground: hsl(234 16% 35%);
+    --color-primary: hsl(266 85% 58%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(223 16% 88%);
+    --color-secondary-foreground: hsl(234 16% 35%);
+    --color-muted: hsl(223 16% 88%);
+    --color-muted-foreground: hsl(233 13% 52%);
+    --color-accent: hsl(223 16% 88%);
+    --color-accent-foreground: hsl(234 16% 35%);
+    --color-border: hsl(225 14% 80%);
+    --color-input: hsl(225 14% 80%);
+    --color-ring: hsl(266 85% 58%);
+    --sidebar-background: 220 23% 93%;
+  }
+  .dark.theme-catppuccin {
+    --color-background: hsl(240 21% 15%);
+    --color-foreground: hsl(226 64% 88%);
+    --color-card: hsl(240 23% 12%);
+    --color-card-foreground: hsl(226 64% 88%);
+    --color-popover: hsl(240 23% 12%);
+    --color-popover-foreground: hsl(226 64% 88%);
+    --color-primary: hsl(267 84% 81%);
+    --color-primary-foreground: hsl(240 21% 12%);
+    --color-secondary: hsl(234 13% 23%);
+    --color-secondary-foreground: hsl(226 50% 84%);
+    --color-muted: hsl(234 13% 23%);
+    --color-muted-foreground: hsl(228 20% 65%);
+    --color-accent: hsl(234 13% 28%);
+    --color-accent-foreground: hsl(226 64% 88%);
+    --color-border: hsl(234 13% 31%);
+    --color-input: hsl(234 13% 31%);
+    --color-ring: hsl(267 84% 81%);
+    --sidebar-background: 240 23% 11%;
+  }
+
+  /* Gruvbox (warm retro amber palette) */
+  .theme-gruvbox {
+    --color-background: hsl(48 87% 88%);
+    --color-foreground: hsl(20 6% 22%);
+    --color-card: hsl(53 73% 91%);
+    --color-card-foreground: hsl(20 6% 22%);
+    --color-popover: hsl(53 73% 91%);
+    --color-popover-foreground: hsl(20 6% 22%);
+    --color-primary: hsl(35 80% 39%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(43 59% 81%);
+    --color-secondary-foreground: hsl(20 6% 28%);
+    --color-muted: hsl(43 59% 81%);
+    --color-muted-foreground: hsl(28 10% 40%);
+    --color-accent: hsl(43 59% 78%);
+    --color-accent-foreground: hsl(20 6% 22%);
+    --color-border: hsl(38 35% 73%);
+    --color-input: hsl(38 35% 73%);
+    --color-ring: hsl(35 80% 39%);
+    --sidebar-background: 53 73% 89%;
+  }
+  .dark.theme-gruvbox {
+    --color-background: hsl(0 0% 16%);
+    --color-foreground: hsl(43 59% 81%);
+    --color-card: hsl(20 6% 22%);
+    --color-card-foreground: hsl(43 59% 81%);
+    --color-popover: hsl(20 6% 22%);
+    --color-popover-foreground: hsl(43 59% 81%);
+    --color-primary: hsl(40 78% 50%);
+    --color-primary-foreground: hsl(0 0% 12%);
+    --color-secondary: hsl(15 8% 30%);
+    --color-secondary-foreground: hsl(43 50% 76%);
+    --color-muted: hsl(15 8% 30%);
+    --color-muted-foreground: hsl(40 15% 60%);
+    --color-accent: hsl(15 8% 33%);
+    --color-accent-foreground: hsl(43 59% 81%);
+    --color-border: hsl(28 10% 36%);
+    --color-input: hsl(28 10% 36%);
+    --color-ring: hsl(40 78% 50%);
+    --sidebar-background: 20 6% 20%;
+  }
+
+  /* Solarized Light (Ethan Schoonover warm yellow palette) */
+  .theme-solarized-light {
+    --color-background: hsl(44 87% 94%);
+    --color-foreground: hsl(194 14% 40%);
+    --color-card: hsl(46 42% 88%);
+    --color-card-foreground: hsl(194 14% 40%);
+    --color-popover: hsl(46 42% 88%);
+    --color-popover-foreground: hsl(194 14% 40%);
+    --color-primary: hsl(205 69% 49%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(46 42% 86%);
+    --color-secondary-foreground: hsl(194 14% 30%);
+    --color-muted: hsl(46 42% 86%);
+    --color-muted-foreground: hsl(195 9% 55%);
+    --color-accent: hsl(46 42% 84%);
+    --color-accent-foreground: hsl(194 14% 30%);
+    --color-border: hsl(46 25% 76%);
+    --color-input: hsl(46 25% 76%);
+    --color-ring: hsl(205 69% 49%);
+    --sidebar-background: 46 42% 90%;
+  }
+  .dark.theme-solarized-light {
+    --color-background: hsl(192 100% 11%);
+    --color-foreground: hsl(180 7% 60%);
+    --color-card: hsl(192 81% 14%);
+    --color-card-foreground: hsl(180 7% 60%);
+    --color-popover: hsl(192 81% 14%);
+    --color-popover-foreground: hsl(180 7% 60%);
+    --color-primary: hsl(205 69% 55%);
+    --color-primary-foreground: hsl(192 100% 8%);
+    --color-secondary: hsl(192 60% 18%);
+    --color-secondary-foreground: hsl(180 7% 65%);
+    --color-muted: hsl(192 60% 18%);
+    --color-muted-foreground: hsl(186 8% 50%);
+    --color-accent: hsl(192 60% 22%);
+    --color-accent-foreground: hsl(180 7% 60%);
+    --color-border: hsl(194 14% 30%);
+    --color-input: hsl(194 14% 30%);
+    --color-ring: hsl(205 69% 55%);
+    --sidebar-background: 192 81% 12%;
+  }
+
+  /* Quiet Light (VS Code built-in calm purple-green) */
+  .theme-quiet-light {
+    --color-background: hsl(0 0% 96%);
+    --color-foreground: hsl(0 0% 20%);
+    --color-card: hsl(0 0% 98%);
+    --color-card-foreground: hsl(0 0% 20%);
+    --color-popover: hsl(0 0% 98%);
+    --color-popover-foreground: hsl(0 0% 20%);
+    --color-primary: hsl(283 35% 47%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(0 0% 92%);
+    --color-secondary-foreground: hsl(0 0% 25%);
+    --color-muted: hsl(0 0% 92%);
+    --color-muted-foreground: hsl(0 0% 45%);
+    --color-accent: hsl(0 0% 90%);
+    --color-accent-foreground: hsl(0 0% 20%);
+    --color-border: hsl(0 0% 86%);
+    --color-input: hsl(0 0% 86%);
+    --color-ring: hsl(283 35% 47%);
+    --sidebar-background: 0 0% 94%;
+  }
+  .dark.theme-quiet-light {
+    --color-background: hsl(220 14% 14%);
+    --color-foreground: hsl(220 9% 78%);
+    --color-card: hsl(220 12% 17%);
+    --color-card-foreground: hsl(220 9% 78%);
+    --color-popover: hsl(220 12% 17%);
+    --color-popover-foreground: hsl(220 9% 78%);
+    --color-primary: hsl(283 45% 65%);
+    --color-primary-foreground: hsl(220 14% 12%);
+    --color-secondary: hsl(220 10% 22%);
+    --color-secondary-foreground: hsl(220 9% 80%);
+    --color-muted: hsl(220 10% 22%);
+    --color-muted-foreground: hsl(220 7% 56%);
+    --color-accent: hsl(220 10% 25%);
+    --color-accent-foreground: hsl(220 9% 78%);
+    --color-border: hsl(220 10% 28%);
+    --color-input: hsl(220 10% 28%);
+    --color-ring: hsl(283 45% 65%);
+    --sidebar-background: 220 12% 13%;
+  }
+
+  /* Ayu Light (warm cream + orange palette) */
+  .theme-ayu-light {
+    --color-background: hsl(0 0% 98%);
+    --color-foreground: hsl(210 5% 38%);
+    --color-card: hsl(0 0% 95%);
+    --color-card-foreground: hsl(210 5% 38%);
+    --color-popover: hsl(0 0% 95%);
+    --color-popover-foreground: hsl(210 5% 38%);
+    --color-primary: hsl(28 100% 56%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(210 9% 90%);
+    --color-secondary-foreground: hsl(210 5% 30%);
+    --color-muted: hsl(210 9% 90%);
+    --color-muted-foreground: hsl(210 4% 50%);
+    --color-accent: hsl(210 9% 88%);
+    --color-accent-foreground: hsl(210 5% 38%);
+    --color-border: hsl(210 4% 82%);
+    --color-input: hsl(210 4% 82%);
+    --color-ring: hsl(28 100% 56%);
+    --sidebar-background: 0 0% 95%;
+  }
+  .dark.theme-ayu-light {
+    --color-background: hsl(223 21% 16%);
+    --color-foreground: hsl(220 13% 78%);
+    --color-card: hsl(220 19% 18%);
+    --color-card-foreground: hsl(220 13% 78%);
+    --color-popover: hsl(220 19% 18%);
+    --color-popover-foreground: hsl(220 13% 78%);
+    --color-primary: hsl(28 100% 63%);
+    --color-primary-foreground: hsl(223 21% 12%);
+    --color-secondary: hsl(220 13% 24%);
+    --color-secondary-foreground: hsl(220 13% 80%);
+    --color-muted: hsl(220 13% 24%);
+    --color-muted-foreground: hsl(220 10% 58%);
+    --color-accent: hsl(220 13% 28%);
+    --color-accent-foreground: hsl(220 13% 78%);
+    --color-border: hsl(220 13% 30%);
+    --color-input: hsl(220 13% 30%);
+    --color-ring: hsl(28 100% 63%);
+    --sidebar-background: 220 19% 16%;
+  }
+
+  /* Noctis Lux (warm cream + gold palette) */
+  .theme-noctis-lux {
+    --color-background: hsl(36 64% 88%);
+    --color-foreground: hsl(190 100% 19%);
+    --color-card: hsl(50 84% 93%);
+    --color-card-foreground: hsl(190 100% 19%);
+    --color-popover: hsl(50 84% 93%);
+    --color-popover-foreground: hsl(190 100% 19%);
+    --color-primary: hsl(34 92% 44%);
+    --color-primary-foreground: hsl(0 0% 100%);
+    --color-secondary: hsl(45 50% 86%);
+    --color-secondary-foreground: hsl(190 100% 22%);
+    --color-muted: hsl(45 50% 86%);
+    --color-muted-foreground: hsl(190 25% 38%);
+    --color-accent: hsl(45 50% 82%);
+    --color-accent-foreground: hsl(190 100% 19%);
+    --color-border: hsl(40 25% 76%);
+    --color-input: hsl(40 25% 76%);
+    --color-ring: hsl(34 92% 44%);
+    --sidebar-background: 45 60% 90%;
+  }
+  .dark.theme-noctis-lux {
+    --color-background: hsl(189 70% 9%);
+    --color-foreground: hsl(50 30% 85%);
+    --color-card: hsl(190 100% 12%);
+    --color-card-foreground: hsl(50 30% 85%);
+    --color-popover: hsl(190 100% 12%);
+    --color-popover-foreground: hsl(50 30% 85%);
+    --color-primary: hsl(34 92% 54%);
+    --color-primary-foreground: hsl(189 70% 8%);
+    --color-secondary: hsl(190 60% 16%);
+    --color-secondary-foreground: hsl(50 25% 80%);
+    --color-muted: hsl(190 60% 16%);
+    --color-muted-foreground: hsl(190 18% 58%);
+    --color-accent: hsl(190 60% 20%);
+    --color-accent-foreground: hsl(50 30% 85%);
+    --color-border: hsl(190 40% 24%);
+    --color-input: hsl(190 40% 24%);
+    --color-ring: hsl(34 92% 54%);
+    --sidebar-background: 190 100% 10%;
+  }
+
   * {
     @apply border-border;
   }
@@ -86,16 +847,87 @@
     @apply bg-background text-foreground antialiased;
     font-family: var(--font-sans);
     min-height: 100vh;
-    background: linear-gradient(180deg, hsl(220 20% 97%) 0%, hsl(216 20% 94%) 100%);
+    background: linear-gradient(180deg, var(--color-background) 0%, color-mix(in oklab, var(--color-background) 97%, black 3%) 100%);
   }
 
   .dark body,
   body.dark {
-    background: linear-gradient(180deg, hsl(222 16% 14%) 0%, hsl(222 16% 12%) 100%);
+    background: linear-gradient(180deg, var(--color-background) 0%, color-mix(in oklab, var(--color-background) 97%, black 3%) 100%);
   }
 }
 
 @layer components {
+  :root[data-admin-background="true"],
+  [data-admin-background="true"] {
+    --admin-glass-card-opacity: 70%;
+    --admin-glass-card-strong-opacity: 78%;
+    --admin-glass-control-opacity: 58%;
+    --admin-glass-sidebar-opacity: 76%;
+    --admin-glass-border-opacity: 72%;
+    --admin-glass-panel-blur: 5px;
+    --admin-glass-control-blur: 3px;
+    --admin-glass-shadow-alpha: 0.14;
+    --admin-glass-card: color-mix(in oklab, var(--color-card) var(--admin-glass-card-opacity), transparent);
+    --admin-glass-card-strong: color-mix(in oklab, var(--color-card) var(--admin-glass-card-strong-opacity), transparent);
+    --admin-glass-control: color-mix(in oklab, var(--color-background) var(--admin-glass-control-opacity), transparent);
+    --admin-glass-sidebar: color-mix(in oklab, hsl(var(--sidebar-background)) var(--admin-glass-sidebar-opacity), transparent);
+    --admin-glass-border: color-mix(in oklab, var(--color-border) var(--admin-glass-border-opacity), transparent);
+    --admin-glass-shadow: 0 18px 46px hsl(222 30% 12% / var(--admin-glass-shadow-alpha));
+    --admin-glass-blur: blur(var(--admin-glass-panel-blur)) saturate(1.06);
+    --admin-glass-control-filter: blur(var(--admin-glass-control-blur)) saturate(1.04);
+  }
+
+  :root.dark[data-admin-background="true"],
+  .dark [data-admin-background="true"] {
+    --admin-glass-card-opacity: 58%;
+    --admin-glass-card-strong-opacity: 68%;
+    --admin-glass-control-opacity: 48%;
+    --admin-glass-sidebar-opacity: 66%;
+    --admin-glass-border-opacity: 62%;
+    --admin-glass-shadow: 0 18px 46px hsl(222 35% 4% / var(--admin-glass-shadow-alpha));
+  }
+
+  [data-admin-background="true"] [data-slot="card"],
+  [data-admin-background="true"] .data-table-shell,
+  [data-admin-background="true"] .toolbar-surface {
+    background-color: var(--admin-glass-card) !important;
+    border-color: var(--admin-glass-border) !important;
+    box-shadow: var(--admin-glass-shadow) !important;
+    -webkit-backdrop-filter: var(--admin-glass-blur);
+    backdrop-filter: var(--admin-glass-blur);
+  }
+
+  [data-admin-background="true"] [data-slot="admin-sidebar"],
+  [data-admin-background="true"] [data-slot="admin-mobile-topbar"],
+  [data-admin-background="true"] [data-slot="admin-mobile-nav"] {
+    background-color: var(--admin-glass-sidebar) !important;
+    border-color: var(--admin-glass-border) !important;
+    box-shadow: var(--admin-glass-shadow) !important;
+    -webkit-backdrop-filter: var(--admin-glass-blur);
+    backdrop-filter: var(--admin-glass-blur);
+  }
+
+  [data-admin-background="true"] [data-slot="status-tile"],
+  [data-admin-background="true"] [data-slot="input"],
+  [data-admin-background="true"] [data-slot="select-trigger"],
+  [data-admin-background="true"] [data-slot="button"][data-variant="outline"],
+  [data-admin-background="true"] [data-select-dropdown="true"] {
+    background-color: var(--admin-glass-control) !important;
+    border-color: var(--admin-glass-border) !important;
+    -webkit-backdrop-filter: var(--admin-glass-control-filter);
+    backdrop-filter: var(--admin-glass-control-filter);
+  }
+
+  [data-admin-background="true"] .data-table-shell [data-slot="table-head"],
+  [data-admin-background="true"] .data-table-shell thead th {
+    background-color: var(--admin-glass-card-strong) !important;
+  }
+
+  [data-admin-background="true"] [data-slot="page-header"] h2,
+  [data-admin-background="true"] [data-slot="page-header"] p {
+    text-shadow: 0 1px 16px color-mix(in oklab, var(--color-background) 72%, transparent);
+  }
+
   .toolbar-surface {
     @apply relative z-30 overflow-visible rounded-lg border border-border bg-card/80 px-3 py-2.5 text-[12px] text-muted-foreground shadow-sm backdrop-blur-sm;
   }

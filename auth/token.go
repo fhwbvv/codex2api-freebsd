@@ -316,7 +316,7 @@ func isNonRetryable(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	for _, needle := range []string{"invalid_grant", "invalid_client", "unauthorized_client", "access_denied"} {
+	for _, needle := range []string{"invalid_grant", "invalid_client", "unauthorized_client", "access_denied", "refresh_token_reused"} {
 		if strings.Contains(msg, needle) {
 			return true
 		}
@@ -354,9 +354,9 @@ func parseIDToken(idToken string) *AccountInfo {
 	var claims struct {
 		Email      string `json:"email"`
 		OpenAIAuth *struct {
-			ChatGPTAccountID                string `json:"chatgpt_account_id"`
-			PlanType                        string `json:"chatgpt_plan_type"`
-			ChatGPTSubscriptionActiveUntil  string `json:"chatgpt_subscription_active_until"`
+			ChatGPTAccountID               string `json:"chatgpt_account_id"`
+			PlanType                       string `json:"chatgpt_plan_type"`
+			ChatGPTSubscriptionActiveUntil string `json:"chatgpt_subscription_active_until"`
 		} `json:"https://api.openai.com/auth"`
 	}
 	if err := json.Unmarshal(decoded, &claims); err != nil {

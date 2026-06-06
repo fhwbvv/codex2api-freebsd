@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -99,6 +100,13 @@ func TestRefreshAccessTokenRejectsEmptyAccessToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "access_token") {
 		t.Fatalf("error = %q, want access_token detail", err.Error())
+	}
+}
+
+func TestRefreshTokenReusedIsNonRetryable(t *testing.T) {
+	reusedErr := errors.New(`刷新失败 (status 401): {"error":{"code":"refresh_token_reused"}}`)
+	if !isNonRetryable(reusedErr) {
+		t.Fatal("refresh_token_reused should be treated as non-retryable")
 	}
 }
 

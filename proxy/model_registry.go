@@ -23,6 +23,7 @@ const (
 
 	ModelSourceBuiltin           = "builtin"
 	ModelSourceOfficialCodexDocs = "official_codex_docs"
+	ModelSourceReasoningEffort   = "reasoning_effort"
 )
 
 // ModelInfo describes one model exposed by this proxy.
@@ -172,6 +173,11 @@ func ListModelCatalog(ctx context.Context, db *database.DB) (ModelCatalog, error
 	}
 
 	merged := mergeModelInfos(rows)
+	if settings, settingsErr := db.GetSystemSettings(ctx); settingsErr == nil && settings != nil {
+		merged = appendReasoningEffortModelInfos(merged, settings.ReasoningEffortModels)
+	} else if settingsErr != nil && catalog.Warning == "" {
+		catalog.Warning = settingsErr.Error()
+	}
 	catalog.Items = merged
 	catalog.Models = enabledModelIDs(merged, false)
 	if len(catalog.Models) == 0 {
@@ -233,6 +239,47 @@ func mergeModelInfos(rows []database.ModelRegistryRow) []ModelInfo {
 	return result
 }
 
+func appendReasoningEffortModelInfos(items []ModelInfo, settingsJSON string) []ModelInfo {
+	entries, _ := parseReasoningEffortModelEntries(settingsJSON, enabledModelIDs(items, false), false)
+	if len(entries) == 0 {
+		return items
+	}
+
+	result := append([]ModelInfo(nil), items...)
+	byID := make(map[string]ModelInfo, len(result)+len(entries)*2)
+	for _, item := range result {
+		byID[strings.ToLower(strings.TrimSpace(item.ID))] = item
+	}
+
+	for _, entry := range entries {
+		baseKey := strings.ToLower(entry.Model)
+		baseInfo, baseExists := byID[baseKey]
+		if !baseExists {
+			baseInfo = modelInfoForID(entry.Model, ModelSourceReasoningEffort)
+			result = append(result, baseInfo)
+			byID[baseKey] = baseInfo
+		}
+
+		alias := ReasoningEffortModelAlias(entry.Model, entry.Effort)
+		if alias == "" {
+			continue
+		}
+		aliasKey := strings.ToLower(alias)
+		if _, exists := byID[aliasKey]; exists {
+			continue
+		}
+		aliasInfo := baseInfo
+		aliasInfo.ID = alias
+		aliasInfo.Source = ModelSourceReasoningEffort
+		aliasInfo.Category = ModelCategoryCodex
+		aliasInfo.LastSeenAt = nil
+		aliasInfo.UpdatedAt = nil
+		result = append(result, aliasInfo)
+		byID[aliasKey] = aliasInfo
+	}
+	return result
+}
+
 // SupportedModelIDs returns enabled runtime model IDs.
 func SupportedModelIDs(ctx context.Context, db *database.DB) []string {
 	catalog, _ := ListModelCatalog(ctx, db)
@@ -242,7 +289,15 @@ func SupportedModelIDs(ctx context.Context, db *database.DB) []string {
 // TextTestModelIDs returns enabled non-image models for account connection tests.
 func TextTestModelIDs(ctx context.Context, db *database.DB) []string {
 	catalog, _ := ListModelCatalog(ctx, db)
-	return enabledModelIDs(catalog.Items, true)
+	ids := enabledModelIDs(catalog.Items, true)
+	filtered := ids[:0]
+	for _, id := range ids {
+		if strings.Contains(id, "(") || strings.Contains(id, ")") {
+			continue
+		}
+		filtered = append(filtered, id)
+	}
+	return filtered
 }
 
 func IsTextTestModelID(ctx context.Context, db *database.DB, model string) bool {

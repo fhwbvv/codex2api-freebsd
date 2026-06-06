@@ -49,6 +49,20 @@ func (g *firstTokenTimeoutGuard) MarkEvent(eventType string) {
 	g.Stop()
 }
 
+func (g *firstTokenTimeoutGuard) MarkPayload(data []byte) {
+	if g == nil || !isFirstTokenPayload(data) {
+		return
+	}
+	g.Stop()
+}
+
+func (g *firstTokenTimeoutGuard) MarkFirstToken() {
+	if g == nil {
+		return
+	}
+	g.Stop()
+}
+
 func (g *firstTokenTimeoutGuard) TimedOut() bool {
 	return g != nil && g.fired.Load()
 }

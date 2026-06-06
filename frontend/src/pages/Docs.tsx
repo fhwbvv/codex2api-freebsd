@@ -905,14 +905,15 @@ review_model = "${quickStartModel}"
 model_reasoning_effort = "${quickReasoningEffort}"${codexServiceTierLine}
 disable_response_storage = true
 network_access = "enabled"
-model_context_window = 1000000
-model_auto_compact_token_limit = 900000
 
 [model_providers.OpenAI]
 name = "OpenAI"
 base_url = "${quickBaseUrl}"
 wire_api = "responses"
-requires_openai_auth = true`;
+requires_openai_auth = true
+
+[features]
+goals = true`;
 
   const codexAuthJson = `{
   "OPENAI_API_KEY": "${activeKey}"

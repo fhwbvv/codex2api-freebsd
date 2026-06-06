@@ -74,6 +74,10 @@ type Account struct {
 	UsageUpdatedAt        time.Time
 	usageProbeInFlight    bool
 	recoveryProbeInFlight bool
+	AutoPause5hThreshold  float64 // 0..1, 0 = disabled
+	AutoPause7dThreshold  float64 // 0..1, 0 = disabled
+	AutoPause5hDisabled   bool
+	AutoPause7dDisabled   bool
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -767,6 +771,9 @@ func (a *Account) dispatchBonusEligibleLocked(now time.Time, tier AccountHealthT
 	if a.usageExhaustedLocked() {
 		return false
 	}
+	if a.quotaAutoPausedLocked(now) {
+		return false
+	}
 	if !a.hasDispatchCredentialLocked() {
 		return false
 	}
@@ -910,11 +917,43 @@ func (a *Account) IsAvailable() bool {
 	if a.premium5hRateLimitedLocked(time.Now()) {
 		return false
 	}
+	now := time.Now()
+	if a.quotaAutoPausedLocked(now) {
+		return false
+	}
 	// 冷却期过了自动恢复
-	if a.Status == StatusCooldown && !time.Now().Before(a.CooldownUtil) {
+	if a.Status == StatusCooldown && !now.Before(a.CooldownUtil) {
 		return a.hasDispatchCredentialLocked()
 	}
 	return a.hasDispatchCredentialLocked()
+}
+
+func normalizeQuotaAutoPauseThreshold(value float64) float64 {
+	switch {
+	case value <= 0:
+		return 0
+	case value > 1:
+		return 1
+	default:
+		return value
+	}
+}
+
+func quotaAutoPausedByWindow(usage float64, valid bool, resetAt time.Time, threshold float64, disabled bool, now time.Time) bool {
+	if disabled || threshold <= 0 || !valid {
+		return false
+	}
+	if !resetAt.IsZero() && !now.Before(resetAt) {
+		return false
+	}
+	return usage/100 >= threshold
+}
+
+func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
+	if quotaAutoPausedByWindow(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, a.AutoPause5hThreshold, a.AutoPause5hDisabled, now) {
+		return true
+	}
+	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.AutoPause7dThreshold, a.AutoPause7dDisabled, now)
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -1499,39 +1538,41 @@ func (a *Account) GetLastUsedAt() time.Time {
 
 // Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
-	mu                        sync.RWMutex
-	accounts                  []*Account
-	globalProxy               string
-	maxConcurrency            int64        // 每账号最大并发数
-	testConcurrency           int64        // 批量测试并发数
-	testModel                 atomic.Value // 测试连接使用的模型（string）
-	db                        *database.DB
-	tokenCache                cache.TokenCache
-	apiKeyGroupsMu            sync.RWMutex
-	apiKeyAllowedGroups       map[int64][]int64
-	apiKeyAllowedGroupSets    map[int64]map[int64]struct{}
-	usageProbeMu              sync.RWMutex
-	usageProbe                func(context.Context, *Account) error
-	usageProbeBatch           atomic.Bool
-	recoveryProbeBatch        atomic.Bool
-	autoCleanUnauthorized     atomic.Bool
-	autoCleanRateLimited      atomic.Bool
-	autoCleanFullUsage        atomic.Bool
-	autoCleanError            atomic.Bool
-	autoCleanExpired          atomic.Bool
-	lazyMode                  atomic.Bool
-	autoCleanupBatch          atomic.Bool
-	maxRetries                int64 // 请求失败最大重试次数（换号重试）
-	maxRateLimitRetries       int64 // 429 最大换号重试次数
-	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
-	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
-	usageProbeConcurrency     int64 // 用量探针并行度
-	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
-	backgroundRefreshWakeCh   chan struct{}
-	lazyRefreshInFlight       sync.Map
-	stopCh                    chan struct{}
-	stopOnce                  sync.Once
-	wg                        sync.WaitGroup
+	mu                                 sync.RWMutex
+	accounts                           []*Account
+	accountsByID                       map[int64]*Account // DBID -> Account 索引，与 accounts 同步维护，供 O(1) 查找
+	globalProxy                        string
+	maxConcurrency                     int64        // 每账号最大并发数
+	testConcurrency                    int64        // 批量测试并发数
+	testModel                          atomic.Value // 测试连接使用的模型（string）
+	db                                 *database.DB
+	tokenCache                         cache.TokenCache
+	apiKeyGroupsMu                     sync.RWMutex
+	apiKeyAllowedGroups                map[int64][]int64
+	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}
+	usageProbeMu                       sync.RWMutex
+	usageProbe                         func(context.Context, *Account) error
+	usageProbeBatch                    atomic.Bool
+	recoveryProbeBatch                 atomic.Bool
+	autoCleanUnauthorized              atomic.Bool
+	autoCleanRateLimited               atomic.Bool
+	autoCleanFullUsage                 atomic.Bool
+	autoCleanError                     atomic.Bool
+	autoCleanExpired                   atomic.Bool
+	lazyMode                           atomic.Bool
+	autoCleanupBatch                   atomic.Bool
+	maxRetries                         int64 // 请求失败最大重试次数（换号重试）
+	maxRateLimitRetries                int64 // 429 最大换号重试次数
+	backgroundRefreshInterval          int64 // 后台刷新/探针巡检间隔（ns）
+	usageProbeMaxAge                   int64 // 用量探针快照最大缓存时长（ns）
+	usageProbeConcurrency              int64 // 用量探针并行度
+	usageProbeResponsesFallbackEnabled atomic.Bool
+	recoveryProbeInterval              int64 // 恢复探测最小间隔（ns）
+	backgroundRefreshWakeCh            chan struct{}
+	lazyRefreshInFlight                sync.Map
+	stopCh                             chan struct{}
+	stopOnce                           sync.Once
+	wg                                 sync.WaitGroup
 
 	// 代理池
 	proxyPool        []string // 已启用的代理 URL 列表
@@ -1542,16 +1583,26 @@ type Store struct {
 	fastScheduler        atomic.Pointer[FastScheduler]
 	fastSchedulerEnabled atomic.Bool
 
+	// Codex 上游 WebSocket 相关（默认全部关闭，不影响现有 HTTP 路径）
+	codexForceWebsocket         atomic.Bool  // 强制 Codex 上游走 WebSocket（复用连接池）
+	codexWSKeepaliveEnabled     atomic.Bool  // 启用上游 WS 空闲连接保活（仅 Ping）
+	codexWSKeepaliveIntervalSec atomic.Int64 // WS 保活 Ping 间隔（秒），默认 60
+	codexWSHideUpstreamErrors   atomic.Bool  // 隐藏上游 WS 原始错误，默认开启
+	codexWSSilentRetryEnabled   atomic.Bool  // 首包前上游 WS 错误静默换号重试，默认开启
+	codexWSSilentMaxRetries     atomic.Int64 // WS 静默换号最大重试次数，默认 2
+
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
 
-	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
-	modelMapping         atomic.Value // 模型映射 JSON 字符串
-	schedulerMode        atomic.Value // string: "round_robin" or "remaining_quota"
-	affinityMode         atomic.Value // string: "bounded" / "off" / "strict"
-	promptFilterConfig   atomic.Value // promptfilter.Config
-	sessionMu            sync.RWMutex
-	sessionBindings      map[string]sessionAffinity
+	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
+	modelMapping          atomic.Value // 模型映射 JSON 字符串
+	codexModelMapping     atomic.Value // Codex 模型映射 JSON 字符串
+	reasoningEffortModels atomic.Value // 带思考强度的模型别名 JSON 数组
+	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
+	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
+	promptFilterConfig    atomic.Value // promptfilter.Config
+	sessionMu             sync.RWMutex
+	sessionBindings       map[string]sessionAffinity
 }
 
 // sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
@@ -1914,17 +1965,21 @@ func truthyEnv(v string) bool {
 func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
-			MaxConcurrency:                   2,
-			TestConcurrency:                  50,
-			TestModel:                        "gpt-5.4",
-			BackgroundRefreshIntervalMinutes: 2,
-			UsageProbeMaxAgeMinutes:          10,
-			UsageProbeConcurrency:            defaultUsageProbeConcurrency,
-			RecoveryProbeIntervalMinutes:     30,
-			LazyMode:                         false,
-			ProxyURL:                         "",
-			MaxRateLimitRetries:              1,
-			SchedulerMode:                    "round_robin",
+			MaxConcurrency:                     2,
+			TestConcurrency:                    50,
+			TestModel:                          "gpt-5.4",
+			BackgroundRefreshIntervalMinutes:   2,
+			UsageProbeMaxAgeMinutes:            10,
+			UsageProbeConcurrency:              defaultUsageProbeConcurrency,
+			UsageProbeResponsesFallbackEnabled: true,
+			RecoveryProbeIntervalMinutes:       30,
+			LazyMode:                           false,
+			ProxyURL:                           "",
+			MaxRateLimitRetries:                1,
+			SchedulerMode:                      "round_robin",
+			CodexWSHideUpstreamErrors:          true,
+			CodexWSSilentRetryEnabled:          true,
+			CodexWSSilentMaxRetries:            2,
 		}
 	}
 	s := &Store{
@@ -1942,6 +1997,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
 	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
 	s.SetUsageProbeConcurrency(settings.UsageProbeConcurrency)
+	s.SetUsageProbeResponsesFallbackEnabled(settings.UsageProbeResponsesFallbackEnabled)
 	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
@@ -1965,6 +2021,12 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
+	if settings.CodexModelMapping != "" {
+		s.codexModelMapping.Store(settings.CodexModelMapping)
+	}
+	if settings.ReasoningEffortModels != "" {
+		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
+	}
 	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
@@ -1973,6 +2035,14 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		s.fastScheduler.Store(NewFastScheduler(int64(settings.MaxConcurrency), s.GetSchedulerMode()))
 		log.Printf("快速调度器已启用（请求热路径将优先走本地内存调度器）")
 	}
+
+	// Codex 上游 WebSocket 相关设置（默认关闭，不影响现有路径）
+	s.codexForceWebsocket.Store(settings.CodexForceWebsocket)
+	s.codexWSKeepaliveEnabled.Store(settings.CodexWSKeepaliveEnabled)
+	s.codexWSKeepaliveIntervalSec.Store(normalizeWSKeepaliveInterval(settings.CodexWSKeepaliveIntervalSec))
+	s.codexWSHideUpstreamErrors.Store(settings.CodexWSHideUpstreamErrors)
+	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
+	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -2064,6 +2134,125 @@ func (s *Store) FastSchedulerEnabled() bool {
 		return false
 	}
 	return s.fastSchedulerEnabled.Load()
+}
+
+// normalizeWSKeepaliveInterval 把 WS 保活间隔(秒)归一,非正值 → 默认 60。
+func normalizeWSKeepaliveInterval(sec int) int64 {
+	if sec <= 0 {
+		return 60
+	}
+	return int64(sec)
+}
+
+// normalizeWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
+func normalizeWSSilentMaxRetries(retries int) int64 {
+	if retries < 0 {
+		return 0
+	}
+	if retries > 10 {
+		return 10
+	}
+	return int64(retries)
+}
+
+// SetCodexForceWebsocket 设置"强制 Codex 上游走 WebSocket"开关（运行时热更新）。
+func (s *Store) SetCodexForceWebsocket(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexForceWebsocket.Store(enabled)
+}
+
+// CodexForceWebsocket 返回是否强制 Codex 上游走 WebSocket。
+func (s *Store) CodexForceWebsocket() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexForceWebsocket.Load()
+}
+
+// SetCodexWSKeepaliveEnabled 设置上游 WS 空闲连接保活开关（运行时热更新）。
+func (s *Store) SetCodexWSKeepaliveEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSKeepaliveEnabled.Store(enabled)
+}
+
+// CodexWSKeepaliveEnabled 返回是否启用上游 WS 连接保活。
+func (s *Store) CodexWSKeepaliveEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.codexWSKeepaliveEnabled.Load()
+}
+
+// SetCodexWSKeepaliveIntervalSec 设置 WS 保活 Ping 间隔（秒）。
+func (s *Store) SetCodexWSKeepaliveIntervalSec(sec int) {
+	if s == nil {
+		return
+	}
+	s.codexWSKeepaliveIntervalSec.Store(normalizeWSKeepaliveInterval(sec))
+}
+
+// CodexWSKeepaliveIntervalSec 返回 WS 保活 Ping 间隔（秒），最小 60。
+func (s *Store) CodexWSKeepaliveIntervalSec() int {
+	if s == nil {
+		return 60
+	}
+	v := s.codexWSKeepaliveIntervalSec.Load()
+	if v <= 0 {
+		return 60
+	}
+	return int(v)
+}
+
+// SetCodexWSHideUpstreamErrors 设置是否向客户端隐藏上游 WS 原始错误。
+func (s *Store) SetCodexWSHideUpstreamErrors(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSHideUpstreamErrors.Store(enabled)
+}
+
+// CodexWSHideUpstreamErrors 返回是否向客户端隐藏上游 WS 原始错误。
+func (s *Store) CodexWSHideUpstreamErrors() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexWSHideUpstreamErrors.Load()
+}
+
+// SetCodexWSSilentRetryEnabled 设置首包前 WS 上游错误是否静默换号重试。
+func (s *Store) SetCodexWSSilentRetryEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.codexWSSilentRetryEnabled.Store(enabled)
+}
+
+// CodexWSSilentRetryEnabled 返回首包前 WS 上游错误是否静默换号重试。
+func (s *Store) CodexWSSilentRetryEnabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.codexWSSilentRetryEnabled.Load()
+}
+
+// SetCodexWSSilentMaxRetries 设置 WS 静默换号最大重试次数。
+func (s *Store) SetCodexWSSilentMaxRetries(retries int) {
+	if s == nil {
+		return
+	}
+	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(retries))
+}
+
+// CodexWSSilentMaxRetries 返回 WS 静默换号最大重试次数。
+func (s *Store) CodexWSSilentMaxRetries() int {
+	if s == nil {
+		return 2
+	}
+	return int(s.codexWSSilentMaxRetries.Load())
 }
 
 // GetProxyURL 获取全局代理地址
@@ -2293,6 +2482,19 @@ func (s *Store) GetUsageProbeConcurrency() int {
 	return n
 }
 
+// SetUsageProbeResponsesFallbackEnabled 设置 wham 失败后是否允许发送真实 /responses 探针。
+func (s *Store) SetUsageProbeResponsesFallbackEnabled(enabled bool) {
+	s.usageProbeResponsesFallbackEnabled.Store(enabled)
+}
+
+// UsageProbeResponsesFallbackEnabled 获取 wham 失败后是否允许发送真实 /responses 探针。
+func (s *Store) UsageProbeResponsesFallbackEnabled() bool {
+	if s == nil {
+		return true
+	}
+	return s.usageProbeResponsesFallbackEnabled.Load()
+}
+
 // UsageProbeRunning reports whether a batch usage probe is currently active.
 func (s *Store) UsageProbeRunning() bool {
 	if s == nil {
@@ -2497,6 +2699,14 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 				account.SetUsageSnapshot5h(parsed, resetAt)
 			}
 		}
+		if threshold, ok := row.GetCredentialFloat64("auto_pause_5h_threshold"); ok {
+			account.AutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(threshold)
+		}
+		if threshold, ok := row.GetCredentialFloat64("auto_pause_7d_threshold"); ok {
+			account.AutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(threshold)
+		}
+		account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
+		account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 		for _, cooldown := range modelCooldowns[row.ID] {
 			account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
 		}
@@ -2507,6 +2717,7 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		s.accounts = append(s.accounts, account)
 	}
 
+	s.rebuildAccountIndex()
 	log.Printf("从数据库加载了 %d 个账号", len(s.accounts))
 	if memberships, err := s.db.ListAccountGroupMemberships(ctx); err == nil {
 		s.ApplyAccountGroupMemberships(memberships)
@@ -2549,7 +2760,9 @@ func (s *Store) StartBackgroundRefresh() {
 		for {
 			select {
 			case <-refreshTimer.C:
-				if !s.GetLazyMode() {
+				if s.GetLazyMode() {
+					s.TriggerUsageProbeAsync()
+				} else {
 					s.parallelRefreshAll(context.Background())
 					s.TriggerUsageProbeAsync()
 					s.TriggerRecoveryProbeAsync()
@@ -2686,7 +2899,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		for attempts := 0; attempts < 16; attempts++ {
 			acc := scheduler.AcquireExcludingWithFilter(apiKeyID, exclude, filter)
 			if acc == nil {
-				return nil
+				break
 			}
 			if s.accountHasCachedCooldown(acc) {
 				scheduler.Release(acc)
@@ -2694,7 +2907,6 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 			}
 			return acc
 		}
-		return nil
 	}
 
 	for attempts := 0; attempts < 16; attempts++ {
@@ -2778,6 +2990,9 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 		return false
 	}
 	if acc.premium5hRateLimitedLocked(now) {
+		return false
+	}
+	if acc.quotaAutoPausedLocked(now) {
 		return false
 	}
 	if acc.isOpenAIResponsesAPILocked() {
@@ -3086,13 +3301,7 @@ func (s *Store) affinityAccountStillHealthy(accountID int64) bool {
 		return false
 	}
 	s.mu.RLock()
-	var target *Account
-	for _, acc := range s.accounts {
-		if acc != nil && acc.DBID == accountID {
-			target = acc
-			break
-		}
-	}
+	target := s.lookupByIDLocked(accountID)
 	s.mu.RUnlock()
 	if target == nil {
 		return false
@@ -3139,13 +3348,7 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	}
 
 	s.mu.RLock()
-	var target *Account
-	for _, acc := range s.accounts {
-		if acc != nil && acc.DBID == id {
-			target = acc
-			break
-		}
-	}
+	target := s.lookupByIDLocked(id)
 	s.mu.RUnlock()
 	if target == nil {
 		return nil
@@ -3403,6 +3606,32 @@ func (s *Store) GetModelMapping() string {
 	return "{}"
 }
 
+// SetCodexModelMapping 动态更新 Codex 模型映射 JSON
+func (s *Store) SetCodexModelMapping(mapping string) {
+	s.codexModelMapping.Store(mapping)
+}
+
+// GetCodexModelMapping 获取当前 Codex 模型映射 JSON
+func (s *Store) GetCodexModelMapping() string {
+	if v, ok := s.codexModelMapping.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
+}
+
+// SetReasoningEffortModels 动态更新带思考强度的模型别名 JSON 数组。
+func (s *Store) SetReasoningEffortModels(value string) {
+	s.reasoningEffortModels.Store(value)
+}
+
+// GetReasoningEffortModels 获取当前带思考强度的模型别名 JSON 数组。
+func (s *Store) GetReasoningEffortModels() string {
+	if v, ok := s.reasoningEffortModels.Load().(string); ok && v != "" {
+		return v
+	}
+	return "[]"
+}
+
 // GetSchedulerMode 获取当前调度模式
 func (s *Store) GetSchedulerMode() string {
 	if v, ok := s.schedulerMode.Load().(string); ok {
@@ -3491,6 +3720,7 @@ func (s *Store) AddAccount(acc *Account) {
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
+	s.rebuildAccountIndex()
 	s.fastSchedulerUpdate(acc)
 }
 
@@ -3502,6 +3732,7 @@ func (s *Store) RemoveAccount(dbID int64) {
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
+			s.rebuildAccountIndex()
 			s.fastSchedulerRemove(dbID)
 			// 清理 RefreshScheduler 中可能残留的任务
 			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
@@ -3516,12 +3747,33 @@ func (s *Store) RemoveAccount(dbID int64) {
 func (s *Store) FindByID(dbID int64) *Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.lookupByIDLocked(dbID)
+}
+
+// lookupByIDLocked 通过索引 O(1) 查找账号；索引缺失时回退到线性扫描。
+// 调用方必须持有 s.mu(读或写锁)。
+func (s *Store) lookupByIDLocked(dbID int64) *Account {
+	if s.accountsByID != nil {
+		return s.accountsByID[dbID]
+	}
 	for _, acc := range s.accounts {
 		if acc.DBID == dbID {
 			return acc
 		}
 	}
 	return nil
+}
+
+// rebuildAccountIndex 根据当前 s.accounts 重建 DBID 索引。
+// 调用方必须持有 s.mu 写锁；在任何修改 s.accounts 的地方调用以保持同步。
+func (s *Store) rebuildAccountIndex() {
+	idx := make(map[int64]*Account, len(s.accounts))
+	for _, acc := range s.accounts {
+		if acc != nil {
+			idx[acc.DBID] = acc
+		}
+	}
+	s.accountsByID = idx
 }
 
 // ApplyAccountSchedulerOverrides 更新运行时账号的调度 override 并立即重算。
@@ -3551,6 +3803,31 @@ func (s *Store) ApplyAccountAllowedAPIKeys(dbID int64, allowedAPIKeyIDs []int64)
 
 	acc.mu.Lock()
 	acc.setAllowedAPIKeyIDsLocked(allowedAPIKeyIDs)
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+func (s *Store) ApplyAccountQuotaAutoPauseConfig(dbID int64, threshold5h, threshold7d *float64, disabled5h, disabled7d *bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if threshold5h != nil {
+		acc.AutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(*threshold5h)
+	}
+	if threshold7d != nil {
+		acc.AutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(*threshold7d)
+	}
+	if disabled5h != nil {
+		acc.AutoPause5hDisabled = *disabled5h
+	}
+	if disabled7d != nil {
+		acc.AutoPause7dDisabled = *disabled7d
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true
@@ -4246,9 +4523,6 @@ func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 
 // TriggerUsageProbeAsync 异步触发一次批量用量探针
 func (s *Store) TriggerUsageProbeAsync() {
-	if s.GetLazyMode() {
-		return
-	}
 	if !s.usageProbeBatch.CompareAndSwap(false, true) {
 		return
 	}
@@ -4470,6 +4744,7 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 		}
 	}
 	s.accounts = kept
+	s.rebuildAccountIndex()
 	s.mu.Unlock()
 }
 
@@ -4524,9 +4799,6 @@ func (s *Store) parallelProbeUsageWith(ctx context.Context, maxAge time.Duration
 // TriggerUsageProbeForceAsync 异步触发一次"无视缓存阈值"的批量用量探针。
 // 用于管理端手动刷新场景。
 func (s *Store) TriggerUsageProbeForceAsync() {
-	if s.GetLazyMode() {
-		return
-	}
 	if !s.usageProbeBatch.CompareAndSwap(false, true) {
 		return
 	}

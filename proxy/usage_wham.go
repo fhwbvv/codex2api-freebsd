@@ -34,12 +34,12 @@ type WhamUsage struct {
 	} `json:"rate_limit"`
 
 	Credits *struct {
-		HasCredits           bool   `json:"has_credits"`
-		Unlimited            bool   `json:"unlimited"`
-		OverageLimitReached  bool   `json:"overage_limit_reached"`
-		Balance              string `json:"balance"`
-		ApproxLocalMessages  []int  `json:"approx_local_messages"`
-		ApproxCloudMessages  []int  `json:"approx_cloud_messages"`
+		HasCredits          bool   `json:"has_credits"`
+		Unlimited           bool   `json:"unlimited"`
+		OverageLimitReached bool   `json:"overage_limit_reached"`
+		Balance             string `json:"balance"`
+		ApproxLocalMessages []int  `json:"approx_local_messages"`
+		ApproxCloudMessages []int  `json:"approx_cloud_messages"`
 	} `json:"credits,omitempty"`
 
 	SpendControl *struct {
@@ -50,10 +50,10 @@ type WhamUsage struct {
 
 // WhamUsageWindow 是单个限流窗口（primary=5h，secondary=7d）。
 type WhamUsageWindow struct {
-	UsedPercent         float64 `json:"used_percent"`
-	LimitWindowSeconds  int64   `json:"limit_window_seconds"`
-	ResetAfterSeconds   int64   `json:"reset_after_seconds"`
-	ResetAt             int64   `json:"reset_at"`
+	UsedPercent        float64 `json:"used_percent"`
+	LimitWindowSeconds int64   `json:"limit_window_seconds"`
+	ResetAfterSeconds  int64   `json:"reset_after_seconds"`
+	ResetAt            int64   `json:"reset_at"`
 }
 
 // QueryWhamUsage 调用 /backend-api/wham/usage 获取账号当前用量。
@@ -114,10 +114,8 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 // ApplyWhamUsage 将 /wham/usage 返回的数据写入账号 state + 持久化。
 // 行为与 SyncCodexUsageState（处理 /responses 响应头时）保持一致：
 //   - plan_type 同步到内存 + DB
-//   - 窗口按 limit_window_seconds 精确分类（18000s→5h，604800s→7d），
-//     未精确匹配时回退到字段位置（primary→5h、secondary→7d）。这与
-//     CPA-Manager 的 pickClassifiedWindows 策略保持一致。
-//     （free 账号只有 7d 窗口，会被后端放在 primary_window 字段里）
+//   - 窗口按 limit_window_seconds 精确分类（18000s→5h，604800s→7d）；
+//     未精确匹配时优先按 free plan / 长 reset 识别 7d，再按字段位置兜底。
 //   - 5h 窗口写入 SetUsageSnapshot5h
 //   - 7d 窗口走 PersistUsageSnapshot
 //   - premium 5h 用尽时走 MarkPremium5hRateLimited
@@ -133,7 +131,7 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 
 	now := time.Now()
 
-	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow)
+	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow, usage.PlanType, now)
 
 	if w5h != nil {
 		resetAt := whamWindowResetAt(w5h, now)
@@ -179,15 +177,15 @@ const (
 //
 // 策略对齐 CPA-Manager 的 pickClassifiedWindows：
 //  1. 第一遍：按 limit_window_seconds 精确匹配（18000→5h，604800→7d）
-//  2. 第二遍：把还没分类、且非空的窗口按字段位置兜底（primary→5h、secondary→7d），
-//     但只填补空槽位、并避免与已分类的窗口冲突
+//  2. 第二遍：把 free plan 或 reset 明显超过 5h 的未知窗口归到 7d
+//  3. 最后按字段位置兜底（primary→5h、secondary→7d），只填补空槽位
 //
 // 这样可同时正确处理：
 //   - plus：primary=18000(5h) + secondary=604800(7d)
 //   - free：primary=604800(7d) + secondary=null（issue #168 报告的场景）
 //   - 字段位置颠倒
-//   - 未来出现的未知窗口长度（按位置兜底，避免数据完全丢失）
-func pickClassifiedWhamWindows(primary, secondary *WhamUsageWindow) (w5h, w7d *WhamUsageWindow) {
+//   - 未来出现的未知窗口长度（先防止 free/长周期误进 5h，再避免数据完全丢失）
+func pickClassifiedWhamWindows(primary, secondary *WhamUsageWindow, planType string, now time.Time) (w5h, w7d *WhamUsageWindow) {
 	for _, w := range []*WhamUsageWindow{primary, secondary} {
 		if w == nil {
 			continue
@@ -205,12 +203,38 @@ func pickClassifiedWhamWindows(primary, secondary *WhamUsageWindow) (w5h, w7d *W
 	}
 
 	if w5h == nil && primary != nil && primary != w7d {
-		w5h = primary
+		if shouldTreatUnknownWhamWindowAs7d(primary, planType, now) && w7d == nil {
+			w7d = primary
+		} else {
+			w5h = primary
+		}
 	}
 	if w7d == nil && secondary != nil && secondary != w5h {
-		w7d = secondary
+		if shouldTreatUnknownWhamWindowAs7d(secondary, planType, now) {
+			w7d = secondary
+		} else if w5h == nil {
+			w5h = secondary
+		} else {
+			w7d = secondary
+		}
 	}
 	return w5h, w7d
+}
+
+func shouldTreatUnknownWhamWindowAs7d(w *WhamUsageWindow, planType string, now time.Time) bool {
+	if w == nil {
+		return false
+	}
+	if auth.NormalizePlanType(planType) == "free" {
+		return true
+	}
+	if w.ResetAfterSeconds > whamWindow5hSeconds {
+		return true
+	}
+	if w.ResetAt > 0 && !now.IsZero() && time.Unix(w.ResetAt, 0).After(now.Add(time.Duration(whamWindow5hSeconds)*time.Second)) {
+		return true
+	}
+	return false
 }
 
 func whamWindowResetAt(w *WhamUsageWindow, now time.Time) time.Time {

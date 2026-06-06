@@ -165,7 +165,7 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 		wsBody, _ = sjson.SetBytes(wsBody, "instructions", "")
 	}
 
-	// 2. 清理多余字段
+	// 2. 清理多余字段（prompt_cache_retention 上游不接受，会返回 400 Unsupported parameter，必须删除）
 	wsBody, _ = sjson.DeleteBytes(wsBody, "prompt_cache_retention")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "safety_identifier")
 	wsBody, _ = sjson.DeleteBytes(wsBody, "disable_response_storage")
@@ -312,9 +312,13 @@ func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
 
 // handleMessage 处理单条 WebSocket 消息
 func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bool) error {
-	// 检查是否是错误消息
-	if err := r.checkError(payload); err != nil {
-		return err
+	// 上游错误帧：透传给下游(转成 SSE 错误事件)，而不是转成 Go error 后静默关闭 pipe。
+	// 否则下游只会读到一个底层 read error → 表现为空响应，无从得知具体错误。
+	if errEvent, isErr := r.buildErrorEvent(payload); isErr {
+		// 把错误内容作为 SSE 数据写给下游，让客户端看到完整错误 JSON。
+		callback(errEvent)
+		// 错误即终止：结束流(等价于 response.failed)。
+		return io.EOF
 	}
 
 	// 标准化完成事件类型
@@ -334,32 +338,40 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 	return nil
 }
 
-// checkError 检查并返回 WebSocket 错误
-func (r *WsResponse) checkError(payload []byte) error {
+// buildErrorEvent 判断 payload 是否为上游错误帧；若是，返回一个下游可识别的
+// response.failed SSE 事件(保留原始错误内容)，第二个返回值标记是否为错误帧。
+func (r *WsResponse) buildErrorEvent(payload []byte) ([]byte, bool) {
 	if len(payload) == 0 {
-		return nil
+		return nil, false
 	}
-
-	// 检查错误类型
 	if gjson.GetBytes(payload, "type").String() != "error" {
-		return nil
+		return nil, false
 	}
 
 	status := int(gjson.GetBytes(payload, "status").Int())
 	if status == 0 {
 		status = int(gjson.GetBytes(payload, "status_code").Int())
 	}
-	if status <= 0 {
-		return nil
-	}
 
-	// 构建错误消息
 	errMsg := gjson.GetBytes(payload, "error.message").String()
 	if errMsg == "" {
+		errMsg = gjson.GetBytes(payload, "message").String()
+	}
+	if errMsg == "" && status > 0 {
 		errMsg = http.StatusText(status)
 	}
+	if errMsg == "" {
+		errMsg = "upstream websocket error"
+	}
 
-	return fmt.Errorf("websocket error (status %d): %s", status, errMsg)
+	// 构造 response.failed 事件：下游 ReadSSEStream 已识别该类型为终止失败，
+	// 与 HTTP 路径的错误语义对齐；同时保留原始上游错误对象供客户端排查。
+	errObj := gjson.GetBytes(payload, "error").Raw
+	if errObj == "" {
+		errObj = fmt.Sprintf(`{"message":%q,"code":%d}`, errMsg, status)
+	}
+	event := fmt.Sprintf(`{"type":"response.failed","response":{"status":"failed","error":%s}}`, errObj)
+	return []byte(event), true
 }
 
 // normalizeCompletionEvent 标准化完成事件类型
@@ -463,7 +475,14 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 		}, nil
 	}
 
-	// 将 WebSocket 响应包装为 http.Response
+	return websocketResponseToHTTP(ctx, wsResp, statusCode, handshakeHeader), nil
+}
+
+func websocketResponseToHTTP(ctx context.Context, wsResp *WsResponse, statusCode int, handshakeHeader http.Header) *http.Response {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	pr, pw := io.Pipe()
 	resp := &http.Response{
 		StatusCode: statusCode,
@@ -472,8 +491,8 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 	}
 
 	// 从 HTTP 握手响应中复制头信息
-	if wsResp.HTTPResponse() != nil {
-		for key, values := range wsResp.HTTPResponse().Header {
+	if handshakeHeader != nil {
+		for key, values := range handshakeHeader {
 			for _, v := range values {
 				resp.Header.Add(key, v)
 			}
@@ -485,8 +504,19 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 	resp.Header.Set("Cache-Control", "no-cache")
 	resp.Header.Set("Connection", "keep-alive")
 
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = wsResp.Close()
+			_ = pw.CloseWithError(ctx.Err())
+		case <-done:
+		}
+	}()
+
 	// 在后台读取 WebSocket 流并写入 pipe
 	go func() {
+		defer close(done)
 		defer pw.Close()
 		defer wsResp.Close()
 
@@ -504,7 +534,7 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 		}
 	}()
 
-	return resp, nil
+	return resp
 }
 
 func normalizeWebsocketHandshakeResponse(handshakeResp *http.Response) (statusCode int, header http.Header, failed bool) {

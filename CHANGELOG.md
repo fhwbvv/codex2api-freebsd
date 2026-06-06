@@ -1,5 +1,56 @@
 # Changelog
 
+## v2.2.7 - 2026-06-05
+
+### Features
+
+- **WebSocket silent retry controls (#195).** Added Codex upstream WS settings for hiding upstream errors, silently retrying pre-first-token upstream failures, and capping silent retries (`codex_ws_hide_upstream_errors`, `codex_ws_silent_retry_enabled`, `codex_ws_silent_max_retries`). These settings are available in the admin UI and persist through both Postgres and SQLite.
+- **WHAM-only usage probe controls.** Added runtime/admin controls so usage probes can rely on the zero-cost WHAM endpoint without falling back to `/responses` probes when that is preferred.
+
+### Fixes
+
+- **WS upstream failure handling (#195).** Retryable upstream WS failures before the first token, including usage-limit, 429, 5xx, read errors, timeouts, and EOFs, now stay server-side while codex2api switches accounts and rebuilds the upstream WS connection. If retries are exhausted, clients receive a unified friendly message while the original upstream error remains in backend logs and usage records.
+- **Responses routing and model hardening (#198).** Hardened `/v1/responses` routing for recent Codex models including `gpt-5.3-codex-spark`, widened local plan gating so stale local `plan_type` records do not incorrectly block real upstream calls, and improved WS/TTFT handling around response payload content.
+- **OpenAI Responses compact routing.** OpenAI Responses API accounts added with `base_url` + `api_key` can now use `/v1/responses/compact`; compact bodies are normalized for that upstream path instead of being sent through the ChatGPT-only compact route.
+- **Usage-limit detection.** `usage_limit_reached` is now recognized even when wrapped inside `response.error`, `response.status_details`, or upstream 5xx-shaped payloads, so exhausted accounts are treated as quota-limited consistently.
+- **Accounts toolbar wrapping.** Improved the admin accounts toolbar layout so search/filter/action controls wrap cleanly on narrower viewports.
+- **Security scan recovery.** Updated React Router to a patched release and raised the Go toolchain directive to `1.26.4`, clearing the failing frontend npm audit and backend govulncheck jobs.
+
+## v2.2.6 - 2026-06-03
+
+### Features
+
+- **Codex upstream WebSocket mode.** Added an opt-in `codex_force_websocket` system setting that routes Codex upstream traffic over a persistent WebSocket long-connection (reusing the `wsrelay` connection pool), reducing per-request TLS/handshake overhead to better match the official CLI. Disabled by default; when off, requests keep using the existing HTTP path. A downstream `https://.../v1/responses` (or `/v1/chat/completions`) HTTP POST is transparently forwarded as a `wss://` upstream connection.
+- **Idle WS keepalive.** Added `codex_ws_keepalive_enabled` and `codex_ws_keepalive_interval_sec` (default 60s) to keep idle upstream WebSocket connections alive with background Ping frames. Keepalive never opens new connections and never sends business frames, so it consumes zero account quota. Disabled by default.
+- **WS request badge.** The Usage log now shows a `ws` badge between the status code and model for requests that went over WebSocket.
+- **Dedicated WebSocket settings card.** WS-related settings are split out of the crowded scheduling card into their own full-width "WebSocket (Codex Upstream)" card in the admin UI.
+- **Bundled Codex CLI bump.** Updated the bundled Codex CLI version from `0.128.0` to `0.136.0` for a more faithful fingerprint and access to newer models.
+
+### Fixes
+
+- **WS upstream error passthrough.** Upstream WebSocket error frames are now relayed to the client as a `response.failed` SSE event preserving the original error, instead of being turned into a low-level read error that surfaced as a mysterious empty response / 32-90s hang. Any upstream error (rate limit, unsupported model, invalid parameter) is now visible to the client.
+- **WS transport robustness.** Fixed the `wsrelay` dialer copy dropping `NetDialContext` (TCP KeepAlive never took effect); added 64KB read/write buffers with a shared write-buffer pool for large 48-91KB upstream frames; replaced the fixed 10ms busy-connection spin with exponential backoff plus a max-wait timeout; raised the read timeout from 60s to 120s so long-reasoning turns are not falsely disconnected; and log a warning when a WS path silently falls back to HTTP.
+- **TLS session resumption.** Standard and uTLS transports now share a `ClientSessionCache`, so reconnects use TLS resumption (1-RTT) to cut cold-connection cost. Bumped `MaxIdleConnsPerHost` and `IdleConnTimeout`, and switched the HTTP server to explicit `ReadHeaderTimeout`/`IdleTimeout` with graceful shutdown (keeping `WriteTimeout` at 0 so streaming responses are never cut off).
+- **Account lookup O(N) → O(1).** The store now keeps a `DBID → account` index, so session-affinity hot paths and all `FindByID` lookups no longer scan the account slice linearly.
+
+## v2.2.5 - 2026-06-02
+
+### Features
+
+- **Codex model registry and reasoning models (#165).** Added system-setting controls for upstream-synced base models and reasoning-effort variants so model list entries can be configured from the admin UI.
+- **Codex model redirect mapping (#189, #190).** Added a dedicated Codex model redirect map that can route downstream model names to another Codex model while preserving request reasoning effort.
+- **Account quota auto-pause controls.** Added 5h/7d usage-threshold auto-pause controls with global defaults, per-account disables, edit-account controls, and batch editing.
+- **Compact request visibility.** Usage logs now detect compact requests and show a compact badge alongside request model/reasoning information.
+- **Email domain account tags (#191).** Account management now derives email domains, supports domain filtering with banned/total stats, searches by domain, and lets users show or hide domain badges.
+- **Configuration examples.** Updated Codex config examples to cover the current model mapping and reasoning-effort setup.
+
+### Fixes
+
+- **Service-tier billing semantics (#183).** Split requested, actual, and billing service-tier handling so billing policy stays explicit when upstream reports a different actual tier.
+- **SQLite and admin billing stability (#185, #186).** Stabilized account billing window reads and SQLite access paths so large account pools do not turn simple admin/API-key queries into transient 503s.
+- **Account status and probe handling.** Unauthorized account errors are recorded more consistently, and batch account rendering has less unnecessary work at scale.
+- **Refresh token reuse handling.** Reused refresh tokens are now treated as non-retryable credential errors instead of entering avoidable retry paths.
+
 ## v2.2.4 - 2026-05-28
 
 ### Features

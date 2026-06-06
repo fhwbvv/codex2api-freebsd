@@ -217,12 +217,40 @@ func TestPickClassifiedWhamWindows_FallsBackToPositionForUnknownSeconds(t *testi
 	primary := &WhamUsageWindow{UsedPercent: 50, LimitWindowSeconds: 0} // 未知/缺失
 	secondary := &WhamUsageWindow{UsedPercent: 20, LimitWindowSeconds: 0}
 
-	w5h, w7d := pickClassifiedWhamWindows(primary, secondary)
+	w5h, w7d := pickClassifiedWhamWindows(primary, secondary, "plus", time.Now())
 	if w5h != primary {
 		t.Errorf("expected primary→5h via position fallback, got %v", w5h)
 	}
 	if w7d != secondary {
 		t.Errorf("expected secondary→7d via position fallback, got %v", w7d)
+	}
+}
+
+func TestPickClassifiedWhamWindows_FreeUnknownPrimaryFallsBackTo7d(t *testing.T) {
+	primary := &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 0}
+
+	w5h, w7d := pickClassifiedWhamWindows(primary, nil, "free", time.Now())
+	if w5h != nil {
+		t.Fatalf("expected no 5h window for free unknown primary, got %v", w5h)
+	}
+	if w7d != primary {
+		t.Fatalf("expected primary→7d for free unknown primary, got %v", w7d)
+	}
+}
+
+func TestPickClassifiedWhamWindows_LongResetPrimaryFallsBackTo7d(t *testing.T) {
+	primary := &WhamUsageWindow{
+		UsedPercent:        100,
+		LimitWindowSeconds: 0,
+		ResetAfterSeconds:  6 * 60 * 60,
+	}
+
+	w5h, w7d := pickClassifiedWhamWindows(primary, nil, "", time.Now())
+	if w5h != nil {
+		t.Fatalf("expected no 5h window for long reset primary, got %v", w5h)
+	}
+	if w7d != primary {
+		t.Fatalf("expected primary→7d for long reset primary, got %v", w7d)
 	}
 }
 

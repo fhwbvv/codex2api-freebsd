@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -50,6 +51,130 @@ func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
 	}
 	if row.ID != id || row.Name != "lookup" || row.Key != key {
 		t.Fatalf("API key row = %#v, want id=%d name=lookup key=%s", row, id, key)
+	}
+}
+
+func TestSQLiteAPIKeyReadDoesNotWaitBehindAccountWrite(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if _, err := db.InsertAPIKey(ctx, "lookup", "sk-test-lookup-1234567890"); err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+	accountID, err := db.InsertAccount(ctx, "writer", "rt-writer", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 返回错误: %v", err)
+	}
+
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx 返回错误: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`, accountID); err != nil {
+		t.Fatalf("hold write transaction: %v", err)
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	count, err := db.CountAPIKeys(readCtx)
+	if err != nil {
+		t.Fatalf("CountAPIKeys while account write is open 返回错误: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("CountAPIKeys = %d, want 1", count)
+	}
+}
+
+func TestSQLiteQueuedAccountWritesDoNotBlockAPIKeyReads(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if _, err := db.InsertAPIKey(ctx, "lookup", "sk-test-lookup-1234567890"); err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+	accountIDs := make([]int64, 0, maxSQLiteOpenConns*2)
+	for i := 0; i < maxSQLiteOpenConns*2; i++ {
+		id, err := db.InsertAccount(ctx, "writer", "rt-writer", "")
+		if err != nil {
+			t.Fatalf("InsertAccount 返回错误: %v", err)
+		}
+		accountIDs = append(accountIDs, id)
+	}
+
+	db.sqliteWriteSem <- struct{}{}
+	var wg sync.WaitGroup
+	for _, accountID := range accountIDs {
+		wg.Add(1)
+		go func(id int64) {
+			defer wg.Done()
+			writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			_ = db.UpdateCredentials(writeCtx, id, map[string]interface{}{"codex_7d_used_percent": 1})
+		}(accountID)
+	}
+
+	readCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	count, err := db.CountAPIKeys(readCtx)
+	<-db.sqliteWriteSem
+	wg.Wait()
+	if err != nil {
+		t.Fatalf("CountAPIKeys while account writes are queued 返回错误: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("CountAPIKeys = %d, want 1", count)
+	}
+}
+
+func TestSQLiteUpdateCredentialsMergesAtomically(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	accountID, err := db.InsertAccountWithCredentials(ctx, "merge", map[string]interface{}{
+		"refresh_token": "rt-merge",
+		"email":         "old@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
+	}
+	if err := db.UpdateCredentials(ctx, accountID, map[string]interface{}{
+		"codex_7d_used_percent": 42.5,
+		"email":                 "new@example.com",
+	}); err != nil {
+		t.Fatalf("UpdateCredentials 返回错误: %v", err)
+	}
+
+	row, err := db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID 返回错误: %v", err)
+	}
+	if got := row.GetCredential("refresh_token"); got != "rt-merge" {
+		t.Fatalf("refresh_token = %q, want rt-merge", got)
+	}
+	if got := row.GetCredential("email"); got != "new@example.com" {
+		t.Fatalf("email = %q, want new@example.com", got)
+	}
+	if got := row.GetCredential("codex_7d_used_percent"); got != "42.5" {
+		t.Fatalf("codex_7d_used_percent = %q, want 42.5", got)
 	}
 }
 
@@ -255,7 +380,7 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
@@ -576,6 +701,8 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		MaxRetries:                       2,
 		MaxRateLimitRetries:              1,
 		ModelMapping:                     "{}",
+		CodexModelMapping:                `{"gpt-5.2":"gpt-5.5"}`,
+		ReasoningEffortModels:            `[{"model":"gpt-5.5","effort":"xhigh"}]`,
 		PromptFilterMode:                 "monitor",
 		PromptFilterThreshold:            50,
 		PromptFilterStrictThreshold:      90,
@@ -591,11 +718,15 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		StreamFlushPolicy:                "immediate",
 		StreamFlushIntervalMS:            20,
 		FirstTokenTimeoutSeconds:         17,
+		BillingTierPolicy:                "requested",
 		ImageStorageConfig:               "{}",
 		SchedulerMode:                    "round_robin",
 		AffinityMode:                     "bounded",
 		BackgroundConfig:                 "{}",
 		ShowFullUsageNumbers:             true,
+		CodexWSHideUpstreamErrors:        true,
+		CodexWSSilentRetryEnabled:        true,
+		CodexWSSilentMaxRetries:          4,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -612,6 +743,24 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if !settings.ShowFullUsageNumbers {
 		t.Fatal("ShowFullUsageNumbers = false, want true")
+	}
+	if settings.BillingTierPolicy != "requested" {
+		t.Fatalf("BillingTierPolicy = %q, want requested", settings.BillingTierPolicy)
+	}
+	if settings.CodexModelMapping != `{"gpt-5.2":"gpt-5.5"}` {
+		t.Fatalf("CodexModelMapping = %q, want gpt-5.2 mapping", settings.CodexModelMapping)
+	}
+	if settings.ReasoningEffortModels != `[{"model":"gpt-5.5","effort":"xhigh"}]` {
+		t.Fatalf("ReasoningEffortModels = %q, want gpt-5.5 xhigh entry", settings.ReasoningEffortModels)
+	}
+	if !settings.CodexWSHideUpstreamErrors {
+		t.Fatal("CodexWSHideUpstreamErrors = false, want true")
+	}
+	if !settings.CodexWSSilentRetryEnabled {
+		t.Fatal("CodexWSSilentRetryEnabled = false, want true")
+	}
+	if settings.CodexWSSilentMaxRetries != 4 {
+		t.Fatalf("CodexWSSilentMaxRetries = %d, want 4", settings.CodexWSSilentMaxRetries)
 	}
 }
 
@@ -768,16 +917,18 @@ func TestUsageLogsReturnBillingFields(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.InsertUsageLog(ctx, &UsageLogInput{
-		AccountID:        1,
-		Endpoint:         "/v1/responses",
-		InboundEndpoint:  "/v1/responses",
-		UpstreamEndpoint: "/v1/responses",
-		Model:            "gpt-5.5",
-		StatusCode:       200,
-		InputTokens:      476,
-		OutputTokens:     252,
-		TotalTokens:      728,
-		ServiceTier:      "default",
+		AccountID:          1,
+		Endpoint:           "/v1/responses",
+		InboundEndpoint:    "/v1/responses",
+		UpstreamEndpoint:   "/v1/responses",
+		Model:              "gpt-5.5",
+		StatusCode:         200,
+		InputTokens:        476,
+		OutputTokens:       252,
+		TotalTokens:        728,
+		ServiceTier:        "default",
+		ActualServiceTier:  "default",
+		BillingServiceTier: "default",
 	}); err != nil {
 		t.Fatalf("InsertUsageLog 返回错误: %v", err)
 	}
@@ -799,6 +950,9 @@ func TestUsageLogsReturnBillingFields(t *testing.T) {
 	if got.InputCost <= 0 || got.OutputCost <= 0 || got.TotalCost != want {
 		t.Fatalf("billing breakdown = input %.12f output %.12f total %.12f, want total %.12f", got.InputCost, got.OutputCost, got.TotalCost, want)
 	}
+	if got.ActualServiceTier != "default" || got.BillingServiceTier != "default" {
+		t.Fatalf("tiers actual=%q billing=%q, want default/default", got.ActualServiceTier, got.BillingServiceTier)
+	}
 }
 
 func TestUsageLogsBillFastByActualServiceTier(t *testing.T) {
@@ -812,28 +966,32 @@ func TestUsageLogsBillFastByActualServiceTier(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.InsertUsageLog(ctx, &UsageLogInput{
-		AccountID:          1,
-		Endpoint:           "/v1/responses",
-		Model:              "gpt-5.4",
-		StatusCode:         200,
-		InputTokens:        1000,
-		OutputTokens:       500,
-		CachedTokens:       200,
-		ServiceTier:        "fast",
-		BillingServiceTier: "default",
+		AccountID:            1,
+		Endpoint:             "/v1/responses",
+		Model:                "gpt-5.4",
+		StatusCode:           200,
+		InputTokens:          1000,
+		OutputTokens:         500,
+		CachedTokens:         200,
+		ServiceTier:          "fast",
+		RequestedServiceTier: "priority",
+		ActualServiceTier:    "default",
+		BillingServiceTier:   "default",
 	}); err != nil {
 		t.Fatalf("InsertUsageLog 返回错误: %v", err)
 	}
 	if err := db.InsertUsageLog(ctx, &UsageLogInput{
-		AccountID:          1,
-		Endpoint:           "/v1/responses",
-		Model:              "gpt-5.4",
-		StatusCode:         200,
-		InputTokens:        1000,
-		OutputTokens:       500,
-		CachedTokens:       200,
-		ServiceTier:        "fast",
-		BillingServiceTier: "priority",
+		AccountID:            1,
+		Endpoint:             "/v1/responses",
+		Model:                "gpt-5.4",
+		StatusCode:           200,
+		InputTokens:          1000,
+		OutputTokens:         500,
+		CachedTokens:         200,
+		ServiceTier:          "fast",
+		RequestedServiceTier: "priority",
+		ActualServiceTier:    "priority",
+		BillingServiceTier:   "priority",
 	}); err != nil {
 		t.Fatalf("InsertUsageLog 返回错误: %v", err)
 	}
@@ -1328,6 +1486,7 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 			Model:        "gpt-5.4",
 			StatusCode:   200,
 			DurationMs:   220,
+			Compact:      true,
 			APIKeyID:     targetAPIKeyID,
 			APIKeyName:   "Team A",
 			APIKeyMasked: "sk-a****...****1111",
@@ -1360,6 +1519,7 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 	}
 
 	foundSnapshot := false
+	foundCompact := false
 	for _, usageLog := range recentLogs {
 		if usageLog.APIKeyID == targetAPIKeyID {
 			foundSnapshot = true
@@ -1369,10 +1529,22 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 			if usageLog.APIKeyMasked != "sk-a****...****1111" {
 				t.Fatalf("APIKeyMasked = %q, want %q", usageLog.APIKeyMasked, "sk-a****...****1111")
 			}
+			if usageLog.Endpoint == "/v1/responses" {
+				foundCompact = true
+				if !usageLog.Compact {
+					t.Fatal("Compact = false, want true for compact usage log")
+				}
+			}
+			if usageLog.Endpoint == "/v1/chat/completions" && usageLog.Compact {
+				t.Fatal("Compact = true, want false for normal usage log")
+			}
 		}
 	}
 	if !foundSnapshot {
 		t.Fatal("未找到带 API 密钥快照的最近日志")
+	}
+	if !foundCompact {
+		t.Fatal("未找到 compact 使用日志")
 	}
 
 	page, err := db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
@@ -1398,6 +1570,9 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 		}
 		if usageLog.APIKeyName != "Team A" {
 			t.Fatalf("APIKeyName = %q, want %q", usageLog.APIKeyName, "Team A")
+		}
+		if usageLog.Endpoint == "/v1/responses" && !usageLog.Compact {
+			t.Fatal("Compact = false, want true in paged usage logs")
 		}
 	}
 }
@@ -1446,5 +1621,52 @@ func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
 	}
 	if got := page.Logs[0].Model; got != "gpt-image-2" {
 		t.Fatalf("Model = %q, want gpt-image-2", got)
+	}
+}
+
+func TestGetAccountsBilledSinceUsesPerAccountWindows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+	insertUsage := func(accountID int64, statusCode int, billed float64, createdAt time.Time) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (account_id, status_code, account_billed, created_at)
+			VALUES ($1, $2, $3, $4)
+		`, accountID, statusCode, billed, sqliteTimeParam(createdAt)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	insertUsage(1, 200, 1.25, now.Add(-4*time.Hour))
+	insertUsage(1, 200, 9.99, now.Add(-6*time.Hour))
+	insertUsage(1, 499, 7.77, now.Add(-30*time.Minute))
+	insertUsage(2, 200, 2.50, now.AddDate(0, 0, -6))
+	insertUsage(2, 200, 8.88, now.AddDate(0, 0, -8))
+
+	got, err := db.GetAccountsBilledSince(ctx, map[int64]time.Time{
+		1: now.Add(-5 * time.Hour),
+		2: now.AddDate(0, 0, -7),
+		3: now.Add(-1 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("GetAccountsBilledSince 返回错误: %v", err)
+	}
+
+	if got[1] != 1.25 {
+		t.Fatalf("account 1 billed = %.2f, want 1.25", got[1])
+	}
+	if got[2] != 2.50 {
+		t.Fatalf("account 2 billed = %.2f, want 2.50", got[2])
+	}
+	if got[3] != 0 {
+		t.Fatalf("account 3 billed = %.2f, want 0", got[3])
 	}
 }

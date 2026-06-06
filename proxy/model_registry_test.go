@@ -100,3 +100,81 @@ func TestDynamicModelRegistryAffectsValidationImmediately(t *testing.T) {
 		t.Fatalf("synced model should pass validation: %#v", result.Errors)
 	}
 }
+
+func TestReasoningEffortModelsAreIncludedInCatalog(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	ctx := context.Background()
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings error: %v", err)
+	}
+	if settings == nil {
+		settings = &database.SystemSettings{
+			SiteName:                         "CodexProxy",
+			MaxConcurrency:                   2,
+			TestModel:                        "gpt-5.4",
+			TestConcurrency:                  50,
+			BackgroundRefreshIntervalMinutes: 2,
+			UsageProbeMaxAgeMinutes:          10,
+			UsageProbeConcurrency:            16,
+			RecoveryProbeIntervalMinutes:     30,
+			PgMaxConns:                       50,
+			RedisPoolSize:                    30,
+			MaxRetries:                       2,
+			MaxRateLimitRetries:              1,
+			ModelMapping:                     "{}",
+			CodexModelMapping:                "{}",
+			PromptFilterMode:                 "monitor",
+			PromptFilterThreshold:            50,
+			PromptFilterStrictThreshold:      90,
+			PromptFilterLogMatches:           true,
+			PromptFilterMaxTextLength:        81920,
+			PromptFilterCustomPatterns:       "[]",
+			PromptFilterDisabledPatterns:     "[]",
+			ClientCompatMode:                 "preserve",
+			CodexMinCLIVersion:               "0.118.0",
+			UsageLogMode:                     "full",
+			UsageLogBatchSize:                200,
+			UsageLogFlushIntervalSeconds:     5,
+			StreamFlushPolicy:                "immediate",
+			StreamFlushIntervalMS:            20,
+			BillingTierPolicy:                "actual",
+			ImageStorageConfig:               "{}",
+			SchedulerMode:                    "round_robin",
+			AffinityMode:                     "bounded",
+			BackgroundConfig:                 "{}",
+		}
+	}
+	settings.ReasoningEffortModels = `[{"model":"gpt-5.5","effort":"xhigh"}]`
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings error: %v", err)
+	}
+
+	catalog, err := ListModelCatalog(ctx, db)
+	if err != nil {
+		t.Fatalf("ListModelCatalog error: %v", err)
+	}
+	if !slices.Contains(catalog.Models, "gpt-5.5(xhigh)") {
+		t.Fatalf("catalog models missing reasoning alias: %v", catalog.Models)
+	}
+
+	var aliasInfo *ModelInfo
+	for i := range catalog.Items {
+		if catalog.Items[i].ID == "gpt-5.5(xhigh)" {
+			aliasInfo = &catalog.Items[i]
+			break
+		}
+	}
+	if aliasInfo == nil {
+		t.Fatalf("catalog items missing reasoning alias: %#v", catalog.Items)
+	}
+	if aliasInfo.Source != ModelSourceReasoningEffort {
+		t.Fatalf("alias source = %q, want %q", aliasInfo.Source, ModelSourceReasoningEffort)
+	}
+	if aliasInfo.Category != ModelCategoryCodex {
+		t.Fatalf("alias category = %q, want %q", aliasInfo.Category, ModelCategoryCodex)
+	}
+	if slices.Contains(TextTestModelIDs(ctx, db), "gpt-5.5(xhigh)") {
+		t.Fatalf("reasoning alias should not be used for direct connection tests")
+	}
+}

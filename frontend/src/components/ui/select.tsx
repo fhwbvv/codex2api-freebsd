@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 export interface SelectOption {
   label: string
   value: string
+  triggerLabel?: string
 }
 
 interface SelectProps {
@@ -136,7 +137,7 @@ export function Select({
         }}
       >
         <span className={cn('truncate', selectedOption ? 'text-foreground' : 'text-muted-foreground')}>
-          {selectedOption?.label ?? placeholder}
+          {selectedOption?.triggerLabel ?? selectedOption?.label ?? placeholder}
         </span>
         <ChevronDown className={cn('size-4 shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')} />
       </button>

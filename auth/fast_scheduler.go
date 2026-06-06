@@ -493,6 +493,9 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	if a.premium5hRateLimitedLocked(now) {
 		available = false
 	}
+	if a.quotaAutoPausedLocked(now) {
+		available = false
+	}
 	// Free 账号 7d 用量耗尽，不参与调度
 	if a.usageExhaustedLocked() {
 		available = false

@@ -25,7 +25,6 @@ import type {
   SystemSettings,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
-import { formatCompactEmail } from "../lib/utils";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -52,6 +51,8 @@ import {
   Upload,
   Download,
   ArrowDownToLine,
+  Eye,
+  EyeOff,
   KeyRound,
   ExternalLink,
   FileText,
@@ -87,6 +88,8 @@ import ChipInput from "../components/ChipInput";
 const ACCOUNT_BATCH_CONCURRENCY = 6;
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
+const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
+  "codex2api:accounts:email-domain-tags-visible";
 const ACCOUNT_VISIBLE_COLUMNS_KEY = "codex2api:accounts:visible-columns";
 const ACCOUNT_TABLE_COLUMNS = [
   "sequence",
@@ -170,6 +173,11 @@ function persistAccountVisibleColumns(
 
 const ACCOUNT_VIEW_MODE_KEY = "codex2api:accounts:view-mode";
 type AccountViewMode = "table" | "grid";
+type EmailDomainStat = {
+  domain: string;
+  total: number;
+  banned: number;
+};
 
 function getInitialAccountViewMode(): AccountViewMode {
   try {
@@ -187,6 +195,18 @@ function persistAccountViewMode(mode: AccountViewMode) {
   } catch {
     // ignore
   }
+}
+
+function getAccountEmailDomain(account: AccountRow): string {
+  return (account.email_domain || "").trim().toLowerCase();
+}
+
+function emailDomainTag(domain: string): string {
+  return domain ? `@${domain}` : "";
+}
+
+function formatAccountListEmail(account: AccountRow): string {
+  return account.email?.trim() || account.name || `ID ${account.id}`;
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -207,6 +227,27 @@ function persistAnalysisVisibility(visible: boolean) {
     );
   } catch {
     // Local storage can be unavailable in restricted browser modes; keep the in-memory toggle working.
+  }
+}
+
+function getInitialEmailDomainVisibility(): boolean {
+  try {
+    return (
+      window.localStorage.getItem(ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY) !== "false"
+    );
+  } catch {
+    return true;
+  }
+}
+
+function persistEmailDomainVisibility(visible: boolean) {
+  try {
+    window.localStorage.setItem(
+      ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY,
+      visible ? "true" : "false",
+    );
+  } catch {
+    // Keep the in-memory toggle working when localStorage is unavailable.
   }
 }
 
@@ -243,6 +284,28 @@ function formatAccountName(account: AccountRow): string {
     return account.name?.trim() || `ID ${account.id}`;
   }
   return account.email || account.name || `ID ${account.id}`;
+}
+
+function formatQuotaAutoPausePercentInput(value?: number | null): string {
+  if (typeof value !== "number" || value <= 0) return "";
+  const percent = value * 100;
+  if (Number.isInteger(percent)) return String(percent);
+  return String(Number(percent.toFixed(2)));
+}
+
+function isPercentThresholdInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  const parsed = Number(trimmed);
+  return !Number.isFinite(parsed) || parsed < 0 || parsed > 100;
+}
+
+function percentThresholdInputToRatio(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed / 100;
 }
 
 function getMediaQueryMatch(query: string): boolean {
@@ -459,6 +522,14 @@ export default function Accounts() {
   );
   const [concurrencyInput, setConcurrencyInput] = useState("");
   const [skipWarmTier, setSkipWarmTier] = useState(false);
+  const [editAutoPause5hThresholdInput, setEditAutoPause5hThresholdInput] =
+    useState("");
+  const [editAutoPause7dThresholdInput, setEditAutoPause7dThresholdInput] =
+    useState("");
+  const [editAutoPause5hDisabled, setEditAutoPause5hDisabled] =
+    useState(false);
+  const [editAutoPause7dDisabled, setEditAutoPause7dDisabled] =
+    useState(false);
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
     number[]
   >([]);
@@ -484,6 +555,9 @@ export default function Accounts() {
   const [showMigrate, setShowMigrate] = useState(false);
   const [showAnalysisCharts, setShowAnalysisCharts] = useState(
     getInitialAnalysisVisibility,
+  );
+  const [showEmailDomainTags, setShowEmailDomainTags] = useState(
+    getInitialEmailDomainVisibility,
   );
   const [migrateUrl, setMigrateUrl] = useState("");
   const [migrateKey, setMigrateKey] = useState("");
@@ -535,6 +609,7 @@ export default function Accounts() {
   const [editTags, setEditTags] = useState<string[]>([]);
   const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
   const [tagFilter, setTagFilter] = useState<string>("");
+  const [domainFilter, setDomainFilter] = useState<string>("");
   const [groupFilter, setGroupFilter] = useState<number | null>(null);
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
   const [showGroupManager, setShowGroupManager] = useState(false);
@@ -549,6 +624,18 @@ export default function Accounts() {
   const [batchTags, setBatchTags] = useState<string[]>([]);
   const [batchGroupIds, setBatchGroupIds] = useState<number[]>([]);
   const [batchMetaSubmitting, setBatchMetaSubmitting] = useState(false);
+  const [showBatchQuotaAutoPauseEditor, setShowBatchQuotaAutoPauseEditor] =
+    useState(false);
+  const [batchAutoPause5hThresholdInput, setBatchAutoPause5hThresholdInput] =
+    useState("");
+  const [batchAutoPause7dThresholdInput, setBatchAutoPause7dThresholdInput] =
+    useState("");
+  const [batchAutoPause5hDisabled, setBatchAutoPause5hDisabled] =
+    useState(false);
+  const [batchAutoPause7dDisabled, setBatchAutoPause7dDisabled] =
+    useState(false);
+  const [batchQuotaAutoPauseSubmitting, setBatchQuotaAutoPauseSubmitting] =
+    useState(false);
   const [visibleColumns, setVisibleColumns] = useState<
     Record<AccountTableColumn, boolean>
   >(getInitialAccountVisibleColumns);
@@ -754,6 +841,10 @@ export default function Accounts() {
   }, [showAnalysisCharts]);
 
   useEffect(() => {
+    persistEmailDomainVisibility(showEmailDomainTags);
+  }, [showEmailDomainTags]);
+
+  useEffect(() => {
     persistAccountVisibleColumns(visibleColumns);
   }, [visibleColumns]);
 
@@ -905,6 +996,25 @@ export default function Accounts() {
     return Array.from(tags).sort();
   }, [accounts]);
 
+  const emailDomainStats = useMemo(() => {
+    const byDomain = new Map<string, EmailDomainStat>();
+    for (const account of accounts) {
+      const domain = getAccountEmailDomain(account);
+      if (!domain) continue;
+      const stat = byDomain.get(domain) ?? { domain, total: 0, banned: 0 };
+      stat.total += 1;
+      if (account.status === "unauthorized") {
+        stat.banned += 1;
+      }
+      byDomain.set(domain, stat);
+    }
+    return Array.from(byDomain.values()).sort((a, b) => {
+      if (b.banned !== a.banned) return b.banned - a.banned;
+      if (b.total !== a.total) return b.total - a.total;
+      return a.domain.localeCompare(b.domain);
+    });
+  }, [accounts]);
+
   const filteredAccounts = useMemo(() => {
     const query = searchQuery.toLowerCase();
     return accounts.filter((account) => {
@@ -957,9 +1067,12 @@ export default function Accounts() {
       if (query) {
         const email = (account.email || "").toLowerCase();
         const name = (account.name || "").toLowerCase();
-        if (!email.includes(query) && !name.includes(query)) return false;
+        const domain = getAccountEmailDomain(account);
+        if (!email.includes(query) && !name.includes(query) && !domain.includes(query))
+          return false;
       }
       if (tagFilter && !(account.tags ?? []).includes(tagFilter)) return false;
+      if (domainFilter && getAccountEmailDomain(account) !== domainFilter) return false;
       if (
         groupFilter !== null &&
         !(account.group_ids ?? []).includes(groupFilter)
@@ -967,7 +1080,7 @@ export default function Accounts() {
         return false;
       return true;
     });
-  }, [accounts, groupFilter, planFilter, searchQuery, statusFilter, tagFilter]);
+  }, [accounts, domainFilter, groupFilter, planFilter, searchQuery, statusFilter, tagFilter]);
 
   const sortedAccounts = useMemo(() => {
     if (!sortKey) return filteredAccounts;
@@ -2028,6 +2141,52 @@ export default function Accounts() {
     }
   };
 
+  const openBatchQuotaAutoPauseEditor = () => {
+    setBatchAutoPause5hThresholdInput("");
+    setBatchAutoPause7dThresholdInput("");
+    setBatchAutoPause5hDisabled(false);
+    setBatchAutoPause7dDisabled(false);
+    setShowBatchQuotaAutoPauseEditor(true);
+  };
+
+  const handleBatchSaveQuotaAutoPause = async () => {
+    const ids = Array.from(selected);
+    if (ids.length === 0) return;
+    if (
+      isPercentThresholdInputInvalid(batchAutoPause5hThresholdInput) ||
+      isPercentThresholdInputInvalid(batchAutoPause7dThresholdInput)
+    ) {
+      showToast(t("accounts.autoPauseThresholdRange"), "error");
+      return;
+    }
+    setBatchQuotaAutoPauseSubmitting(true);
+    try {
+      const payload = {
+        auto_pause_5h_threshold: percentThresholdInputToRatio(
+          batchAutoPause5hThresholdInput,
+        ),
+        auto_pause_7d_threshold: percentThresholdInputToRatio(
+          batchAutoPause7dThresholdInput,
+        ),
+        auto_pause_5h_disabled: batchAutoPause5hDisabled,
+        auto_pause_7d_disabled: batchAutoPause7dDisabled,
+      };
+      const { success, fail } = await runAccountBatch(ids, (id) =>
+        api.updateAccountScheduler(id, payload),
+      );
+      showToast(t("accounts.batchAutoPauseDone", { success, fail }));
+      setShowBatchQuotaAutoPauseEditor(false);
+      await reload();
+    } catch (error) {
+      showToast(
+        t("accounts.batchAutoPauseFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setBatchQuotaAutoPauseSubmitting(false);
+    }
+  };
+
   const handleBatchTest = async (ids?: number[]) => {
     if (ids && ids.length === 0) return;
     setBatchTesting(true);
@@ -2153,6 +2312,14 @@ export default function Accounts() {
         : String(account.base_concurrency_override),
     );
     setSkipWarmTier(account.skip_warm_tier ?? false);
+    setEditAutoPause5hThresholdInput(
+      formatQuotaAutoPausePercentInput(account.auto_pause_5h_threshold),
+    );
+    setEditAutoPause7dThresholdInput(
+      formatQuotaAutoPausePercentInput(account.auto_pause_7d_threshold),
+    );
+    setEditAutoPause5hDisabled(account.auto_pause_5h_disabled ?? false);
+    setEditAutoPause7dDisabled(account.auto_pause_7d_disabled ?? false);
     setAllowedAPIKeySelection(
       filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
@@ -2178,6 +2345,10 @@ export default function Accounts() {
     setConcurrencyMode("default");
     setConcurrencyInput("");
     setSkipWarmTier(false);
+    setEditAutoPause5hThresholdInput("");
+    setEditAutoPause7dThresholdInput("");
+    setEditAutoPause5hDisabled(false);
+    setEditAutoPause7dDisabled(false);
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditTags([]);
@@ -2206,6 +2377,18 @@ export default function Accounts() {
     (parsedBaseConcurrency === null ||
       parsedBaseConcurrency < 1 ||
       parsedBaseConcurrency > 50);
+  const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
+    editAutoPause5hThresholdInput,
+  );
+  const editAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
+    editAutoPause7dThresholdInput,
+  );
+  const batchAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
+    batchAutoPause5hThresholdInput,
+  );
+  const batchAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
+    batchAutoPause7dThresholdInput,
+  );
   const openAIAccountInputInvalid = Boolean(
     editingAccount?.openai_responses_api &&
     editTab === "account" &&
@@ -2253,7 +2436,12 @@ export default function Accounts() {
 
   const handleSaveScheduler = async () => {
     if (!editingAccount) return;
-    if (scoreInputInvalid || concurrencyInputInvalid) {
+    if (
+      scoreInputInvalid ||
+      concurrencyInputInvalid ||
+      editAutoPause5hThresholdInvalid ||
+      editAutoPause7dThresholdInvalid
+    ) {
       showToast(t("accounts.schedulerInvalidInput"), "error");
       return;
     }
@@ -2269,6 +2457,14 @@ export default function Accounts() {
         proxy_url: editProxyUrl.trim() || null,
         tags: editTags,
         group_ids: editGroupIds,
+        auto_pause_5h_threshold: percentThresholdInputToRatio(
+          editAutoPause5hThresholdInput,
+        ),
+        auto_pause_7d_threshold: percentThresholdInputToRatio(
+          editAutoPause7dThresholdInput,
+        ),
+        auto_pause_5h_disabled: editAutoPause5hDisabled,
+        auto_pause_7d_disabled: editAutoPause7dDisabled,
       };
       await api.updateAccountScheduler(editingAccount.id, payload);
       showToast(t("accounts.schedulerSaveSuccess"));
@@ -2374,7 +2570,7 @@ export default function Accounts() {
 
   return (
     <div
-      className="relative"
+      className="relative @container/accounts"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -2655,8 +2851,8 @@ export default function Accounts() {
             </div>
           ) : null}
 
-          <div className="mb-3 grid gap-3 xl:grid-cols-[minmax(0,1fr)_max-content]">
-            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:flex-wrap max-lg:overflow-visible xl:flex-nowrap">
+          <div className="mb-3 grid gap-3 @min-[1600px]/accounts:grid-cols-[minmax(0,1fr)_max-content]">
+            <div className="toolbar-surface flex flex-wrap items-center gap-1.5 overflow-visible @min-[1600px]/accounts:flex-nowrap">
               <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">
                 {t("accounts.filter")}
               </span>
@@ -2704,7 +2900,7 @@ export default function Accounts() {
               ))}
             </div>
 
-            <div className="toolbar-surface flex items-center gap-1.5 overflow-visible max-lg:flex-wrap max-lg:overflow-visible xl:flex-nowrap">
+            <div className="toolbar-surface flex flex-wrap items-center gap-1.5 overflow-visible @min-[1600px]/accounts:flex-nowrap">
               <span className="shrink-0 whitespace-nowrap font-semibold text-foreground">
                 {t("accounts.schedulerView")}
               </span>
@@ -2731,7 +2927,7 @@ export default function Accounts() {
             </div>
           </div>
 
-          <div className="mb-4 flex items-center gap-2 overflow-visible max-lg:flex-wrap max-lg:overflow-visible">
+          <div className="mb-4 flex flex-wrap items-center gap-2 overflow-visible @min-[1600px]/accounts:flex-nowrap">
             <div className="relative w-64 shrink-0 max-sm:w-full">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
               <Input
@@ -2782,6 +2978,44 @@ export default function Accounts() {
               ]}
             />
             <Select
+              className="w-64 shrink-0"
+              compact
+              value={domainFilter || "all"}
+              onValueChange={(value) => {
+                setDomainFilter(value === "all" ? "" : value);
+                setPage(1);
+              }}
+              options={[
+                { value: "all", label: t("accounts.emailDomainFilter") },
+                ...emailDomainStats.map((stat) => ({
+                  value: stat.domain,
+                  triggerLabel: stat.domain,
+                  label: t("accounts.emailDomainFilterOption", {
+                    domain: stat.domain,
+                    banned: stat.banned,
+                    total: stat.total,
+                  }),
+                })),
+              ]}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              aria-pressed={showEmailDomainTags}
+              onClick={() => setShowEmailDomainTags((visible) => !visible)}
+            >
+              {showEmailDomainTags ? (
+                <EyeOff className="size-3.5" />
+              ) : (
+                <Eye className="size-3.5" />
+              )}
+              {showEmailDomainTags
+                ? t("accounts.hideEmailDomainTags")
+                : t("accounts.showEmailDomainTags")}
+            </Button>
+            <Select
               className="w-36 shrink-0"
               compact
               value={groupFilter === null ? "all" : String(groupFilter)}
@@ -2807,7 +3041,7 @@ export default function Accounts() {
               <FolderOpen className="size-3.5" />
               {t("accounts.groupManage")}
             </Button>
-            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            <div className="flex w-full shrink-0 items-center gap-1.5 @min-[1600px]/accounts:ml-auto @min-[1600px]/accounts:w-auto">
               <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
                 <button
                   type="button"
@@ -2946,6 +3180,15 @@ export default function Accounts() {
                   variant="outline"
                   size="sm"
                   disabled={batchLoading || batchTesting}
+                  onClick={openBatchQuotaAutoPauseEditor}
+                >
+                  <Hourglass className="size-3 mr-1" />
+                  {t("accounts.batchAutoPauseEdit")}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={batchLoading || batchTesting}
                   onClick={() => void handleBatchResetStatus()}
                 >
                   <RotateCcw className="size-3 mr-1" />
@@ -3001,6 +3244,7 @@ export default function Accounts() {
                           selected={isSelected}
                           allGroups={allGroups}
                           lazyMode={lazyMode}
+                          showEmailDomainTags={showEmailDomainTags}
                           refreshing={refreshingIds.has(account.id)}
                           authJsonExporting={authJsonExportingIds.has(account.id)}
                           t={t}
@@ -3179,34 +3423,50 @@ export default function Accounts() {
                               </TableCell>
                             )}
                             {visibleColumns.email && (
-                              <TableCell className="text-[14px] text-muted-foreground">
-                                <span>
-                                  {account.openai_responses_api
-                                    ? formatAccountName(account)
-                                    : formatCompactEmail(account.email)}
-                                </span>
-                                {account.at_only && (
-                                  <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
-                                    AT
+                              <TableCell className="min-w-[220px] whitespace-normal text-[14px] text-muted-foreground">
+                                <div className="flex min-w-0 flex-col items-start gap-1">
+                                  <span className="break-all">
+                                    {account.openai_responses_api
+                                      ? formatAccountName(account)
+                                      : formatAccountListEmail(account)}
                                   </span>
-                                )}
-                                {account.openai_responses_api && (
-                                  <span className="ml-1.5 inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
-                                    Responses API
-                                  </span>
-                                )}
-                                {account.enabled === false && (
-                                  <span className="ml-1.5 inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
-                                    <PowerOff className="size-2.5 mr-0.5" />
-                                    {t("accounts.disabled")}
-                                  </span>
-                                )}
-                                {account.locked && (
-                                  <span className="ml-1.5 inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
-                                    <Lock className="size-2.5 mr-0.5" />
-                                    {t("accounts.lock")}
-                                  </span>
-                                )}
+                                  {showEmailDomainTags &&
+                                    getAccountEmailDomain(account) && (
+                                    <EmailDomainBadge
+                                      domain={getAccountEmailDomain(account)}
+                                      t={t}
+                                    />
+                                  )}
+                                  {(account.at_only ||
+                                    account.openai_responses_api ||
+                                    account.enabled === false ||
+                                    account.locked) && (
+                                    <div className="flex flex-wrap gap-1">
+                                      {account.at_only && (
+                                        <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
+                                          AT
+                                        </span>
+                                      )}
+                                      {account.openai_responses_api && (
+                                        <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
+                                          Responses API
+                                        </span>
+                                      )}
+                                      {account.enabled === false && (
+                                        <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
+                                          <PowerOff className="mr-0.5 size-2.5" />
+                                          {t("accounts.disabled")}
+                                        </span>
+                                      )}
+                                      {account.locked && (
+                                        <span className="inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                                          <Lock className="mr-0.5 size-2.5" />
+                                          {t("accounts.lock")}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
                               </TableCell>
                             )}
                             {visibleColumns.tags && (
@@ -3215,6 +3475,15 @@ export default function Accounts() {
                                   items={account.tags ?? []}
                                   tone="purple"
                                 />
+                                {showEmailDomainTags &&
+                                  getAccountEmailDomain(account) && (
+                                  <div className="mt-1.5 flex flex-wrap gap-1">
+                                    <EmailDomainBadge
+                                      domain={getAccountEmailDomain(account)}
+                                      t={t}
+                                    />
+                                  </div>
+                                )}
                               </TableCell>
                             )}
                             {visibleColumns.groups && (
@@ -4347,7 +4616,10 @@ export default function Accounts() {
                   disabled={
                     editSubmitting ||
                     (editTab === "scheduler" &&
-                      (scoreInputInvalid || concurrencyInputInvalid)) ||
+                      (scoreInputInvalid ||
+                        concurrencyInputInvalid ||
+                        editAutoPause5hThresholdInvalid ||
+                        editAutoPause7dThresholdInvalid)) ||
                     openAIAccountInputInvalid
                   }
                 >
@@ -4666,6 +4938,51 @@ export default function Accounts() {
                         </div>
                       </div>
 
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.autoPauseTitle")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.autoPauseHint")}
+                        </div>
+                        <div className="mt-4 grid gap-4 md:grid-cols-2">
+                          <QuotaAutoPauseWindowEditor
+                            disabledLabel={t("accounts.autoPause5hDisabled")}
+                            disabledHint={t("accounts.autoPauseDisabledHint")}
+                            thresholdLabel={t(
+                              "accounts.autoPause5hThreshold",
+                            )}
+                            thresholdHint={t("accounts.autoPauseThresholdHint")}
+                            thresholdPlaceholder={t(
+                              "accounts.autoPauseThresholdPlaceholder",
+                            )}
+                            thresholdValue={editAutoPause5hThresholdInput}
+                            thresholdInvalid={editAutoPause5hThresholdInvalid}
+                            disabled={editAutoPause5hDisabled}
+                            invalidLabel={t("accounts.autoPauseThresholdRange")}
+                            onThresholdChange={setEditAutoPause5hThresholdInput}
+                            onDisabledChange={setEditAutoPause5hDisabled}
+                          />
+                          <QuotaAutoPauseWindowEditor
+                            disabledLabel={t("accounts.autoPause7dDisabled")}
+                            disabledHint={t("accounts.autoPauseDisabledHint")}
+                            thresholdLabel={t(
+                              "accounts.autoPause7dThreshold",
+                            )}
+                            thresholdHint={t("accounts.autoPauseThresholdHint")}
+                            thresholdPlaceholder={t(
+                              "accounts.autoPauseThresholdPlaceholder",
+                            )}
+                            thresholdValue={editAutoPause7dThresholdInput}
+                            thresholdInvalid={editAutoPause7dThresholdInvalid}
+                            disabled={editAutoPause7dDisabled}
+                            invalidLabel={t("accounts.autoPauseThresholdRange")}
+                            onThresholdChange={setEditAutoPause7dThresholdInput}
+                            onDisabledChange={setEditAutoPause7dDisabled}
+                          />
+                        </div>
+                      </div>
+
                       <div className="rounded-xl border border-border p-4">
                         <div className="text-sm font-semibold text-foreground">
                           {t("accounts.allowedAPIKeysLabel")}
@@ -4899,6 +5216,79 @@ export default function Accounts() {
                     })
                   )}
                 </div>
+              </div>
+            </div>
+          </Modal>
+
+          <Modal
+            show={showBatchQuotaAutoPauseEditor}
+            title={t("accounts.batchAutoPauseTitle")}
+            contentClassName="sm:max-w-[680px]"
+            onClose={() => {
+              if (batchQuotaAutoPauseSubmitting) return;
+              setShowBatchQuotaAutoPauseEditor(false);
+            }}
+            footer={
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setShowBatchQuotaAutoPauseEditor(false)}
+                  disabled={batchQuotaAutoPauseSubmitting}
+                >
+                  {t("common.cancel")}
+                </Button>
+                <Button
+                  type="button"
+                  onClick={() => void handleBatchSaveQuotaAutoPause()}
+                  disabled={
+                    batchQuotaAutoPauseSubmitting ||
+                    batchAutoPause5hThresholdInvalid ||
+                    batchAutoPause7dThresholdInvalid
+                  }
+                >
+                  {batchQuotaAutoPauseSubmitting
+                    ? t("common.saving")
+                    : t("common.save")}
+                </Button>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
+                {t("accounts.batchAutoPauseDesc", { count: selected.size })}
+              </div>
+              <div className="grid gap-4 md:grid-cols-2">
+                <QuotaAutoPauseWindowEditor
+                  disabledLabel={t("accounts.autoPause5hDisabled")}
+                  disabledHint={t("accounts.autoPauseDisabledHint")}
+                  thresholdLabel={t("accounts.autoPause5hThreshold")}
+                  thresholdHint={t("accounts.autoPauseThresholdHint")}
+                  thresholdPlaceholder={t(
+                    "accounts.autoPauseThresholdPlaceholder",
+                  )}
+                  thresholdValue={batchAutoPause5hThresholdInput}
+                  thresholdInvalid={batchAutoPause5hThresholdInvalid}
+                  disabled={batchAutoPause5hDisabled}
+                  invalidLabel={t("accounts.autoPauseThresholdRange")}
+                  onThresholdChange={setBatchAutoPause5hThresholdInput}
+                  onDisabledChange={setBatchAutoPause5hDisabled}
+                />
+                <QuotaAutoPauseWindowEditor
+                  disabledLabel={t("accounts.autoPause7dDisabled")}
+                  disabledHint={t("accounts.autoPauseDisabledHint")}
+                  thresholdLabel={t("accounts.autoPause7dThreshold")}
+                  thresholdHint={t("accounts.autoPauseThresholdHint")}
+                  thresholdPlaceholder={t(
+                    "accounts.autoPauseThresholdPlaceholder",
+                  )}
+                  thresholdValue={batchAutoPause7dThresholdInput}
+                  thresholdInvalid={batchAutoPause7dThresholdInvalid}
+                  disabled={batchAutoPause7dDisabled}
+                  invalidLabel={t("accounts.autoPauseThresholdRange")}
+                  onThresholdChange={setBatchAutoPause7dThresholdInput}
+                  onDisabledChange={setBatchAutoPause7dDisabled}
+                />
               </div>
             </div>
           </Modal>
@@ -5455,6 +5845,80 @@ function PreviewItem({ label, value }: { label: string; value: string }) {
       </div>
       <div className="mt-1 text-base font-semibold text-foreground">
         {value}
+      </div>
+    </div>
+  );
+}
+
+function QuotaAutoPauseWindowEditor({
+  disabledLabel,
+  disabledHint,
+  thresholdLabel,
+  thresholdHint,
+  thresholdPlaceholder,
+  thresholdValue,
+  thresholdInvalid,
+  disabled,
+  invalidLabel,
+  onThresholdChange,
+  onDisabledChange,
+}: {
+  disabledLabel: string;
+  disabledHint: string;
+  thresholdLabel: string;
+  thresholdHint: string;
+  thresholdPlaceholder: string;
+  thresholdValue: string;
+  thresholdInvalid: boolean;
+  disabled: boolean;
+  invalidLabel: string;
+  onThresholdChange: (value: string) => void;
+  onDisabledChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-muted/10 p-3">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="text-sm font-semibold text-foreground">
+            {disabledLabel}
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {disabledHint}
+          </div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-label={disabledLabel}
+          aria-checked={disabled}
+          onClick={() => onDisabledChange(!disabled)}
+          className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${disabled ? "bg-primary" : "bg-muted"}`}
+        >
+          <span
+            className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${disabled ? "translate-x-4" : "translate-x-0"}`}
+          />
+        </button>
+      </div>
+      <label className="mt-4 block text-sm font-semibold text-muted-foreground">
+        {thresholdLabel}
+      </label>
+      <Input
+        className="mt-2"
+        type="number"
+        min={0}
+        max={100}
+        step={0.1}
+        inputMode="decimal"
+        value={thresholdValue}
+        placeholder={thresholdPlaceholder}
+        onChange={(event: ChangeEvent<HTMLInputElement>) =>
+          onThresholdChange(event.target.value)
+        }
+      />
+      <div
+        className={`mt-1.5 text-xs ${thresholdInvalid ? "text-red-500" : "text-muted-foreground"}`}
+      >
+        {thresholdInvalid ? invalidLabel : thresholdHint}
       </div>
     </div>
   );
@@ -6131,6 +6595,26 @@ function ChipList({
   );
 }
 
+function EmailDomainBadge({
+  domain,
+  t,
+}: {
+  domain: string;
+  t: ReturnType<typeof useTranslation>["t"];
+}) {
+  const label = emailDomainTag(domain);
+  if (!label) return null;
+
+  return (
+    <span
+      className="inline-flex max-w-full items-center break-all rounded-md bg-cyan-500/10 px-1.5 py-0.5 text-left text-[10px] font-semibold leading-tight text-cyan-700 ring-1 ring-inset ring-cyan-500/20 dark:text-cyan-300"
+      title={`${t("accounts.emailDomainSystemTag")}: ${label}`}
+    >
+      {label}
+    </span>
+  );
+}
+
 function normalizeGroupColor(color?: string): string {
   const value = (color || "").trim();
   return /^#[0-9a-fA-F]{6}$/.test(value) ? value : ACCOUNT_GROUP_COLORS[0];
@@ -6258,6 +6742,7 @@ function AccountMobileCard({
   selected,
   allGroups,
   lazyMode,
+  showEmailDomainTags,
   refreshing,
   authJsonExporting,
   t,
@@ -6277,6 +6762,7 @@ function AccountMobileCard({
   selected: boolean;
   allGroups: AccountGroup[];
   lazyMode: boolean;
+  showEmailDomainTags: boolean;
   refreshing: boolean;
   authJsonExporting: boolean;
   t: ReturnType<typeof useTranslation>["t"];
@@ -6293,7 +6779,7 @@ function AccountMobileCard({
 }) {
   const displayName = account.openai_responses_api
     ? formatAccountName(account)
-    : formatCompactEmail(account.email);
+    : formatAccountListEmail(account);
   const fullName = formatAccountName(account);
   const groups = resolveAccountGroups(account.group_ids ?? [], allGroups);
   const refreshDisabled =
@@ -6327,9 +6813,15 @@ function AccountMobileCard({
                   expiresAt={account.subscription_expires_at}
                   planType={account.plan_type}
                 />
+                {showEmailDomainTags && getAccountEmailDomain(account) && (
+                  <EmailDomainBadge
+                    domain={getAccountEmailDomain(account)}
+                    t={t}
+                  />
+                )}
               </div>
               <div
-                className="mt-1 truncate text-[15px] font-semibold leading-tight text-foreground"
+                className="mt-1 break-all text-[15px] font-semibold leading-tight text-foreground"
                 title={fullName}
               >
                 {displayName}
@@ -6451,9 +6943,16 @@ function AccountMobileCard({
         </AccountMobileMetric>
       </div>
 
-      {((account.tags ?? []).length > 0 || groups.length > 0) && (
+      {((account.tags ?? []).length > 0 ||
+        (showEmailDomainTags && getAccountEmailDomain(account)) ||
+        groups.length > 0) && (
         <div className="mt-3 space-y-1.5 border-t border-border pt-2">
           <ChipList items={account.tags ?? []} tone="purple" />
+          {showEmailDomainTags && getAccountEmailDomain(account) && (
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              <EmailDomainBadge domain={getAccountEmailDomain(account)} t={t} />
+            </div>
+          )}
           <GroupChipList groups={groups} />
         </div>
       )}

@@ -53,6 +53,28 @@ func TestRefreshAccountRejectsInvalidID(t *testing.T) {
 	}
 }
 
+func TestAccountEmailDomain(t *testing.T) {
+	tests := []struct {
+		name  string
+		email string
+		want  string
+	}{
+		{name: "lowercases domain", email: "User@Example.COM", want: "example.com"},
+		{name: "trims whitespace", email: " user@mail.example.com ", want: "mail.example.com"},
+		{name: "rejects missing at", email: "https://api.openai.com", want: ""},
+		{name: "rejects blank local", email: "@example.com", want: ""},
+		{name: "rejects malformed domain", email: "user@example com", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := accountEmailDomain(tt.email); got != tt.want {
+				t.Fatalf("accountEmailDomain(%q) = %q, want %q", tt.email, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNormalizeBackgroundUploadMedia(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -925,6 +947,16 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 			body:    `{"base_concurrency_override":0}`,
 			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
 		},
+		{
+			name:    "5h auto pause threshold out of range",
+			body:    `{"auto_pause_5h_threshold":1.01}`,
+			message: "auto_pause_5h_threshold 超出范围，必须在 0..1 之间",
+		},
+		{
+			name:    "7d auto pause threshold out of range",
+			body:    `{"auto_pause_7d_threshold":-0.01}`,
+			message: "auto_pause_7d_threshold 超出范围，必须在 0..1 之间",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1009,6 +1041,45 @@ func TestUpdateAccountSchedulerPersistsAllowedAPIKeyIDs(t *testing.T) {
 	}
 	if got := rows[0].GetCredentialInt64Slice("allowed_api_key_ids"); len(got) != 2 || got[0] != keyID1 || got[1] != keyID2 {
 		t.Fatalf("allowed_api_key_ids = %v, want [%d %d]", got, keyID1, keyID2)
+	}
+}
+
+func TestUpdateAccountSchedulerPersistsQuotaAutoPauseConfig(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":null,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	threshold5h, ok := rows[0].GetCredentialFloat64("auto_pause_5h_threshold")
+	if !ok || threshold5h != 0.95 {
+		t.Fatalf("auto_pause_5h_threshold = (%v, %t), want (0.95, true)", threshold5h, ok)
+	}
+	threshold7d, ok := rows[0].GetCredentialFloat64("auto_pause_7d_threshold")
+	if !ok || threshold7d != 0 {
+		t.Fatalf("auto_pause_7d_threshold = (%v, %t), want (0, true)", threshold7d, ok)
+	}
+	if !rows[0].GetCredentialBool("auto_pause_5h_disabled") {
+		t.Fatal("auto_pause_5h_disabled = false, want true")
+	}
+	if rows[0].GetCredentialBool("auto_pause_7d_disabled") {
+		t.Fatal("auto_pause_7d_disabled = true, want false")
 	}
 }
 
@@ -1202,7 +1273,7 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"skip_warm_tier":true,"allowed_api_key_ids":[%d,%d]}`, keyID2, keyID1)))
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"skip_warm_tier":true,"allowed_api_key_ids":[%d,%d],"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":0.9,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false}`, keyID2, keyID1)))
 	ginCtx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ginCtx)
@@ -1224,6 +1295,20 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	}
 	if got := runtimeAccount.GetAllowedAPIKeyIDs(); len(got) != 2 || got[0] != keyID1 || got[1] != keyID2 {
 		t.Fatalf("runtime allowed_api_key_ids = %v, want [%d %d]", got, keyID1, keyID2)
+	}
+	runtimeAccount.Mu().RLock()
+	defer runtimeAccount.Mu().RUnlock()
+	if runtimeAccount.AutoPause5hThreshold != 0.95 {
+		t.Fatalf("runtime auto_pause_5h_threshold = %v, want 0.95", runtimeAccount.AutoPause5hThreshold)
+	}
+	if runtimeAccount.AutoPause7dThreshold != 0.9 {
+		t.Fatalf("runtime auto_pause_7d_threshold = %v, want 0.9", runtimeAccount.AutoPause7dThreshold)
+	}
+	if !runtimeAccount.AutoPause5hDisabled {
+		t.Fatal("runtime auto_pause_5h_disabled = false, want true")
+	}
+	if runtimeAccount.AutoPause7dDisabled {
+		t.Fatal("runtime auto_pause_7d_disabled = true, want false")
 	}
 }
 
@@ -1330,6 +1415,136 @@ func TestExportAccountsSkipsAccountsWithoutCredentials(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("got %d entries, want 0 (account has no credentials)", len(entries))
+	}
+}
+
+func TestListAccountsPopulatesBilledWindows(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	accountID, err := db.InsertAccountWithCredentials(ctx, "cost-account", map[string]interface{}{
+		"refresh_token":           "rt_cost_account",
+		"codex_5h_used_percent":   12.5,
+		"codex_5h_reset_at":       now.Add(30 * time.Minute).Format(time.RFC3339),
+		"codex_7d_used_percent":   34.5,
+		"codex_7d_reset_at":       now.Add(24 * time.Hour).Format(time.RFC3339),
+		"codex_usage_updated_at":  now.Format(time.RFC3339),
+		"email":                   "cost@example.com",
+		"plan_type":               "plus",
+		"subscription_expires_at": now.AddDate(0, 1, 0).Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
+	}
+
+	db.SetUsageLogConfig(database.UsageLogModeFull, 1, 1)
+	if err := db.InsertUsageLog(ctx, &database.UsageLogInput{
+		AccountID:      accountID,
+		Endpoint:       "/v1/responses",
+		Model:          "gpt-5.4",
+		EffectiveModel: "gpt-5.4",
+		StatusCode:     http.StatusOK,
+		InputTokens:    1000,
+		OutputTokens:   500,
+		TotalTokens:    1500,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		usage, err := db.GetAccountTimeRangeUsage(ctx, now.Add(-time.Hour))
+		if err == nil {
+			if row, ok := usage[accountID]; ok && row.AccountBilled > 0 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("usage log was not flushed before deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("store.Init 返回错误: %v", err)
+	}
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts", nil)
+
+	handler.ListAccounts(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload accountsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Accounts) != 1 {
+		t.Fatalf("accounts len = %d, want 1", len(payload.Accounts))
+	}
+	account := payload.Accounts[0]
+	if account.EmailDomain != "example.com" {
+		t.Fatalf("EmailDomain = %q, want example.com", account.EmailDomain)
+	}
+	if account.Billed5h == nil || *account.Billed5h <= 0 {
+		t.Fatalf("Billed5h = %v, want positive value", account.Billed5h)
+	}
+	if account.Billed7d == nil || *account.Billed7d <= 0 {
+		t.Fatalf("Billed7d = %v, want positive value", account.Billed7d)
+	}
+	if account.Usage5hDetail == nil || account.Usage5hDetail.AccountBilled <= 0 {
+		t.Fatalf("Usage5hDetail = %#v, want positive account_billed", account.Usage5hDetail)
+	}
+	if account.Usage7dDetail == nil || account.Usage7dDetail.AccountBilled <= 0 {
+		t.Fatalf("Usage7dDetail = %#v, want positive account_billed", account.Usage7dDetail)
+	}
+}
+
+func TestForceUsageProbeTriggersInLazyMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token", Status: auth.StatusReady})
+
+	called := make(chan struct{}, 1)
+	store.SetUsageProbeFunc(func(ctx context.Context, acc *auth.Account) error {
+		called <- struct{}{}
+		return nil
+	})
+	handler := &Handler{store: store}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/usage/probe", nil)
+
+	handler.ForceUsageProbe(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload struct {
+		Triggered bool   `json:"triggered"`
+		Mode      string `json:"mode"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !payload.Triggered || payload.Mode != "wham_only" {
+		t.Fatalf("payload = %#v, want triggered wham_only", payload)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered")
 	}
 }
 

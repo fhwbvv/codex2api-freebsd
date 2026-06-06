@@ -144,7 +144,7 @@ func (h *Handler) enforceAPIKeyLimitsAndReply(c *gin.Context, model string) bool
 		errType = api.ErrorTypePermission
 		errCode = api.ErrCodeInvalidRequest
 	}
-	api.SendError(c, api.NewAPIError(errCode, msg, errType))
+	api.SendErrorWithStatus(c, api.NewAPIError(errCode, msg, errType), status)
 	return true
 }
 

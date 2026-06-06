@@ -30,8 +30,8 @@ func TestResolveServiceTier(t *testing.T) {
 	if got := resolveServiceTier("", "fast"); got != "fast" {
 		t.Fatalf("expected requested tier fallback, got %q", got)
 	}
-	if got := resolveServiceTier("default", "fast"); got != "fast" {
-		t.Fatalf("expected requested fast to win for logging, got %q", got)
+	if got := resolveServiceTier("default", "fast"); got != "default" {
+		t.Fatalf("expected actual default to win for logging, got %q", got)
 	}
 	// priority 是 fast 的同义词，入库归一化为 fast，便于 UI 徽章/筛选统一识别
 	if got := resolveServiceTier("priority", ""); got != "fast" {
@@ -43,10 +43,8 @@ func TestResolveServiceTier(t *testing.T) {
 	if got := resolveServiceTier("priority", "default"); got != "fast" {
 		t.Fatalf("expected actual priority to normalize to fast, got %q", got)
 	}
-	// codex CLI 0.129+ 直接发 service_tier="priority"；上游配额耗尽降级到 default 时，
-	// 也要锁定为 fast，避免 fast 用户的日志被错误归类成 default。
-	if got := resolveServiceTier("default", "priority"); got != "fast" {
-		t.Fatalf("expected requested priority + downgraded default to be fast, got %q", got)
+	if got := resolveServiceTier("default", "priority"); got != "default" {
+		t.Fatalf("expected requested priority + upstream default to log actual default, got %q", got)
 	}
 	// flex / default 等其它 tier 保持原值
 	if got := resolveServiceTier("flex", ""); got != "flex" {
@@ -58,6 +56,10 @@ func TestResolveServiceTier(t *testing.T) {
 }
 
 func TestResolveBillingServiceTier(t *testing.T) {
+	previous := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(previous) })
+	ApplyRuntimeSettings(RuntimeSettings{BillingTierPolicy: BillingTierPolicyActual})
+
 	tests := []struct {
 		name      string
 		actual    string
@@ -65,8 +67,8 @@ func TestResolveBillingServiceTier(t *testing.T) {
 		want      string
 	}{
 		{name: "actual priority wins", actual: "priority", requested: "fast", want: "priority"},
-		{name: "requested fast bills priority even when upstream downgrades to default", actual: "default", requested: "fast", want: "priority"},
-		{name: "requested fast bills priority even when upstream reports unknown tier", actual: "burst", requested: "fast", want: "priority"},
+		{name: "actual default wins when requested fast downgrades", actual: "default", requested: "fast", want: "default"},
+		{name: "actual unknown tier wins when requested fast", actual: "burst", requested: "fast", want: "burst"},
 		{name: "upstream concrete tier wins when client did not request fast", actual: "burst", requested: "", want: "burst"},
 		{name: "requested fast fallback bills priority", actual: "", requested: "fast", want: "priority"},
 		{name: "requested priority fallback bills priority", actual: "", requested: "priority", want: "priority"},
@@ -79,6 +81,47 @@ func TestResolveBillingServiceTier(t *testing.T) {
 				t.Fatalf("resolveBillingServiceTier(%q, %q) = %q, want %q", tt.actual, tt.requested, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveBillingServiceTierRequestedPolicy(t *testing.T) {
+	tests := []struct {
+		name      string
+		actual    string
+		requested string
+		want      string
+	}{
+		{name: "requested fast bills priority when upstream downgrades", actual: "default", requested: "fast", want: "priority"},
+		{name: "requested priority bills priority when upstream downgrades", actual: "default", requested: "priority", want: "priority"},
+		{name: "actual tier fallback when no requested tier", actual: "default", requested: "", want: "default"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveBillingServiceTierForPolicy(tt.actual, tt.requested, BillingTierPolicyRequested); got != tt.want {
+				t.Fatalf("resolveBillingServiceTierForPolicy(%q, %q, requested) = %q, want %q", tt.actual, tt.requested, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveUsageServiceTiersSplitsRequestedActualBilling(t *testing.T) {
+	previous := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(previous) })
+	ApplyRuntimeSettings(RuntimeSettings{BillingTierPolicy: BillingTierPolicyActual})
+
+	got := resolveUsageServiceTiers("default", "priority")
+	if got.RequestedServiceTier != "priority" {
+		t.Fatalf("requested tier = %q, want priority", got.RequestedServiceTier)
+	}
+	if got.ActualServiceTier != "default" {
+		t.Fatalf("actual tier = %q, want default", got.ActualServiceTier)
+	}
+	if got.ServiceTier != "default" {
+		t.Fatalf("legacy service tier = %q, want default", got.ServiceTier)
+	}
+	if got.BillingServiceTier != "default" {
+		t.Fatalf("billing tier = %q, want default", got.BillingServiceTier)
 	}
 }
 
@@ -1236,6 +1279,30 @@ func TestPrepareCompactResponsesBody_RemovesUnsupportedInjectedFields(t *testing
 	}
 	if input.Array()[0].Get("content").String() != "test" {
 		t.Fatalf("expected compact input content to be preserved, got %s", input.Raw)
+	}
+}
+
+func TestPrepareOpenAIResponsesCompactBody_RemovesUnsupportedFields(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-4.1",
+		"input":"hello",
+		"include":["reasoning.encrypted_content"],
+		"store":true,
+		"stream":true
+	}`)
+
+	got := PrepareOpenAIResponsesCompactBody(raw)
+
+	for _, field := range []string{"include", "store", "stream"} {
+		if gjson.GetBytes(got, field).Exists() {
+			t.Fatalf("expected %s to be removed for OpenAI Responses compact body, got %s", field, got)
+		}
+	}
+	if model := gjson.GetBytes(got, "model").String(); model != "gpt-4.1" {
+		t.Fatalf("model = %q, want gpt-4.1; body=%s", model, got)
+	}
+	if input := gjson.GetBytes(got, "input").String(); input != "hello" {
+		t.Fatalf("input = %q, want hello; body=%s", input, got)
 	}
 }
 

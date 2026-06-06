@@ -251,6 +251,46 @@ func TestNeedsUsageProbeAllowsReadyAccount(t *testing.T) {
 	}
 }
 
+func TestTriggerUsageProbeAsyncRunsInLazyMode(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	store.AddAccount(&Account{DBID: 1, AccessToken: "token", Status: StatusReady})
+
+	called := make(chan struct{}, 1)
+	store.SetUsageProbeFunc(func(ctx context.Context, acc *Account) error {
+		called <- struct{}{}
+		return nil
+	})
+
+	store.TriggerUsageProbeAsync()
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered in lazy mode")
+	}
+}
+
+func TestTriggerUsageProbeForceAsyncRunsInLazyMode(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	store.AddAccount(&Account{DBID: 1, AccessToken: "token", Status: StatusReady})
+
+	called := make(chan struct{}, 1)
+	store.SetUsageProbeFunc(func(ctx context.Context, acc *Account) error {
+		called <- struct{}{}
+		return nil
+	})
+
+	store.TriggerUsageProbeForceAsync()
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("forced usage probe was not triggered in lazy mode")
+	}
+}
+
 func TestRefreshSingleBypassesCachedAccessToken(t *testing.T) {
 	ctx := context.Background()
 	tokenCache := cache.NewMemory(1)

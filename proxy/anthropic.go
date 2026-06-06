@@ -138,8 +138,8 @@ func canonicalizeCodexModel(model string, supportedModels []string) string {
 		return ""
 	}
 	for _, supported := range supportedModels {
-		if trimmed == supported {
-			return trimmed
+		if strings.EqualFold(trimmed, supported) {
+			return supported
 		}
 	}
 
@@ -173,14 +173,9 @@ func canonicalizeCodexModel(model string, supportedModels []string) string {
 func resolveAnthropicModel(model string, dynamicMappingJSON string, supportedModels []string) string {
 	model = strings.TrimSpace(model)
 
-	// 1. 尝试动态映射（从系统设置）
-	if dynamicMappingJSON != "" && dynamicMappingJSON != "{}" {
-		var dynamicMap map[string]string
-		if json.Unmarshal([]byte(dynamicMappingJSON), &dynamicMap) == nil {
-			if mapped, ok := dynamicMap[model]; ok && mapped != "" {
-				return canonicalizeCodexModel(mapped, supportedModels)
-			}
-		}
+	// 1. 尝试动态映射（从系统设置，支持精确和 * 通配）
+	if mapped, ok := resolveConfiguredModelMapping(model, dynamicMappingJSON, supportedModels); ok {
+		return mapped
 	}
 
 	// 2. 尝试默认映射

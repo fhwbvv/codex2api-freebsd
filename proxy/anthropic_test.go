@@ -134,7 +134,7 @@ func TestAnthropicUsageServiceTierResolution(t *testing.T) {
 		want   string
 	}{
 		{"no fast intent", "", "default", "default"},
-		{"fast intent upstream default", "fast", "default", "fast"},
+		{"fast intent upstream default", "fast", "default", "default"},
 		{"fast intent upstream priority", "fast", "priority", "fast"},
 	}
 	for _, tc := range cases {

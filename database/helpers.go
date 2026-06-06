@@ -333,9 +333,12 @@ func (db *DB) SetMaxOpenConns(n int) {
 		return
 	}
 	if db.isSQLite() {
-		// SQLite 单文件模式下保持单连接，避免写锁竞争。
-		db.conn.SetMaxOpenConns(1)
-		db.conn.SetMaxIdleConns(1)
+		if db.sqliteSingleConn {
+			db.conn.SetMaxOpenConns(1)
+			db.conn.SetMaxIdleConns(1)
+			return
+		}
+		applySQLiteConnLimits(db.conn, n)
 		return
 	}
 	db.conn.SetMaxOpenConns(n)

@@ -204,6 +204,19 @@ function formatTokenPricePerMillion(value?: number | null): string {
   return `$${safeNumber(value).toFixed(4)} / 1M Token`
 }
 
+function isFastTier(tier?: string | null): boolean {
+  const normalized = (tier || '').trim().toLowerCase()
+  return normalized === 'fast' || normalized === 'priority'
+}
+
+function formatServiceTierLabel(t: ReturnType<typeof useTranslation>['t'], tier?: string | null): string {
+  const normalized = (tier || '').trim().toLowerCase()
+  if (!normalized) return '-'
+  if (isFastTier(normalized)) return t('usage.billingTierFast')
+  if (normalized === 'default') return t('usage.billingTierStandard')
+  return normalized
+}
+
 function UsageCostCell({ log }: { log: UsageLog }) {
   const { t } = useTranslation()
   const accountBilled = safeNumber(log.account_billed)
@@ -211,6 +224,9 @@ function UsageCostCell({ log }: { log: UsageLog }) {
   const totalCost = safeNumber(log.total_cost)
   const displayCost = userBilled > 0 ? userBilled : accountBilled
   const longContextThreshold = safeNumber(log.long_context_threshold)
+  const requestedTier = log.requested_service_tier || ''
+  const actualTier = log.actual_service_tier || log.service_tier || ''
+  const billingTier = log.billing_service_tier || log.service_tier || ''
   const hasCostContext = log.status_code < 400 && (
     accountBilled > 0 ||
     userBilled > 0 ||
@@ -258,14 +274,20 @@ function UsageCostCell({ log }: { log: UsageLog }) {
           {log.cached_tokens > 0 && log.cache_read_price_per_mtoken > 0 && (
             <CostTooltipRow label={t('usage.cacheReadUnitPrice')} value={formatTokenPricePerMillion(log.cache_read_price_per_mtoken)} valueClassName="text-cyan-300" />
           )}
+          {requestedTier && (
+            <CostTooltipRow label={t('usage.requestedTier')} value={formatServiceTierLabel(t, requestedTier)} valueClassName="text-slate-200" />
+          )}
+          {actualTier && (
+            <CostTooltipRow
+              label={t('usage.actualTier')}
+              value={formatServiceTierLabel(t, actualTier)}
+              valueClassName={isFastTier(actualTier) ? 'text-amber-300' : 'text-slate-200'}
+            />
+          )}
           <CostTooltipRow
             label={t('usage.billingTier')}
-            value={(log.service_tier === 'fast' || log.service_tier === 'priority')
-              ? t('usage.billingTierFast')
-              : t('usage.billingTierStandard')}
-            valueClassName={(log.service_tier === 'fast' || log.service_tier === 'priority')
-              ? 'text-amber-300'
-              : 'text-slate-200'}
+            value={formatServiceTierLabel(t, billingTier)}
+            valueClassName={isFastTier(billingTier) ? 'text-amber-300' : 'text-slate-200'}
           />
           {log.long_context && longContextThreshold > 0 && (
             <CostTooltipRow
@@ -1461,6 +1483,15 @@ export default function Usage() {
                         </TableCell>}
                         {visibleColumns.model && <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">
+                            {log.via_websocket && (
+                              <Badge
+                                variant="outline"
+                                title="WebSocket"
+                                className="text-[11px] font-semibold uppercase border-transparent bg-cyan-500/12 text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-400"
+                              >
+                                ws
+                              </Badge>
+                            )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
                               {log.model || '-'}
                             </Badge>
@@ -1486,10 +1517,21 @@ export default function Usage() {
                             {isImageUsageLog(log) && (
                               <ImageUsageBadge log={log} />
                             )}
-                            {(log.service_tier === 'fast' || log.service_tier === 'priority') && (
+                            {log.compact && (
+                              <Badge
+                                variant="outline"
+                                className="text-[11px] font-semibold gap-0.5 border-transparent bg-teal-500/12 text-teal-700 dark:bg-teal-500/20 dark:text-teal-300"
+                                title={t('usage.compactRequestTooltip')}
+                              >
+                                <Box className="size-3" />
+                                {t('usage.compactRequest')}
+                              </Badge>
+                            )}
+                            {isFastTier(log.billing_service_tier || log.service_tier) && (
                               <Badge
                                 variant="outline"
                                 className="text-[11px] font-semibold gap-0.5 border-transparent bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400"
+                                title={`${t('usage.billingTier')}: ${formatServiceTierLabel(t, log.billing_service_tier || log.service_tier)}`}
                               >
                                 <Zap className="size-3" />
                                 Fast

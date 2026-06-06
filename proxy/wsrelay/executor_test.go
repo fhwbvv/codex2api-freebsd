@@ -1,10 +1,13 @@
 package wsrelay
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/proxy"
 	"github.com/gorilla/websocket"
@@ -146,6 +149,61 @@ func TestNormalizeWebsocketHandshakeResponse(t *testing.T) {
 			t.Fatalf("statusCode = %d, want %d", statusCode, http.StatusUnauthorized)
 		}
 	})
+}
+
+func TestWebsocketResponseToHTTPClosesBodyOnContextCancel(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		time.Sleep(5 * time.Second)
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	session := NewSession(1, nil)
+	pr := session.AddPendingRequest("session-1")
+	wc := NewWsConnection(conn, session, wsURL)
+	manager := NewManager()
+	defer manager.Stop()
+	wsResp := &WsResponse{
+		conn:        wc,
+		pendingReq:  pr,
+		sessionID:   "session-1",
+		manager:     manager,
+		readErrChan: make(chan error, 1),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resp := websocketResponseToHTTP(ctx, wsResp, http.StatusOK, http.Header{})
+	cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := resp.Body.Read(make([]byte, 1))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Body.Read returned nil error after context cancellation")
+		}
+		if err != context.Canceled && err != io.ErrClosedPipe && !strings.Contains(err.Error(), "canceled") && !strings.Contains(err.Error(), "closed") {
+			t.Fatalf("Body.Read error = %v, want context cancellation or closed pipe", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Body.Read stayed blocked after context cancellation")
+	}
 }
 
 func TestSendRequestWritesResponseCreatePayloadDirectly(t *testing.T) {

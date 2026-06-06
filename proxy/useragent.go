@@ -12,9 +12,9 @@ import (
 //   {originator}/{version} ({OS} {OS_version}; {arch}) {terminal}
 //
 // 示例：
-//   codex_cli_rs/0.128.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464
-//   codex_cli_rs/0.128.0 (Mac OS 15.1.0; arm64) Ghostty/1.2.3
-//   codex_cli_rs/0.128.0 (Windows 10.0.26120; x86_64) WindowsTerminal
+//   codex_cli_rs/0.136.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464
+//   codex_cli_rs/0.136.0 (Mac OS 15.1.0; arm64) Ghostty/1.2.3
+//   codex_cli_rs/0.136.0 (Windows 10.0.26120; x86_64) WindowsTerminal
 
 // ClientProfile 表示一个模拟客户端的完整身份
 type ClientProfile struct {
@@ -23,7 +23,7 @@ type ClientProfile struct {
 }
 
 const (
-	latestCodexCLIVersion         = "0.128.0"
+	latestCodexCLIVersion         = "0.136.0"
 	latestCodexCLIUserAgentPrefix = "codex_cli_rs/" + latestCodexCLIVersion
 )
 

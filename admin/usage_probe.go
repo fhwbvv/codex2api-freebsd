@@ -34,6 +34,10 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 	if err := h.probeUsageViaWham(ctx, account); err == nil {
 		return nil
 	} else {
+		if h.store.GetLazyMode() || !h.store.UsageProbeResponsesFallbackEnabled() {
+			log.Printf("[账号 %d] wham 用量探测失败，已按配置跳过 /responses 探针: %v", account.DBID, err)
+			return err
+		}
 		log.Printf("[账号 %d] wham 用量探测失败，回退到 /responses 探针: %v", account.DBID, err)
 	}
 
@@ -104,6 +108,11 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 		proxy.Apply429Cooldown(h.store, account, body, resp, h.store.GetTestModel())
 		return nil
 	default:
+		if proxy.IsUsageLimitReachedError(body) {
+			h.store.ReportRequestFailure(account, "client", 0)
+			proxy.Apply429Cooldown(h.store, account, body, resp, h.store.GetTestModel())
+			return nil
+		}
 		if shouldMarkUsageProbeAccountError(resp.StatusCode, body) {
 			h.store.MarkError(account, fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
 			return nil
@@ -129,17 +138,13 @@ func shouldMarkUsageProbeAccountError(statusCode int, body []byte) bool {
 // ForceUsageProbe 主动触发一次"忽略缓存阈值"的全量用量探针，并立即返回。
 // 真正的探针在后台并发执行（受 usage_probe_concurrency 限制）。
 func (h *Handler) ForceUsageProbe(c *gin.Context) {
-	if h.store.GetLazyMode() {
-		c.JSON(http.StatusOK, gin.H{
-			"triggered":   false,
-			"reason":      "lazy_mode",
-			"concurrency": h.store.GetUsageProbeConcurrency(),
-		})
-		return
-	}
 	h.store.TriggerUsageProbeForceAsync()
-	c.JSON(http.StatusOK, gin.H{
+	payload := gin.H{
 		"triggered":   true,
 		"concurrency": h.store.GetUsageProbeConcurrency(),
-	})
+	}
+	if h.store.GetLazyMode() || !h.store.UsageProbeResponsesFallbackEnabled() {
+		payload["mode"] = "wham_only"
+	}
+	c.JSON(http.StatusOK, payload)
 }

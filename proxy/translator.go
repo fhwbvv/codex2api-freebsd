@@ -1479,6 +1479,8 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 
 	// 7. 删除 Codex 不支持的字段
+	// 注意：prompt_cache_retention 上游(HTTP 与 WS 路径)均不接受，会返回
+	// 400 Unsupported parameter，因此在此一并剥离，executor / wsrelay 层也各自兜底删除。
 	for _, field := range []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
@@ -1556,6 +1558,17 @@ func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
 	body, _ = sjson.DeleteBytes(body, "store")
 	body, _ = sjson.DeleteBytes(body, "stream")
 	return body, expandedInputRaw
+}
+
+// PrepareOpenAIResponsesCompactBody 为中转（OpenAI Responses API）账号准备
+// /responses/compact 请求体。它复用 OpenAI Responses 预处理，并移除 compact
+// 端点不接受的自动注入字段（include/store/stream）。
+func PrepareOpenAIResponsesCompactBody(rawBody []byte) []byte {
+	body := PrepareOpenAIResponsesBody(rawBody)
+	body, _ = sjson.DeleteBytes(body, "include")
+	body, _ = sjson.DeleteBytes(body, "store")
+	body, _ = sjson.DeleteBytes(body, "stream")
+	return body
 }
 
 // normalizeReasoningEffort 将 reasoning_effort 钳位到上游支持的值
@@ -1815,46 +1828,70 @@ func sanitizeServiceTierForUpstream(body []byte) []byte {
 	}
 }
 
-// resolveServiceTier 从实际 tier 和请求 tier 中选择最终值。
-// 入库时把 "priority" 归一化为 "fast"：两者在 OpenAI Responses API 是同义词
-// （codex2api 把 fast → priority 后透传上游），codex2api 的 UI/筛选/徽章统一以
-// "fast" 为规范名。
-//
-// 两个真实场景都需要识别为 fast：
-//  1. 客户端发 fast（codex2api 自己的 UI/SDK），上游透传后回 priority/降级 default；
-//  2. codex CLI 0.129+ 等订阅客户端直接发 service_tier="priority"，上游降级时回 default。
-//
-// 因此只要客户端**意图**是 fast/priority，就锁定为 fast，不被上游降级值掩盖。
-func resolveServiceTier(actualTier, requestedTier string) string {
-	requestedTier = strings.TrimSpace(requestedTier)
-	if requestedTier == "fast" || requestedTier == "priority" {
-		return "fast"
-	}
-	actualTier = strings.TrimSpace(actualTier)
-	final := actualTier
-	if final == "" {
-		final = requestedTier
-	}
-	if final == "priority" {
-		return "fast"
-	}
-	return final
+type usageServiceTiers struct {
+	ServiceTier          string
+	RequestedServiceTier string
+	ActualServiceTier    string
+	BillingServiceTier   string
 }
 
-// resolveBillingServiceTier 按"请求意图"决定计费 tier：
-// 只要客户端显式请求 fast/priority，就锁定为 priority 计费（×2），
-// 不被上游降级值（如 default）掩盖——保证 fast 用户不会因为上游通道波动而漏费。
-// 客户端没指定 tier 时，才回退到上游实际报告的 tier。
-func resolveBillingServiceTier(actualTier, requestedTier string) string {
-	requestedTier = strings.ToLower(strings.TrimSpace(requestedTier))
-	if requestedTier == "priority" || requestedTier == "fast" {
+func normalizeServiceTierValue(tier string) string {
+	return strings.ToLower(strings.TrimSpace(tier))
+}
+
+func normalizeDisplayServiceTier(tier string) string {
+	tier = normalizeServiceTierValue(tier)
+	if tier == "priority" {
+		return "fast"
+	}
+	return tier
+}
+
+func normalizeBillingServiceTier(tier string) string {
+	tier = normalizeServiceTierValue(tier)
+	if tier == "priority" || tier == "fast" {
 		return "priority"
+	}
+	return tier
+}
+
+// resolveServiceTier is the legacy service_tier field for usage logs.
+// It now prefers the upstream actual tier so response.service_tier="default"
+// is not masked by a requested fast/priority intent.
+func resolveServiceTier(actualTier, requestedTier string) string {
+	if actual := normalizeDisplayServiceTier(actualTier); actual != "" {
+		return actual
+	}
+	return normalizeDisplayServiceTier(requestedTier)
+}
+
+func resolveUsageServiceTiers(actualTier, requestedTier string) usageServiceTiers {
+	return usageServiceTiers{
+		ServiceTier:          resolveServiceTier(actualTier, requestedTier),
+		RequestedServiceTier: normalizeServiceTierValue(requestedTier),
+		ActualServiceTier:    normalizeServiceTierValue(actualTier),
+		BillingServiceTier:   resolveBillingServiceTier(actualTier, requestedTier),
+	}
+}
+
+// resolveBillingServiceTier selects the tier used for money. The default policy
+// follows upstream actual service_tier; requested policy preserves the old
+// "client asked for fast/priority, bill priority" behavior.
+func resolveBillingServiceTier(actualTier, requestedTier string) string {
+	return resolveBillingServiceTierForPolicy(actualTier, requestedTier, CurrentRuntimeSettings().BillingTierPolicy)
+}
+
+func resolveBillingServiceTierForPolicy(actualTier, requestedTier, policy string) string {
+	actualTier = normalizeBillingServiceTier(actualTier)
+	requestedTier = normalizeBillingServiceTier(requestedTier)
+
+	if NormalizeBillingTierPolicy(policy) == BillingTierPolicyRequested {
+		if requestedTier != "" {
+			return requestedTier
+		}
+		return actualTier
 	}
 
-	actualTier = strings.ToLower(strings.TrimSpace(actualTier))
-	if actualTier == "priority" || actualTier == "fast" {
-		return "priority"
-	}
 	if actualTier != "" {
 		return actualTier
 	}

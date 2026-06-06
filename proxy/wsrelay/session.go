@@ -14,8 +14,10 @@ const (
 	// 心跳间隔：每 30 秒发送 Ping
 	HeartbeatPingInterval = 30 * time.Second
 
-	// 读超时：60 秒无响应则断开
-	ReadTimeout = 60 * time.Second
+	// 读超时：120 秒无响应则断开。
+	// 心跳 30s 仍提供 4 个窗口容错；放宽到 120s 避免长推理 / priority 排队的
+	// 活跃 turn（上游一段时间不下发增量帧）被误判为连接断开。
+	ReadTimeout = 120 * time.Second
 
 	// 写超时：30 秒
 	WriteTimeout = 30 * time.Second
@@ -28,6 +30,11 @@ const (
 
 	// Pending 请求超时：2 分钟
 	PendingRequestTimeout = 2 * time.Minute
+
+	// 复用同一 session 的连接时，等待其空闲的轮询退避参数。
+	AcquireInitialBackoff = 10 * time.Millisecond  // 初始退避
+	AcquireMaxBackoff     = 200 * time.Millisecond // 退避封顶
+	AcquireMaxWait        = 30 * time.Second        // 最大累计等待，超时返回错误
 )
 
 // ==================== Pending 请求管理 ====================

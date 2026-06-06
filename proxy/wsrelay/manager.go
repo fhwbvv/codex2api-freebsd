@@ -182,7 +182,13 @@ type Manager struct {
 
 	// 可选的探活函数（用于测试替换），nil 时使用默认 probeConnection
 	probeFunc func(wc *WsConnection) bool
+
+	// 可选的保活 Ping 函数（用于测试替换），nil 时使用默认 SendHeartbeat
+	keepalivePingFunc func(wc *WsConnection) error
 }
+
+// wsWriteBufferPool 在所有上游 WS 连接间共享写缓冲，降低高并发下的内存占用。
+var wsWriteBufferPool = &sync.Pool{}
 
 // NewManager 创建连接池管理器
 func NewManager() *Manager {
@@ -190,6 +196,11 @@ func NewManager() *Manager {
 		dialer: &websocket.Dialer{
 			HandshakeTimeout:  HandshakeTimeout,
 			EnableCompression: true,
+			// 上游 Codex WS 帧可达 48-91KB，默认 4KB 缓冲会导致单帧多轮 syscall；
+			// 调大到 64KB 减少读写循环次数，写缓冲走共享池复用。
+			ReadBufferSize:  64 * 1024,
+			WriteBufferSize: 64 * 1024,
+			WriteBufferPool: wsWriteBufferPool,
 			NetDialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
@@ -313,7 +324,8 @@ func (m *Manager) AcquireConnection(
 ) (*WsConnection, *PendingRequest, error) {
 	key := m.poolKey(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, proxyOverride))
 	lock := m.keyLock(key)
-	wait := 10 * time.Millisecond
+	wait := AcquireInitialBackoff
+	var waited time.Duration
 
 	for {
 		lock.Lock()
@@ -336,10 +348,22 @@ func (m *Manager) AcquireConnection(
 			}
 			if wc.IsConnected() && !wc.IsExpired() && wc.session != nil {
 				lock.Unlock()
+				// 连接被同 session 的前一个请求占用：指数退避轮询等待其空闲，
+				// 累计等待超过上限则返回错误，避免无界阻塞与固定间隔空转抢锁。
+				if waited >= AcquireMaxWait {
+					return nil, nil, fmt.Errorf("acquire websocket connection timed out after %s waiting for busy session", AcquireMaxWait)
+				}
 				select {
 				case <-ctx.Done():
 					return nil, nil, ctx.Err()
 				case <-time.After(wait):
+				}
+				waited += wait
+				if wait < AcquireMaxBackoff {
+					wait *= 2
+					if wait > AcquireMaxBackoff {
+						wait = AcquireMaxBackoff
+					}
 				}
 				continue
 			}
@@ -413,11 +437,10 @@ func (m *Manager) createConnection(
 	headers http.Header,
 	proxyOverride string,
 ) (*WsConnection, error) {
-	// 创建拨号器副本（避免修改共享 dialer）
-	dialer := &websocket.Dialer{
-		HandshakeTimeout:  m.dialer.HandshakeTimeout,
-		EnableCompression: m.dialer.EnableCompression,
-	}
+	// 浅拷贝共享 dialer，继承全部调优字段（NetDialContext/KeepAlive、读写缓冲、压缩等），
+	// 仅按需覆盖 Proxy；避免逐字段重建时漏抄字段（曾导致 NetDialContext/KeepAlive 失效）。
+	dialerCopy := *m.dialer
+	dialer := &dialerCopy
 
 	// 配置代理（Resin 反代模式下跳过，URL 已包含 Resin 地址）
 	proxyURL := effectiveProxyURL(account, proxyOverride)

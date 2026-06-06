@@ -27,6 +27,7 @@ export interface AccountRow {
   id: number
   name: string
   email: string
+  email_domain?: string
   plan_type: string
   subscription_expires_at?: string
   status: AccountStatus
@@ -78,6 +79,10 @@ export interface AccountRow {
   rate_limit_attempts?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
+  auto_pause_5h_threshold?: number | null
+  auto_pause_7d_threshold?: number | null
+  auto_pause_5h_disabled?: boolean
+  auto_pause_7d_disabled?: boolean
   usage_5h_detail?: AccountUsageWindow
   usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
@@ -154,6 +159,10 @@ export interface UpdateAccountSchedulerRequest {
   proxy_url?: string | null
   tags?: string[] | null
   group_ids?: number[] | null
+  auto_pause_5h_threshold?: number | null
+  auto_pause_7d_threshold?: number | null
+  auto_pause_5h_disabled?: boolean
+  auto_pause_7d_disabled?: boolean
 }
 
 export interface AccountGroup {
@@ -364,9 +373,10 @@ export interface RuntimeStatusResponse {
     status: RuntimeHealthStatus
     lazy_mode: boolean
     background_refresh_interval_minutes: number
-    usage_probe_max_age_minutes: number
-    usage_probe_concurrency: number
-    recovery_probe_interval_minutes: number
+	    usage_probe_max_age_minutes: number
+	    usage_probe_concurrency: number
+	    usage_probe_responses_fallback_enabled: boolean
+	    recovery_probe_interval_minutes: number
     usage_probe_running: boolean
     recovery_probe_running: boolean
     auto_cleanup_running: boolean
@@ -511,9 +521,10 @@ export interface SystemSettings {
   test_model: string
   test_concurrency: number
   background_refresh_interval_minutes: number
-  usage_probe_max_age_minutes: number
-  usage_probe_concurrency: number
-  recovery_probe_interval_minutes: number
+	  usage_probe_max_age_minutes: number
+	  usage_probe_concurrency: number
+	  usage_probe_responses_fallback_enabled: boolean
+	  recovery_probe_interval_minutes: number
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number
@@ -528,6 +539,12 @@ export interface SystemSettings {
   auto_clean_expired: boolean
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
+  codex_force_websocket: boolean
+  codex_ws_keepalive_enabled: boolean
+  codex_ws_keepalive_interval_sec: number
+  codex_ws_hide_upstream_errors: boolean
+  codex_ws_silent_retry_enabled: boolean
+  codex_ws_silent_max_retries: number
   scheduler_mode: string
   affinity_mode?: string
   max_retries: number
@@ -539,6 +556,8 @@ export interface SystemSettings {
   cache_label: string
   expired_cleaned?: number
   model_mapping: string
+  codex_model_mapping: string
+  reasoning_effort_models: string
   resin_url: string
   resin_platform_name: string
   prompt_filter_enabled: boolean
@@ -558,6 +577,7 @@ export interface SystemSettings {
   stream_flush_policy: 'immediate' | 'coalesce' | string
   stream_flush_interval_ms: number
   first_token_timeout_seconds: number
+  billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
@@ -807,8 +827,13 @@ export interface UsageLog {
   inbound_endpoint: string
   upstream_endpoint: string
   stream: boolean
+  compact: boolean
+  via_websocket?: boolean
   cached_tokens: number
   service_tier: string
+  requested_service_tier: string
+  actual_service_tier: string
+  billing_service_tier: string
   api_key_id: number
   api_key_name: string
   api_key_masked: string

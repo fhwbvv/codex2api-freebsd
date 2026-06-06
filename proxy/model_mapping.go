@@ -1,0 +1,225 @@
+package proxy
+
+import (
+	"encoding/json"
+	"strings"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+)
+
+type modelMappingRule struct {
+	From       string
+	To         string
+	Index      int
+	Wildcard   bool
+	LiteralLen int
+	StarCount  int
+}
+
+func parseModelMappingRules(mappingJSON string) []modelMappingRule {
+	mappingJSON = strings.TrimSpace(mappingJSON)
+	if mappingJSON == "" || mappingJSON == "{}" {
+		return nil
+	}
+
+	dec := json.NewDecoder(strings.NewReader(mappingJSON))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
+		return nil
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return nil
+	}
+
+	rules := make([]modelMappingRule, 0)
+	index := 0
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil
+		}
+		var rawValue any
+		if err := dec.Decode(&rawValue); err != nil {
+			return nil
+		}
+		value, ok := rawValue.(string)
+		if !ok {
+			continue
+		}
+
+		from := strings.TrimSpace(key)
+		to := strings.TrimSpace(value)
+		if from == "" || to == "" {
+			continue
+		}
+		starCount := strings.Count(from, "*")
+		rules = append(rules, modelMappingRule{
+			From:       from,
+			To:         to,
+			Index:      index,
+			Wildcard:   starCount > 0,
+			LiteralLen: len(strings.ReplaceAll(from, "*", "")),
+			StarCount:  starCount,
+		})
+		index++
+	}
+	return rules
+}
+
+func resolveConfiguredModelMapping(model string, mappingJSON string, supportedModels []string) (string, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", false
+	}
+
+	rules := parseModelMappingRules(mappingJSON)
+	if len(rules) == 0 {
+		return model, false
+	}
+
+	for _, rule := range rules {
+		if !rule.Wildcard && strings.EqualFold(rule.From, model) {
+			return canonicalizeCodexModel(rule.To, supportedModels), true
+		}
+	}
+
+	var best *modelMappingRule
+	for i := range rules {
+		rule := &rules[i]
+		if !rule.Wildcard || !wildcardModelPatternMatch(rule.From, model) {
+			continue
+		}
+		if best == nil || isMoreSpecificModelMapping(rule, best) {
+			best = rule
+		}
+	}
+	if best != nil {
+		return canonicalizeCodexModel(best.To, supportedModels), true
+	}
+	return model, false
+}
+
+func isMoreSpecificModelMapping(candidate, current *modelMappingRule) bool {
+	if candidate.LiteralLen != current.LiteralLen {
+		return candidate.LiteralLen > current.LiteralLen
+	}
+	if candidate.StarCount != current.StarCount {
+		return candidate.StarCount < current.StarCount
+	}
+	return candidate.Index < current.Index
+}
+
+func wildcardModelPatternMatch(pattern string, model string) bool {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	model = strings.ToLower(strings.TrimSpace(model))
+	if pattern == "" {
+		return model == ""
+	}
+	if !strings.Contains(pattern, "*") {
+		return pattern == model
+	}
+
+	parts := strings.Split(pattern, "*")
+	position := 0
+	if first := parts[0]; first != "" {
+		if !strings.HasPrefix(model, first) {
+			return false
+		}
+		position = len(first)
+	}
+
+	for i := 1; i < len(parts); i++ {
+		part := parts[i]
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(model[position:], part)
+		if idx < 0 {
+			return false
+		}
+		position += idx + len(part)
+	}
+
+	if last := parts[len(parts)-1]; last != "" {
+		return strings.HasSuffix(model, last)
+	}
+	return true
+}
+
+func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedModels []string) ([]byte, string, string, bool) {
+	originalModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
+	effectiveModel := originalModel
+	if originalModel == "" || !gjson.ValidBytes(rawBody) || h == nil || h.store == nil {
+		return rawBody, originalModel, effectiveModel, false
+	}
+
+	updatedBody := rawBody
+	modelForMapping := originalModel
+	mappingApplied := false
+	if entry, ok := resolveReasoningEffortModelAlias(originalModel, h.store.GetReasoningEffortModels(), supportedModels); ok {
+		var err error
+		updatedBody, err = sjson.SetBytes(updatedBody, "model", entry.Model)
+		if err != nil {
+			return rawBody, originalModel, effectiveModel, false
+		}
+		updatedBody, err = sjson.SetBytes(updatedBody, "reasoning_effort", entry.Effort)
+		if err != nil {
+			return rawBody, originalModel, effectiveModel, false
+		}
+		updatedBody, err = sjson.SetBytes(updatedBody, "reasoning.effort", entry.Effort)
+		if err != nil {
+			return rawBody, originalModel, effectiveModel, false
+		}
+		modelForMapping = entry.Model
+		effectiveModel = entry.Model
+		mappingApplied = !strings.EqualFold(originalModel, entry.Model)
+	}
+
+	mappedModel, ok := resolveConfiguredModelMapping(modelForMapping, h.store.GetCodexModelMapping(), supportedModels)
+	if ok && mappedModel != "" && !strings.EqualFold(mappedModel, modelForMapping) {
+		var err error
+		updatedBody, err = sjson.SetBytes(updatedBody, "model", mappedModel)
+		if err != nil {
+			return rawBody, originalModel, effectiveModel, mappingApplied
+		}
+		effectiveModel = mappedModel
+		mappingApplied = true
+	}
+	return updatedBody, originalModel, effectiveModel, mappingApplied
+}
+
+func (h *Handler) resolveConfiguredRequestModel(model string, supportedModels []string) (string, bool) {
+	model = strings.TrimSpace(model)
+	if model == "" || h == nil || h.store == nil {
+		return model, false
+	}
+	resolved := false
+	if entry, ok := resolveReasoningEffortModelAlias(model, h.store.GetReasoningEffortModels(), supportedModels); ok {
+		model = entry.Model
+		resolved = true
+	}
+	mappedModel, ok := resolveConfiguredModelMapping(model, h.store.GetCodexModelMapping(), supportedModels)
+	if !ok || mappedModel == "" || mappedModel == model {
+		return model, resolved
+	}
+	return mappedModel, true
+}
+
+func usageEffectiveModelForMapping(originalModel string, effectiveModel string, mapped bool) string {
+	if !mapped {
+		return ""
+	}
+	originalModel = strings.TrimSpace(originalModel)
+	effectiveModel = strings.TrimSpace(effectiveModel)
+	if originalModel == "" || effectiveModel == "" || strings.EqualFold(originalModel, effectiveModel) {
+		return ""
+	}
+	return effectiveModel
+}

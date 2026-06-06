@@ -16,6 +16,9 @@ const (
 	StreamFlushPolicyImmediate = "immediate"
 	StreamFlushPolicyCoalesce  = "coalesce"
 
+	BillingTierPolicyActual    = "actual"
+	BillingTierPolicyRequested = "requested"
+
 	defaultClientCompatMode      = ClientCompatModePreserve
 	defaultCodexMinCLIVersion    = "0.118.0"
 	defaultStreamFlushPolicy     = StreamFlushPolicyImmediate
@@ -24,6 +27,11 @@ const (
 	maxStreamFlushIntervalMS     = 1000
 	defaultFirstTokenTimeoutSec  = 0
 	maxFirstTokenTimeoutSec      = 600
+	defaultBillingTierPolicy     = BillingTierPolicyActual
+	defaultCodexWSHideErrors     = true
+	defaultCodexWSSilentRetry    = true
+	defaultCodexWSSilentRetries  = 2
+	maxCodexWSSilentRetries      = 10
 )
 
 type RuntimeSettings struct {
@@ -32,6 +40,11 @@ type RuntimeSettings struct {
 	StreamFlushPolicy     string
 	StreamFlushIntervalMS int
 	FirstTokenTimeoutSec  int
+	BillingTierPolicy     string
+	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
+	CodexWSHideErrors     bool // 隐藏 Codex WS 上游原始错误（默认 true）
+	CodexWSSilentRetry    bool // 首包前 Codex WS 上游错误静默换号重试（默认 true）
+	CodexWSSilentRetries  int  // Codex WS 静默换号最大重试次数（默认 2）
 }
 
 var runtimeSettings atomic.Value // stores RuntimeSettings
@@ -47,6 +60,10 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		StreamFlushPolicy:     defaultStreamFlushPolicy,
 		StreamFlushIntervalMS: defaultStreamFlushIntervalMS,
 		FirstTokenTimeoutSec:  defaultFirstTokenTimeoutSec,
+		BillingTierPolicy:     defaultBillingTierPolicy,
+		CodexWSHideErrors:     defaultCodexWSHideErrors,
+		CodexWSSilentRetry:    defaultCodexWSSilentRetry,
+		CodexWSSilentRetries:  defaultCodexWSSilentRetries,
 	}
 }
 
@@ -74,10 +91,22 @@ func NormalizeStreamFlushPolicy(policy string) string {
 	}
 }
 
+func NormalizeBillingTierPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "", BillingTierPolicyActual:
+		return BillingTierPolicyActual
+	case BillingTierPolicyRequested:
+		return BillingTierPolicyRequested
+	default:
+		return BillingTierPolicyActual
+	}
+}
+
 func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	defaults := DefaultRuntimeSettings()
 	settings.ClientCompatMode = NormalizeClientCompatMode(settings.ClientCompatMode)
 	settings.StreamFlushPolicy = NormalizeStreamFlushPolicy(settings.StreamFlushPolicy)
+	settings.BillingTierPolicy = NormalizeBillingTierPolicy(settings.BillingTierPolicy)
 	if strings.TrimSpace(settings.CodexMinCLIVersion) == "" {
 		settings.CodexMinCLIVersion = defaults.CodexMinCLIVersion
 	} else {
@@ -95,6 +124,12 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.FirstTokenTimeoutSec > maxFirstTokenTimeoutSec {
 		settings.FirstTokenTimeoutSec = maxFirstTokenTimeoutSec
 	}
+	if settings.CodexWSSilentRetries < 0 {
+		settings.CodexWSSilentRetries = 0
+	}
+	if settings.CodexWSSilentRetries > maxCodexWSSilentRetries {
+		settings.CodexWSSilentRetries = maxCodexWSSilentRetries
+	}
 	return settings
 }
 
@@ -106,6 +141,11 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.StreamFlushPolicy = settings.StreamFlushPolicy
 		next.StreamFlushIntervalMS = settings.StreamFlushIntervalMS
 		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
+		next.BillingTierPolicy = settings.BillingTierPolicy
+		next.CodexForceWebsocket = settings.CodexForceWebsocket
+		next.CodexWSHideErrors = settings.CodexWSHideUpstreamErrors
+		next.CodexWSSilentRetry = settings.CodexWSSilentRetryEnabled
+		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)

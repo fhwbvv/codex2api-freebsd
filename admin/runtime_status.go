@@ -61,7 +61,7 @@ func (h *Handler) buildRuntimeStatus(ctx context.Context, r *http.Request) runti
 	if probes.Status != runtimeStatusOK {
 		addCheck("probes", probes.Status, statusCode(probes.Status, "probes"), statusMessage(probes.Status, "后台刷新和探针配置正常", "探针运行态不可用"))
 	} else if probes.LazyMode {
-		addCheck("probes", runtimeStatusOK, "lazy_mode_enabled", "惰性模式已开启，主动探针按配置暂停")
+		addCheck("probes", runtimeStatusOK, "lazy_mode_enabled", "惰性模式已开启，仅保留 wham 用量探针")
 	} else {
 		addCheck("probes", runtimeStatusOK, "probes_enabled", "后台刷新和探针配置正常")
 	}
@@ -252,6 +252,7 @@ func (h *Handler) runtimeProbesStatus() runtimeProbesResponse {
 	resp.BackgroundRefreshIntervalMinutes = h.store.GetBackgroundRefreshIntervalMinutes()
 	resp.UsageProbeMaxAgeMinutes = h.store.GetUsageProbeMaxAgeMinutes()
 	resp.UsageProbeConcurrency = h.store.GetUsageProbeConcurrency()
+	resp.UsageProbeResponsesFallbackEnabled = h.store.UsageProbeResponsesFallbackEnabled()
 	resp.RecoveryProbeIntervalMinutes = h.store.GetRecoveryProbeIntervalMinutes()
 	resp.UsageProbeRunning = h.store.UsageProbeRunning()
 	resp.RecoveryProbeRunning = h.store.RecoveryProbeRunning()

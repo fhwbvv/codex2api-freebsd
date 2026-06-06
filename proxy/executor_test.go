@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -117,6 +118,25 @@ func TestClassifyResponseFailedOutcomeInvalidRequest(t *testing.T) {
 	}
 	if outcome.penalize {
 		t.Fatal("client-side response.failed should not penalize account")
+	}
+}
+
+func TestClassifyResponseFailedOutcomeUsageLimit(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_in_seconds":3600}}}`)
+
+	outcome := classifyResponseFailedOutcome(payload)
+
+	if outcome.logStatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", outcome.logStatusCode, http.StatusTooManyRequests)
+	}
+	if outcome.failureKind != "usage_limit" {
+		t.Fatalf("failure kind = %q, want usage_limit", outcome.failureKind)
+	}
+	if !outcome.penalize {
+		t.Fatal("usage_limit response.failed should penalize account")
+	}
+	if !IsUsageLimitReachedError(payload) {
+		t.Fatal("nested response.failed usage_limit_reached should be detected")
 	}
 }
 
@@ -421,5 +441,69 @@ func TestResolveSessionIDPrefersContinuityHeaders(t *testing.T) {
 	headers.Set("Idempotency-Key", "idempotency-key-1")
 	if got := ResolveSessionID(headers, []byte(`{"prompt_cache_key":"body-key"}`)); got != "idempotency-key-1" {
 		t.Fatalf("ResolveSessionID() = %q, want %q", got, "idempotency-key-1")
+	}
+}
+
+func TestResolveExplicitSessionIDDoesNotUseAPIKeyFallback(t *testing.T) {
+	headers := http.Header{"Authorization": []string{"Bearer sk-test-123"}}
+
+	if got := ResolveExplicitSessionID(headers, []byte(`{}`)); got != "" {
+		t.Fatalf("ResolveExplicitSessionID() = %q, want empty", got)
+	}
+	if got := ResolveSessionID(headers, []byte(`{}`)); got == "" {
+		t.Fatal("ResolveSessionID() should still generate API-key fallback")
+	}
+}
+
+func TestExecuteRequestExplicitFalseBypassesForcedWebsocket(t *testing.T) {
+	previousSettings := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(previousSettings) })
+	nextSettings := previousSettings
+	nextSettings.CodexForceWebsocket = true
+	ApplyRuntimeSettings(nextSettings)
+
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+	wsCalled := false
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+		wsCalled = true
+		return nil, errors.New("websocket should not be used")
+	}
+
+	_, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1}, []byte(`{"model":"gpt-5.4"}`), "", "", "sk-local", nil, http.Header{}, false)
+	if err == nil {
+		t.Fatal("ExecuteRequest() error = nil, want missing account error after bypassing websocket")
+	}
+	if wsCalled {
+		t.Fatal("WebsocketExecuteFunc was called despite explicit useWebsocket=false")
+	}
+}
+
+func TestExecuteRequestForcedWebsocketUsesStatelessSessionWhenMissing(t *testing.T) {
+	previousSettings := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(previousSettings) })
+	nextSettings := previousSettings
+	nextSettings.CodexForceWebsocket = true
+	ApplyRuntimeSettings(nextSettings)
+
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+	var gotSessionID string
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+		gotSessionID = sessionID
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_test"}`)),
+		}, nil
+	}
+
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, []byte(`{"model":"gpt-5.4"}`), "", "", "sk-local", nil, http.Header{})
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	defer resp.Body.Close()
+	if !strings.HasPrefix(gotSessionID, "stateless-") {
+		t.Fatalf("sessionID = %q, want stateless-*", gotSessionID)
 	}
 }

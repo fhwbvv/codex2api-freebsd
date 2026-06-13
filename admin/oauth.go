@@ -278,6 +278,13 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 	newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 	h.store.AddAccount(newAcc)
 
+	if newAcc.GetAccessToken() != "" {
+		h.triggerImportedAccountUsageProbe(id, "oauth")
+	} else if !h.store.GetLazyMode() {
+		// 异步刷新 AT，刷新成功后立即做 wham 用量采样。
+		go h.refreshImportedAccountAndProbe(id, "oauth_refresh")
+	}
+
 	email := ""
 	planType := ""
 	if accountInfo != nil {
@@ -462,6 +469,13 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 
 	newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 	h.store.AddAccount(newAcc)
+
+	if newAcc.GetAccessToken() != "" {
+		h.triggerImportedAccountUsageProbe(id, "oauth_callback")
+	} else if !h.store.GetLazyMode() {
+		// 异步刷新 AT，刷新成功后立即做 wham 用量采样。
+		go h.refreshImportedAccountAndProbe(id, "oauth_callback_refresh")
+	}
 
 	email := ""
 	planType := ""

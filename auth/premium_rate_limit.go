@@ -109,7 +109,7 @@ func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
 
 	updatedAt := time.Now()
 	acc.mu.Lock()
-	acc.UsageUpdatedAt = updatedAt
+	acc.UsageUpdatedAt5h = updatedAt
 	acc.mu.Unlock()
 
 	s.fastSchedulerUpdate(acc)
@@ -140,7 +140,7 @@ func (s *Store) MarkPremium5hRateLimited(acc *Account, resetAt time.Time) {
 	acc.UsagePercent5h = 100
 	acc.UsagePercent5hValid = true
 	acc.Reset5hAt = resetAt
-	acc.UsageUpdatedAt = now
+	acc.UsageUpdatedAt5h = now
 	acc.LastRateLimitedAt = now
 	acc.Status = StatusCooldown
 	acc.CooldownUtil = resetAt

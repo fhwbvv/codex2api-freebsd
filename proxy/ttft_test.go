@@ -1,6 +1,10 @@
 package proxy
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tidwall/gjson"
+)
 
 func TestIsFirstTokenEvent(t *testing.T) {
 	cases := []struct {
@@ -41,6 +45,33 @@ func TestIsFirstTokenEvent(t *testing.T) {
 	}
 }
 
+func TestIsPreContentLifecycleEvent(t *testing.T) {
+	cases := []struct {
+		eventType string
+		want      bool
+	}{
+		// 仅 created / in_progress 属于可短暂缓冲的前置生命周期帧
+		{"response.created", true},
+		{"response.in_progress", true},
+		{" response.created ", true},
+		// 结构帧标志响应已开始，必须立即下发
+		{"response.output_item.added", false},
+		{"response.content_part.added", false},
+		// reasoning / 内容增量必须立即下发
+		{"response.reasoning_summary_text.delta", false},
+		{"response.output_text.delta", false},
+		// 终止帧不属于前置生命周期
+		{"response.completed", false},
+		{"response.failed", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isPreContentLifecycleEvent(tc.eventType); got != tc.want {
+			t.Fatalf("isPreContentLifecycleEvent(%q) = %v, want %v", tc.eventType, got, tc.want)
+		}
+	}
+}
+
 func TestIsFirstTokenPayload(t *testing.T) {
 	cases := []struct {
 		name string
@@ -64,6 +95,84 @@ func TestIsFirstTokenPayload(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := isFirstTokenPayload(tc.data); got != tc.want {
 				t.Fatalf("isFirstTokenPayload(%s) = %v, want %v", tc.data, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIsFirstTokenResultForMode(t *testing.T) {
+	cases := []struct {
+		name       string
+		data       string
+		mode       string
+		wantStrict bool
+		wantMode   bool
+	}{
+		{
+			name:       "output_item_added",
+			data:       `{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+			mode:       FirstTokenModeLoose,
+			wantStrict: false,
+			wantMode:   true,
+		},
+		{
+			name:       "content_part_added",
+			data:       `{"type":"response.content_part.added","part":{"type":"output_text","text":""}}`,
+			mode:       FirstTokenModeLoose,
+			wantStrict: false,
+			wantMode:   true,
+		},
+		{
+			name:       "created",
+			data:       `{"type":"response.created"}`,
+			mode:       FirstTokenModeLoose,
+			wantStrict: false,
+			wantMode:   false,
+		},
+		{
+			name:       "in_progress",
+			data:       `{"type":"response.in_progress"}`,
+			mode:       FirstTokenModeLoose,
+			wantStrict: false,
+			wantMode:   false,
+		},
+		{
+			name:       "completed",
+			data:       `{"type":"response.completed"}`,
+			mode:       FirstTokenModeLoose,
+			wantStrict: false,
+			wantMode:   false,
+		},
+		{
+			name:       "failed",
+			data:       `{"type":"response.failed"}`,
+			mode:       FirstTokenModeLoose,
+			wantStrict: false,
+			wantMode:   false,
+		},
+		{
+			name:       "text_delta",
+			data:       `{"type":"response.output_text.delta","delta":"hello"}`,
+			mode:       FirstTokenModeLoose,
+			wantStrict: true,
+			wantMode:   true,
+		},
+		{
+			name:       "invalid_mode_uses_strict",
+			data:       `{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+			mode:       "invalid",
+			wantStrict: false,
+			wantMode:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed := gjson.Parse(tc.data)
+			if got := isFirstTokenResultForMode(parsed, FirstTokenModeStrict); got != tc.wantStrict {
+				t.Fatalf("strict mode got %v, want %v", got, tc.wantStrict)
+			}
+			if got := isFirstTokenResultForMode(parsed, tc.mode); got != tc.wantMode {
+				t.Fatalf("mode %q got %v, want %v", tc.mode, got, tc.wantMode)
 			}
 		})
 	}

@@ -17,6 +17,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -46,6 +47,7 @@ type Handler struct {
 	db                     *database.DB
 	rateLimiter            *proxy.RateLimiter
 	refreshAccount         func(context.Context, int64) error
+	probeUsage             func(context.Context, *auth.Account) error
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
 	cpuSampler             *cpuSampler
 	startedAt              time.Time
@@ -129,6 +131,63 @@ func validateImportFileSize(fh *multipart.FileHeader) error {
 	return nil
 }
 
+func (h *Handler) usageProbeFunc() func(context.Context, *auth.Account) error {
+	if h != nil && h.probeUsage != nil {
+		return h.probeUsage
+	}
+	if h != nil {
+		return h.ProbeUsageSnapshot
+	}
+	return nil
+}
+
+func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64, source string) {
+	if h == nil || h.store == nil {
+		return
+	}
+	account := h.store.FindByID(accountID)
+	if account == nil {
+		return
+	}
+	if account.GetAccessToken() == "" {
+		return
+	}
+	probeFn := h.usageProbeFunc()
+	if probeFn == nil {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	if err := probeFn(probeCtx, account); err != nil {
+		log.Printf("导入账号 %d 用量采样失败 (%s): %v", accountID, source, err)
+	}
+}
+
+func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
+	go h.probeImportedAccountUsage(context.Background(), accountID, source)
+}
+
+func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source string) {
+	if h == nil || h.store == nil || account == nil {
+		return
+	}
+	if h.store.MarkUsage7dRateLimited(account) {
+		log.Printf("导入账号 %d 已按 7d 用量耗尽标记限流 (%s)", account.DBID, source)
+	}
+}
+
+func (h *Handler) refreshImportedAccountAndProbe(accountID int64, source string) {
+	refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := h.refreshAccountByID(refreshCtx, accountID)
+	cancel()
+	if err != nil {
+		log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+		return
+	}
+	log.Printf("导入账号 %d 刷新成功", accountID)
+	h.probeImportedAccountUsage(context.Background(), accountID, source)
+}
+
 func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
 	if h == nil || h.cache == nil {
 		return
@@ -187,6 +246,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		handler.imageProxy.SetRuntimeCache(tc)
 	}
 	handler.refreshAccount = handler.refreshSingleAccount
+	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
 	handler.resetRadarHookRunner = handler.runResetRadarSignalHook
 	if db != nil {
@@ -229,6 +289,11 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/sub2api/import", h.ImportFromSub2API)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
+	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
+	api.DELETE("/accounts/recycle-bin", h.EmptyRecycleBin)
+	api.POST("/accounts/recycle-bin/batch-test", h.RecycleBinBatchTest)
+	api.POST("/accounts/:id/restore", h.RestoreAccount)
+	api.DELETE("/accounts/:id/purge", h.PurgeAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.POST("/accounts/:id/enable", h.ToggleAccountEnabled)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
@@ -392,24 +457,7 @@ func (h *Handler) GetStats(c *gin.Context) {
 		return
 	}
 
-	total := len(accounts)
-	available := h.store.AvailableCount()
-	rateLimitedCount := 0
-	for _, acc := range h.store.Accounts() {
-		if acc == nil {
-			continue
-		}
-		switch acc.RuntimeStatus() {
-		case "rate_limited", "usage_exhausted":
-			rateLimitedCount++
-		}
-	}
-	errCount := 0
-	for _, acc := range accounts {
-		if acc.Status == "error" {
-			errCount++
-		}
-	}
+	accountCounts := summarizeDashboardAccounts(accounts, h.store.Accounts())
 
 	usageStats, _ := h.getUsageStatsCached(ctx, time.Time{}, time.Time{})
 	todayReqs := int64(0)
@@ -418,12 +466,73 @@ func (h *Handler) GetStats(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, statsResponse{
-		Total:         total,
-		Available:     available,
-		RateLimited:   rateLimitedCount,
-		Error:         errCount,
+		Total:         accountCounts.total,
+		Available:     accountCounts.normal,
+		RateLimited:   accountCounts.rateLimited,
+		Error:         accountCounts.abnormal,
 		TodayRequests: todayReqs,
 	})
+}
+
+type dashboardAccountCounts struct {
+	total       int
+	normal      int
+	rateLimited int
+	abnormal    int
+	disabled    int
+}
+
+func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*auth.Account) dashboardAccountCounts {
+	runtimeByID := make(map[int64]*auth.Account, len(runtimeAccounts))
+	for _, acc := range runtimeAccounts {
+		if acc != nil {
+			runtimeByID[acc.DBID] = acc
+		}
+	}
+
+	var counts dashboardAccountCounts
+	counts.total = len(rows)
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(row.Status))
+		cooldownReason := strings.ToLower(strings.TrimSpace(row.CooldownReason))
+		if acc, ok := runtimeByID[row.ID]; ok {
+			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
+			cooldownReason = ""
+		}
+
+		if !row.Enabled {
+			counts.disabled++
+		}
+		if isDashboardAbnormalAccount(status) {
+			counts.abnormal++
+			continue
+		}
+		if isDashboardRateLimitedAccount(status, cooldownReason) {
+			counts.rateLimited++
+			continue
+		}
+		counts.normal++
+	}
+	return counts
+}
+
+func isDashboardAbnormalAccount(status string) bool {
+	return status == "unauthorized" || status == "error"
+}
+
+func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
+	switch status {
+	case "rate_limited", "usage_exhausted", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+		return true
+	}
+	switch cooldownReason {
+	case "rate_limited", "rate_limited_5h", "rate_limited_7d":
+		return true
+	}
+	return false
 }
 
 // ==================== Accounts ====================
@@ -457,6 +566,7 @@ type accountResponse struct {
 	CreatedAt                string                     `json:"created_at"`
 	UpdatedAt                string                     `json:"updated_at"`
 	CodexUsageUpdatedAt      string                     `json:"codex_usage_updated_at,omitempty"`
+	Codex5HUsageUpdatedAt    string                     `json:"codex_5h_usage_updated_at,omitempty"`
 	ActiveRequests           int64                      `json:"active_requests"`
 	TotalRequests            int64                      `json:"total_requests"`
 	LastUsedAt               string                     `json:"last_used_at"`
@@ -606,6 +716,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			CreatedAt:                row.CreatedAt.Format(time.RFC3339),
 			UpdatedAt:                row.UpdatedAt.Format(time.RFC3339),
 			CodexUsageUpdatedAt:      row.GetCredential("codex_usage_updated_at"),
+			Codex5HUsageUpdatedAt:    row.GetCredential("codex_5h_usage_updated_at"),
 		}
 		resp.AutoPause5hThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_5h_threshold")
 		resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
@@ -1413,6 +1524,11 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		return
 	}
 
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamAddAccounts(c, req, seeds)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
@@ -1441,17 +1557,11 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
-		if !h.store.GetLazyMode() {
-			// 异步刷新 AT
-			go func(accountID int64) {
-				refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-					log.Printf("新账号 %d 刷新失败: %v", accountID, err)
-				} else {
-					log.Printf("新账号 %d 刷新成功，已加入号池", accountID)
-				}
-			}(id)
+		if newAcc.GetAccessToken() != "" {
+			h.triggerImportedAccountUsageProbe(id, "manual_add")
+		} else if !h.store.GetLazyMode() {
+			// 异步刷新 AT，刷新成功后立即做 wham 用量采样。
+			go h.refreshImportedAccountAndProbe(id, "manual_add_refresh")
 		}
 	}
 
@@ -1467,6 +1577,64 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		"message": msg,
 		"success": successCount,
 		"failed":  failCount,
+	})
+}
+
+func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []tokenCredentialSeed) {
+	setupSSE(c)
+
+	total := len(seeds)
+	successCount := 0
+	failCount := 0
+	sendImportEvent(c, importEvent{
+		Type: "progress", Current: 0, Total: total,
+		Success: 0, Duplicate: 0, Failed: 0,
+	})
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	for i, seed := range seeds {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("account-%d", i+1)
+		} else if len(seeds) > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
+		if err != nil {
+			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
+			failCount++
+			sendImportEvent(c, importEvent{
+				Type: "progress", Current: i + 1, Total: total,
+				Success: successCount, Duplicate: 0, Failed: failCount,
+			})
+			continue
+		}
+
+		successCount++
+		h.db.InsertAccountEventAsync(id, "added", "manual")
+
+		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		h.store.AddAccount(newAcc)
+
+		if newAcc.GetAccessToken() != "" {
+			h.triggerImportedAccountUsageProbe(id, "manual_add")
+		} else if !h.store.GetLazyMode() {
+			go h.refreshImportedAccountAndProbe(id, "manual_add_refresh")
+		}
+
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: i + 1, Total: total,
+			Success: successCount, Duplicate: 0, Failed: failCount,
+		})
+	}
+
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: successCount, Duplicate: 0, Failed: failCount,
 	})
 }
 
@@ -1933,42 +2101,44 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 
 // importToken 导入时的统一 token 载体
 type importToken struct {
-	refreshToken        string
-	sessionToken        string
-	accessToken         string // AT-only 兼容路径
-	name                string
-	email               string
-	idToken             string
-	accountID           string
-	chatgptAccountID    string // sub2api 等导出格式中的 ChatGPT 账号唯一标识，用于精确去重
-	planType            string
-	expiresAt           string
-	codex7DUsedPercent  string
-	codex7DResetAt      string
-	codex5HUsedPercent  string
-	codex5HResetAt      string
-	codexUsageUpdatedAt string
+	refreshToken          string
+	sessionToken          string
+	accessToken           string // AT-only 兼容路径
+	name                  string
+	email                 string
+	idToken               string
+	accountID             string
+	chatgptAccountID      string // sub2api 等导出格式中的 ChatGPT 账号唯一标识，用于精确去重
+	planType              string
+	expiresAt             string
+	codex7DUsedPercent    string
+	codex7DResetAt        string
+	codex5HUsedPercent    string
+	codex5HResetAt        string
+	codex5HUsageUpdatedAt string
+	codexUsageUpdatedAt   string
 }
 
 // jsonAccountEntry CLIProxyAPI 凭证 JSON 条目
 type jsonAccountEntry struct {
-	RefreshToken        string                 `json:"refresh_token"`
-	SessionToken        string                 `json:"session_token"`
-	SessionTokenCamel   string                 `json:"sessionToken"`
-	AccessToken         string                 `json:"access_token"`
-	IDToken             string                 `json:"id_token"`
-	AccountID           string                 `json:"account_id"`
-	ChatGPTAccountID    string                 `json:"chatgpt_account_id"`
-	Email               string                 `json:"email"`
-	Name                string                 `json:"name"`
-	PlanType            string                 `json:"plan_type"`
-	Codex7DUsedPercent  importJSONScalarString `json:"codex_7d_used_percent"`
-	Codex7DResetAt      string                 `json:"codex_7d_reset_at"`
-	Codex5HUsedPercent  importJSONScalarString `json:"codex_5h_used_percent"`
-	Codex5HResetAt      string                 `json:"codex_5h_reset_at"`
-	CodexUsageUpdatedAt string                 `json:"codex_usage_updated_at"`
-	Expired             importJSONScalarString `json:"expired"`
-	ExpiresAt           importJSONScalarString `json:"expires_at"`
+	RefreshToken          string                 `json:"refresh_token"`
+	SessionToken          string                 `json:"session_token"`
+	SessionTokenCamel     string                 `json:"sessionToken"`
+	AccessToken           string                 `json:"access_token"`
+	IDToken               string                 `json:"id_token"`
+	AccountID             string                 `json:"account_id"`
+	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
+	Email                 string                 `json:"email"`
+	Name                  string                 `json:"name"`
+	PlanType              string                 `json:"plan_type"`
+	Codex7DUsedPercent    importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt        string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent    importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
+	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
+	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
+	Expired               importJSONScalarString `json:"expired"`
+	ExpiresAt             importJSONScalarString `json:"expires_at"`
 }
 
 type sub2apiImportPayload struct {
@@ -1981,22 +2151,23 @@ type sub2apiAccountEntry struct {
 }
 
 type sub2apiAccountCredentials struct {
-	RefreshToken        string                 `json:"refresh_token"`
-	SessionToken        string                 `json:"session_token"`
-	SessionTokenCamel   string                 `json:"sessionToken"`
-	AccessToken         string                 `json:"access_token"`
-	IDToken             string                 `json:"id_token"`
-	AccountID           string                 `json:"account_id"`
-	ChatGPTAccountID    string                 `json:"chatgpt_account_id"`
-	Email               string                 `json:"email"`
-	PlanType            string                 `json:"plan_type"`
-	Codex7DUsedPercent  importJSONScalarString `json:"codex_7d_used_percent"`
-	Codex7DResetAt      string                 `json:"codex_7d_reset_at"`
-	Codex5HUsedPercent  importJSONScalarString `json:"codex_5h_used_percent"`
-	Codex5HResetAt      string                 `json:"codex_5h_reset_at"`
-	CodexUsageUpdatedAt string                 `json:"codex_usage_updated_at"`
-	ExpiresAt           importJSONScalarString `json:"expires_at"`
-	Expired             importJSONScalarString `json:"expired"`
+	RefreshToken          string                 `json:"refresh_token"`
+	SessionToken          string                 `json:"session_token"`
+	SessionTokenCamel     string                 `json:"sessionToken"`
+	AccessToken           string                 `json:"access_token"`
+	IDToken               string                 `json:"id_token"`
+	AccountID             string                 `json:"account_id"`
+	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
+	Email                 string                 `json:"email"`
+	PlanType              string                 `json:"plan_type"`
+	Codex7DUsedPercent    importJSONScalarString `json:"codex_7d_used_percent"`
+	Codex7DResetAt        string                 `json:"codex_7d_reset_at"`
+	Codex5HUsedPercent    importJSONScalarString `json:"codex_5h_used_percent"`
+	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
+	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
+	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
+	ExpiresAt             importJSONScalarString `json:"expires_at"`
+	Expired               importJSONScalarString `json:"expired"`
 }
 
 type importJSONScalarString string
@@ -2077,21 +2248,22 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
-				refreshToken:        rt,
-				sessionToken:        st,
-				accessToken:         at,
-				name:                name,
-				email:               email,
-				idToken:             strings.TrimSpace(entry.IDToken),
-				accountID:           strings.TrimSpace(entry.AccountID),
-				chatgptAccountID:    strings.TrimSpace(entry.ChatGPTAccountID),
-				planType:            strings.TrimSpace(entry.PlanType),
-				expiresAt:           firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
-				codex7DUsedPercent:  strings.TrimSpace(entry.Codex7DUsedPercent.String()),
-				codex7DResetAt:      strings.TrimSpace(entry.Codex7DResetAt),
-				codex5HUsedPercent:  strings.TrimSpace(entry.Codex5HUsedPercent.String()),
-				codex5HResetAt:      strings.TrimSpace(entry.Codex5HResetAt),
-				codexUsageUpdatedAt: strings.TrimSpace(entry.CodexUsageUpdatedAt),
+				refreshToken:          rt,
+				sessionToken:          st,
+				accessToken:           at,
+				name:                  name,
+				email:                 email,
+				idToken:               strings.TrimSpace(entry.IDToken),
+				accountID:             strings.TrimSpace(entry.AccountID),
+				chatgptAccountID:      strings.TrimSpace(entry.ChatGPTAccountID),
+				planType:              strings.TrimSpace(entry.PlanType),
+				expiresAt:             firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
+				codex7DUsedPercent:    strings.TrimSpace(entry.Codex7DUsedPercent.String()),
+				codex7DResetAt:        strings.TrimSpace(entry.Codex7DResetAt),
+				codex5HUsedPercent:    strings.TrimSpace(entry.Codex5HUsedPercent.String()),
+				codex5HResetAt:        strings.TrimSpace(entry.Codex5HResetAt),
+				codex5HUsageUpdatedAt: strings.TrimSpace(entry.Codex5HUsageUpdatedAt),
+				codexUsageUpdatedAt:   strings.TrimSpace(entry.CodexUsageUpdatedAt),
 			})
 		}
 	}
@@ -2118,26 +2290,83 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
-				refreshToken:        rt,
-				sessionToken:        st,
-				accessToken:         at,
-				name:                name,
-				email:               email,
-				idToken:             strings.TrimSpace(account.Credentials.IDToken),
-				accountID:           strings.TrimSpace(account.Credentials.AccountID),
-				chatgptAccountID:    strings.TrimSpace(account.Credentials.ChatGPTAccountID),
-				planType:            strings.TrimSpace(account.Credentials.PlanType),
-				expiresAt:           firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
-				codex7DUsedPercent:  strings.TrimSpace(account.Credentials.Codex7DUsedPercent.String()),
-				codex7DResetAt:      strings.TrimSpace(account.Credentials.Codex7DResetAt),
-				codex5HUsedPercent:  strings.TrimSpace(account.Credentials.Codex5HUsedPercent.String()),
-				codex5HResetAt:      strings.TrimSpace(account.Credentials.Codex5HResetAt),
-				codexUsageUpdatedAt: strings.TrimSpace(account.Credentials.CodexUsageUpdatedAt),
+				refreshToken:          rt,
+				sessionToken:          st,
+				accessToken:           at,
+				name:                  name,
+				email:                 email,
+				idToken:               strings.TrimSpace(account.Credentials.IDToken),
+				accountID:             strings.TrimSpace(account.Credentials.AccountID),
+				chatgptAccountID:      strings.TrimSpace(account.Credentials.ChatGPTAccountID),
+				planType:              strings.TrimSpace(account.Credentials.PlanType),
+				expiresAt:             firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
+				codex7DUsedPercent:    strings.TrimSpace(account.Credentials.Codex7DUsedPercent.String()),
+				codex7DResetAt:        strings.TrimSpace(account.Credentials.Codex7DResetAt),
+				codex5HUsedPercent:    strings.TrimSpace(account.Credentials.Codex5HUsedPercent.String()),
+				codex5HResetAt:        strings.TrimSpace(account.Credentials.Codex5HResetAt),
+				codex5HUsageUpdatedAt: strings.TrimSpace(account.Credentials.Codex5HUsageUpdatedAt),
+				codexUsageUpdatedAt:   strings.TrimSpace(account.Credentials.CodexUsageUpdatedAt),
 			})
 		}
 	}
 
 	return tokens
+}
+
+func importTokenCredentialIdentity(t importToken) string {
+	switch {
+	case t.refreshToken != "":
+		return "rt:" + t.refreshToken
+	case t.sessionToken != "":
+		return "st:" + t.sessionToken
+	case t.accessToken != "":
+		return "at:" + t.accessToken
+	default:
+		return ""
+	}
+}
+
+func conflictingImportChatGPTIDs(tokens []importToken) map[string]bool {
+	identitiesByID := make(map[string]map[string]struct{})
+	for _, t := range tokens {
+		id := strings.TrimSpace(t.chatgptAccountID)
+		if id == "" {
+			continue
+		}
+		identity := importTokenCredentialIdentity(t)
+		if identity == "" {
+			continue
+		}
+		identities := identitiesByID[id]
+		if identities == nil {
+			identities = make(map[string]struct{}, 1)
+			identitiesByID[id] = identities
+		}
+		identities[identity] = struct{}{}
+	}
+
+	conflicts := make(map[string]bool)
+	for id, identities := range identitiesByID {
+		if len(identities) > 1 {
+			conflicts[id] = true
+		}
+	}
+	return conflicts
+}
+
+func reliableImportChatGPTID(t importToken, conflicts map[string]bool) string {
+	id := strings.TrimSpace(t.chatgptAccountID)
+	if id == "" || conflicts[id] {
+		return ""
+	}
+	return id
+}
+
+func importStoredAccountID(t importToken, conflicts map[string]bool) string {
+	if strings.TrimSpace(t.accountID) != "" {
+		return strings.TrimSpace(t.accountID)
+	}
+	return reliableImportChatGPTID(t, conflicts)
 }
 
 // ImportAccounts 批量导入账号（支持 TXT / JSON）
@@ -2377,22 +2606,25 @@ func sendSSEJSON(c *gin.Context, event any) {
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
 func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
 	// 文件内去重：
-	// 1) 当条目带有 chatgpt_account_id 时，以它作为唯一键 —— 这是 ChatGPT 端真正的账号标识，
-	//    可以避免因导出工具误把同一 RT 复制给多个不同账号而被错误合并。
+	// 1) 当 chatgpt_account_id 在本批次内与凭据一一对应时，以它作为唯一键。
+	//    如果同一个 chatgpt_account_id 对应多个不同 RT / ST / AT，说明导出工具把非账号唯一字段写进了这里，
+	//    此时把它视为不可靠并回退到 RT / ST / AT 去重。
 	// 2) 没有 chatgpt_account_id 时，退回到 RT / ST / AT 顺序去重（兼容旧导出格式）。
 	// 3) 同一份文件内若出现"同一个 RT 对应多个不同 chatgpt_account_id"，
 	//    会被全部保留为独立账号；数据库层面 refresh_token 没有 UNIQUE 约束，因此安全。
+	conflictingChatGPTIDs := conflictingImportChatGPTIDs(tokens)
 	seenChatGPTID := make(map[string]bool)
 	seenRT := make(map[string]bool)
 	seenST := make(map[string]bool)
 	seenAT := make(map[string]bool)
 	var unique []importToken
 	for _, t := range tokens {
-		if t.chatgptAccountID != "" {
-			if seenChatGPTID[t.chatgptAccountID] {
+		reliableChatGPTID := reliableImportChatGPTID(t, conflictingChatGPTIDs)
+		if reliableChatGPTID != "" {
+			if seenChatGPTID[reliableChatGPTID] {
 				continue
 			}
-			seenChatGPTID[t.chatgptAccountID] = true
+			seenChatGPTID[reliableChatGPTID] = true
 			if t.refreshToken != "" {
 				seenRT[t.refreshToken] = true
 			}
@@ -2467,7 +2699,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	// 当导入条目带 chatgpt_account_id 时，按它查数据库已有账号 —— 这是 ChatGPT 端真实的账号唯一标识。
 	hasChatGPTID := false
 	for _, t := range unique {
-		if t.chatgptAccountID != "" {
+		if reliableImportChatGPTID(t, conflictingChatGPTIDs) != "" {
 			hasChatGPTID = true
 			break
 		}
@@ -2484,9 +2716,10 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var newTokens []importToken
 	duplicateCount := 0
 	for _, t := range unique {
+		reliableChatGPTID := reliableImportChatGPTID(t, conflictingChatGPTIDs)
 		// 优先按 chatgpt_account_id 判定数据库内是否已存在该账号；
 		// 命中则跳过，避免同一账号被重复导入。
-		if t.chatgptAccountID != "" && existingChatGPTIDs[t.chatgptAccountID] {
+		if reliableChatGPTID != "" && existingChatGPTIDs[reliableChatGPTID] {
 			duplicateCount++
 			continue
 		}
@@ -2494,11 +2727,11 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		case t.refreshToken != "":
 			// 已经按 chatgpt_account_id 排除过重复账号；此处仅当条目没有 chatgpt_account_id 时才回退到 RT 去重，
 			// 否则当多个不同账号共享同一 RT（部分导出工具的常见格式）时会被错误判定为重复。
-			if t.chatgptAccountID == "" && existingRTs[t.refreshToken] {
+			if reliableChatGPTID == "" && existingRTs[t.refreshToken] {
 				duplicateCount++
-			} else if t.chatgptAccountID == "" && t.sessionToken != "" && existingSTs[t.sessionToken] {
+			} else if reliableChatGPTID == "" && t.sessionToken != "" && existingSTs[t.sessionToken] {
 				duplicateCount++
-			} else if t.chatgptAccountID == "" && t.accessToken != "" && existingATs[t.accessToken] {
+			} else if reliableChatGPTID == "" && t.accessToken != "" && existingATs[t.accessToken] {
 				duplicateCount++
 			} else {
 				newTokens = append(newTokens, t)
@@ -2596,18 +2829,19 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-					sessionToken:        tok.sessionToken,
-					accessToken:         tok.accessToken,
-					idToken:             tok.idToken,
-					accountID:           firstNonEmpty(tok.accountID, tok.chatgptAccountID),
-					email:               tok.email,
-					planType:            tok.planType,
-					expiresAtRaw:        tok.expiresAt,
-					codex7DUsedPercent:  tok.codex7DUsedPercent,
-					codex7DResetAt:      tok.codex7DResetAt,
-					codex5HUsedPercent:  tok.codex5HUsedPercent,
-					codex5HResetAt:      tok.codex5HResetAt,
-					codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
+					sessionToken:          tok.sessionToken,
+					accessToken:           tok.accessToken,
+					idToken:               tok.idToken,
+					accountID:             importStoredAccountID(tok, conflictingChatGPTIDs),
+					email:                 tok.email,
+					planType:              tok.planType,
+					expiresAtRaw:          tok.expiresAt,
+					codex7DUsedPercent:    tok.codex7DUsedPercent,
+					codex7DResetAt:        tok.codex7DResetAt,
+					codex5HUsedPercent:    tok.codex5HUsedPercent,
+					codex5HResetAt:        tok.codex5HResetAt,
+					codex5HUsageUpdatedAt: tok.codex5HUsageUpdatedAt,
+					codexUsageUpdatedAt:   tok.codexUsageUpdatedAt,
 				})
 				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 				if len(tokenCredentialMap(seed)) > 0 {
@@ -2616,6 +2850,10 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					credCancel()
 				}
 				h.store.AddAccount(newAcc)
+				h.applyImportedAccountUsageState(newAcc, "import_at")
+				if newAcc.GetAccessToken() != "" {
+					h.triggerImportedAccountUsageProbe(id, "import_at")
+				}
 			} else {
 				// RT 导入路径；如果导入文件里同时带 AT，则先沿用它，后台调度到期前再刷新。
 				if name == "" {
@@ -2629,18 +2867,19 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					id, err = h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
 				} else {
 					seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-						sessionToken:        tok.sessionToken,
-						accessToken:         tok.accessToken,
-						idToken:             tok.idToken,
-						accountID:           tok.accountID,
-						email:               tok.email,
-						planType:            tok.planType,
-						expiresAtRaw:        tok.expiresAt,
-						codex7DUsedPercent:  tok.codex7DUsedPercent,
-						codex7DResetAt:      tok.codex7DResetAt,
-						codex5HUsedPercent:  tok.codex5HUsedPercent,
-						codex5HResetAt:      tok.codex5HResetAt,
-						codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
+						sessionToken:          tok.sessionToken,
+						accessToken:           tok.accessToken,
+						idToken:               tok.idToken,
+						accountID:             importStoredAccountID(tok, conflictingChatGPTIDs),
+						email:                 tok.email,
+						planType:              tok.planType,
+						expiresAtRaw:          tok.expiresAt,
+						codex7DUsedPercent:    tok.codex7DUsedPercent,
+						codex7DResetAt:        tok.codex7DResetAt,
+						codex5HUsedPercent:    tok.codex5HUsedPercent,
+						codex5HResetAt:        tok.codex5HResetAt,
+						codex5HUsageUpdatedAt: tok.codex5HUsageUpdatedAt,
+						codexUsageUpdatedAt:   tok.codexUsageUpdatedAt,
 					})
 					id, err = h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
 				}
@@ -2658,19 +2897,20 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				h.db.InsertAccountEventAsync(id, "added", "import")
 
 				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-					refreshToken:        tok.refreshToken,
-					sessionToken:        tok.sessionToken,
-					accessToken:         tok.accessToken,
-					idToken:             tok.idToken,
-					accountID:           tok.accountID,
-					email:               tok.email,
-					planType:            tok.planType,
-					expiresAtRaw:        tok.expiresAt,
-					codex7DUsedPercent:  tok.codex7DUsedPercent,
-					codex7DResetAt:      tok.codex7DResetAt,
-					codex5HUsedPercent:  tok.codex5HUsedPercent,
-					codex5HResetAt:      tok.codex5HResetAt,
-					codexUsageUpdatedAt: tok.codexUsageUpdatedAt,
+					refreshToken:          tok.refreshToken,
+					sessionToken:          tok.sessionToken,
+					accessToken:           tok.accessToken,
+					idToken:               tok.idToken,
+					accountID:             importStoredAccountID(tok, conflictingChatGPTIDs),
+					email:                 tok.email,
+					planType:              tok.planType,
+					expiresAtRaw:          tok.expiresAt,
+					codex7DUsedPercent:    tok.codex7DUsedPercent,
+					codex7DResetAt:        tok.codex7DResetAt,
+					codex5HUsedPercent:    tok.codex5HUsedPercent,
+					codex5HResetAt:        tok.codex5HResetAt,
+					codex5HUsageUpdatedAt: tok.codex5HUsageUpdatedAt,
+					codexUsageUpdatedAt:   tok.codexUsageUpdatedAt,
 				})
 				if len(tokenCredentialMap(seed)) > 0 {
 					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -2681,18 +2921,13 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 				h.store.AddAccount(newAcc)
+				h.applyImportedAccountUsageState(newAcc, "import")
 
-				if tok.accessToken == "" && !h.store.GetLazyMode() {
-					// 后台异步刷新，不阻塞导入流程
-					go func(accountID int64) {
-						refreshCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-						defer cancel()
-						if err := h.store.RefreshSingle(refreshCtx, accountID); err != nil {
-							log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
-						} else {
-							log.Printf("导入账号 %d 刷新成功", accountID)
-						}
-					}(id)
+				if newAcc.GetAccessToken() != "" {
+					h.triggerImportedAccountUsageProbe(id, "import")
+				} else if !h.store.GetLazyMode() {
+					// 后台异步刷新，不阻塞导入流程；刷新成功后立即做 wham 用量采样。
+					go h.refreshImportedAccountAndProbe(id, "import_refresh")
 				}
 			}
 		}(i, t)
@@ -2738,11 +2973,20 @@ func (h *Handler) GetAccountUsage(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
 		return
 	}
+	days := 30
+	if raw := strings.TrimSpace(c.Query("days")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 || parsed > 3650 {
+			writeError(c, http.StatusBadRequest, "days 参数无效，需要 0-3650 的整数")
+			return
+		}
+		days = parsed
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
-	detail, err := h.db.GetAccountUsageStats(ctx, id)
+	detail, err := h.db.GetAccountUsageStats(ctx, id, days)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -2786,6 +3030,165 @@ func (h *Handler) deleteAccountByID(ctx context.Context, id int64) error {
 	h.store.RemoveAccount(id)
 	h.db.InsertAccountEventAsync(id, "deleted", "manual")
 	return nil
+}
+
+type recycleBinAccountResponse struct {
+	ID                 int64    `json:"id"`
+	Name               string   `json:"name"`
+	Email              string   `json:"email"`
+	PlanType           string   `json:"plan_type"`
+	ATOnly             bool     `json:"at_only"`
+	OpenAIResponsesAPI bool     `json:"openai_responses_api"`
+	BaseURL            string   `json:"base_url,omitempty"`
+	Models             []string `json:"models,omitempty"`
+	CreatedAt          string   `json:"created_at"`
+	DeletedAt          string   `json:"deleted_at,omitempty"`
+	LastTestStatus     string   `json:"last_test_status,omitempty"`
+	LastTestAt         string   `json:"last_test_at,omitempty"`
+}
+
+// ListRecycleBinAccounts 获取回收站账号列表
+// GET /api/admin/accounts/recycle-bin
+func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := h.db.ListDeleted(ctx)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	accounts := make([]recycleBinAccountResponse, 0, len(rows))
+	for _, row := range rows {
+		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamOpenAIResponses)
+		email := row.GetCredential("email")
+		baseURL := row.GetCredential("base_url")
+		if isOpenAIResponsesAccount && email == "" {
+			email = baseURL
+		}
+		planType := row.GetCredential("plan_type")
+		if isOpenAIResponsesAccount && planType == "" {
+			planType = "api"
+		}
+		resp := recycleBinAccountResponse{
+			ID:                 row.ID,
+			Name:               row.Name,
+			Email:              email,
+			PlanType:           planType,
+			ATOnly:             !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			OpenAIResponsesAPI: isOpenAIResponsesAccount,
+			BaseURL:            baseURL,
+			Models:             row.GetCredentialStringSlice("models"),
+			CreatedAt:          row.CreatedAt.Format(time.RFC3339),
+			LastTestStatus:     row.GetCredential("recycle_last_test_status"),
+			LastTestAt:         row.GetCredential("recycle_last_test_at"),
+		}
+		if row.DeletedAt.Valid {
+			resp.DeletedAt = row.DeletedAt.Time.Format(time.RFC3339)
+		} else if !row.UpdatedAt.IsZero() {
+			// 旧数据可能没有 deleted_at；软删除会刷新 updated_at，用它兜底。
+			resp.DeletedAt = row.UpdatedAt.Format(time.RFC3339)
+		}
+		accounts = append(accounts, resp)
+	}
+	c.JSON(http.StatusOK, gin.H{"accounts": accounts})
+}
+
+// RestoreAccount 将回收站中的账号恢复到账号池
+// POST /api/admin/accounts/:id/restore
+func (h *Handler) RestoreAccount(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.restoreAccountByID(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "回收站中不存在该账号")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "恢复失败: "+err.Error())
+		return
+	}
+	writeMessage(c, http.StatusOK, "账号已恢复")
+}
+
+// restoreAccountByID 将回收站账号恢复为 active 并重新加入运行时池。
+func (h *Handler) restoreAccountByID(ctx context.Context, id int64) error {
+	if err := h.db.RestoreAccount(ctx, id); err != nil {
+		return err
+	}
+	if err := h.store.LoadAccountByID(ctx, id); err != nil {
+		log.Printf("恢复账号 %d 后加载运行时失败: %v", id, err)
+	}
+	h.db.InsertAccountEventAsync(id, "restored", "recycle_bin")
+	return nil
+}
+
+// PurgeAccount 从回收站彻底删除账号（物理删除）
+// DELETE /api/admin/accounts/:id/purge
+func (h *Handler) PurgeAccount(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.db.PurgeAccount(ctx, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "回收站中不存在该账号")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "彻底删除失败: "+err.Error())
+		return
+	}
+	h.store.RemoveAccount(id)
+	security.SecurityAuditLog("ACCOUNT_PURGED", fmt.Sprintf("account_id=%d ip=%s", id, c.ClientIP()))
+	writeMessage(c, http.StatusOK, "账号已彻底删除")
+}
+
+// emptyRecycleBinConfirmToken 清空回收站的确认令牌；调用方必须在请求体中
+// 显式携带，防止误调用或脚本一键清空导致账号被不可逆地物理删除。
+const emptyRecycleBinConfirmToken = "EMPTY-RECYCLE-BIN"
+
+// EmptyRecycleBin 清空回收站
+// DELETE /api/admin/accounts/recycle-bin
+// 请求体必须携带 {"confirm":"EMPTY-RECYCLE-BIN"}，否则拒绝执行。
+func (h *Handler) EmptyRecycleBin(c *gin.Context) {
+	var req struct {
+		Confirm string `json:"confirm"`
+	}
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			writeError(c, http.StatusBadRequest, "请求格式错误")
+			return
+		}
+	}
+	if strings.TrimSpace(req.Confirm) != emptyRecycleBinConfirmToken {
+		writeError(c, http.StatusBadRequest, `清空回收站需要确认：请求体需携带 confirm="EMPTY-RECYCLE-BIN"`)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	purged, err := h.db.PurgeDeletedAccounts(ctx)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "清空回收站失败: "+err.Error())
+		return
+	}
+	security.SecurityAuditLog("RECYCLE_BIN_EMPTIED", fmt.Sprintf("purged=%d ip=%s", purged, c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{"message": "回收站已清空", "purged": purged})
 }
 
 // BatchDeleteAccounts 批量删除账号；stream=true 时以 SSE 返回实时进度。
@@ -3469,7 +3872,7 @@ func parseOpsErrorLogFilter(c *gin.Context, withPaging bool) (database.UsageLogF
 			}
 		}
 		if ps := c.Query("page_size"); ps != "" {
-			if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 200 {
+			if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 500 {
 				filter.PageSize = n
 			}
 		}
@@ -3812,7 +4215,7 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 			page, _ := strconv.Atoi(pageStr)
 			pageSize := 20
 			if ps := c.Query("page_size"); ps != "" {
-				if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 200 {
+				if n, err := strconv.Atoi(ps); err == nil && n > 0 && n <= 500 {
 					pageSize = n
 				}
 			}
@@ -3825,16 +4228,26 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 				}
 				apiKeyID = &parsed
 			}
+			var accountID *int64
+			if accountIDStr := c.Query("account_id"); accountIDStr != "" {
+				parsed, err := strconv.ParseInt(accountIDStr, 10, 64)
+				if err != nil || parsed <= 0 {
+					writeError(c, http.StatusBadRequest, "account_id 参数无效，需要正整数")
+					return
+				}
+				accountID = &parsed
+			}
 
 			filter := database.UsageLogFilter{
-				Start:    startTime,
-				End:      endTime,
-				Page:     page,
-				PageSize: pageSize,
-				Email:    c.Query("email"),
-				Model:    c.Query("model"),
-				Endpoint: c.Query("endpoint"),
-				APIKeyID: apiKeyID,
+				Start:     startTime,
+				End:       endTime,
+				Page:      page,
+				PageSize:  pageSize,
+				Email:     c.Query("email"),
+				Model:     c.Query("model"),
+				Endpoint:  c.Query("endpoint"),
+				APIKeyID:  apiKeyID,
+				AccountID: accountID,
 			}
 			if fastStr := c.Query("fast"); fastStr != "" {
 				v := fastStr == "true"
@@ -4206,14 +4619,15 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		return out
 	}
 	out := database.APIKeyLimits{
-		ModelAllow:   clean(in.ModelAllow),
-		ModelDeny:    clean(in.ModelDeny),
-		RPM:          maxInt(in.RPM, 0),
-		RPD:          maxInt(in.RPD, 0),
-		CostLimit5h:  maxFloat(in.CostLimit5h, 0),
-		CostLimit7d:  maxFloat(in.CostLimit7d, 0),
-		TokenLimit5h: maxInt64(in.TokenLimit5h, 0),
-		TokenLimit7d: maxInt64(in.TokenLimit7d, 0),
+		ModelAllow:     clean(in.ModelAllow),
+		ModelDeny:      clean(in.ModelDeny),
+		RPM:            maxInt(in.RPM, 0),
+		RPD:            maxInt(in.RPD, 0),
+		MaxConcurrency: maxInt(in.MaxConcurrency, 0),
+		CostLimit5h:    maxFloat(in.CostLimit5h, 0),
+		CostLimit7d:    maxFloat(in.CostLimit7d, 0),
+		TokenLimit5h:   maxInt64(in.TokenLimit5h, 0),
+		TokenLimit7d:   maxInt64(in.TokenLimit7d, 0),
 	}
 	return out
 }
@@ -4346,157 +4760,163 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
-	SiteName                           string `json:"site_name"`
-	SiteLogo                           string `json:"site_logo"`
-	BackgroundImage                    string `json:"background_image"`
-	BackgroundOpacity                  int    `json:"background_opacity"`
-	BackgroundBlur                     int    `json:"background_blur"`
-	BackgroundGlassOpacity             int    `json:"background_glass_opacity"`
-	BackgroundGlassBlur                int    `json:"background_glass_blur"`
-	MaxConcurrency                     int    `json:"max_concurrency"`
-	GlobalRPM                          int    `json:"global_rpm"`
-	TestModel                          string `json:"test_model"`
-	TestConcurrency                    int    `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes   int    `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes            int    `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency              int    `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled bool   `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes       int    `json:"recovery_probe_interval_minutes"`
-	LazyMode                           bool   `json:"lazy_mode"`
-	ProxyURL                           string `json:"proxy_url"`
-	PgMaxConns                         int    `json:"pg_max_conns"`
-	RedisPoolSize                      int    `json:"redis_pool_size"`
-	AutoCleanUnauthorized              bool   `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited               bool   `json:"auto_clean_rate_limited"`
-	AdminSecret                        string `json:"admin_secret"`
-	AdminAuthSource                    string `json:"admin_auth_source"`
-	AutoCleanFullUsage                 bool   `json:"auto_clean_full_usage"`
-	AutoCleanError                     bool   `json:"auto_clean_error"`
-	AutoCleanExpired                   bool   `json:"auto_clean_expired"`
-	ProxyPoolEnabled                   bool   `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled               bool   `json:"fast_scheduler_enabled"`
-	CodexForceWebsocket                bool   `json:"codex_force_websocket"`
-	CodexWSKeepaliveEnabled            bool   `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec        int    `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors          bool   `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled          bool   `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries            int    `json:"codex_ws_silent_max_retries"`
-	SchedulerMode                      string `json:"scheduler_mode"`
-	AffinityMode                       string `json:"affinity_mode"`
-	MaxRetries                         int    `json:"max_retries"`
-	MaxRateLimitRetries                int    `json:"max_rate_limit_retries"`
-	AllowRemoteMigration               bool   `json:"allow_remote_migration"`
-	DatabaseDriver                     string `json:"database_driver"`
-	DatabaseLabel                      string `json:"database_label"`
-	CacheDriver                        string `json:"cache_driver"`
-	CacheLabel                         string `json:"cache_label"`
-	ExpiredCleaned                     int    `json:"expired_cleaned,omitempty"`
-	ModelMapping                       string `json:"model_mapping"`
-	CodexModelMapping                  string `json:"codex_model_mapping"`
-	ReasoningEffortModels              string `json:"reasoning_effort_models"`
-	ResinURL                           string `json:"resin_url"`
-	ResinPlatformName                  string `json:"resin_platform_name"`
-	PromptFilterEnabled                bool   `json:"prompt_filter_enabled"`
-	PromptFilterMode                   string `json:"prompt_filter_mode"`
-	PromptFilterThreshold              int    `json:"prompt_filter_threshold"`
-	PromptFilterStrictThreshold        int    `json:"prompt_filter_strict_threshold"`
-	PromptFilterLogMatches             bool   `json:"prompt_filter_log_matches"`
-	PromptFilterMaxTextLength          int    `json:"prompt_filter_max_text_length"`
-	PromptFilterSensitiveWords         string `json:"prompt_filter_sensitive_words"`
-	PromptFilterCustomPatterns         string `json:"prompt_filter_custom_patterns"`
-	PromptFilterDisabledPatterns       string `json:"prompt_filter_disabled_patterns"`
-	ClientCompatMode                   string `json:"client_compat_mode"`
-	CodexMinCLIVersion                 string `json:"codex_min_cli_version"`
-	UsageLogMode                       string `json:"usage_log_mode"`
-	UsageLogBatchSize                  int    `json:"usage_log_batch_size"`
-	UsageLogFlushIntervalSeconds       int    `json:"usage_log_flush_interval_seconds"`
-	StreamFlushPolicy                  string `json:"stream_flush_policy"`
-	StreamFlushIntervalMS              int    `json:"stream_flush_interval_ms"`
-	FirstTokenTimeoutSeconds           int    `json:"first_token_timeout_seconds"`
-	BillingTierPolicy                  string `json:"billing_tier_policy"`
-	ShowFullUsageNumbers               bool   `json:"show_full_usage_numbers"`
-	ImageStorageBackend                string `json:"image_storage_backend"`
-	ImageS3Endpoint                    string `json:"image_s3_endpoint"`
-	ImageS3Region                      string `json:"image_s3_region"`
-	ImageS3Bucket                      string `json:"image_s3_bucket"`
-	ImageS3AccessKey                   string `json:"image_s3_access_key"`
-	ImageS3SecretKey                   string `json:"image_s3_secret_key"`
-	ImageS3Prefix                      string `json:"image_s3_prefix"`
-	ImageS3ForcePathStyle              bool   `json:"image_s3_force_path_style"`
+	SiteName                           string  `json:"site_name"`
+	SiteLogo                           string  `json:"site_logo"`
+	BackgroundImage                    string  `json:"background_image"`
+	BackgroundOpacity                  int     `json:"background_opacity"`
+	BackgroundBlur                     int     `json:"background_blur"`
+	BackgroundGlassOpacity             int     `json:"background_glass_opacity"`
+	BackgroundGlassBlur                int     `json:"background_glass_blur"`
+	MaxConcurrency                     int     `json:"max_concurrency"`
+	GlobalRPM                          int     `json:"global_rpm"`
+	TestModel                          string  `json:"test_model"`
+	TestConcurrency                    int     `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes   int     `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes            int     `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency              int     `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled bool    `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes       int     `json:"recovery_probe_interval_minutes"`
+	LazyMode                           bool    `json:"lazy_mode"`
+	ProxyURL                           string  `json:"proxy_url"`
+	PgMaxConns                         int     `json:"pg_max_conns"`
+	RedisPoolSize                      int     `json:"redis_pool_size"`
+	AutoCleanUnauthorized              bool    `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited               bool    `json:"auto_clean_rate_limited"`
+	AdminSecret                        string  `json:"admin_secret"`
+	AdminAuthSource                    string  `json:"admin_auth_source"`
+	AutoCleanFullUsage                 bool    `json:"auto_clean_full_usage"`
+	AutoCleanError                     bool    `json:"auto_clean_error"`
+	AutoCleanExpired                   bool    `json:"auto_clean_expired"`
+	ProxyPoolEnabled                   bool    `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled               bool    `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket                bool    `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled            bool    `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec        int     `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors          bool    `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled          bool    `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries            int     `json:"codex_ws_silent_max_retries"`
+	SchedulerMode                      string  `json:"scheduler_mode"`
+	AffinityMode                       string  `json:"affinity_mode"`
+	MaxRetries                         int     `json:"max_retries"`
+	MaxRateLimitRetries                int     `json:"max_rate_limit_retries"`
+	AllowRemoteMigration               bool    `json:"allow_remote_migration"`
+	DatabaseDriver                     string  `json:"database_driver"`
+	DatabaseLabel                      string  `json:"database_label"`
+	CacheDriver                        string  `json:"cache_driver"`
+	CacheLabel                         string  `json:"cache_label"`
+	ExpiredCleaned                     int     `json:"expired_cleaned,omitempty"`
+	ModelMapping                       string  `json:"model_mapping"`
+	CodexModelMapping                  string  `json:"codex_model_mapping"`
+	ReasoningEffortModels              string  `json:"reasoning_effort_models"`
+	ResinURL                           string  `json:"resin_url"`
+	ResinPlatformName                  string  `json:"resin_platform_name"`
+	PromptFilterEnabled                bool    `json:"prompt_filter_enabled"`
+	PromptFilterMode                   string  `json:"prompt_filter_mode"`
+	PromptFilterThreshold              int     `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold        int     `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches             bool    `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength          int     `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords         string  `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns         string  `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns       string  `json:"prompt_filter_disabled_patterns"`
+	ClientCompatMode                   string  `json:"client_compat_mode"`
+	CodexMinCLIVersion                 string  `json:"codex_min_cli_version"`
+	UsageLogMode                       string  `json:"usage_log_mode"`
+	UsageLogBatchSize                  int     `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds       int     `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                  string  `json:"stream_flush_policy"`
+	StreamFlushIntervalMS              int     `json:"stream_flush_interval_ms"`
+	FirstTokenMode                     string  `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds           int     `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                  string  `json:"billing_tier_policy"`
+	ShowFullUsageNumbers               bool    `json:"show_full_usage_numbers"`
+	ImageStorageBackend                string  `json:"image_storage_backend"`
+	ImageS3Endpoint                    string  `json:"image_s3_endpoint"`
+	ImageS3Region                      string  `json:"image_s3_region"`
+	ImageS3Bucket                      string  `json:"image_s3_bucket"`
+	ImageS3AccessKey                   string  `json:"image_s3_access_key"`
+	ImageS3SecretKey                   string  `json:"image_s3_secret_key"`
+	ImageS3Prefix                      string  `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle              bool    `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold               float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold               float64 `json:"auto_pause_7d_threshold"`
 }
 
 type updateSettingsReq struct {
-	SiteName                           *string `json:"site_name"`
-	SiteLogo                           *string `json:"site_logo"`
-	BackgroundImage                    *string `json:"background_image"`
-	BackgroundOpacity                  *int    `json:"background_opacity"`
-	BackgroundBlur                     *int    `json:"background_blur"`
-	BackgroundGlassOpacity             *int    `json:"background_glass_opacity"`
-	BackgroundGlassBlur                *int    `json:"background_glass_blur"`
-	MaxConcurrency                     *int    `json:"max_concurrency"`
-	GlobalRPM                          *int    `json:"global_rpm"`
-	TestModel                          *string `json:"test_model"`
-	TestConcurrency                    *int    `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes   *int    `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes            *int    `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency              *int    `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled *bool   `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes       *int    `json:"recovery_probe_interval_minutes"`
-	LazyMode                           *bool   `json:"lazy_mode"`
-	ProxyURL                           *string `json:"proxy_url"`
-	PgMaxConns                         *int    `json:"pg_max_conns"`
-	RedisPoolSize                      *int    `json:"redis_pool_size"`
-	AutoCleanUnauthorized              *bool   `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited               *bool   `json:"auto_clean_rate_limited"`
-	AdminSecret                        *string `json:"admin_secret"`
-	AutoCleanFullUsage                 *bool   `json:"auto_clean_full_usage"`
-	AutoCleanError                     *bool   `json:"auto_clean_error"`
-	AutoCleanExpired                   *bool   `json:"auto_clean_expired"`
-	ProxyPoolEnabled                   *bool   `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled               *bool   `json:"fast_scheduler_enabled"`
-	CodexForceWebsocket                *bool   `json:"codex_force_websocket"`
-	CodexWSKeepaliveEnabled            *bool   `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec        *int    `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors          *bool   `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled          *bool   `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries            *int    `json:"codex_ws_silent_max_retries"`
-	SchedulerMode                      *string `json:"scheduler_mode"`
-	AffinityMode                       *string `json:"affinity_mode"`
-	MaxRetries                         *int    `json:"max_retries"`
-	MaxRateLimitRetries                *int    `json:"max_rate_limit_retries"`
-	AllowRemoteMigration               *bool   `json:"allow_remote_migration"`
-	ModelMapping                       *string `json:"model_mapping"`
-	CodexModelMapping                  *string `json:"codex_model_mapping"`
-	ReasoningEffortModels              *string `json:"reasoning_effort_models"`
-	ResinURL                           *string `json:"resin_url"`
-	ResinPlatformName                  *string `json:"resin_platform_name"`
-	PromptFilterEnabled                *bool   `json:"prompt_filter_enabled"`
-	PromptFilterMode                   *string `json:"prompt_filter_mode"`
-	PromptFilterThreshold              *int    `json:"prompt_filter_threshold"`
-	PromptFilterStrictThreshold        *int    `json:"prompt_filter_strict_threshold"`
-	PromptFilterLogMatches             *bool   `json:"prompt_filter_log_matches"`
-	PromptFilterMaxTextLength          *int    `json:"prompt_filter_max_text_length"`
-	PromptFilterSensitiveWords         *string `json:"prompt_filter_sensitive_words"`
-	PromptFilterCustomPatterns         *string `json:"prompt_filter_custom_patterns"`
-	PromptFilterDisabledPatterns       *string `json:"prompt_filter_disabled_patterns"`
-	ClientCompatMode                   *string `json:"client_compat_mode"`
-	CodexMinCLIVersion                 *string `json:"codex_min_cli_version"`
-	UsageLogMode                       *string `json:"usage_log_mode"`
-	UsageLogBatchSize                  *int    `json:"usage_log_batch_size"`
-	UsageLogFlushIntervalSeconds       *int    `json:"usage_log_flush_interval_seconds"`
-	StreamFlushPolicy                  *string `json:"stream_flush_policy"`
-	StreamFlushIntervalMS              *int    `json:"stream_flush_interval_ms"`
-	FirstTokenTimeoutSeconds           *int    `json:"first_token_timeout_seconds"`
-	BillingTierPolicy                  *string `json:"billing_tier_policy"`
-	ShowFullUsageNumbers               *bool   `json:"show_full_usage_numbers"`
-	ImageStorageBackend                *string `json:"image_storage_backend"`
-	ImageS3Endpoint                    *string `json:"image_s3_endpoint"`
-	ImageS3Region                      *string `json:"image_s3_region"`
-	ImageS3Bucket                      *string `json:"image_s3_bucket"`
-	ImageS3AccessKey                   *string `json:"image_s3_access_key"`
-	ImageS3SecretKey                   *string `json:"image_s3_secret_key"`
-	ImageS3Prefix                      *string `json:"image_s3_prefix"`
-	ImageS3ForcePathStyle              *bool   `json:"image_s3_force_path_style"`
+	SiteName                           *string  `json:"site_name"`
+	SiteLogo                           *string  `json:"site_logo"`
+	BackgroundImage                    *string  `json:"background_image"`
+	BackgroundOpacity                  *int     `json:"background_opacity"`
+	BackgroundBlur                     *int     `json:"background_blur"`
+	BackgroundGlassOpacity             *int     `json:"background_glass_opacity"`
+	BackgroundGlassBlur                *int     `json:"background_glass_blur"`
+	MaxConcurrency                     *int     `json:"max_concurrency"`
+	GlobalRPM                          *int     `json:"global_rpm"`
+	TestModel                          *string  `json:"test_model"`
+	TestConcurrency                    *int     `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes   *int     `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes            *int     `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency              *int     `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled *bool    `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes       *int     `json:"recovery_probe_interval_minutes"`
+	LazyMode                           *bool    `json:"lazy_mode"`
+	ProxyURL                           *string  `json:"proxy_url"`
+	PgMaxConns                         *int     `json:"pg_max_conns"`
+	RedisPoolSize                      *int     `json:"redis_pool_size"`
+	AutoCleanUnauthorized              *bool    `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited               *bool    `json:"auto_clean_rate_limited"`
+	AdminSecret                        *string  `json:"admin_secret"`
+	AutoCleanFullUsage                 *bool    `json:"auto_clean_full_usage"`
+	AutoCleanError                     *bool    `json:"auto_clean_error"`
+	AutoCleanExpired                   *bool    `json:"auto_clean_expired"`
+	ProxyPoolEnabled                   *bool    `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled               *bool    `json:"fast_scheduler_enabled"`
+	CodexForceWebsocket                *bool    `json:"codex_force_websocket"`
+	CodexWSKeepaliveEnabled            *bool    `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec        *int     `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors          *bool    `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled          *bool    `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries            *int     `json:"codex_ws_silent_max_retries"`
+	SchedulerMode                      *string  `json:"scheduler_mode"`
+	AffinityMode                       *string  `json:"affinity_mode"`
+	MaxRetries                         *int     `json:"max_retries"`
+	MaxRateLimitRetries                *int     `json:"max_rate_limit_retries"`
+	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
+	ModelMapping                       *string  `json:"model_mapping"`
+	CodexModelMapping                  *string  `json:"codex_model_mapping"`
+	ReasoningEffortModels              *string  `json:"reasoning_effort_models"`
+	ResinURL                           *string  `json:"resin_url"`
+	ResinPlatformName                  *string  `json:"resin_platform_name"`
+	PromptFilterEnabled                *bool    `json:"prompt_filter_enabled"`
+	PromptFilterMode                   *string  `json:"prompt_filter_mode"`
+	PromptFilterThreshold              *int     `json:"prompt_filter_threshold"`
+	PromptFilterStrictThreshold        *int     `json:"prompt_filter_strict_threshold"`
+	PromptFilterLogMatches             *bool    `json:"prompt_filter_log_matches"`
+	PromptFilterMaxTextLength          *int     `json:"prompt_filter_max_text_length"`
+	PromptFilterSensitiveWords         *string  `json:"prompt_filter_sensitive_words"`
+	PromptFilterCustomPatterns         *string  `json:"prompt_filter_custom_patterns"`
+	PromptFilterDisabledPatterns       *string  `json:"prompt_filter_disabled_patterns"`
+	ClientCompatMode                   *string  `json:"client_compat_mode"`
+	CodexMinCLIVersion                 *string  `json:"codex_min_cli_version"`
+	UsageLogMode                       *string  `json:"usage_log_mode"`
+	UsageLogBatchSize                  *int     `json:"usage_log_batch_size"`
+	UsageLogFlushIntervalSeconds       *int     `json:"usage_log_flush_interval_seconds"`
+	StreamFlushPolicy                  *string  `json:"stream_flush_policy"`
+	StreamFlushIntervalMS              *int     `json:"stream_flush_interval_ms"`
+	FirstTokenMode                     *string  `json:"first_token_mode"`
+	FirstTokenTimeoutSeconds           *int     `json:"first_token_timeout_seconds"`
+	BillingTierPolicy                  *string  `json:"billing_tier_policy"`
+	ShowFullUsageNumbers               *bool    `json:"show_full_usage_numbers"`
+	ImageStorageBackend                *string  `json:"image_storage_backend"`
+	ImageS3Endpoint                    *string  `json:"image_s3_endpoint"`
+	ImageS3Region                      *string  `json:"image_s3_region"`
+	ImageS3Bucket                      *string  `json:"image_s3_bucket"`
+	ImageS3AccessKey                   *string  `json:"image_s3_access_key"`
+	ImageS3SecretKey                   *string  `json:"image_s3_secret_key"`
+	ImageS3Prefix                      *string  `json:"image_s3_prefix"`
+	ImageS3ForcePathStyle              *bool    `json:"image_s3_force_path_style"`
+	AutoPause5hThreshold               *float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold               *float64 `json:"auto_pause_7d_threshold"`
 }
 
 type brandingResponse struct {
@@ -5053,6 +5473,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:       h.db.GetUsageLogFlushIntervalSeconds(),
 		StreamFlushPolicy:                  runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:              runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                     runtimeCfg.FirstTokenMode,
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
@@ -5064,6 +5485,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ImageS3SecretKey:                   imgCfg.SecretKey,
 		ImageS3Prefix:                      imgPrefix,
 		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
+		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 	})
 }
 
@@ -5073,6 +5496,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
+	}
+	if req.AutoPause5hThreshold != nil {
+		if err := validateAutoPauseThreshold("auto_pause_5h_threshold", *req.AutoPause5hThreshold); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.AutoPause7dThreshold != nil {
+		if err := validateAutoPauseThreshold("auto_pause_7d_threshold", *req.AutoPause7dThreshold); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	currentAdminSecret := ""
@@ -5433,6 +5868,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.StreamFlushIntervalMS = *req.StreamFlushIntervalMS
 		log.Printf("设置已更新: stream_flush_interval_ms = %d", runtimeCfg.StreamFlushIntervalMS)
 	}
+	if req.FirstTokenMode != nil {
+		runtimeCfg.FirstTokenMode = proxy.NormalizeFirstTokenMode(*req.FirstTokenMode)
+		log.Printf("设置已更新: first_token_mode = %s", runtimeCfg.FirstTokenMode)
+	}
 	if req.FirstTokenTimeoutSeconds != nil {
 		runtimeCfg.FirstTokenTimeoutSec = *req.FirstTokenTimeoutSeconds
 		log.Printf("设置已更新: first_token_timeout_seconds = %d", runtimeCfg.FirstTokenTimeoutSec)
@@ -5444,6 +5883,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.ShowFullUsageNumbers != nil {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
+	}
+	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
+		t5h := h.store.GetGlobalAutoPause5hThreshold()
+		t7d := h.store.GetGlobalAutoPause7dThreshold()
+		if req.AutoPause5hThreshold != nil {
+			t5h = *req.AutoPause5hThreshold
+		}
+		if req.AutoPause7dThreshold != nil {
+			t7d = *req.AutoPause7dThreshold
+		}
+		h.store.SetGlobalAutoPauseThresholds(t5h, t7d)
+		log.Printf("设置已更新: auto_pause thresholds 5h=%.4f 7d=%.4f", t5h, t7d)
 	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
@@ -5665,11 +6116,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:       usageLogFlushIntervalSeconds,
 		StreamFlushPolicy:                  runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:              runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                     runtimeCfg.FirstTokenMode,
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		ImageStorageConfig:                 imgConfigJSON,
 		BackgroundConfig:                   encodeBackgroundConfig(bgCfg),
+		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -5755,6 +6209,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		UsageLogFlushIntervalSeconds:       usageLogFlushIntervalSeconds,
 		StreamFlushPolicy:                  runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:              runtimeCfg.StreamFlushIntervalMS,
+		FirstTokenMode:                     runtimeCfg.FirstTokenMode,
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		ImageStorageBackend:                imgCfg.Backend,
@@ -5765,6 +6220,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ImageS3SecretKey:                   imgCfg.SecretKey,
 		ImageS3Prefix:                      strings.TrimSuffix(imgCfg.Prefix, "/"),
 		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
+		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
+		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 	})
 }
 
@@ -5817,20 +6274,21 @@ func (h *Handler) TestImageStorageConnection(c *gin.Context) {
 // ==================== 导出 & 迁移 ====================
 
 type cpaExportEntry struct {
-	Type                string `json:"type"`
-	Email               string `json:"email"`
-	PlanType            string `json:"plan_type,omitempty"`
-	Codex7DUsedPercent  string `json:"codex_7d_used_percent,omitempty"`
-	Codex7DResetAt      string `json:"codex_7d_reset_at,omitempty"`
-	Codex5HUsedPercent  string `json:"codex_5h_used_percent,omitempty"`
-	Codex5HResetAt      string `json:"codex_5h_reset_at,omitempty"`
-	CodexUsageUpdatedAt string `json:"codex_usage_updated_at,omitempty"`
-	Expired             string `json:"expired"`
-	IDToken             string `json:"id_token"`
-	AccountID           string `json:"account_id"`
-	AccessToken         string `json:"access_token"`
-	LastRefresh         string `json:"last_refresh"`
-	RefreshToken        string `json:"refresh_token"`
+	Type                  string `json:"type"`
+	Email                 string `json:"email"`
+	PlanType              string `json:"plan_type,omitempty"`
+	Codex7DUsedPercent    string `json:"codex_7d_used_percent,omitempty"`
+	Codex7DResetAt        string `json:"codex_7d_reset_at,omitempty"`
+	Codex5HUsedPercent    string `json:"codex_5h_used_percent,omitempty"`
+	Codex5HResetAt        string `json:"codex_5h_reset_at,omitempty"`
+	Codex5HUsageUpdatedAt string `json:"codex_5h_usage_updated_at,omitempty"`
+	CodexUsageUpdatedAt   string `json:"codex_usage_updated_at,omitempty"`
+	Expired               string `json:"expired"`
+	IDToken               string `json:"id_token"`
+	AccountID             string `json:"account_id"`
+	AccessToken           string `json:"access_token"`
+	LastRefresh           string `json:"last_refresh"`
+	RefreshToken          string `json:"refresh_token"`
 }
 
 type accountAuthJSONTokens struct {
@@ -5979,20 +6437,21 @@ func (h *Handler) ExportAccounts(c *gin.Context) {
 			accountID = row.GetCredential("account_id")
 		}
 		entries = append(entries, cpaExportEntry{
-			Type:                "codex",
-			Email:               row.GetCredential("email"),
-			PlanType:            row.GetCredential("plan_type"),
-			Codex7DUsedPercent:  row.GetCredential("codex_7d_used_percent"),
-			Codex7DResetAt:      row.GetCredential("codex_7d_reset_at"),
-			Codex5HUsedPercent:  row.GetCredential("codex_5h_used_percent"),
-			Codex5HResetAt:      row.GetCredential("codex_5h_reset_at"),
-			CodexUsageUpdatedAt: row.GetCredential("codex_usage_updated_at"),
-			Expired:             row.GetCredential("expires_at"),
-			IDToken:             row.GetCredential("id_token"),
-			AccountID:           accountID,
-			AccessToken:         at,
-			LastRefresh:         row.UpdatedAt.Format(time.RFC3339),
-			RefreshToken:        rt,
+			Type:                  "codex",
+			Email:                 row.GetCredential("email"),
+			PlanType:              row.GetCredential("plan_type"),
+			Codex7DUsedPercent:    row.GetCredential("codex_7d_used_percent"),
+			Codex7DResetAt:        row.GetCredential("codex_7d_reset_at"),
+			Codex5HUsedPercent:    row.GetCredential("codex_5h_used_percent"),
+			Codex5HResetAt:        row.GetCredential("codex_5h_reset_at"),
+			Codex5HUsageUpdatedAt: row.GetCredential("codex_5h_usage_updated_at"),
+			CodexUsageUpdatedAt:   row.GetCredential("codex_usage_updated_at"),
+			Expired:               row.GetCredential("expires_at"),
+			IDToken:               row.GetCredential("id_token"),
+			AccountID:             accountID,
+			AccessToken:           at,
+			LastRefresh:           row.UpdatedAt.Format(time.RFC3339),
+			RefreshToken:          rt,
 		})
 	}
 
@@ -6023,8 +6482,13 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "url 和 admin_key 是必填字段")
 		return
 	}
+	parsedURL, err := url.Parse(strings.TrimSpace(req.URL))
+	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		writeError(c, http.StatusBadRequest, "url 必须是完整的 http/https 地址")
+		return
+	}
 
-	remoteURL := strings.TrimRight(req.URL, "/")
+	remoteURL := strings.TrimRight(parsedURL.String(), "/")
 	exportURL := remoteURL + "/api/admin/accounts/export?filter=healthy&remote=true"
 
 	fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -6075,19 +6539,20 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 			name = "migrate"
 		}
 		tokens = append(tokens, importToken{
-			refreshToken:        rt,
-			accessToken:         at,
-			name:                name,
-			email:               strings.TrimSpace(entry.Email),
-			idToken:             strings.TrimSpace(entry.IDToken),
-			accountID:           strings.TrimSpace(entry.AccountID),
-			planType:            strings.TrimSpace(entry.PlanType),
-			expiresAt:           strings.TrimSpace(entry.Expired),
-			codex7DUsedPercent:  strings.TrimSpace(entry.Codex7DUsedPercent),
-			codex7DResetAt:      strings.TrimSpace(entry.Codex7DResetAt),
-			codex5HUsedPercent:  strings.TrimSpace(entry.Codex5HUsedPercent),
-			codex5HResetAt:      strings.TrimSpace(entry.Codex5HResetAt),
-			codexUsageUpdatedAt: strings.TrimSpace(entry.CodexUsageUpdatedAt),
+			refreshToken:          rt,
+			accessToken:           at,
+			name:                  name,
+			email:                 strings.TrimSpace(entry.Email),
+			idToken:               strings.TrimSpace(entry.IDToken),
+			accountID:             strings.TrimSpace(entry.AccountID),
+			planType:              strings.TrimSpace(entry.PlanType),
+			expiresAt:             strings.TrimSpace(entry.Expired),
+			codex7DUsedPercent:    strings.TrimSpace(entry.Codex7DUsedPercent),
+			codex7DResetAt:        strings.TrimSpace(entry.Codex7DResetAt),
+			codex5HUsedPercent:    strings.TrimSpace(entry.Codex5HUsedPercent),
+			codex5HResetAt:        strings.TrimSpace(entry.Codex5HResetAt),
+			codex5HUsageUpdatedAt: strings.TrimSpace(entry.Codex5HUsageUpdatedAt),
+			codexUsageUpdatedAt:   strings.TrimSpace(entry.CodexUsageUpdatedAt),
 		})
 	}
 
@@ -6350,7 +6815,12 @@ func (h *Handler) TestProxy(c *gin.Context) {
 		ID   int64  `json:"id"`
 		Lang string `json:"lang"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || req.URL == "" {
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请提供代理 URL")
+		return
+	}
+	proxyURL := strings.TrimSpace(req.URL)
+	if proxyURL == "" {
 		writeError(c, http.StatusBadRequest, "请提供代理 URL")
 		return
 	}
@@ -6359,7 +6829,7 @@ func (h *Handler) TestProxy(c *gin.Context) {
 	transport := &http.Transport{}
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport.DialContext = baseDialer.DialContext
-	if err := auth.ConfigureTransportProxy(transport, req.URL, baseDialer); err != nil {
+	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
 		c.JSON(http.StatusOK, gin.H{"success": false, "error": fmt.Sprintf("代理 URL 格式错误: %v", err)})
 		return
 	}

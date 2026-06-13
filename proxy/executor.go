@@ -260,7 +260,16 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if wantWebsocket {
 		sessionID = strings.TrimSpace(sessionID)
 		if sessionID == "" {
+			// stateless 连接 ID 仅用于 WS 连接池隔离，保证同一 API Key 的并发请求
+			// 不挤在一条连接上排队。prompt cache key 必须保持确定性：若请求体没有
+			// 显式 prompt_cache_key，这里注入与 HTTP 路径同源的确定性 key，否则
+			// 上游 prompt cache 每次请求都会 miss（v2.2.7 引入的回归）。
 			sessionID = statelessWebsocketSessionID()
+			if strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String()) == "" {
+				if cacheKey := deterministicPromptCacheKey(apiKey, account); cacheKey != "" {
+					requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
+				}
+			}
 		}
 	}
 	if wantWebsocket && WebsocketExecuteFunc != nil {
@@ -688,8 +697,31 @@ func ResolveExplicitSessionID(headers http.Header, body []byte) string {
 	return ""
 }
 
+const statelessWebsocketSessionPrefix = "stateless-"
+
 func statelessWebsocketSessionID() string {
-	return "stateless-" + uuid.NewString()
+	return statelessWebsocketSessionPrefix + uuid.NewString()
+}
+
+// IsStatelessWebsocketSessionID 判断是否为 WS 路径生成的一次性连接 ID。
+// 这类 ID 只用于连接池隔离，不能当作 prompt cache key 发往上游。
+func IsStatelessWebsocketSessionID(sessionID string) bool {
+	return strings.HasPrefix(sessionID, statelessWebsocketSessionPrefix)
+}
+
+// deterministicPromptCacheKey 生成与 ResolveSessionID 兜底逻辑同源的确定性
+// prompt cache key：优先按下游 API Key 派生，无 API Key 时按账号派生。
+func deterministicPromptCacheKey(apiKey string, account *auth.Account) string {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey != "" {
+		return uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:prompt-cache:"+apiKey)).String()
+	}
+	if account != nil {
+		if id := account.ID(); id > 0 {
+			return uuid.NewSHA1(uuid.NameSpaceOID, []byte(fmt.Sprintf("codex2api:prompt-cache:auth:%d", id))).String()
+		}
+	}
+	return ""
 }
 
 // ReadSSEStream 从上游 SSE 响应读取事件流

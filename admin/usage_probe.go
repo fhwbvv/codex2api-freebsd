@@ -71,7 +71,7 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account) 
 	state := proxy.ApplyWhamUsage(h.store, account, usage)
 	h.store.ReportRequestSuccess(account, 0)
 	// 用量未耗尽时重置冷却
-	if !state.Premium5hRateLimited && (!state.HasUsage7d || state.UsagePct7d < 100) {
+	if !applyUsageLimitedAccountState(h.store, account, state) {
 		h.store.ClearCooldown(account)
 	}
 	return nil
@@ -95,7 +95,7 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 	case http.StatusOK:
 		h.store.ReportRequestSuccess(account, 0)
 		// 只有用量未耗尽时才重置状态
-		if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
+		if !applyUsageLimitedAccountState(h.store, account, usageState) {
 			h.store.ClearCooldown(account)
 		}
 		return nil

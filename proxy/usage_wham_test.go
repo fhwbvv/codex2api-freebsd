@@ -134,6 +134,38 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	}
 }
 
+func TestApplyWhamUsage5hOnlyDoesNotRefreshStale7dProbeFreshness(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:                2,
+		AccessToken:         "at",
+		PlanType:            "plus",
+		Status:              auth.StatusReady,
+		UsagePercent7d:      40,
+		UsagePercent7dValid: true,
+		UsageUpdatedAt:      time.Now().Add(-20 * time.Minute),
+	}
+
+	now := time.Now()
+	usage := &WhamUsage{PlanType: "plus"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 83, LimitWindowSeconds: 18000, ResetAt: now.Add(2 * time.Hour).Unix()}
+
+	result := ApplyWhamUsage(store, account, usage)
+
+	if !result.Used5hHeaders || !result.HasUsage5h {
+		t.Fatalf("ApplyWhamUsage result = %+v, want 5h-only usage snapshot", result)
+	}
+	if result.HasUsage7d {
+		t.Fatalf("ApplyWhamUsage result = %+v, want no 7d snapshot from 5h-only usage", result)
+	}
+	if !result.Persisted5hOnly {
+		t.Fatalf("ApplyWhamUsage result = %+v, want 5h-only persistence path", result)
+	}
+	if !account.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = false, want true because 5h-only WHAM sync must not refresh stale 7d freshness")
+	}
+}
+
 // 复现 issue #168：free 账号的 wham 响应里 primary_window 实际承载的是 7d 数据
 // （limit_window_seconds=604800），secondary_window=null。代码必须按
 // limit_window_seconds 而不是字段位置来分类，否则 7d 数据会被错误写入 5h 槽位。
@@ -268,6 +300,24 @@ func TestApplyWhamUsage_MarksPremium5hLimitedAt100Percent(t *testing.T) {
 	}
 	if !account.IsPremium5hRateLimited() {
 		t.Error("account should be in premium 5h rate-limited state after ApplyWhamUsage")
+	}
+}
+
+func TestApplyWhamUsage_Marks7dLimitedAt100Percent(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 1, AccessToken: "at", PlanType: "team", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy}
+
+	now := time.Now()
+	usage := &WhamUsage{PlanType: "team"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 20, LimitWindowSeconds: 18000, ResetAt: now.Add(2 * time.Hour).Unix()}
+	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 604800, ResetAt: now.Add(5 * 24 * time.Hour).Unix()}
+
+	result := ApplyWhamUsage(store, account, usage)
+	if !result.Usage7dRateLimited {
+		t.Fatalf("Usage7dRateLimited = false, result=%+v", result)
+	}
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
 	}
 }
 

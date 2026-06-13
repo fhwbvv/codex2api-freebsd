@@ -106,6 +106,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS usage_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			account_id INTEGER DEFAULT 0,
+			client_ip TEXT DEFAULT '',
 			endpoint TEXT DEFAULT '',
 			model TEXT DEFAULT '',
 			prompt_tokens INTEGER DEFAULT 0,
@@ -210,6 +211,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				usage_log_flush_interval_seconds INTEGER DEFAULT 5,
 				stream_flush_policy TEXT DEFAULT 'immediate',
 				stream_flush_interval_ms INTEGER DEFAULT 20,
+				first_token_mode TEXT DEFAULT 'strict',
 				first_token_timeout_seconds INTEGER DEFAULT 0,
 				image_storage_config TEXT DEFAULT '{}',
 				show_full_usage_numbers INTEGER DEFAULT 0,
@@ -358,6 +360,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "api_key_id", "INTEGER DEFAULT 0"},
 		{"usage_logs", "api_key_name", "TEXT DEFAULT ''"},
 		{"usage_logs", "api_key_masked", "TEXT DEFAULT ''"},
+		{"usage_logs", "client_ip", "TEXT DEFAULT ''"},
 		{"usage_logs", "image_count", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_width", "INTEGER DEFAULT 0"},
 		{"usage_logs", "image_height", "INTEGER DEFAULT 0"},
@@ -429,12 +432,17 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "usage_log_flush_interval_seconds", "INTEGER DEFAULT 5"},
 		{"system_settings", "stream_flush_policy", "TEXT DEFAULT 'immediate'"},
 		{"system_settings", "stream_flush_interval_ms", "INTEGER DEFAULT 20"},
+		{"system_settings", "first_token_mode", "TEXT DEFAULT 'strict'"},
 		{"system_settings", "first_token_timeout_seconds", "INTEGER DEFAULT 0"},
 		{"system_settings", "billing_tier_policy", "TEXT DEFAULT 'actual'"},
 		{"system_settings", "image_storage_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "show_full_usage_numbers", "INTEGER DEFAULT 0"},
 		{"system_settings", "scheduler_mode", "TEXT DEFAULT 'round_robin'"},
 		{"system_settings", "affinity_mode", "TEXT DEFAULT 'bounded'"},
+		{"system_settings", "auto_pause_5h_threshold", "REAL DEFAULT 0"},
+		{"system_settings", "auto_pause_7d_threshold", "REAL DEFAULT 0"},
+		{"account_groups", "auto_pause_5h_threshold", "REAL DEFAULT 0"},
+		{"account_groups", "auto_pause_7d_threshold", "REAL DEFAULT 0"},
 		{"accounts", "enabled", "INTEGER DEFAULT 1"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
 		{"accounts", "credit_enabled", "INTEGER DEFAULT 0"},
@@ -460,6 +468,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_accounts_cooldown_until ON accounts(cooldown_until);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_created_at ON usage_logs(account_id, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
@@ -854,8 +863,8 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 
 		stats.TodayRequests++
 		stats.TodayTokens += totalTokens
-		stats.TotalPrompt += promptTokens
-		stats.TotalCompletion += completionTokens
+		stats.TodayPrompt += promptTokens
+		stats.TodayCompletion += completionTokens
 		stats.TotalCachedTokens += cachedTokens
 		stats.TodayCachedTokens += cachedTokens
 		stats.TodayAccountBilled += accountBilled
@@ -938,11 +947,11 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
 	}
-	stats.ModelStats, err = db.getUsageModelStats(ctx, 10)
+	stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.populateUsageBreakdownStats(ctx, stats); err != nil {
+	if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd); err != nil {
 		return nil, err
 	}
 

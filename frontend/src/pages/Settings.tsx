@@ -34,11 +34,15 @@ type ReasoningEffortModelEntry = {
   model: string
   effort: string
 }
+type AutoSaveStatus = 'idle' | 'saving' | 'saved' | 'error'
+
 const EMPTY_REASONING_EFFORT_MODEL_ENTRIES: ReasoningEffortModelEntry[] = []
 const REASONING_EFFORT_OPTIONS = ['low', 'medium', 'high', 'xhigh'].map((effort) => ({
   label: effort,
   value: effort,
 }))
+const AUTO_SAVE_STATUS_RESET_MS = 1800
+const AUTO_SAVE_TOAST_MS = 2000
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
@@ -76,6 +80,20 @@ const normalizeReasoningEffortValue = (effort: string) => {
   const value = effort.trim().toLowerCase()
   if (value === 'max') return 'xhigh'
   return ['low', 'medium', 'high', 'xhigh'].includes(value) ? value : 'xhigh'
+}
+
+const normalizeBillingTierPolicyValue = (value?: string | null): 'actual' | 'requested' =>
+  value === 'requested' ? 'requested' : 'actual'
+
+const normalizeFirstTokenModeValue = (value?: string | null): 'strict' | 'loose' =>
+  value === 'loose' ? 'loose' : 'strict'
+
+const getSettingsPatchValues = (settings: SystemSettings, keys: Array<keyof SystemSettings>): Partial<SystemSettings> => {
+  const patch: Record<string, unknown> = {}
+  for (const key of keys) {
+    patch[key] = settings[key]
+  }
+  return patch as Partial<SystemSettings>
 }
 
 const parseReasoningEffortModelEntries = (value: string): ReasoningEffortModelEntry[] => {
@@ -484,8 +502,13 @@ function textToBase64(value: string) {
 }
 
 function minifySVG(value: string) {
-  return value
-    .replace(/<!--[\s\S]*?-->/g, '')
+  // 循环剥离注释直到不动点：单次替换可能因相邻片段重新拼出 "<!--" 而残留
+  let out = value
+  for (let prev = ''; prev !== out; ) {
+    prev = out
+    out = out.replace(/<!--[\s\S]*?-->/g, '').replace(/<!--/g, '')
+  }
+  return out
     .replace(/>\s+</g, '><')
     .replace(/\s{2,}/g, ' ')
     .trim()
@@ -605,16 +628,25 @@ export default function Settings() {
     { label: t('settings.streamFlushImmediate'), value: 'immediate' },
     { label: t('settings.streamFlushCoalesce'), value: 'coalesce' },
   ]
+  const firstTokenModeOptions = [
+    { label: t('settings.firstTokenModeStrict'), value: 'strict' },
+    { label: t('settings.firstTokenModeLoose'), value: 'loose' },
+  ]
   const imageStorageBackendOptions = [
     { label: t('settings.imageStorageLocal'), value: 'local' },
     { label: t('settings.imageStorageS3'), value: 's3' },
   ]
   const normalizeLazySettingsForm = useCallback((settings: SystemSettings): SystemSettings => {
-    if (!settings.lazy_mode) {
-      return settings
+    const normalized = {
+      ...settings,
+      billing_tier_policy: normalizeBillingTierPolicyValue(settings.billing_tier_policy),
+      first_token_mode: normalizeFirstTokenModeValue(settings.first_token_mode),
+    }
+    if (!normalized.lazy_mode) {
+      return normalized
     }
     return {
-      ...settings,
+      ...normalized,
       auto_clean_full_usage: false,
     }
   }, [])
@@ -683,6 +715,7 @@ export default function Settings() {
     usage_log_flush_interval_seconds: 5,
     stream_flush_policy: 'immediate',
     stream_flush_interval_ms: 20,
+    first_token_mode: 'strict',
     first_token_timeout_seconds: 0,
     billing_tier_policy: 'actual',
     show_full_usage_numbers: false,
@@ -694,9 +727,13 @@ export default function Settings() {
     image_s3_secret_key: '',
     image_s3_prefix: '',
     image_s3_force_path_style: false,
+    auto_pause_5h_threshold: 0,
+    auto_pause_7d_threshold: 0,
   })
   const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
+  const [autoSaveStatus, setAutoSaveStatus] = useState<AutoSaveStatus>('idle')
+  const [autoSaveError, setAutoSaveError] = useState('')
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
@@ -707,11 +744,135 @@ export default function Settings() {
   const logoFileInputRef = useRef<HTMLInputElement>(null)
   const backgroundFileInputRef = useRef<HTMLInputElement>(null)
   const persistedBrandingRef = useRef<Partial<SiteBranding> | null>(null)
+  const settingsFormRef = useRef(settingsForm)
+  const autoSavePendingCountRef = useRef(0)
+  const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
+  const autoSaveStatusTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
   const { toast, showToast } = useToast()
+
+  useEffect(() => {
+    settingsFormRef.current = settingsForm
+  }, [settingsForm])
+
+  useEffect(() => {
+    return () => {
+      if (autoSaveStatusTimerRef.current) {
+        window.clearTimeout(autoSaveStatusTimerRef.current)
+      }
+    }
+  }, [])
+
+  const commitSettingsForm = useCallback(
+    (next: SystemSettings) => {
+      const normalized = normalizeLazySettingsForm(next)
+      settingsFormRef.current = normalized
+      setSettingsForm(normalized)
+      return normalized
+    },
+    [normalizeLazySettingsForm],
+  )
+
+  const scheduleAutoSaveStatusReset = useCallback(() => {
+    if (autoSaveStatusTimerRef.current) {
+      window.clearTimeout(autoSaveStatusTimerRef.current)
+    }
+    autoSaveStatusTimerRef.current = window.setTimeout(() => {
+      setAutoSaveStatus((status) => (status === 'saved' ? 'idle' : status))
+      autoSaveStatusTimerRef.current = null
+    }, AUTO_SAVE_STATUS_RESET_MS)
+  }, [])
+
+  const finishAutoSaveRequest = useCallback((status: Exclude<AutoSaveStatus, 'idle' | 'saving'>) => {
+    autoSavePendingCountRef.current = Math.max(0, autoSavePendingCountRef.current - 1)
+    if (autoSavePendingCountRef.current > 0) {
+      setAutoSaveStatus('saving')
+      return
+    }
+    setAutoSaveStatus(status)
+    if (status === 'saved') {
+      scheduleAutoSaveStatusReset()
+    }
+  }, [scheduleAutoSaveStatusReset])
+
+  const autoSaveSettingsPatch = useCallback(async (patch: Partial<SystemSettings>) => {
+    const patchKeys = Object.keys(patch) as Array<keyof SystemSettings>
+    if (patchKeys.length === 0) return
+
+    const previous = settingsFormRef.current
+    const optimistic = commitSettingsForm({
+      ...previous,
+      ...patch,
+    })
+    const rollbackPatch = getSettingsPatchValues(previous, patchKeys)
+    const requestedVersions: Record<string, number> = {}
+
+    for (const key of patchKeys) {
+      const fieldKey = String(key)
+      const nextVersion = (autoSaveFieldVersionsRef.current[fieldKey] ?? 0) + 1
+      autoSaveFieldVersionsRef.current[fieldKey] = nextVersion
+      requestedVersions[fieldKey] = nextVersion
+    }
+
+    autoSavePendingCountRef.current += 1
+    if (autoSaveStatusTimerRef.current) {
+      window.clearTimeout(autoSaveStatusTimerRef.current)
+      autoSaveStatusTimerRef.current = null
+    }
+    setAutoSaveError('')
+    setAutoSaveStatus('saving')
+
+    try {
+      const updated = await api.updateSettings(getSettingsPatchValues(optimistic, patchKeys))
+      const mergeKeys = patchKeys.filter((key) => {
+        const fieldKey = String(key)
+        return autoSaveFieldVersionsRef.current[fieldKey] === requestedVersions[fieldKey]
+      })
+      if (mergeKeys.length > 0) {
+        commitSettingsForm({
+          ...settingsFormRef.current,
+          ...getSettingsPatchValues(updated, mergeKeys),
+        })
+      }
+      const autoSaveSuccessMessage = updated.expired_cleaned && updated.expired_cleaned > 0
+        ? `${t('settings.autoSaved')} · ${t('settings.expiredCleanedResult', { count: updated.expired_cleaned })}`
+        : t('settings.autoSaved')
+      showToast(autoSaveSuccessMessage, 'success', AUTO_SAVE_TOAST_MS)
+      finishAutoSaveRequest('saved')
+    } catch (error) {
+      const rollbackKeys = patchKeys.filter((key) => {
+        const fieldKey = String(key)
+        return autoSaveFieldVersionsRef.current[fieldKey] === requestedVersions[fieldKey]
+      })
+      if (rollbackKeys.length > 0) {
+        commitSettingsForm({
+          ...settingsFormRef.current,
+          ...getSettingsPatchValues({ ...previous, ...rollbackPatch }, rollbackKeys),
+        })
+      }
+      const message = getErrorMessage(error)
+      setAutoSaveError(message)
+      showToast(`${t('settings.autoSaveFailed')}: ${message}`, 'error')
+      finishAutoSaveRequest('error')
+    }
+  }, [commitSettingsForm, finishAutoSaveRequest, showToast, t])
+
+  const autoSaveBooleanField = useCallback((field: keyof SystemSettings, value: string, extraPatch: Partial<SystemSettings> = {}) => {
+    void autoSaveSettingsPatch({
+      ...extraPatch,
+      [field]: value === 'true',
+    } as Partial<SystemSettings>)
+  }, [autoSaveSettingsPatch])
+
+  const autoSaveStringField = useCallback((field: keyof SystemSettings, value: string, extraPatch: Partial<SystemSettings> = {}) => {
+    void autoSaveSettingsPatch({
+      ...extraPatch,
+      [field]: value,
+    } as Partial<SystemSettings>)
+  }, [autoSaveSettingsPatch])
 
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
-    setSettingsForm(normalizeLazySettingsForm(settings))
+    commitSettingsForm(settings)
     const branding = {
       site_name: settings.site_name,
       site_logo: settings.site_logo,
@@ -731,7 +892,7 @@ export default function Settings() {
     return {
       health,
     }
-  }, [applyBranding, normalizeLazySettingsForm])
+  }, [applyBranding, commitSettingsForm])
 
   const { data, loading, error, reload } = useDataLoader<{
     health: HealthResponse | null
@@ -747,7 +908,7 @@ export default function Settings() {
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
       const updated = await api.updateSettings(normalizeLazySettingsForm(settingsForm))
-      setSettingsForm(normalizeLazySettingsForm(updated))
+      commitSettingsForm(updated)
       const branding = {
         site_name: updated.site_name,
         site_logo: updated.site_logo,
@@ -910,6 +1071,31 @@ export default function Settings() {
   const showConnectionPool = isExternalDatabase || isExternalCache
   const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
   const saveButtonLabel = savingSettings ? t('common.saving') : t('settings.saveSettings')
+  const autoSaveStatusMeta = autoSaveStatus === 'idle' ? null : (
+    <span
+      className={cn(
+        'inline-flex items-center gap-1 font-medium',
+        autoSaveStatus === 'saving' && 'text-muted-foreground',
+        autoSaveStatus === 'saved' && 'text-emerald-600 dark:text-emerald-400',
+        autoSaveStatus === 'error' && 'text-destructive',
+      )}
+      title={autoSaveStatus === 'error' ? autoSaveError : undefined}
+    >
+      <span
+        className={cn(
+          'size-1.5 rounded-full',
+          autoSaveStatus === 'saving' && 'animate-pulse bg-muted-foreground',
+          autoSaveStatus === 'saved' && 'bg-emerald-500',
+          autoSaveStatus === 'error' && 'bg-destructive',
+        )}
+      />
+      {autoSaveStatus === 'saving'
+        ? t('settings.autoSaving')
+        : autoSaveStatus === 'saved'
+          ? t('settings.autoSaved')
+          : t('settings.autoSaveFailed')}
+    </span>
+  )
   const siteLogoPreview = sanitizeBrandingLogo(settingsForm.site_logo) || DEFAULT_SITE_LOGO
   const backgroundImagePreview = sanitizeBrandingImage(settingsForm.background_image)
   const backgroundIsVideo = isBrandingVideo(backgroundImagePreview)
@@ -946,7 +1132,7 @@ export default function Settings() {
   const modelsLastSyncedLabel = modelsLastSyncedAt ? formatBeijingTime(modelsLastSyncedAt) : t('settings.modelsNeverSynced')
   const modelsSourceLabel = modelsSourceURL || 'https://developers.openai.com/codex/models'
   const renderSaveButton = (className?: string) => (
-    <Button className={className} onClick={() => void handleSaveSettings()} disabled={savingSettings}>
+    <Button className={className} onClick={() => void handleSaveSettings()} disabled={savingSettings || autoSaveStatus === 'saving'}>
       <Save className="size-4" />
       {saveButtonLabel}
     </Button>
@@ -966,6 +1152,7 @@ export default function Settings() {
         <PageHeader
           title={t('settings.title')}
           description={t('settings.description')}
+          actionMeta={autoSaveStatusMeta}
           actions={renderSaveButton('max-sm:w-full')}
         />
 
@@ -1069,7 +1256,7 @@ export default function Settings() {
                 <SettingField label={t('settings.usageProbeResponsesFallback')} description={t('settings.usageProbeResponsesFallbackDesc')}>
                   <Select
                     value={settingsForm.usage_probe_responses_fallback_enabled ? 'true' : 'false'}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, usage_probe_responses_fallback_enabled: value === 'true' }))}
+                    onValueChange={(value) => autoSaveBooleanField('usage_probe_responses_fallback_enabled', value)}
                     options={booleanOptions}
                   />
                 </SettingField>
@@ -1086,7 +1273,13 @@ export default function Settings() {
                 <SettingField label={t('settings.lazyMode')} description={t('settings.lazyModeDesc')}>
                   <Select
                     value={settingsForm.lazy_mode ? 'true' : 'false'}
-                    onValueChange={(value) => setSettingsForm((f) => normalizeLazySettingsForm({ ...f, lazy_mode: value === 'true' }))}
+                    onValueChange={(value) => {
+                      const enabled = value === 'true'
+                      void autoSaveSettingsPatch({
+                        lazy_mode: enabled,
+                        auto_clean_full_usage: enabled ? false : settingsFormRef.current.auto_clean_full_usage,
+                      })
+                    }}
                     options={booleanOptions}
                   />
                 </SettingField>
@@ -1098,7 +1291,7 @@ export default function Settings() {
                 <SettingField label={t('settings.testModelLabel')} description={t('settings.testModelHint')}>
                   <Select
                     value={settingsForm.test_model}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, test_model: value }))}
+                    onValueChange={(value) => autoSaveStringField('test_model', value)}
                     options={textModelOptions}
                   />
                 </SettingField>
@@ -1114,21 +1307,21 @@ export default function Settings() {
                 <SettingField label={t('settings.fastSchedulerEnabled')} description={t('settings.fastSchedulerEnabledDesc')}>
                   <Select
                     value={settingsForm.fast_scheduler_enabled ? 'true' : 'false'}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, fast_scheduler_enabled: value === 'true' }))}
+                    onValueChange={(value) => autoSaveBooleanField('fast_scheduler_enabled', value)}
                     options={booleanOptions}
                   />
                 </SettingField>
                 <SettingField label={t('settings.schedulerMode')} description={t('settings.schedulerModeDesc')}>
                   <Select
                     value={settingsForm.scheduler_mode}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, scheduler_mode: value }))}
+                    onValueChange={(value) => autoSaveStringField('scheduler_mode', value)}
                     options={schedulerModeOptions}
                   />
                 </SettingField>
                 <SettingField label={t('settings.affinityMode')} description={t('settings.affinityModeDesc')}>
                   <Select
                     value={settingsForm.affinity_mode || 'bounded'}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, affinity_mode: value }))}
+                    onValueChange={(value) => autoSaveStringField('affinity_mode', value)}
                     options={affinityModeOptions}
                   />
                 </SettingField>
@@ -1136,19 +1329,62 @@ export default function Settings() {
             </SettingsCard>
           </div>
 
+          <SettingsCard title={t('settings.globalAutoPauseTitle')} description={t('settings.globalAutoPauseDesc')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
+              <SettingField label={t('settings.globalAutoPause5h')} description={t('settings.globalAutoPauseHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  inputMode="decimal"
+                  placeholder={t('settings.globalAutoPausePlaceholder')}
+                  value={settingsForm.auto_pause_5h_threshold > 0 ? (settingsForm.auto_pause_5h_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_threshold: isNaN(ratio) ? 0 : ratio }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_5h_threshold: settingsForm.auto_pause_5h_threshold })
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.globalAutoPause7d')} description={t('settings.globalAutoPauseHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  inputMode="decimal"
+                  placeholder={t('settings.globalAutoPausePlaceholder')}
+                  value={settingsForm.auto_pause_7d_threshold > 0 ? (settingsForm.auto_pause_7d_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                    setSettingsForm(f => ({ ...f, auto_pause_7d_threshold: isNaN(ratio) ? 0 : ratio }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_7d_threshold: settingsForm.auto_pause_7d_threshold })
+                  }}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.codexWebsocket')} description={t('settings.codexWebsocketDesc')}>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
               <SettingField label={t('settings.codexForceWebsocket')} description={t('settings.codexForceWebsocketDesc')}>
                 <Select
                   value={settingsForm.codex_force_websocket ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_force_websocket: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('codex_force_websocket', value)}
                   options={booleanOptions}
                 />
               </SettingField>
               <SettingField label={t('settings.codexWSKeepaliveEnabled')} description={t('settings.codexWSKeepaliveEnabledDesc')}>
                 <Select
                   value={settingsForm.codex_ws_keepalive_enabled ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_ws_keepalive_enabled: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('codex_ws_keepalive_enabled', value)}
                   options={booleanOptions}
                 />
               </SettingField>
@@ -1164,14 +1400,14 @@ export default function Settings() {
               <SettingField label={t('settings.codexWSHideUpstreamErrors')} description={t('settings.codexWSHideUpstreamErrorsDesc')}>
                 <Select
                   value={settingsForm.codex_ws_hide_upstream_errors ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_ws_hide_upstream_errors: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('codex_ws_hide_upstream_errors', value)}
                   options={booleanOptions}
                 />
               </SettingField>
               <SettingField label={t('settings.codexWSSilentRetryEnabled')} description={t('settings.codexWSSilentRetryEnabledDesc')}>
                 <Select
                   value={settingsForm.codex_ws_silent_retry_enabled ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, codex_ws_silent_retry_enabled: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('codex_ws_silent_retry_enabled', value)}
                   options={booleanOptions}
                 />
               </SettingField>
@@ -1192,7 +1428,7 @@ export default function Settings() {
               <SettingField label={t('settings.clientCompatMode')} description={t('settings.clientCompatModeDesc')}>
                 <Select
                   value={settingsForm.client_compat_mode}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, client_compat_mode: value }))}
+                  onValueChange={(value) => autoSaveStringField('client_compat_mode', value)}
                   options={clientCompatOptions}
                 />
               </SettingField>
@@ -1205,7 +1441,7 @@ export default function Settings() {
               <SettingField label={t('settings.usageLogMode')} description={t('settings.usageLogModeDesc')}>
                 <Select
                   value={settingsForm.usage_log_mode}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, usage_log_mode: value }))}
+                  onValueChange={(value) => autoSaveStringField('usage_log_mode', value)}
                   options={usageLogModeOptions}
                 />
               </SettingField>
@@ -1230,14 +1466,14 @@ export default function Settings() {
               <SettingField label={t('settings.billingTierPolicy')} description={t('settings.billingTierPolicyDesc')}>
                 <Select
                   value={settingsForm.billing_tier_policy}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, billing_tier_policy: value }))}
+                  onValueChange={(value) => autoSaveStringField('billing_tier_policy', value)}
                   options={billingTierPolicyOptions}
                 />
               </SettingField>
               <SettingField label={t('settings.streamFlushPolicy')} description={t('settings.streamFlushPolicyDesc')}>
                 <Select
                   value={settingsForm.stream_flush_policy}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, stream_flush_policy: value }))}
+                  onValueChange={(value) => autoSaveStringField('stream_flush_policy', value)}
                   options={streamFlushPolicyOptions}
                 />
               </SettingField>
@@ -1248,6 +1484,13 @@ export default function Settings() {
                   max={1000}
                   value={settingsForm.stream_flush_interval_ms}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: parseInt(e.target.value) || 20 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.firstTokenMode')} description={t('settings.firstTokenModeDesc')}>
+                <Select
+                  value={settingsForm.first_token_mode}
+                  onValueChange={(value) => autoSaveStringField('first_token_mode', value)}
+                  options={firstTokenModeOptions}
                 />
               </SettingField>
               <SettingField label={t('settings.firstTokenTimeout')} description={t('settings.firstTokenTimeoutDesc')}>
@@ -1318,7 +1561,7 @@ export default function Settings() {
                   <SettingField label={t('settings.imageS3ForcePathStyle')} description={t('settings.imageS3ForcePathStyleDesc')}>
                     <Select
                       value={settingsForm.image_s3_force_path_style ? 'true' : 'false'}
-                      onValueChange={(value) => setSettingsForm((f) => ({ ...f, image_s3_force_path_style: value === 'true' }))}
+                      onValueChange={(value) => autoSaveBooleanField('image_s3_force_path_style', value)}
                       options={booleanOptions}
                     />
                   </SettingField>
@@ -1345,21 +1588,21 @@ export default function Settings() {
               <SettingField label={t('settings.autoCleanUnauthorized')} description={t('settings.autoCleanUnauthorizedDesc')}>
                 <Select
                   value={settingsForm.auto_clean_unauthorized ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_unauthorized: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('auto_clean_unauthorized', value)}
                   options={booleanOptions}
                 />
               </SettingField>
               <SettingField label={t('settings.autoCleanRateLimited')} description={t('settings.autoCleanRateLimitedDesc')}>
                 <Select
                   value={settingsForm.auto_clean_rate_limited ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_rate_limited: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('auto_clean_rate_limited', value)}
                   options={booleanOptions}
                 />
               </SettingField>
               <SettingField label={t('settings.autoCleanFullUsage')} description={t('settings.autoCleanFullUsageDesc')}>
                 <Select
                   value={lazyModeActive ? 'false' : settingsForm.auto_clean_full_usage ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => normalizeLazySettingsForm({ ...f, auto_clean_full_usage: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('auto_clean_full_usage', value)}
                   disabled={lazyModeActive}
                   options={booleanOptions}
                 />
@@ -1367,14 +1610,14 @@ export default function Settings() {
               <SettingField label={t('settings.autoCleanError')} description={t('settings.autoCleanErrorDesc')}>
                 <Select
                   value={settingsForm.auto_clean_error ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_error: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('auto_clean_error', value)}
                   options={booleanOptions}
                 />
               </SettingField>
               <SettingField label={t('settings.autoCleanExpired')} description={t('settings.autoCleanExpiredDesc')}>
                 <Select
                   value={settingsForm.auto_clean_expired ? 'true' : 'false'}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, auto_clean_expired: value === 'true' }))}
+                  onValueChange={(value) => autoSaveBooleanField('auto_clean_expired', value)}
                   options={booleanOptions}
                 />
               </SettingField>
@@ -1412,21 +1655,21 @@ export default function Settings() {
                   <Select
                     value={settingsForm.allow_remote_migration ? 'true' : 'false'}
                     disabled={!canConfigureRemoteMigration}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, allow_remote_migration: value === 'true' }))}
+                    onValueChange={(value) => autoSaveBooleanField('allow_remote_migration', value)}
                     options={booleanOptions}
                   />
                 </SettingField>
                 <SettingField label={t('settings.promptFilterEnabled')} description={t('settings.promptFilterEnabledDesc')}>
                   <Select
                     value={settingsForm.prompt_filter_enabled ? 'true' : 'false'}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, prompt_filter_enabled: value === 'true' }))}
+                    onValueChange={(value) => autoSaveBooleanField('prompt_filter_enabled', value)}
                     options={booleanOptions}
                   />
                 </SettingField>
                 <SettingField label={t('settings.promptFilterMode')} description={t('settings.promptFilterModeDesc')}>
                   <Select
                     value={settingsForm.prompt_filter_mode}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, prompt_filter_mode: value }))}
+                    onValueChange={(value) => autoSaveStringField('prompt_filter_mode', value)}
                     options={[
                       { label: t('promptFilter.modeMonitor'), value: 'monitor' },
                       { label: t('promptFilter.modeWarn'), value: 'warn' },
@@ -1515,7 +1758,7 @@ export default function Settings() {
                 <SettingField label={t('settings.showFullUsageNumbers')} description={t('settings.showFullUsageNumbersDesc')}>
                   <Select
                     value={settingsForm.show_full_usage_numbers ? 'true' : 'false'}
-                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, show_full_usage_numbers: value === 'true' }))}
+                    onValueChange={(value) => autoSaveBooleanField('show_full_usage_numbers', value)}
                     options={booleanOptions}
                   />
                 </SettingField>

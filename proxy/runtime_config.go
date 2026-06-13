@@ -16,6 +16,9 @@ const (
 	StreamFlushPolicyImmediate = "immediate"
 	StreamFlushPolicyCoalesce  = "coalesce"
 
+	FirstTokenModeStrict = "strict"
+	FirstTokenModeLoose  = "loose"
+
 	BillingTierPolicyActual    = "actual"
 	BillingTierPolicyRequested = "requested"
 
@@ -25,6 +28,7 @@ const (
 	defaultStreamFlushIntervalMS = 20
 	minStreamFlushIntervalMS     = 1
 	maxStreamFlushIntervalMS     = 1000
+	defaultFirstTokenMode        = FirstTokenModeStrict
 	defaultFirstTokenTimeoutSec  = 0
 	maxFirstTokenTimeoutSec      = 600
 	defaultBillingTierPolicy     = BillingTierPolicyActual
@@ -39,6 +43,7 @@ type RuntimeSettings struct {
 	CodexMinCLIVersion    string
 	StreamFlushPolicy     string
 	StreamFlushIntervalMS int
+	FirstTokenMode        string
 	FirstTokenTimeoutSec  int
 	BillingTierPolicy     string
 	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
@@ -59,6 +64,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexMinCLIVersion:    defaultCodexMinCLIVersion,
 		StreamFlushPolicy:     defaultStreamFlushPolicy,
 		StreamFlushIntervalMS: defaultStreamFlushIntervalMS,
+		FirstTokenMode:        defaultFirstTokenMode,
 		FirstTokenTimeoutSec:  defaultFirstTokenTimeoutSec,
 		BillingTierPolicy:     defaultBillingTierPolicy,
 		CodexWSHideErrors:     defaultCodexWSHideErrors,
@@ -91,6 +97,17 @@ func NormalizeStreamFlushPolicy(policy string) string {
 	}
 }
 
+func NormalizeFirstTokenMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", FirstTokenModeStrict:
+		return FirstTokenModeStrict
+	case FirstTokenModeLoose:
+		return FirstTokenModeLoose
+	default:
+		return FirstTokenModeStrict
+	}
+}
+
 func NormalizeBillingTierPolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
 	case "", BillingTierPolicyActual:
@@ -106,6 +123,7 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	defaults := DefaultRuntimeSettings()
 	settings.ClientCompatMode = NormalizeClientCompatMode(settings.ClientCompatMode)
 	settings.StreamFlushPolicy = NormalizeStreamFlushPolicy(settings.StreamFlushPolicy)
+	settings.FirstTokenMode = NormalizeFirstTokenMode(settings.FirstTokenMode)
 	settings.BillingTierPolicy = NormalizeBillingTierPolicy(settings.BillingTierPolicy)
 	if strings.TrimSpace(settings.CodexMinCLIVersion) == "" {
 		settings.CodexMinCLIVersion = defaults.CodexMinCLIVersion
@@ -140,6 +158,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexMinCLIVersion = settings.CodexMinCLIVersion
 		next.StreamFlushPolicy = settings.StreamFlushPolicy
 		next.StreamFlushIntervalMS = settings.StreamFlushIntervalMS
+		next.FirstTokenMode = settings.FirstTokenMode
 		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
 		next.BillingTierPolicy = settings.BillingTierPolicy
 		next.CodexForceWebsocket = settings.CodexForceWebsocket
@@ -179,4 +198,8 @@ func currentFirstTokenTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func currentFirstTokenMode() string {
+	return CurrentRuntimeSettings().FirstTokenMode
 }

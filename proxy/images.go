@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -50,7 +52,12 @@ const (
 
 	// MaxImageEditInputCount caps the number of input images for edit requests.
 	MaxImageEditInputCount = 10
+
+	imageStreamConnectedComment = ": connected\n\n"
+	imageStreamKeepaliveComment = ": keepalive\n\n"
 )
+
+var imageStreamKeepaliveInterval = 15 * time.Second
 
 type imageCallResult struct {
 	Result        string
@@ -526,6 +533,86 @@ func responsesBodyHasImageGenerationTool(body []byte) bool {
 	return strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation")
 }
 
+func responsesBodyRequestsImageGeneration(body []byte) bool {
+	if isImageOnlyModel(gjson.GetBytes(body, "model").String()) {
+		return true
+	}
+	choice := gjson.GetBytes(body, "tool_choice")
+	if choice.Type == gjson.String && strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation") {
+		return true
+	}
+	if choice.Exists() && strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation") {
+		return true
+	}
+	for _, key := range responsesImageGenerationOptionFields {
+		value := gjson.GetBytes(body, key)
+		if value.Exists() && value.Type != gjson.Null {
+			return true
+		}
+	}
+	return false
+}
+
+// explicitlyRequestsImageGeneration 判断请求是否显式要求图片生成：image-only
+// 模型、tool_choice=image_generation、顶层图片选项字段，或 tools[] 中显式声明的
+// image_generation 工具。WebSocket 上游传输大体积图片数据会卡死，这类请求必须
+// 改走 HTTP（issue #220）。
+func explicitlyRequestsImageGeneration(body []byte) bool {
+	return responsesBodyRequestsImageGeneration(body) || responsesBodyHasImageGenerationTool(body)
+}
+
+// stripResponsesImageGenerationTool 移除请求体中的 image_generation 工具及指向它的
+// tool_choice。仅在 WebSocket 上游模式下、且请求未显式要求生图时使用：此时 body 中
+// 的 image_generation 工具一定是 PrepareResponsesBody 自动注入的，移除后可防止模型
+// 自主调用图片工具产生大体积数据导致 WS 流卡死（issue #220）。显式生图请求已被
+// explicitlyRequestsImageGeneration 判定为强制 HTTP，不会走到这里。
+func stripResponsesImageGenerationTool(body []byte) []byte {
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && tools.IsArray() {
+		kept := make([]interface{}, 0, len(tools.Array()))
+		removed := false
+		for _, tool := range tools.Array() {
+			if strings.TrimSpace(tool.Get("type").String()) == "image_generation" {
+				removed = true
+				continue
+			}
+			kept = append(kept, tool.Value())
+		}
+		if removed {
+			if len(kept) == 0 {
+				body, _ = sjson.DeleteBytes(body, "tools")
+			} else {
+				body, _ = sjson.SetBytes(body, "tools", kept)
+			}
+		}
+	}
+	choice := gjson.GetBytes(body, "tool_choice")
+	if choice.Exists() {
+		isImageChoice := false
+		if choice.Type == gjson.String {
+			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation")
+		} else {
+			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation")
+		}
+		if isImageChoice {
+			body, _ = sjson.DeleteBytes(body, "tool_choice")
+		}
+	}
+	// 移除与图片工具配套注入的桥接 instructions（引导模型调用 image_generation
+	// 工具）；保留用户自带的 instructions 内容。
+	if instructions := gjson.GetBytes(body, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		cleaned := strings.ReplaceAll(instructions, "\n\n"+codexImageGenerationBridgeText, "")
+		cleaned = strings.ReplaceAll(cleaned, codexImageGenerationBridgeText, "")
+		cleaned = strings.TrimSpace(cleaned)
+		if cleaned == "" {
+			body, _ = sjson.DeleteBytes(body, "instructions")
+		} else {
+			body, _ = sjson.SetBytes(body, "instructions", cleaned)
+		}
+	}
+	return body
+}
+
 func validateImagesModel(model string) error {
 	if !isImageOnlyModel(model) {
 		return fmt.Errorf("images endpoint requires an image model, got %q", strings.TrimSpace(model))
@@ -622,7 +709,7 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 }
 
 func (h *Handler) ImagesGenerations(c *gin.Context) {
-	rawBody, err := io.ReadAll(c.Request.Body)
+	rawBody, err := readRawRequestBody(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -668,6 +755,13 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
+	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
 	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
@@ -783,6 +877,13 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
@@ -810,7 +911,7 @@ func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string)
 }
 
 func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
-	rawBody, err := io.ReadAll(c.Request.Body)
+	rawBody, err := readRawRequestBody(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -887,6 +988,13 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
+	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
 	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
@@ -1302,6 +1410,51 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		readErr        error
 	)
 	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	var (
+		writeMu   sync.Mutex
+		closeOnce sync.Once
+	)
+	closeUpstream := func() {
+		if closer, ok := body.(io.Closer); ok {
+			closeOnce.Do(func() {
+				_ = closer.Close()
+			})
+		}
+	}
+	getReadErr := func() error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return readErr
+	}
+	setReadErr := func(err error) {
+		if err == nil {
+			return
+		}
+		writeMu.Lock()
+		if readErr == nil {
+			readErr = err
+		}
+		writeMu.Unlock()
+	}
+	writeRaw := func(data string, forceFlush bool) error {
+		var err error
+		writeMu.Lock()
+		if readErr == nil {
+			if err = streamWriter.WriteString(data); err == nil && forceFlush {
+				err = streamWriter.Flush()
+			}
+			if err != nil && readErr == nil {
+				readErr = err
+			}
+		} else {
+			err = readErr
+		}
+		writeMu.Unlock()
+		if err != nil {
+			closeUpstream()
+		}
+		return err
+	}
 	writeEvent := func(eventName string, payload []byte) {
 		var builder strings.Builder
 		if strings.TrimSpace(eventName) != "" {
@@ -1312,13 +1465,18 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		builder.WriteString("data: ")
 		builder.Write(payload)
 		builder.WriteString("\n\n")
-		if err := streamWriter.WriteString(builder.String()); err != nil && readErr == nil {
-			readErr = err
-		}
+		_ = writeRaw(builder.String(), true)
 	}
+	if err := writeRaw(imageStreamConnectedComment, true); err != nil {
+		return nil, 0, 0, imageUsageLogInfo{}, err
+	}
+	stopKeepalive := startImageStreamKeepalive(c.Request.Context(), imageStreamKeepaliveInterval, func() bool {
+		return writeRaw(imageStreamKeepaliveComment, true) == nil
+	})
+	defer stopKeepalive()
 
 	err := ReadSSEStream(body, func(data []byte) bool {
-		if readErr != nil {
+		if getReadErr() != nil {
 			return false
 		}
 		if firstTokenMs == 0 {
@@ -1351,8 +1509,8 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		case "response.completed":
 			results, completedAt, usageRaw, firstMeta, completedUsage, err := extractImagesFromResponsesCompleted(data, fallbackModel)
 			if err != nil {
-				readErr = err
 				writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+				setReadErr(err)
 				return false
 			}
 			if completedUsage != nil {
@@ -1366,8 +1524,9 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 				results = pendingResults
 			}
 			if len(results) == 0 {
-				readErr = fmt.Errorf("upstream did not return image output")
-				writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+				err := fmt.Errorf("upstream did not return image output")
+				writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+				setReadErr(err)
 				return false
 			}
 			eventName := streamPrefix + ".completed"
@@ -1379,23 +1538,29 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			}
 			return false
 		case "error":
-			readErr = imageGenerationFailureError(data)
-			writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+			err := imageGenerationFailureError(data)
+			writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			setReadErr(err)
 			return false
 		case "response.failed":
-			readErr = imageGenerationFailureError(data)
-			writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+			err := imageGenerationFailureError(data)
+			writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+			setReadErr(err)
 			return false
 		}
 		return true
 	})
+	stopKeepalive()
 	if err != nil {
+		if streamErr := getReadErr(); streamErr != nil {
+			return usage, imageCount, firstTokenMs, imageLogInfo, streamErr
+		}
 		return usage, imageCount, firstTokenMs, imageLogInfo, err
 	}
-	if readErr == nil {
-		readErr = streamWriter.Flush()
+	if getReadErr() == nil {
+		_ = writeRaw("", true)
 	}
-	if imageCount == 0 && len(pendingResults) > 0 && readErr == nil {
+	if imageCount == 0 && len(pendingResults) > 0 && getReadErr() == nil {
 		eventName := streamPrefix + ".completed"
 		for _, image := range pendingResults {
 			mergeImageMeta(&image, streamMeta)
@@ -1404,11 +1569,44 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			imageCount++
 		}
 	}
-	if imageCount == 0 && readErr == nil {
-		readErr = fmt.Errorf("stream disconnected before image generation completed")
-		writeEvent("error", buildImagesStreamErrorPayload(readErr.Error()))
+	if imageCount == 0 && getReadErr() == nil {
+		err := fmt.Errorf("stream disconnected before image generation completed")
+		writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
+		setReadErr(err)
 	}
-	return usage, imageCount, firstTokenMs, imageLogInfo, readErr
+	return usage, imageCount, firstTokenMs, imageLogInfo, getReadErr()
+}
+
+func startImageStreamKeepalive(ctx context.Context, interval time.Duration, writeKeepalive func() bool) func() {
+	if interval <= 0 || writeKeepalive == nil {
+		return func() {}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !writeKeepalive() {
+					return
+				}
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() {
+		stopOnce.Do(func() {
+			close(done)
+		})
+	}
 }
 
 func imageGenerationFailureError(payload []byte) error {

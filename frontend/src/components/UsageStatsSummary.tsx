@@ -2,16 +2,25 @@ import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { BarChart3, Clock, Gauge, Zap } from 'lucide-react'
 import type { UsageStats } from '../types'
+import { formatUsageNumber } from '../lib/usageFormat'
 import { Card, CardContent } from '@/components/ui/card'
 
 interface UsageStatsSummaryProps {
   stats: UsageStats
   className?: string
+  rangeLabel?: string
+  showFullUsageNumbers?: boolean
 }
 
-export default function UsageStatsSummary({ stats, className = '' }: UsageStatsSummaryProps) {
+export default function UsageStatsSummary({
+  stats,
+  className = '',
+  rangeLabel,
+  showFullUsageNumbers = false,
+}: UsageStatsSummaryProps) {
   const { t, i18n } = useTranslation()
   const locale = i18n.language
+  const rangeParams = rangeLabel ? { range: rangeLabel } : undefined
 
   return (
     <Card className={`py-0 ${className}`}>
@@ -22,32 +31,41 @@ export default function UsageStatsSummary({ stats, className = '' }: UsageStatsS
             icon={<BarChart3 className="size-5" />}
             iconBg="bg-blue-500/10 text-blue-500"
             title={t('dashboard.trafficGroup')}
-            primaryLabel={t('dashboard.todayRequests')}
+            primaryLabel={rangeLabel ? t('dashboard.rangeRequests', rangeParams) : t('dashboard.todayRequests')}
             primaryValue={formatInteger(stats.today_requests, locale)}
           >
             <MetricLine label={t('dashboard.totalRequests')} value={formatInteger(stats.total_requests, locale)} />
-            <MetricLine label={t('dashboard.rpmTpm')} value={`${formatInteger(stats.rpm, locale)} / ${formatInteger(stats.tpm, locale)}`} />
+            <MetricLine
+              label={t('dashboard.rpmTpm')}
+              value={`${formatInteger(stats.rpm, locale)} / ${formatUsageNumber(stats.tpm, showFullUsageNumbers, locale)}`}
+            />
           </MetricGroup>
 
           <MetricGroup
             icon={<Zap className="size-5" />}
             iconBg="bg-purple-500/10 text-purple-500"
             title={t('dashboard.tokenGroup')}
-            primaryLabel={t('dashboard.todayTokens')}
-            primaryValue={formatInteger(stats.today_tokens, locale)}
+            primaryLabel={rangeLabel ? t('dashboard.rangeTokens', rangeParams) : t('dashboard.todayTokens')}
+            primaryValue={formatUsageNumber(stats.today_tokens, showFullUsageNumbers, locale)}
           >
-            <MetricLine label={t('dashboard.totalTokens')} value={formatInteger(stats.total_tokens, locale)} />
-            <MetricLine label={t('dashboard.billing')} value={`${t('usage.todayCost')}: ${formatMoney(stats.today_user_billed)} / ${t('dashboard.totalCostShort')}: ${formatMoney(stats.total_user_billed)}`} />
+            <MetricLine label={t('dashboard.totalTokens')} value={formatUsageNumber(stats.total_tokens, showFullUsageNumbers, locale)} />
+            <MetricLine
+              label={t('dashboard.billing')}
+              value={`${rangeLabel ? t('dashboard.rangeCost', rangeParams) : t('usage.todayCost')}: ${formatMoney(stats.today_user_billed)} / ${t('dashboard.totalCostShort')}: ${formatMoney(stats.total_user_billed)}`}
+            />
           </MetricGroup>
 
           <MetricGroup
             icon={<Gauge className="size-5" />}
             iconBg="bg-teal-500/10 text-teal-500"
             title={t('dashboard.cacheGroup')}
-            primaryLabel={t('dashboard.todayCacheHitRate')}
+            primaryLabel={rangeLabel ? t('dashboard.rangeCacheHitRate', rangeParams) : t('dashboard.todayCacheHitRate')}
             primaryValue={formatPercent(stats.today_cache_rate ?? 0)}
           >
-            <MetricLine label={t('dashboard.todayCachedTokens')} value={formatInteger(stats.today_cached_tokens ?? 0, locale)} />
+            <MetricLine
+              label={rangeLabel ? t('dashboard.rangeCachedTokens', rangeParams) : t('dashboard.todayCachedTokens')}
+              value={formatUsageNumber(stats.today_cached_tokens ?? 0, showFullUsageNumbers, locale)}
+            />
             <MetricLine label={t('dashboard.totalCacheHitRate')} value={formatPercent(stats.total_cache_rate ?? 0)} />
           </MetricGroup>
 
@@ -59,7 +77,11 @@ export default function UsageStatsSummary({ stats, className = '' }: UsageStatsS
             primaryValue={formatLatency(stats.avg_first_token_ms)}
           >
             <MetricLine label={t('dashboard.avgCompletionLatency')} value={formatLatency(stats.avg_duration_ms)} />
-            <MetricLine label={t('dashboard.todayErrorRate')} value={formatPercent(stats.error_rate)} tone={stats.error_rate > 1 ? 'danger' : 'default'} />
+            <MetricLine
+              label={rangeLabel ? t('dashboard.rangeErrorRate', rangeParams) : t('dashboard.todayErrorRate')}
+              value={formatPercent(stats.error_rate)}
+              tone={stats.error_rate > 1 ? 'danger' : 'default'}
+            />
           </MetricGroup>
         </div>
       </CardContent>

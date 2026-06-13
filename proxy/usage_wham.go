@@ -135,7 +135,7 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 
 	if w5h != nil {
 		resetAt := whamWindowResetAt(w5h, now)
-		account.SetUsageSnapshot5h(w5h.UsedPercent, resetAt)
+		account.SetUsageSnapshot5hAt(w5h.UsedPercent, resetAt, now)
 		result.UsagePct5h = w5h.UsedPercent
 		result.Reset5hAt = resetAt
 		result.HasUsage5h = true
@@ -149,6 +149,9 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 		result.HasUsage7d = true
 		if store != nil {
 			store.PersistUsageSnapshot(account, w7d.UsedPercent)
+			if result.UsagePct7d >= 100 {
+				result.Usage7dRateLimited = store.MarkUsage7dRateLimited(account)
+			}
 		}
 	} else if result.Used5hHeaders && store != nil {
 		// 只有 5h 数据时，单独持久化 5h 快照

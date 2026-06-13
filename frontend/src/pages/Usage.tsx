@@ -13,6 +13,7 @@ import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
 import { formatCompactEmail } from '../lib/utils'
+import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -29,32 +30,6 @@ import {
 import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
-
-function formatTokens(value?: number | null, showFullNumbers = false): string {
-  if (value === undefined || value === null) return '0'
-  const numericValue = Number(value)
-  if (!Number.isFinite(numericValue)) return '0'
-  const roundedValue = Math.round(numericValue)
-  if (showFullNumbers) return roundedValue.toLocaleString()
-
-  const absValue = Math.abs(numericValue)
-  const units = [
-    { value: 1_000_000_000_000, suffix: 'T' },
-    { value: 1_000_000_000, suffix: 'B' },
-    { value: 1_000_000, suffix: 'M' },
-    { value: 1_000, suffix: 'K' },
-  ]
-  const unit = units.find((item) => absValue >= item.value)
-  if (!unit) return roundedValue.toLocaleString()
-
-  const scaled = numericValue / unit.value
-  const fractionDigits = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 2
-  const compact = scaled
-    .toFixed(fractionDigits)
-    .replace(/\.0+$/, '')
-    .replace(/(\.\d*?)0+$/, '$1')
-  return `${compact}${unit.suffix}`
-}
 
 function getStatusBadgeClassName(statusCode: number): string {
   if (statusCode === 200) {
@@ -75,10 +50,11 @@ function getStatusBadgeClassName(statusCode: number): string {
   return 'border-transparent bg-slate-500/14 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
 }
 
-const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
+type UsagePresetRangeKey = 'today' | TimeRangeKey
+const USAGE_TIME_RANGE_OPTIONS: UsagePresetRangeKey[] = ['today', '1h', '6h', '24h', '7d', '30d']
 
 // 本页面局部的"自定义"区间标记。不污染全局 TimeRangeKey 类型 (Dashboard 等仍只识别预设档)。
-type UsageTimeRangeKey = TimeRangeKey | 'custom'
+type UsageTimeRangeKey = UsagePresetRangeKey | 'custom'
 interface CustomRange {
   start: string // RFC3339 with offset
   end: string
@@ -104,6 +80,13 @@ function dateToLocalRFC3339(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${sign}${pad(Math.floor(absOffset / 60))}:${pad(absOffset % 60)}`
 }
 
+function getTodayRangeISO(): { start: string; end: string } {
+  const now = new Date()
+  const start = new Date(now)
+  start.setHours(0, 0, 0, 0)
+  return { start: dateToLocalRFC3339(start), end: dateToLocalRFC3339(now) }
+}
+
 function resolveRangeISO(
   range: UsageTimeRangeKey,
   custom: CustomRange | null,
@@ -111,7 +94,43 @@ function resolveRangeISO(
   if (range === 'custom' && custom) {
     return { start: custom.start, end: custom.end }
   }
+  if (range === 'today') {
+    return getTodayRangeISO()
+  }
   return getTimeRangeISO((range === 'custom' ? '24h' : range) as TimeRangeKey)
+}
+
+function getInitialUsageSearchParams(): URLSearchParams {
+  if (typeof window === 'undefined') return new URLSearchParams()
+  return new URLSearchParams(window.location.search)
+}
+
+function getInitialUsageAccountID(): string {
+  const raw = getInitialUsageSearchParams().get('account_id') || ''
+  return /^\d+$/.test(raw) ? raw : ''
+}
+
+function getInitialUsageRange(): UsageTimeRangeKey {
+  const params = getInitialUsageSearchParams()
+  const range = params.get('range') || ''
+  if (range === 'custom' && params.get('days')) return 'custom'
+  if (range === '7d' || range === '30d') return range
+  return 'today'
+}
+
+function getInitialUsageCustomRange(): CustomRange | null {
+  const params = getInitialUsageSearchParams()
+  const days = Number(params.get('days') || 0)
+  if (params.get('range') !== 'custom' || !Number.isFinite(days) || days <= 0 || days > CUSTOM_RANGE_MAX_DAYS) {
+    return null
+  }
+  const end = new Date()
+  const start = new Date(end)
+  start.setDate(start.getDate() - days)
+  return {
+    start: dateToLocalRFC3339(start),
+    end: dateToLocalRFC3339(end),
+  }
 }
 
 const USAGE_ANALYSIS_VISIBILITY_KEY = 'usage_analysis_visible'
@@ -381,11 +400,9 @@ function ModelSharePie({
 
   return (
     <div className={modelPieShellClass}>
-      <div className="mb-1.5 flex items-start justify-between gap-3">
-        <div>
-          <div className="text-[13px] font-semibold text-foreground">{t('usage.modelPieTitle')}</div>
-          <div className="mt-0.5 text-xs text-muted-foreground">{metricLabel}</div>
-        </div>
+      <div className="mb-1.5 flex items-baseline justify-between gap-3">
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{t('usage.modelPieTitle')}</div>
+        <div className="text-[11px] font-medium text-muted-foreground/80">{metricLabel}</div>
       </div>
       <div className="relative h-[150px] max-xl:h-[140px]">
         <ResponsiveContainer width="100%" height="100%">
@@ -397,9 +414,8 @@ function ModelSharePie({
               cx="50%"
               cy="50%"
               innerRadius="54%"
-              outerRadius="78%"
+              outerRadius="84%"
               paddingAngle={0}
-              stroke="none"
               strokeWidth={0}
             >
               {pieData.map((_, index) => (
@@ -407,6 +423,7 @@ function ModelSharePie({
               ))}
             </Pie>
             <RechartsTooltip
+              cursor={false}
               formatter={(value, name) => [
                 useAmount ? formatCostCardValue(Number(value ?? 0)) : formatTokens(Number(value ?? 0), showFullUsageNumbers),
                 String(name ?? ''),
@@ -424,19 +441,22 @@ function ModelSharePie({
         </ResponsiveContainer>
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div className="max-w-[112px] text-center">
-            <div className="text-[11px] font-medium text-muted-foreground">{metricLabel}</div>
-            <div className="mt-0.5 truncate font-geist-mono text-[13px] font-semibold tabular-nums text-foreground">
+            <div className="truncate font-geist-mono text-[15px] font-semibold tabular-nums tracking-tight text-foreground">
               {centerValue}
             </div>
+            <div className="mt-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">{metricLabel}</div>
           </div>
         </div>
       </div>
-      <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 max-sm:grid-cols-1">
+      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 max-sm:grid-cols-1">
         {pieData.map((item, index) => (
           <div key={`${item.model}-${index}`} className="flex items-center gap-2 text-xs">
-            <span className="size-2 shrink-0 rounded-full" style={{ background: modelPieColors[index % modelPieColors.length] }} />
-            <span className="min-w-0 flex-1 truncate font-medium text-foreground" title={item.model}>{item.model}</span>
-            <span className="shrink-0 font-geist-mono tabular-nums text-muted-foreground">{item.share.toFixed(1)}%</span>
+            <span
+              className="size-2.5 shrink-0 rounded-full"
+              style={{ background: modelPieColors[index % modelPieColors.length] }}
+            />
+            <span className="min-w-0 flex-1 truncate text-muted-foreground" title={item.model}>{item.model}</span>
+            <span className="shrink-0 font-geist-mono text-[11px] font-medium tabular-nums text-foreground">{item.share.toFixed(1)}%</span>
           </div>
         ))}
       </div>
@@ -452,66 +472,61 @@ function ModelStatsPanel({
   showFullUsageNumbers: boolean
 }) {
   const { t } = useTranslation()
+  const accent: PanelAccentKey = 'blue'
   const totalRequests = stats.reduce((sum, item) => sum + safeNumber(item.requests), 0)
   const maxRequests = Math.max(1, ...stats.map((item) => safeNumber(item.requests)))
 
   return (
-    <Card className="py-0">
-      <CardContent className="flex flex-col p-4">
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h3 className="text-base font-semibold text-foreground">{t('usage.modelStatsTitle')}</h3>
-            <p className="mt-1 text-xs text-muted-foreground">{t('usage.modelStatsDesc')}</p>
-          </div>
-          <div className="size-10 flex shrink-0 items-center justify-center rounded-xl bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300">
-            <BarChart3 className="size-[18px]" />
-          </div>
-        </div>
+    <PanelShell>
+      <PanelHeader
+        accent={accent}
+        icon={<BarChart3 />}
+        title={t('usage.modelStatsTitle')}
+        description={t('usage.modelStatsDesc')}
+      />
 
-        {stats.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-border bg-muted/30 px-3 py-8 text-center text-sm text-muted-foreground">
-            {t('usage.noModelStats')}
-          </div>
-        ) : (
-          <div className="grid grid-cols-[minmax(0,1fr)_minmax(220px,260px)] gap-4 max-lg:grid-cols-1">
-            <div className="space-y-2.5">
-              {stats.slice(0, 5).map((item) => {
-                const share = totalRequests > 0 ? (item.requests / totalRequests) * 100 : 0
-                const width = `${Math.max(4, Math.min(100, (item.requests / maxRequests) * 100))}%`
-                return (
-                  <div key={item.model} className="space-y-1">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.model}>
-                          {item.model}
-                        </div>
-                        <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-muted-foreground">
-                          <span>{t('usage.modelStatsRequests')}: {formatTokens(item.requests, showFullUsageNumbers)}</span>
-                          <span>{t('usage.modelStatsTokens')}: {formatTokens(item.tokens, showFullUsageNumbers)}</span>
-                          {item.error_count > 0 && (
-                            <span className="text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')}: {formatTokens(item.error_count, showFullUsageNumbers)}</span>
-                          )}
-                        </div>
+      {stats.length === 0 ? (
+        <EmptyPanel accent={accent} icon={<BarChart3 />} text={t('usage.noModelStats')} />
+      ) : (
+        <div className="grid grid-cols-[minmax(0,1fr)_minmax(220px,260px)] gap-4 max-lg:grid-cols-1">
+          <div className="space-y-3">
+            {stats.slice(0, 5).map((item) => {
+              const share = totalRequests > 0 ? (item.requests / totalRequests) * 100 : 0
+              return (
+                <div key={item.model} className="space-y-1.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.model}>
+                        {item.model}
                       </div>
-                      <div className="shrink-0 text-right">
-                        <div className="font-geist-mono text-[13px] font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
-                          {formatCostCardValue(item.user_billed)}
-                        </div>
-                        <div className="mt-0.5 text-xs text-muted-foreground">{share.toFixed(1)}%</div>
+                      <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-muted-foreground">
+                        <span className="tabular-nums">{t('usage.modelStatsRequests')} {formatTokens(item.requests, showFullUsageNumbers)}</span>
+                        <span aria-hidden="true" className="text-border">·</span>
+                        <span className="tabular-nums">{t('usage.modelStatsTokens')} {formatTokens(item.tokens, showFullUsageNumbers)}</span>
+                        {item.error_count > 0 && (
+                          <>
+                            <span aria-hidden="true" className="text-border">·</span>
+                            <span className="tabular-nums text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')} {formatTokens(item.error_count, showFullUsageNumbers)}</span>
+                          </>
+                        )}
                       </div>
                     </div>
-                    <div className="h-1.5 overflow-hidden rounded-full bg-muted">
-                      <div className="h-full rounded-full bg-blue-500/70" style={{ width }} />
+                    <div className="shrink-0 text-right">
+                      <div className="font-geist-mono text-[13px] font-semibold tabular-nums tracking-tight text-emerald-600 dark:text-emerald-400">
+                        {formatCostCardValue(item.user_billed)}
+                      </div>
+                      <div className="mt-0.5 font-geist-mono text-[11px] tabular-nums text-muted-foreground">{share.toFixed(1)}%</div>
                     </div>
                   </div>
-                )
-              })}
-            </div>
-            <ModelSharePie stats={stats} showFullUsageNumbers={showFullUsageNumbers} />
+                  <AccentBar accent={accent} ratio={safeNumber(item.requests) / maxRequests} />
+                </div>
+              )
+            })}
           </div>
-        )}
-      </CardContent>
-    </Card>
+          <ModelSharePie stats={stats} showFullUsageNumbers={showFullUsageNumbers} />
+        </div>
+      )}
+    </PanelShell>
   )
 }
 
@@ -525,6 +540,7 @@ function FeatureStatsPanel({
   showFullUsageNumbers: boolean
 }) {
   const { t } = useTranslation()
+  const accent: PanelAccentKey = 'cyan'
   const safeStats = stats ?? {
     stream_requests: 0,
     sync_requests: 0,
@@ -547,51 +563,56 @@ function FeatureStatsPanel({
   ]
 
   return (
-    <Card className="py-0">
-      <CardContent className="flex h-full flex-col p-4">
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h3 className="text-base font-semibold text-foreground">{t('usage.featureStatsTitle')}</h3>
-            <p className="mt-1 text-xs text-muted-foreground">{t('usage.featureStatsDesc')}</p>
-          </div>
-          <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-cyan-500/12 text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-300">
-            <Activity className="size-[18px]" />
-          </div>
-        </div>
+    <PanelShell>
+      <PanelHeader
+        accent={accent}
+        icon={<Activity />}
+        title={t('usage.featureStatsTitle')}
+        description={t('usage.featureStatsDesc')}
+      />
 
-        <div className="grid flex-1 grid-cols-2 gap-2 max-sm:grid-cols-1">
-          {items.map((item) => {
-            const pct = totalRequests > 0 ? (item.value / totalRequests) * 100 : 0
-            return (
-              <div
-                key={item.label}
-                className="group relative overflow-hidden rounded-lg border px-3 py-2.5 transition-colors"
-                style={{
-                  background: `color-mix(in srgb, ${item.color} 10%, transparent)`,
-                  borderColor: `color-mix(in srgb, ${item.color} 28%, transparent)`,
-                }}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="truncate text-[12px] font-medium text-foreground/80">{item.label}</span>
-                  <span className="font-geist-mono text-[10px] font-semibold tabular-nums text-foreground/60">
-                    {pct.toFixed(1)}%
-                  </span>
-                </div>
-                <div className="mt-0.5 font-geist-mono text-[20px] font-bold leading-tight tabular-nums text-foreground">
-                  {formatTokens(item.value, showFullUsageNumbers)}
-                </div>
-                <div className="mt-1.5 h-[3px] overflow-hidden rounded-full bg-foreground/5">
-                  <div
-                    className="h-full rounded-full transition-all"
-                    style={{ width: `${Math.min(100, pct)}%`, background: item.color }}
+      <div className="grid flex-1 grid-cols-2 gap-2.5 max-sm:grid-cols-1">
+        {items.map((item) => {
+          const pct = totalRequests > 0 ? (item.value / totalRequests) * 100 : 0
+          return (
+            <div
+              key={item.label}
+              className="group/tile relative flex flex-col justify-between overflow-hidden rounded-xl border px-3 py-2.5 transition-all duration-200 hover:-translate-y-0.5"
+              style={{
+                background: `color-mix(in srgb, ${item.color} 9%, transparent)`,
+                borderColor: `color-mix(in srgb, ${item.color} 26%, transparent)`,
+              }}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="flex min-w-0 items-center gap-1.5 text-[12px] font-medium text-foreground/80">
+                  <span
+                    aria-hidden="true"
+                    className="size-1.5 shrink-0 rounded-full"
+                    style={{ background: item.color }}
                   />
-                </div>
+                  <span className="truncate">{item.label}</span>
+                </span>
+                <span className="shrink-0 font-geist-mono text-[10px] font-semibold tabular-nums text-foreground/55">
+                  {pct.toFixed(1)}%
+                </span>
               </div>
-            )
-          })}
-        </div>
-      </CardContent>
-    </Card>
+              <div className="mt-1 font-geist-mono text-[20px] font-bold leading-tight tabular-nums text-foreground">
+                {formatTokens(item.value, showFullUsageNumbers)}
+              </div>
+              <div className="mt-2 h-[3px] overflow-hidden rounded-full bg-foreground/[0.06]">
+                <div
+                  className="h-full rounded-full transition-[width] duration-500 ease-out"
+                  style={{
+                    width: `${Math.min(100, pct)}%`,
+                    background: `linear-gradient(90deg, color-mix(in srgb, ${item.color} 92%, transparent), color-mix(in srgb, ${item.color} 55%, transparent))`,
+                  }}
+                />
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </PanelShell>
   )
 }
 
@@ -607,10 +628,11 @@ function EndpointStatsPanel({
   const { t } = useTranslation()
   return (
     <DistributionPanel
+      accent="violet"
       title={t('usage.endpointStatsTitle')}
       description={t('usage.endpointStatsDesc')}
       emptyText={t('usage.noEndpointStats')}
-      icon={<Route className="size-[18px]" />}
+      icon={<Route />}
       items={stats.map((item) => ({
         key: item.endpoint,
         label: item.endpoint,
@@ -636,10 +658,11 @@ function APIKeyStatsPanel({
   const { t } = useTranslation()
   return (
     <DistributionPanel
+      accent="amber"
       title={t('usage.apiKeyStatsTitle')}
       description={t('usage.apiKeyStatsDesc')}
       emptyText={t('usage.noApiKeyStats')}
-      icon={<KeyRound className="size-[18px]" />}
+      icon={<KeyRound />}
       items={stats.map((item) => ({
         key: `${item.api_key_id}-${item.label}`,
         label: item.label,
@@ -655,6 +678,7 @@ function APIKeyStatsPanel({
 }
 
 function DistributionPanel({
+  accent,
   title,
   description,
   emptyText,
@@ -664,6 +688,7 @@ function DistributionPanel({
   totalRequests,
   showFullUsageNumbers,
 }: {
+  accent: PanelAccentKey
   title: string
   description: string
   emptyText: string
@@ -674,58 +699,51 @@ function DistributionPanel({
   showFullUsageNumbers: boolean
 }) {
   const { t } = useTranslation()
+  const visibleItems = items.slice(0, limit)
   const maxRequests = Math.max(1, ...items.map((item) => safeNumber(item.requests)))
 
   return (
-    <Card className="h-full py-0">
-      <CardContent className="flex h-full flex-col p-4">
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h3 className="text-base font-semibold text-foreground">{title}</h3>
-            <p className="mt-1 text-xs text-muted-foreground">{description}</p>
-          </div>
-          <div className="size-10 flex shrink-0 items-center justify-center rounded-xl bg-muted text-foreground">
-            {icon}
-          </div>
-        </div>
+    <PanelShell>
+      <PanelHeader accent={accent} icon={icon} title={title} description={description} />
 
-        {items.length === 0 ? (
-          <div className="flex min-h-[150px] flex-1 items-center justify-center rounded-lg border border-dashed border-border bg-muted/20 px-3 text-center text-sm text-muted-foreground">
-            {emptyText}
-          </div>
-        ) : (
-          <div className="space-y-3">
-            {items.slice(0, limit).map((item) => {
-              const width = `${Math.max(5, Math.min(100, (safeNumber(item.requests) / maxRequests) * 100))}%`
-              return (
-                <div key={item.key} className="space-y-1.5">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="truncate font-geist-mono text-[13px] font-semibold text-foreground" title={item.label}>
-                        {item.label}
-                      </div>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                        <span>{t('usage.modelStatsRequests')}: {formatTokens(item.requests, showFullUsageNumbers)}</span>
-                        <span>{t('usage.modelStatsTokens')}: {formatTokens(item.tokens, showFullUsageNumbers)}</span>
-                        {item.errors > 0 && (
-                          <span className="text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')}: {formatTokens(item.errors, showFullUsageNumbers)}</span>
-                        )}
-                      </div>
+      {visibleItems.length === 0 ? (
+        <EmptyPanel accent={accent} icon={icon} text={emptyText} />
+      ) : (
+        <div className="space-y-3.5">
+          {visibleItems.map((item, index) => (
+            <div key={item.key} className="space-y-1.5">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex min-w-0 items-start gap-2.5">
+                  <RankBadge accent={accent} rank={index + 1} />
+                  <div className="min-w-0">
+                    <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.label}>
+                      {item.label}
                     </div>
-                    <span className="shrink-0 font-geist-mono text-xs tabular-nums text-muted-foreground">
-                      {formatPercent(item.requests, totalRequests)}
-                    </span>
-                  </div>
-                  <div className="h-2 overflow-hidden rounded-full bg-muted">
-                    <div className="h-full rounded-full bg-emerald-500/70" style={{ width }} />
+                    <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[11px] text-muted-foreground">
+                      <span className="tabular-nums">{t('usage.modelStatsRequests')} {formatTokens(item.requests, showFullUsageNumbers)}</span>
+                      <span aria-hidden="true" className="text-border">·</span>
+                      <span className="tabular-nums">{t('usage.modelStatsTokens')} {formatTokens(item.tokens, showFullUsageNumbers)}</span>
+                      {item.errors > 0 && (
+                        <>
+                          <span aria-hidden="true" className="text-border">·</span>
+                          <span className="tabular-nums text-amber-600 dark:text-amber-400">{t('usage.modelStatsErrors')} {formatTokens(item.errors, showFullUsageNumbers)}</span>
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
-              )
-            })}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+                <span className="ml-1 inline-block min-w-[3.25rem] shrink-0 text-right font-geist-mono text-[13px] font-semibold tabular-nums tracking-tight text-foreground">
+                  {formatPercent(item.requests, totalRequests)}
+                </span>
+              </div>
+              <div className="pl-[30px]">
+                <AccentBar accent={accent} ratio={safeNumber(item.requests) / maxRequests} thickness="h-2" minWidth={5} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </PanelShell>
   )
 }
 
@@ -811,21 +829,183 @@ const usageTableHeadClass = 'text-[12px] font-semibold'
 const usageTableTextClass = 'text-[14px]'
 const usageTableMonoClass = 'font-mono text-[13px] tabular-nums'
 const usageTableBadgeClass = 'text-[13px]'
+// Premium Minimal: a single-accent (primary) ramp. Instead of 20 competing hues,
+// the donut + legend read as one calm material with descending opacity, so it is
+// automatically correct under every theme-* palette (it only ever uses --color-primary).
 const modelPieColors = [
-  '#2563eb', '#059669', '#f59e0b', '#dc2626', '#7c3aed',
-  '#0891b2', '#db2777', '#ea580c', '#4f46e5', '#16a34a',
-  '#ca8a04', '#e11d48', '#0d9488', '#9333ea', '#65a30d',
-  '#0284c7', '#c026d3', '#d97706', '#6366f1', '#14b8a6',
+  'color-mix(in oklab, var(--color-primary) 92%, transparent)',
+  'color-mix(in oklab, var(--color-primary) 70%, transparent)',
+  'color-mix(in oklab, var(--color-primary) 50%, transparent)',
+  'color-mix(in oklab, var(--color-primary) 34%, transparent)',
+  'color-mix(in oklab, var(--color-primary) 22%, transparent)',
 ]
-const modelPieShellClass = 'flex min-h-[196px] flex-col border-l border-border pl-4 max-lg:min-h-0 max-lg:border-l-0 max-lg:border-t max-lg:pl-0 max-lg:pt-3'
+const modelPieShellClass = 'flex min-h-[196px] flex-col rounded-xl border border-border bg-muted/20 p-3 max-lg:min-h-0'
 
-type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'duration' | 'time'
+// ============================================================================
+// Shared "Unified Accent System" infrastructure for the four analysis panels.
+// Each panel carries one accent identity (model=blue, feature=cyan,
+// endpoint=violet, apiKey=amber) flowing through its icon chip, header
+// underline, gradient capsule bars and rank badges. Every accent is expressed
+// only through theme-safe light+dark token pairs, so the panels stay correct
+// across dark mode and every theme-* palette (no bare single-mode color).
+// ============================================================================
+type PanelAccent = {
+  /** icon chip background + foreground (light + dark) */
+  chip: string
+  /** soft ring around the icon chip */
+  ring: string
+  /** thin header underline rule (gradient fades out to the right) */
+  underline: string
+  /** gradient fill for AccentBar capsules */
+  bar: string
+  /** rank chip background + foreground for the top rows */
+  rank: string
+}
+
+const PANEL_ACCENTS: Record<'blue' | 'cyan' | 'violet' | 'amber', PanelAccent> = {
+  blue: {
+    chip: 'bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-300',
+    ring: 'ring-1 ring-inset ring-blue-500/20 dark:ring-blue-500/30',
+    underline: 'from-blue-500/45 via-blue-500/20 to-transparent dark:from-blue-400/45 dark:via-blue-400/20',
+    bar: 'from-blue-500/85 to-blue-500/45 dark:from-blue-400/90 dark:to-blue-400/45',
+    rank: 'bg-blue-500/14 text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-500/22 dark:text-blue-300 dark:ring-blue-500/30',
+  },
+  cyan: {
+    chip: 'bg-cyan-500/12 text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-300',
+    ring: 'ring-1 ring-inset ring-cyan-500/20 dark:ring-cyan-500/30',
+    underline: 'from-cyan-500/45 via-cyan-500/20 to-transparent dark:from-cyan-400/45 dark:via-cyan-400/20',
+    bar: 'from-cyan-500/85 to-cyan-500/45 dark:from-cyan-400/90 dark:to-cyan-400/45',
+    rank: 'bg-cyan-500/14 text-cyan-600 ring-1 ring-inset ring-cyan-500/20 dark:bg-cyan-500/22 dark:text-cyan-300 dark:ring-cyan-500/30',
+  },
+  violet: {
+    chip: 'bg-violet-500/12 text-violet-600 dark:bg-violet-500/20 dark:text-violet-300',
+    ring: 'ring-1 ring-inset ring-violet-500/20 dark:ring-violet-500/30',
+    underline: 'from-violet-500/45 via-violet-500/20 to-transparent dark:from-violet-400/45 dark:via-violet-400/20',
+    bar: 'from-violet-500/85 to-violet-500/45 dark:from-violet-400/90 dark:to-violet-400/45',
+    rank: 'bg-violet-500/14 text-violet-600 ring-1 ring-inset ring-violet-500/20 dark:bg-violet-500/22 dark:text-violet-300 dark:ring-violet-500/30',
+  },
+  amber: {
+    chip: 'bg-amber-500/12 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300',
+    ring: 'ring-1 ring-inset ring-amber-500/20 dark:ring-amber-500/30',
+    underline: 'from-amber-500/45 via-amber-500/20 to-transparent dark:from-amber-400/45 dark:via-amber-400/20',
+    bar: 'from-amber-500/85 to-amber-500/45 dark:from-amber-400/90 dark:to-amber-400/45',
+    rank: 'bg-amber-500/14 text-amber-600 ring-1 ring-inset ring-amber-500/20 dark:bg-amber-500/22 dark:text-amber-300 dark:ring-amber-500/30',
+  },
+}
+
+type PanelAccentKey = keyof typeof PANEL_ACCENTS
+
+// PanelShell — Card wrapper with the StatCard hover lift, shared by all panels.
+// The Card primitive carries bg-card/border/shadow so glass mode + every
+// theme-* palette adapt automatically.
+function PanelShell({ className = '', children }: { className?: string; children: ReactNode }) {
+  return (
+    <Card className={`group/panel h-full py-0 transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md ${className}`}>
+      <CardContent className="flex h-full flex-col p-5">{children}</CardContent>
+    </Card>
+  )
+}
+
+// PanelHeader — pixel-consistent header: accent icon chip (with soft ring),
+// title + description, and a thin accent underline rule beneath the row.
+function PanelHeader({
+  accent,
+  icon,
+  title,
+  description,
+  trailing,
+}: {
+  accent: PanelAccentKey
+  icon: ReactNode
+  title: string
+  description: string
+  trailing?: ReactNode
+}) {
+  const a = PANEL_ACCENTS[accent]
+  return (
+    <div className="mb-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <div
+            aria-hidden="true"
+            className={`flex size-10 shrink-0 items-center justify-center rounded-xl transition-transform duration-200 group-hover/panel:scale-[1.04] ${a.chip} ${a.ring} [&_svg]:size-[18px]`}
+          >
+            {icon}
+          </div>
+          <div className="min-w-0">
+            <h3 className="truncate text-[15px] font-semibold tracking-tight text-foreground">{title}</h3>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{description}</p>
+          </div>
+        </div>
+        {trailing ? <div className="shrink-0">{trailing}</div> : null}
+      </div>
+      <div className={`mt-3 h-px w-full rounded-full bg-gradient-to-r ${a.underline}`} />
+    </div>
+  )
+}
+
+// AccentBar — the single unified bar treatment: a rounded-full gradient capsule
+// on a neutral, slightly recessed bg-muted track with rounded caps.
+function AccentBar({
+  accent,
+  ratio,
+  thickness = 'h-1.5',
+  minWidth = 4,
+}: {
+  accent: PanelAccentKey
+  /** 0..1 fill ratio (clamped); width derived against the panel max */
+  ratio: number
+  thickness?: string
+  minWidth?: number
+}) {
+  const pct = Math.max(minWidth, Math.min(100, ratio * 100))
+  return (
+    <div className={`${thickness} overflow-hidden rounded-full bg-muted ring-1 ring-inset ring-border/50`}>
+      <div
+        className={`h-full rounded-full bg-gradient-to-r transition-[width] duration-500 ease-out ${PANEL_ACCENTS[accent].bar}`}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  )
+}
+
+// RankBadge — #1/#2/#3 markers in the panel accent; neutral chip for 4+.
+function RankBadge({ accent, rank }: { accent: PanelAccentKey; rank: number }) {
+  const isTop = rank <= 3
+  const cls = isTop ? PANEL_ACCENTS[accent].rank : 'bg-muted text-muted-foreground'
+  return (
+    <span
+      aria-hidden="true"
+      className={`flex size-5 shrink-0 items-center justify-center rounded-md text-[11px] font-bold leading-none tabular-nums ${cls}`}
+    >
+      {rank}
+    </span>
+  )
+}
+
+// EmptyPanel — unified empty state used by every panel.
+function EmptyPanel({ accent, icon, text }: { accent: PanelAccentKey; icon: ReactNode; text: string }) {
+  return (
+    <div className="flex min-h-[140px] flex-1 flex-col items-center justify-center gap-2.5 rounded-xl border border-dashed border-border/70 px-4 text-center">
+      <div
+        aria-hidden="true"
+        className={`flex size-9 items-center justify-center rounded-lg opacity-70 ${PANEL_ACCENTS[accent].chip} [&_svg]:size-[16px]`}
+      >
+        {icon}
+      </div>
+      <p className="text-[13px] text-muted-foreground">{text}</p>
+    </div>
+  )
+}
+
+type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'duration' | 'time'
 
 const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string }> = [
   { key: 'status', labelKey: 'usage.tableStatus' },
   { key: 'model', labelKey: 'usage.tableModel' },
   { key: 'account', labelKey: 'usage.tableAccount' },
   { key: 'apiKey', labelKey: 'usage.tableApiKey' },
+  { key: 'clientIp', labelKey: 'usage.tableClientIP' },
   { key: 'endpoint', labelKey: 'usage.tableEndpoint' },
   { key: 'type', labelKey: 'usage.tableType' },
   { key: 'token', labelKey: 'usage.tableToken' },
@@ -842,6 +1022,7 @@ const DEFAULT_USAGE_VISIBLE_COLUMNS: Record<UsageTableColumn, boolean> = {
   model: true,
   account: true,
   apiKey: true,
+  clientIp: true,
   endpoint: true,
   type: true,
   token: true,
@@ -934,8 +1115,8 @@ export default function Usage() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = usePersistedPageSize('usage_logs', 20, DEFAULT_PAGE_SIZE_OPTIONS)
   const [clearing, setClearing] = useState(false)
-  const [timeRange, setTimeRange] = useState<UsageTimeRangeKey>('1h')
-  const [customRange, setCustomRange] = useState<CustomRange | null>(null)
+  const [timeRange, setTimeRange] = useState<UsageTimeRangeKey>(getInitialUsageRange)
+  const [customRange, setCustomRange] = useState<CustomRange | null>(getInitialUsageCustomRange)
   const [showCustomPopover, setShowCustomPopover] = useState(false)
   const customChipRef = useRef<HTMLButtonElement>(null)
   const [logs, setLogs] = useState<UsageLog[]>([])
@@ -946,6 +1127,7 @@ export default function Usage() {
   const [filterModel, setFilterModel] = useState('')
   const [filterEndpoint, setFilterEndpoint] = useState('')
   const [filterApiKeyId, setFilterApiKeyId] = useState('')
+  const [filterAccountId, setFilterAccountId] = useState(getInitialUsageAccountID)
   const [filterFast, setFilterFast] = useState('')
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
@@ -1008,6 +1190,7 @@ export default function Usage() {
         model: filterModel || undefined,
         endpoint: filterEndpoint || undefined,
         apiKeyId: filterApiKeyId || undefined,
+        accountId: filterAccountId || undefined,
         fast: filterFast || undefined,
         stream: filterStream || undefined,
       })
@@ -1018,7 +1201,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -1075,14 +1258,16 @@ export default function Usage() {
     }
   }, [page, totalPages])
 
-  const totalRequests = stats?.total_requests ?? 0
-  const totalTokens = stats?.total_tokens ?? 0
-  const totalPromptTokens = stats?.total_prompt_tokens ?? 0
-  const totalCompletionTokens = stats?.total_completion_tokens ?? 0
-  const totalAccountBilled = stats?.total_account_billed ?? 0
-  const totalUserBilled = stats?.total_user_billed ?? 0
-  const todayRequests = stats?.today_requests ?? 0
-  const todayUserBilled = stats?.today_user_billed ?? 0
+  const cumulativeRequests = stats?.total_requests ?? 0
+  const cumulativeTokens = stats?.total_tokens ?? 0
+  const cumulativeAccountBilled = stats?.total_account_billed ?? 0
+  const cumulativeUserBilled = stats?.total_user_billed ?? 0
+  const rangeRequests = stats?.today_requests ?? 0
+  const rangeTokens = stats?.today_tokens ?? 0
+  const rangePromptTokens = stats?.today_prompt_tokens ?? 0
+  const rangeCompletionTokens = stats?.today_completion_tokens ?? 0
+  const rangeAccountBilled = stats?.today_account_billed ?? 0
+  const rangeUserBilled = stats?.today_user_billed ?? 0
   const modelStats = stats?.model_stats ?? []
   const featureStats = stats?.feature_stats
   const endpointStats = stats?.endpoint_stats ?? []
@@ -1091,20 +1276,22 @@ export default function Usage() {
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
   const avgDurationMs = stats?.avg_duration_ms ?? 0
-  const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
+  const successRequests = rangeRequests - Math.round(rangeRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
-  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
+  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterAccountId || filterStream || filterFast)
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
   ]
-  // 顶部 6 张卡片里的 today_* 字段联动顶部时间范围,标签也跟着改 —— 与下方请求记录的范围一致。
-  // 后端在 GetUsageStats 收到 start/end 后,today_* 字段语义即"该区间统计"。
+  // 顶部主卡片展示当前区间; total_* 保留为清空日志基线叠加后的累计值。
   const rangeLabel = timeRange === 'custom'
     ? t('usage.customRange')
+    : timeRange === 'today'
+      ? t('usage.today')
     : t(`dashboard.timeRange${timeRange.toUpperCase()}`)
-  const rangeRequestsLabel = t('usage.rangeRequests', { range: rangeLabel })
-  const rangeCostLabel = t('usage.rangeCost', { range: rangeLabel })
+  const rangeRequestsLabel = t('usage.rangeRequestsCard', { range: rangeLabel })
+  const rangeTokensLabel = t('usage.rangeTokensCard', { range: rangeLabel })
+  const rangeCostLabel = t('usage.rangeCostCard', { range: rangeLabel })
 
   return (
     <StateShell
@@ -1139,17 +1326,17 @@ export default function Usage() {
           <Card className="min-w-0 py-0">
             <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalRequestsCard')}</span>
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">{rangeRequestsLabel}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-primary/12 text-primary">
                   <Activity className="size-4" />
                 </div>
               </div>
               <div className={usageStatValueClass}>
-                {formatTokens(totalRequests, showFullUsageNumbers)}
+                {formatTokens(rangeRequests, showFullUsageNumbers)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
                 <span className="text-[hsl(var(--success))]">● {t('usage.success')}: {formatTokens(successRequests, showFullUsageNumbers)}</span>
-                <span>● {rangeRequestsLabel}: {formatTokens(todayRequests, showFullUsageNumbers)}</span>
+                <span>● {t('usage.cumulative')}: {formatTokens(cumulativeRequests, showFullUsageNumbers)}</span>
               </div>
             </CardContent>
           </Card>
@@ -1157,17 +1344,18 @@ export default function Usage() {
           <Card className="min-w-0 py-0">
             <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalTokensCard')}</span>
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">{rangeTokensLabel}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]">
                   <Box className="size-4" />
                 </div>
               </div>
               <div className={usageStatValueClass}>
-                {formatTokens(totalTokens, showFullUsageNumbers)}
+                {formatTokens(rangeTokens, showFullUsageNumbers)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
-                <span>{t('usage.inputTokens')}: {formatTokens(totalPromptTokens, showFullUsageNumbers)}</span>
-                <span>{t('usage.outputTokens')}: {formatTokens(totalCompletionTokens, showFullUsageNumbers)}</span>
+                <span>{t('usage.inputTokens')}: {formatTokens(rangePromptTokens, showFullUsageNumbers)}</span>
+                <span>{t('usage.outputTokens')}: {formatTokens(rangeCompletionTokens, showFullUsageNumbers)}</span>
+                <span>{t('usage.cumulative')}: {formatTokens(cumulativeTokens, showFullUsageNumbers)}</span>
               </div>
             </CardContent>
           </Card>
@@ -1175,17 +1363,18 @@ export default function Usage() {
           <Card className="min-w-0 py-0">
             <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalCostCard')}</span>
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">{rangeCostLabel}</span>
                 <div className="flex size-9 items-center justify-center rounded-lg bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300">
                   <CircleDollarSign className="size-4" />
                 </div>
               </div>
               <div className={`${usageStatValueClass} text-emerald-600 dark:text-emerald-400`}>
-                {formatCostCardValue(totalUserBilled)}
+                {formatCostCardValue(rangeUserBilled)}
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground leading-snug">
-                <span>{rangeCostLabel}: {formatCostCardValue(todayUserBilled)}</span>
-                <span>{t('usage.accountCost')}: {formatCostCardValue(totalAccountBilled)}</span>
+                <span>{t('usage.accountCost')}: {formatCostCardValue(rangeAccountBilled)}</span>
+                <span>{t('usage.cumulative')}: {formatCostCardValue(cumulativeUserBilled)}</span>
+                <span>{t('usage.cumulativeAccountCost')}: {formatCostCardValue(cumulativeAccountBilled)}</span>
               </div>
             </CardContent>
           </Card>
@@ -1240,12 +1429,12 @@ export default function Usage() {
           <>
             <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(360px,0.5fr)] gap-3 max-lg:grid-cols-1">
               <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
-              <FeatureStatsPanel stats={featureStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
+              <FeatureStatsPanel stats={featureStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
             </div>
 
             <div className="grid grid-cols-2 gap-3 max-lg:grid-cols-1">
-              <EndpointStatsPanel stats={endpointStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
-              <APIKeyStatsPanel stats={apiKeyStats} totalRequests={totalRequests} showFullUsageNumbers={showFullUsageNumbers} />
+              <EndpointStatsPanel stats={endpointStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
+              <APIKeyStatsPanel stats={apiKeyStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
             </div>
           </>
         )}
@@ -1257,7 +1446,7 @@ export default function Usage() {
               <div className="flex shrink-0 items-center gap-3">
                 <h3 className="whitespace-nowrap text-base font-semibold text-foreground">{t('usage.requestLogs')}</h3>
                 <div className="inline-flex shrink-0 rounded-lg border border-border bg-muted/50 p-0.5">
-                  {TIME_RANGE_OPTIONS.map((key) => (
+                  {USAGE_TIME_RANGE_OPTIONS.map((key) => (
                     <button
                       key={key}
                       type="button"
@@ -1272,7 +1461,7 @@ export default function Usage() {
                           : 'text-muted-foreground hover:text-foreground'
                       }`}
                     >
-                      {t(`dashboard.timeRange${key.toUpperCase()}`)}
+                      {key === 'today' ? t('usage.today') : t(`dashboard.timeRange${key.toUpperCase()}`)}
                     </button>
                   ))}
                   <button
@@ -1350,6 +1539,18 @@ export default function Usage() {
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleSearchChange(e.target.value)}
                 />
               </div>
+
+              {filterAccountId && (
+                <button
+                  type="button"
+                  onClick={() => { setFilterAccountId(''); setPage(1) }}
+                  className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg border border-primary/30 bg-primary/10 px-2.5 text-[13px] font-medium text-primary transition-colors hover:bg-primary/15"
+                  title={t('usage.accountIdFilterTitle', { id: filterAccountId })}
+                >
+                  {t('usage.accountIdFilter', { id: filterAccountId })}
+                  <X className="size-3.5" />
+                </button>
+              )}
 
               {/* 模型下拉 */}
               <Select
@@ -1429,6 +1630,7 @@ export default function Usage() {
                     setSearchInput(''); setSearchEmail('')
                     setFilterModel(''); setFilterEndpoint('')
                     setFilterApiKeyId('')
+                    setFilterAccountId('')
                     setFilterStream(''); setFilterFast('')
                     setPage(1)
                   }}
@@ -1464,12 +1666,13 @@ export default function Usage() {
                       {visibleColumns.model && <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>}
                       {visibleColumns.account && <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>}
                       {visibleColumns.apiKey && <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>}
+                      {visibleColumns.clientIp && <TableHead className={usageTableHeadClass}>{t('usage.tableClientIP')}</TableHead>}
                       {visibleColumns.endpoint && <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>}
                       {visibleColumns.type && <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>}
                       {visibleColumns.token && <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>}
                       {visibleColumns.cost && <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>}
                       {visibleColumns.cached && <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>}
-                      {visibleColumns.firstToken && <TableHead className={usageTableHeadClass}>{t('usage.tableFirstToken')}</TableHead>}
+                      {visibleColumns.firstToken && <TableHead className={usageTableHeadClass}><span title={t('usage.tableFirstTokenHint')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableFirstToken')}</span></TableHead>}
                       {visibleColumns.duration && <TableHead className={usageTableHeadClass}>{t('usage.tableDuration')}</TableHead>}
                       {visibleColumns.time && <TableHead className={usageTableHeadClass}>{t('usage.tableTime')}</TableHead>}
                     </TableRow>
@@ -1517,16 +1720,6 @@ export default function Usage() {
                             {isImageUsageLog(log) && (
                               <ImageUsageBadge log={log} />
                             )}
-                            {log.compact && (
-                              <Badge
-                                variant="outline"
-                                className="text-[11px] font-semibold gap-0.5 border-transparent bg-teal-500/12 text-teal-700 dark:bg-teal-500/20 dark:text-teal-300"
-                                title={t('usage.compactRequestTooltip')}
-                              >
-                                <Box className="size-3" />
-                                {t('usage.compactRequest')}
-                              </Badge>
-                            )}
                             {isFastTier(log.billing_service_tier || log.service_tier) && (
                               <Badge
                                 variant="outline"
@@ -1547,6 +1740,11 @@ export default function Usage() {
                             {formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}
                           </span>
                         </TableCell>}
+                        {visibleColumns.clientIp && <TableCell className={`${usageTableMonoClass} text-muted-foreground whitespace-nowrap`}>
+                          <span title={log.client_ip || '-'}>
+                            {log.client_ip || '-'}
+                          </span>
+                        </TableCell>}
                         {visibleColumns.endpoint && <TableCell>
                           <div className={`${usageTableMonoClass} leading-relaxed`}>
                             <span className="text-muted-foreground">
@@ -1558,17 +1756,29 @@ export default function Usage() {
                           </div>
                         </TableCell>}
                         {visibleColumns.type && <TableCell>
-                          <Badge
-                            variant="outline"
-                            className={usageTableBadgeClass}
-                            style={{
-                              background: log.stream ? 'rgba(99, 102, 241, 0.12)' : 'rgba(107, 114, 128, 0.12)',
-                              color: log.stream ? '#6366f1' : '#6b7280',
-                              borderColor: 'transparent',
-                            }}
-                          >
-                            {log.stream ? 'stream' : 'sync'}
-                          </Badge>
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <Badge
+                              variant="outline"
+                              className={usageTableBadgeClass}
+                              style={{
+                                background: log.stream ? 'rgba(99, 102, 241, 0.12)' : 'rgba(107, 114, 128, 0.12)',
+                                color: log.stream ? '#6366f1' : '#6b7280',
+                                borderColor: 'transparent',
+                              }}
+                            >
+                              {log.stream ? 'stream' : 'sync'}
+                            </Badge>
+                            {log.compact && (
+                              <Badge
+                                variant="outline"
+                                className="text-[11px] font-semibold gap-0.5 border-transparent bg-teal-500/12 text-teal-700 dark:bg-teal-500/20 dark:text-teal-300"
+                                title={t('usage.compactRequestTooltip')}
+                              >
+                                <Box className="size-3" />
+                                {t('usage.compactRequest')}
+                              </Badge>
+                            )}
+                          </div>
                         </TableCell>}
                         {visibleColumns.token && <TableCell>
                           {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (

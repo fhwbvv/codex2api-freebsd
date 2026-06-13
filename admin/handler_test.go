@@ -75,6 +75,38 @@ func TestAccountEmailDomain(t *testing.T) {
 	}
 }
 
+func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "error", Enabled: true},   // DB stale, runtime active
+		{ID: 2, Status: "active", Enabled: true},  // runtime unauthorized
+		{ID: 3, Status: "active", Enabled: false}, // disabled
+		{ID: 4, Status: "active", Enabled: true},  // runtime rate limited
+		{ID: 5, Status: "active", Enabled: true},  // normal
+		{ID: 6, Status: "error", Enabled: true},   // DB error without runtime override
+		{ID: 7, Status: "cooldown", Enabled: true, CooldownReason: "rate_limited"},
+	}
+
+	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1"}
+	unauthorized := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
+	unauthorized.SetCooldownWithReason(time.Hour, "unauthorized")
+	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3"}
+	rateLimited := &auth.Account{DBID: 4, Status: auth.StatusReady, AccessToken: "at-4"}
+	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
+	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
+
+	got := summarizeDashboardAccounts(rows, []*auth.Account{
+		activeFromStaleDB,
+		unauthorized,
+		disabled,
+		rateLimited,
+		normal,
+	})
+
+	if got.total != 7 || got.normal != 3 || got.rateLimited != 2 || got.abnormal != 2 || got.disabled != 1 {
+		t.Fatalf("counts = %+v, want total=7 normal=3 rateLimited=2 abnormal=2 disabled=1", got)
+	}
+}
+
 func TestNormalizeBackgroundUploadMedia(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -616,7 +648,7 @@ func TestUpdateAPIKeyRefreshesRuntimeStoreAndCache(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
-	groupID, err := db.CreateAccountGroup(ctx, "Team", "", "#2563eb", 0)
+	groupID, err := db.CreateAccountGroup(ctx, "Team", "", "#2563eb", 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
 	}
@@ -775,6 +807,91 @@ func TestGetUsageLogsRejectsInvalidAPIKeyID(t *testing.T) {
 	}
 	if got := payload["error"]; got != "api_key_id 参数无效，需要正整数" {
 		t.Fatalf("error = %q, want %q", got, "api_key_id 参数无效，需要正整数")
+	}
+}
+
+func TestGetUsageLogsAllowsFiveHundredPageSize(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "usage-logs-page-size.sqlite")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("new test db: %v", err)
+	}
+	dbClosed := false
+	t.Cleanup(func() {
+		if !dbClosed {
+			_ = db.Close()
+		}
+		_ = os.Remove(dbPath)
+	})
+
+	db.SetUsageLogConfig(database.UsageLogModeFull, 1000, 3600)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+
+	baseTime := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 501; i++ {
+		if err := db.InsertUsageLog(ctx, &database.UsageLogInput{
+			AccountID:  accountID,
+			Endpoint:   fmt.Sprintf("/v1/log-%03d", i),
+			Model:      "gpt-5.4",
+			StatusCode: http.StatusOK,
+		}); err != nil {
+			t.Fatalf("InsertUsageLog %d returned error: %v", i, err)
+		}
+	}
+	dbClosed = true
+	if err := db.Close(); err != nil {
+		t.Fatalf("flush usage logs: %v", err)
+	}
+
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite db: %v", err)
+	}
+	if _, err := rawDB.ExecContext(ctx, `
+		UPDATE usage_logs
+		SET created_at = datetime(?, printf('+%d seconds', id - 1))
+	`, baseTime.Format("2006-01-02 15:04:05")); err != nil {
+		_ = rawDB.Close()
+		t.Fatalf("update created_at: %v", err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatalf("close raw sqlite db: %v", err)
+	}
+
+	db, err = database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("reopen test db: %v", err)
+	}
+	dbClosed = false
+	handler := &Handler{db: db}
+
+	start := baseTime.Add(-time.Minute).Format(time.RFC3339)
+	end := baseTime.Add(502 * time.Second).Format(time.RFC3339)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/usage/logs?start="+start+"&end="+end+"&page=2&page_size=500", nil)
+
+	handler.GetUsageLogs(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var payload database.UsageLogPage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Total != 501 {
+		t.Fatalf("total = %d, want 501", payload.Total)
+	}
+	if len(payload.Logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(payload.Logs))
+	}
+	if got := payload.Logs[0].Endpoint; got != "/v1/log-000" {
+		t.Fatalf("endpoint = %q, want /v1/log-000", got)
 	}
 }
 

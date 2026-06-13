@@ -331,7 +331,7 @@ func (h *Handler) runResetRadarSignalHook(ctx context.Context, signalID string) 
 	}
 
 	log.Printf("收到 Codex Reset Radar 重置信号 %s，开始批量测试 %d 个账号以刷新状态和用量窗口", signalID, len(accounts))
-	counts := h.runBatchTest(ctx, accounts, 0, nil)
+	counts := h.runBatchTest(ctx, accounts, 0, h.runSingleBatchTest, nil)
 	result.Total = int64(counts.Total)
 	result.Success = counts.Success
 	result.Failed = counts.Failed

@@ -211,6 +211,14 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(closeCode, apiErr.Message, apiErr)
 	}
+	releaseAPIKeyConcurrency, concurrencyErr, ok := h.acquireAPIKeyConcurrencyForWebSocket(c)
+	if !ok {
+		_ = writeResponsesWSError(conn, concurrencyErr)
+		return newResponsesWSCloseError(websocket.CloseTryAgainLater, concurrencyErr.Message, concurrencyErr)
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
+	}
 
 	accountFilter := accountFilterForModel(effectiveModel)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
@@ -230,6 +238,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	var lastRetryableUpstreamErr *api.APIError
 	retryExclusions := newRetryAccountExclusions()
 	invalidEncryptedContentRetried := false
+	forceHTTPAfterWSMessageTooBig := false
 	var lastUpstreamCancel context.CancelFunc
 	defer func() {
 		if lastUpstreamCancel != nil {
@@ -269,7 +278,18 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
-		resp, reqErr := ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, true)
+		useWebsocket := !forceHTTPAfterWSMessageTooBig
+		// 显式生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
+		// 图片数据会卡死（issue #220）。
+		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
+			useWebsocket = false
+		}
+		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死。
+		upstreamBody := codexBody
+		if useWebsocket {
+			upstreamBody = stripResponsesImageGenerationTool(codexBody)
+		}
+		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -279,6 +299,13 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
+				log.Printf("Responses WebSocket upstream request frame too large; falling back to HTTP (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
+				forceHTTPAfterWSMessageTooBig = true
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				continue
+			}
 			retryable := IsRetryableError(reqErr) || kind != ""
 			shouldRetry := false
 			if silentRetryEnabled && retryable && attempt < maxRetries {
@@ -367,7 +394,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				InboundEndpoint:      "/v1/responses",
 				UpstreamEndpoint:     "/v1/responses",
 				Stream:               true,
-				ViaWebsocket:         true,
+				ViaWebsocket:         useWebsocket,
 				ServiceTier:          usageTiers.ServiceTier,
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
@@ -391,10 +418,15 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
+				if useWebsocket && isWebsocketMessageTooBigOutcome(retryErr.outcome) {
+					log.Printf("Responses WebSocket upstream message too large before first token; falling back to HTTP (attempt %d, account %d): %s", attempt+1, account.ID(), retryErr.outcome.failureMessage)
+					forceHTTPAfterWSMessageTooBig = true
+					continue
+				}
 				if silentRetryEnabled && attempt < maxRetries {
 					if isFirstTokenTimeoutOutcome(retryErr.outcome) {
 						retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
@@ -438,7 +470,10 @@ func (h *Handler) streamResponsesWSUpstream(
 	ttftGuard *firstTokenTimeoutGuard,
 	silentRetryEnabled bool,
 	hideUpstreamErrors bool,
+	viaWebsocket bool,
 ) error {
+	SyncCodexUsageState(h.store, account, resp)
+
 	account.Mu().RLock()
 	c.Set("x-account-email", account.Email)
 	account.Mu().RUnlock()
@@ -478,11 +513,11 @@ func (h *Handler) streamResponsesWSUpstream(
 	readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 		parsed := gjson.ParseBytes(data)
 		eventType := parsed.Get("type").String()
-		isFirstToken := isFirstTokenResult(parsed)
+		ttftGuard.MarkProgress(eventType)
+		isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 		if !ttftRecorded && isFirstToken {
 			firstTokenMs = int(time.Since(start).Milliseconds())
 			ttftRecorded = true
-			ttftGuard.MarkFirstToken()
 		}
 		if eventType == "response.output_text.delta" {
 			deltaCharCount += len(parsed.Get("delta").String())
@@ -503,7 +538,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			gotTerminal = true
 		}
 		if !clientGone {
-			shouldDefer := ttftGuard != nil && !ttftRecorded && !gotTerminal && !isFirstToken
+			shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
 			if shouldDefer {
 				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), data...))
 				pendingFirstTokenBytes += len(data)
@@ -551,9 +586,14 @@ func (h *Handler) streamResponsesWSUpstream(
 			outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 		}
 	}
+	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, viaWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		resp.Body.Close()
+		h.store.Release(account)
+		h.store.UnbindSessionAffinity(affinityKey, account.ID())
+		return &responsesWSRetryableStreamError{outcome: outcome}
+	}
 	if silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
 		resp.Body.Close()
-		SyncCodexUsageState(h.store, account, resp)
 		if !isFirstTokenTimeoutOutcome(outcome) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		}
@@ -590,7 +630,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		InboundEndpoint:      "/v1/responses",
 		UpstreamEndpoint:     "/v1/responses",
 		Stream:               true,
-		ViaWebsocket:         true,
+		ViaWebsocket:         viaWebsocket,
 		ServiceTier:          usageTiers.ServiceTier,
 		RequestedServiceTier: usageTiers.RequestedServiceTier,
 		ActualServiceTier:    usageTiers.ActualServiceTier,
@@ -613,7 +653,6 @@ func (h *Handler) streamResponsesWSUpstream(
 	h.logUsageForRequest(c, logInput)
 
 	resp.Body.Close()
-	SyncCodexUsageState(h.store, account, resp)
 	if outcome.penalize {
 		recyclePooledClient(account, proxyURL)
 		h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)

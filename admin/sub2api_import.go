@@ -54,13 +54,13 @@ type sub2apiDataPayload struct {
 
 // sub2api 分页 list 返回的账号状态条目
 type sub2apiListAccount struct {
-	ID               int64      `json:"id"`
-	Name             string     `json:"name"`
-	Platform         string     `json:"platform"`
-	Status           string     `json:"status"`
-	ErrorMessage     string     `json:"error_message"`
-	RateLimitedAt    *time.Time `json:"rate_limited_at"`
-	RateLimitResetAt *time.Time `json:"rate_limit_reset_at"`
+	ID               int64                  `json:"id"`
+	Name             string                 `json:"name"`
+	Platform         string                 `json:"platform"`
+	Status           string                 `json:"status"`
+	ErrorMessage     string                 `json:"error_message"`
+	RateLimitedAt    *time.Time             `json:"rate_limited_at"`
+	RateLimitResetAt *time.Time             `json:"rate_limit_reset_at"`
 	Credentials      map[string]interface{} `json:"credentials"`
 }
 
@@ -308,21 +308,22 @@ func sub2apiAccountToImportToken(a sub2apiAccountInternal) (importToken, bool) {
 		return importToken{}, false
 	}
 	tok := importToken{
-		refreshToken:        rt,
-		sessionToken:        st,
-		accessToken:         at,
-		name:                a.Name,
-		email:               a.Email,
-		idToken:             stringFromMap(c, "id_token"),
-		accountID:           stringFromMap(c, "account_id"),
-		chatgptAccountID:    a.ChatGPTAccountID,
-		planType:            a.PlanType,
-		expiresAt:           stringFromMap(c, "expires_at"),
-		codex7DUsedPercent:  stringFromMap(c, "codex_7d_used_percent"),
-		codex7DResetAt:      stringFromMap(c, "codex_7d_reset_at"),
-		codex5HUsedPercent:  stringFromMap(c, "codex_5h_used_percent"),
-		codex5HResetAt:      stringFromMap(c, "codex_5h_reset_at"),
-		codexUsageUpdatedAt: stringFromMap(c, "codex_usage_updated_at"),
+		refreshToken:          rt,
+		sessionToken:          st,
+		accessToken:           at,
+		name:                  a.Name,
+		email:                 a.Email,
+		idToken:               stringFromMap(c, "id_token"),
+		accountID:             stringFromMap(c, "account_id"),
+		chatgptAccountID:      a.ChatGPTAccountID,
+		planType:              a.PlanType,
+		expiresAt:             stringFromMap(c, "expires_at"),
+		codex7DUsedPercent:    stringFromMap(c, "codex_7d_used_percent"),
+		codex7DResetAt:        stringFromMap(c, "codex_7d_reset_at"),
+		codex5HUsedPercent:    stringFromMap(c, "codex_5h_used_percent"),
+		codex5HResetAt:        stringFromMap(c, "codex_5h_reset_at"),
+		codex5HUsageUpdatedAt: stringFromMap(c, "codex_5h_usage_updated_at"),
+		codexUsageUpdatedAt:   stringFromMap(c, "codex_usage_updated_at"),
 	}
 	if tok.name == "" {
 		tok.name = tok.email
@@ -419,7 +420,7 @@ func normalizeSub2APICreds(rawBaseURL, rawAPIKey string) (string, string, string
 	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
 		return "", "", "base_url 必须以 http:// 或 https:// 开头"
 	}
-	if _, err := url.Parse(baseURL); err != nil {
+	if parsed, err := url.Parse(baseURL); err != nil || parsed.Host == "" {
 		return "", "", "base_url 不是合法的 URL"
 	}
 	baseURL = strings.TrimRight(baseURL, "/")

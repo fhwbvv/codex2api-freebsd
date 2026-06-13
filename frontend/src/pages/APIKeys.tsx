@@ -17,7 +17,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Select } from "@/components/ui/select";
+import { Select, type SelectOption } from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -42,6 +42,7 @@ import {
 } from "lucide-react";
 
 type ExpireMode = "never" | "7" | "30" | "90" | "custom";
+type TokenLimitUnit = "token" | "k" | "m" | "b";
 
 interface CreateKeyFormState {
   name: string;
@@ -67,21 +68,36 @@ interface LimitsFormState {
   modelDeny: string[];
   rpm: string;
   rpd: string;
+  maxConcurrency: string;
   costLimit5h: string;
   costLimit7d: string;
   tokenLimit5h: string;
+  tokenLimit5hUnit: TokenLimitUnit;
   tokenLimit7d: string;
+  tokenLimit7dUnit: TokenLimitUnit;
 }
+
+const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
+  token: 1,
+  k: 1_000,
+  m: 1_000_000,
+  b: 1_000_000_000,
+};
+
+const TOKEN_LIMIT_UNIT_ORDER: TokenLimitUnit[] = ["b", "m", "k", "token"];
 
 const emptyLimitsForm: LimitsFormState = {
   modelAllow: [],
   modelDeny: [],
   rpm: "",
   rpd: "",
+  maxConcurrency: "",
   costLimit5h: "",
   costLimit7d: "",
   tokenLimit5h: "",
+  tokenLimit5hUnit: "token",
   tokenLimit7d: "",
+  tokenLimit7dUnit: "token",
 };
 
 const initialCreateForm: CreateKeyFormState = {
@@ -969,11 +985,17 @@ function buildExpirationPayload(
 
 function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
   if (!limits) return emptyLimitsForm;
+  const token5h = formatTokenLimitForForm(limits.token_limit_5h);
+  const token7d = formatTokenLimitForForm(limits.token_limit_7d);
   return {
     modelAllow: Array.isArray(limits.model_allow) ? limits.model_allow : [],
     modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
     rpm: limits.rpm && limits.rpm > 0 ? String(limits.rpm) : "",
     rpd: limits.rpd && limits.rpd > 0 ? String(limits.rpd) : "",
+    maxConcurrency:
+      limits.max_concurrency && limits.max_concurrency > 0
+        ? String(limits.max_concurrency)
+        : "",
     costLimit5h:
       limits.cost_limit_5h && limits.cost_limit_5h > 0
         ? String(limits.cost_limit_5h)
@@ -982,15 +1004,38 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.cost_limit_7d && limits.cost_limit_7d > 0
         ? String(limits.cost_limit_7d)
         : "",
-    tokenLimit5h:
-      limits.token_limit_5h && limits.token_limit_5h > 0
-        ? String(limits.token_limit_5h)
-        : "",
-    tokenLimit7d:
-      limits.token_limit_7d && limits.token_limit_7d > 0
-        ? String(limits.token_limit_7d)
-        : "",
+    tokenLimit5h: token5h.value,
+    tokenLimit5hUnit: token5h.unit,
+    tokenLimit7d: token7d.value,
+    tokenLimit7dUnit: token7d.unit,
   };
+}
+
+function formatTokenLimitForForm(value?: number): {
+  value: string;
+  unit: TokenLimitUnit;
+} {
+  if (!value || value <= 0 || !Number.isFinite(value)) {
+    return { value: "", unit: "token" };
+  }
+  const integerValue = Math.trunc(value);
+  const unit =
+    TOKEN_LIMIT_UNIT_ORDER.find(
+      (candidate) => integerValue % TOKEN_LIMIT_UNIT_MULTIPLIERS[candidate] === 0,
+    ) ?? "token";
+  return {
+    value: String(integerValue / TOKEN_LIMIT_UNIT_MULTIPLIERS[unit]),
+    unit,
+  };
+}
+
+function parseTokenLimit(value: string, unit: TokenLimitUnit): number {
+  const trimmed = value.trim();
+  if (!trimmed) return 0;
+  const amount = Number(trimmed);
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  const tokens = amount * TOKEN_LIMIT_UNIT_MULTIPLIERS[unit];
+  return Number.isInteger(tokens) && tokens > 0 ? tokens : 0;
 }
 
 // limitsFormToPayload 把表单值转为后端期望的 APIKeyLimits。
@@ -1001,15 +1046,20 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     const n = Number(s.trim());
     return Number.isFinite(n) && n > 0 ? n : 0;
   };
+  const intNum = (s: string) => {
+    const n = Number(s.trim());
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  };
   return {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
-    rpm: num(form.rpm),
-    rpd: num(form.rpd),
+    rpm: intNum(form.rpm),
+    rpd: intNum(form.rpd),
+    max_concurrency: intNum(form.maxConcurrency),
     cost_limit_5h: num(form.costLimit5h),
     cost_limit_7d: num(form.costLimit7d),
-    token_limit_5h: num(form.tokenLimit5h),
-    token_limit_7d: num(form.tokenLimit7d),
+    token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
+    token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
   };
 }
 
@@ -1196,11 +1246,21 @@ function LimitsEditor({
     value.modelDeny.length > 0 ||
     value.rpm !== "" ||
     value.rpd !== "" ||
+    value.maxConcurrency !== "" ||
     value.costLimit5h !== "" ||
     value.costLimit7d !== "" ||
     value.tokenLimit5h !== "" ||
     value.tokenLimit7d !== "";
   const [open, setOpen] = useState(hasAny);
+  const tokenUnitOptions = useMemo(
+    () =>
+      (["token", "k", "m", "b"] as TokenLimitUnit[]).map((unit) => ({
+        label: t(`apiKeys.limits.tokenUnits.${unit}`),
+        triggerLabel: t(`apiKeys.limits.tokenUnitShort.${unit}`),
+        value: unit,
+      })),
+    [t],
+  );
 
   const patch = (next: Partial<LimitsFormState>) =>
     onChange({ ...value, ...next });
@@ -1271,6 +1331,12 @@ function LimitsEditor({
               suffix={t("apiKeys.limits.rpdSuffix")}
             />
             <LimitNumberField
+              label={t("apiKeys.limits.maxConcurrency")}
+              value={value.maxConcurrency}
+              onChange={(maxConcurrency) => patch({ maxConcurrency })}
+              suffix={t("apiKeys.limits.concurrencySuffix")}
+            />
+            <LimitNumberField
               label={t("apiKeys.limits.cost5h")}
               value={value.costLimit5h}
               onChange={(costLimit5h) => patch({ costLimit5h })}
@@ -1284,21 +1350,67 @@ function LimitsEditor({
               suffix="$"
               step="0.01"
             />
-            <LimitNumberField
+            <TokenLimitField
               label={t("apiKeys.limits.tokens5h")}
               value={value.tokenLimit5h}
-              onChange={(tokenLimit5h) => patch({ tokenLimit5h })}
-              suffix="tk"
+              unit={value.tokenLimit5hUnit}
+              unitOptions={tokenUnitOptions}
+              onValueChange={(tokenLimit5h) => patch({ tokenLimit5h })}
+              onUnitChange={(tokenLimit5hUnit) => patch({ tokenLimit5hUnit })}
             />
-            <LimitNumberField
+            <TokenLimitField
               label={t("apiKeys.limits.tokens7d")}
               value={value.tokenLimit7d}
-              onChange={(tokenLimit7d) => patch({ tokenLimit7d })}
-              suffix="tk"
+              unit={value.tokenLimit7dUnit}
+              unitOptions={tokenUnitOptions}
+              onValueChange={(tokenLimit7d) => patch({ tokenLimit7d })}
+              onUnitChange={(tokenLimit7dUnit) => patch({ tokenLimit7dUnit })}
             />
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function TokenLimitField({
+  label,
+  value,
+  unit,
+  unitOptions,
+  onValueChange,
+  onUnitChange,
+}: {
+  label: string;
+  value: string;
+  unit: TokenLimitUnit;
+  unitOptions: SelectOption[];
+  onValueChange: (next: string) => void;
+  onUnitChange: (next: TokenLimitUnit) => void;
+}) {
+  return (
+    <div className="space-y-1">
+      <label className="text-[11px] font-medium text-muted-foreground">
+        {label}
+      </label>
+      <div className="grid grid-cols-[minmax(0,1fr)_112px] gap-2">
+        <Input
+          type="number"
+          min="0"
+          step="0.01"
+          inputMode="decimal"
+          value={value}
+          onChange={(e) => onValueChange(e.target.value)}
+          placeholder="0"
+          className="text-xs"
+        />
+        <Select
+          value={unit}
+          onValueChange={(next) => onUnitChange(next as TokenLimitUnit)}
+          options={unitOptions}
+          compact
+        />
+      </div>
     </div>
   );
 }

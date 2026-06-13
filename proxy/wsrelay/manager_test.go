@@ -158,3 +158,66 @@ func TestAcquireConnectionWaitsWhileSessionHasPendingRequest(t *testing.T) {
 		t.Fatal("expected acquire to stop when session stays busy until context timeout")
 	}
 }
+
+func newTestSlotConnection(manager *Manager, account *auth.Account, wsURL, slotSession string) (*WsConnection, *Session) {
+	key := manager.poolKey(account.ID(), wsURL, slotSession, "")
+	session := NewSession(account.ID(), manager)
+	session.SetConnected(true)
+	conn := &WsConnection{
+		session:  session,
+		URL:      wsURL,
+		PoolKey:  key,
+		httpResp: &http.Response{StatusCode: http.StatusSwitchingProtocols},
+	}
+	conn.SetState(StateConnected)
+	conn.Touch()
+	manager.connections.Store(key, conn)
+	manager.sessions.Store(key, session)
+	return conn, session
+}
+
+func TestAcquireReusableConnectionReusesIdleSlot(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
+
+	account := &auth.Account{DBID: 42}
+	wsURL := "wss://example.test/responses"
+	conn, _ := newTestSlotConnection(manager, account, wsURL, "cache-key#0")
+
+	got, pr, usedKey, err := manager.AcquireReusableConnection(context.Background(), account, wsURL, "cache-key", "stateless-xyz", 4, http.Header{}, "")
+	if err != nil {
+		t.Fatalf("AcquireReusableConnection() error = %v", err)
+	}
+	if got != conn {
+		t.Fatal("expected idle slot connection to be reused")
+	}
+	if usedKey != "cache-key#0" {
+		t.Fatalf("usedKey = %q, want cache-key#0", usedKey)
+	}
+	got.session.RemovePendingRequest(pr.RequestID)
+}
+
+func TestAcquireReusableConnectionSkipsBusySlot(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
+
+	account := &auth.Account{DBID: 42}
+	wsURL := "wss://example.test/responses"
+	_, busySession := newTestSlotConnection(manager, account, wsURL, "cache-key#0")
+	busySession.AddPendingRequest("cache-key#0") // 占用 slot 0
+	idleConn, _ := newTestSlotConnection(manager, account, wsURL, "cache-key#1")
+
+	got, pr, usedKey, err := manager.AcquireReusableConnection(context.Background(), account, wsURL, "cache-key", "stateless-xyz", 4, http.Header{}, "")
+	if err != nil {
+		t.Fatalf("AcquireReusableConnection() error = %v", err)
+	}
+	if got != idleConn {
+		t.Fatal("expected busy slot 0 to be skipped and idle slot 1 reused")
+	}
+	if usedKey != "cache-key#1" {
+		t.Fatalf("usedKey = %q, want cache-key#1", usedKey)
+	}
+	got.session.RemovePendingRequest(pr.RequestID)
+}

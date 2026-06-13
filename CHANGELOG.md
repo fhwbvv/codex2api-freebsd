@@ -1,5 +1,89 @@
 # Changelog
 
+## v2.3.2 - 2026-06-12
+
+### Features
+
+- **Group filter: ungrouped and exclude modes (#229).** The account group filter now supports an "ungrouped" quick option and per-group tri-state filtering (only / hide / off), so accounts outside chosen groups can be isolated, selected in bulk, and assigned to a group quickly. The groups column is also shown by default in the table view.
+
+### Fixes
+
+- **`gpt-5.3-codex-spark` no longer receives the default image tool (#230).** The Responses translator auto-injected the hosted `image_generation` tool (plus bridge instructions) into ordinary text requests; spark rejects hosted image tools, so text-only spark requests failed on the HTTP upstream path. The default injection is now skipped for spark while explicitly supplied image tools are still honored.
+- **Tools without a `type` field no longer fail requests (#219).** Tool definitions missing `type` (or with `type: null`) were forwarded verbatim and the upstream rejected the whole request with 400 `Unsupported tool type: None`. Function-shaped tools (a nested `function` object or a top-level `name`) are now treated as `type: "function"` per OpenAI SDK convention on both the Chat Completions and Responses paths; unrecognizable typeless tools are dropped instead of failing the request.
+- **Usage logs are requeued when a flush fails (#233).** Failed usage-log batches are put back at the front of the buffer and retried on the next flush instead of being dropped, and usage-log inserts plus API key quota updates now run in a single transaction on both SQLite and PostgreSQL.
+- **Reduced timer allocations while waiting for Redis token refresh (#231).** `WaitForRefreshComplete` now reuses a single ticker and timeout timer instead of allocating a new timer every 200ms poll (previously up to ~150 timers per 30s wait).
+
+### Performance
+
+- **Request bodies are read once and reused (#232).** `RequestSizeLimiter` caches the body it already reads, and the body-cache middleware plus all JSON proxy handlers reuse it, cutting up to ~2/3 of duplicated request-body buffer allocations on hot paths.
+
+## v2.3.1 - 2026-06-11
+
+### Features
+
+- **Group-level and global auto-pause thresholds (#227).** Usage auto-pause thresholds can now be set globally (Settings) and per account group (group dialog), resolved with account > group > global priority. Account-level settings win when present, otherwise the smallest non-zero group threshold applies, falling back to the global default. Changes take effect immediately without a restart, and out-of-range values are rejected consistently across all three levels.
+- **API key concurrency limits (#226).** Each API key can cap its concurrent in-flight requests via `limits.max_concurrency`. Requests over the cap receive 429 with a descriptive message across all proxy entrances (responses, compact, chat completions, Anthropic messages, images, WebSocket turns). Unset or 0 means unlimited.
+- **Account group multi-select binding (#217, #222).** Account group assignment now uses a searchable multi-select dropdown instead of assigning new groups to all accounts.
+
+### Fixes
+
+- **WebSocket prompt cache restored (#202).** Since v2.2.7, requests without an explicit session identifier got a random per-request `stateless-` ID on the WS upstream path, which leaked into `prompt_cache_key` and the WS handshake session headers — so the upstream prompt cache never hit in WS mode (HTTP was unaffected). WS now injects a deterministic cache key derived from the downstream API key (matching HTTP behavior), restoring cache hits (~86% of input tokens on repeated prefixes in live testing).
+- **WebSocket connection reuse under high RPM.** Sessionless requests previously opened a new WS connection per request; sustained load (~200 RPM) triggered upstream handshake throttling (`bad handshake` → 503). Such requests now reuse warm connections from a per-(account, cache key) slot pool (8 slots, falling back to one-shot connections when all slots are busy). Live testing at 200 RPM went from 128/200 success to 200/200 with zero handshake failures and roughly halved latency.
+- **Codex CLI compact v2 input items (#224).** `/responses` no longer returns 400 `Invalid input type 'compaction_trigger'` for Codex CLI compact v2 payloads.
+- **Usage probed immediately after OAuth account add.** Newly added OAuth accounts get an immediate usage probe instead of waiting for the next cycle.
+- **Account table scrolling.** Adjusted account table scrolling behavior in the admin UI.
+
+## v2.3.0 - 2026-06-10
+
+### Features
+
+- **Account recycle bin.** Soft-deleted accounts now land in a recycle bin instead of vanishing. Accounts can be restored to the runtime pool without a restart, test-connected before restoring (429/usage-limit results are recorded as rate-limited rather than failed), batch-tested with an optional auto-restore-on-pass toggle, filtered by plan type and searched with pagination, and permanently purged behind a typed confirmation enforced on the API as well.
+- **Client IP in usage logs.** Usage records now capture the requesting client IP and display it in the usage views.
+
+### Fixes
+
+- **Relay accounts on `/v1/messages` and `/v1/chat/completions` (#181).** Both endpoints now schedule OpenAI Responses (relay API-key) accounts and forward over HTTP like `/v1/responses`, instead of returning 503 "No available accounts" once Codex OAuth accounts were rate-limited on relay-only deployments.
+- **Image generation no longer routed over WebSocket (#220).** Requests carrying an `image_generation` tool (including the auto-injected one) are forced onto HTTP, and requests that do go over WS get the auto-injected image tool, its `tool_choice`, and bridge instructions stripped, so image generation can no longer stall WS streams on large base64 payloads.
+- **Image SSE keep-alive.** Image generation SSE streams now stay alive through long upstream pauses, preventing idle disconnects mid-generation.
+- **Account rate-limit state sync.** Rate-limit state observed by usage probes and WHAM checks is synced back to runtime account state so scheduling and status displays stay consistent.
+- **Account status summary counts.** Admin account status summary counters now align with the account list filters.
+
+### Security
+
+- **Code-scanning hardening.** Local image storage rejects keys containing path separators on write and `..` traversal segments on read/delete (legacy relative refs keep working); remote-migration and sub2api import URLs must be complete http/https URLs with a host; SVG logo minification strips comments to a fixed point so `<!--` cannot survive sanitization.
+
+## v2.2.9 - 2026-06-09
+
+### Features
+
+- **Account proxy validation (#212).** Added proxy test controls across account add/edit, OAuth generation, and OpenAI Responses account forms, backed by an admin proxy test endpoint that reports reachability, latency, IP, and location.
+- **Usage range and reset-time display.** Dashboard usage cards now label and query the selected time range instead of always showing "today", and account quota reset labels now display precise seconds with full timestamps available in tooltips.
+
+### Fixes
+
+- **WebSocket message-too-big fallback (#214).** Upstream WebSocket `close 1009` / `message too big` failures before the first downstream token now fall back to HTTP for the same request instead of rotating accounts through another WS attempt, with logs classified as `message_too_big`.
+- **CPA/sub2api JSON import (#215).** JSON imports now avoid treating repeated or conflicting ChatGPT account IDs as the same account when credentials differ, fixing failed or collapsed imports from CPA/sub2api export files.
+- **Batch account test state updates.** Batch connection tests now update account status consistently with single-account tests, including `response.failed`, unauthorized, generic upstream errors, and usage-limit results; successful tests still recover stale banned/cooldown state.
+- **Quota auto-pause scheduling (#216).** Accounts that reached configured usage thresholds remain out of scheduling while their quota window is still active, and stale reset timestamps are ignored so reset/cooldown state does not linger incorrectly.
+
+## v2.2.8 - 2026-06-08
+
+### Features
+
+- **Account usage analytics.** Expanded the account usage details modal with Overview, Details, and Quality views, range-aware totals, richer model distribution controls, and quality signals including error rate, retry count, average first-token latency, P95 response time, streaming ratio, and compact ratio.
+- **Batch account import workflow.** Refresh Token batch import now has progress feedback and kicks off usage sampling so newly imported accounts do not require a separate manual batch test before usage data becomes visible.
+- **First-token mode setting (#207).** Added a system setting for strict vs loose first-token detection, making TTFT behavior configurable while keeping thinking/pre-output events from being counted incorrectly in strict mode.
+- **Usage visibility controls (#203, #209, #210).** Usage stats now support additional time ranges, full token-number display, compact request markers, and dedicated WS/Fast request badges.
+
+### Fixes
+
+- **Batch account test consistency (#194).** Batch tests now match single-account tests more closely by using the WHAM usage preflight and parsing real SSE terminal events from a short request; `response.failed`, missing output, and `usage_limit_reached` are no longer treated as successful account recovery.
+- **Forced WebSocket usage logs (#205, #210).** Requests forced through upstream WebSocket now persist and display the `via_websocket` marker correctly, with Fast tier shown as its own request badge.
+- **Responses compact and quota handling (#174, #201).** OpenAI Responses API-key accounts can forward `/v1/responses/compact`, and nested `usage_limit_reached` errors are handled consistently for cooldown and sampling.
+- **Billing tier policy persistence (#206).** `billing_tier_policy` now stays aligned across frontend save behavior, backend normalization, and database persistence.
+- **OAuth authorization UX.** OAuth authorization links can be regenerated and copied reliably, including HTTP admin deployments where the Clipboard API may be unavailable.
+- **Image and WS routing stability (#198).** Explicit image generation requests bypass forced WS routing, and `gpt-5.3-codex-spark` scheduling/model filtering is hardened.
+
 ## v2.2.7 - 2026-06-05
 
 ### Features

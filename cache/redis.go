@@ -252,8 +252,17 @@ func (tc *redisTokenCache) ReleaseRefreshLock(ctx context.Context, accountID int
 
 // WaitForRefreshComplete 等待另一个进程完成刷新（轮询锁 + 读取缓存）
 func (tc *redisTokenCache) WaitForRefreshComplete(ctx context.Context, accountID int64, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	timeoutTimer := time.NewTimer(timeout)
+	defer timeoutTimer.Stop()
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
 		// 检查锁是否还在
 		exists, err := tc.client.Exists(ctx, refreshLockKey(accountID)).Result()
 		if err != nil {
@@ -274,10 +283,11 @@ func (tc *redisTokenCache) WaitForRefreshComplete(ctx context.Context, accountID
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+		case <-timeoutTimer.C:
+			return "", fmt.Errorf("等待刷新超时")
+		case <-ticker.C:
 		}
 	}
-	return "", fmt.Errorf("等待刷新超时")
 }
 
 // ==================== 运行态缓存 ====================

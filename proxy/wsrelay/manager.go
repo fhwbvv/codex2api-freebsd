@@ -391,6 +391,79 @@ func (m *Manager) AcquireConnection(
 	}
 }
 
+// StatelessConnectionSlots 无显式会话的请求在每个 (account, cacheKey) 维度下
+// 复用的持久连接槽位数。槽位内空闲连接直接复用,避免每个请求都重新握手——
+// 持续高 RPM 下逐请求握手会触发上游 WS 握手限流（bad handshake → 503）。
+const StatelessConnectionSlots = 8
+
+// AcquireReusableConnection 在固定槽位内复用或创建连接，返回实际使用的 session key。
+// 第一遍只复用已存在且空闲的连接；第二遍在空槽位新建持久连接；槽位全忙时回退到
+// fallbackKey 的一次性连接，保持与原 stateless 行为一致的并发上限（无上限）。
+func (m *Manager) AcquireReusableConnection(
+	ctx context.Context,
+	account *auth.Account,
+	wsURL string,
+	baseKey string,
+	fallbackKey string,
+	slots int,
+	headers http.Header,
+	proxyOverride string,
+) (*WsConnection, *PendingRequest, string, error) {
+	proxyURL := effectiveProxyURL(account, proxyOverride)
+	// 第一遍：复用空闲连接（探活失败或已断开的顺手清理，让第二遍可以补位）
+	for i := 0; i < slots; i++ {
+		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
+		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
+		lock := m.keyLock(key)
+		lock.Lock()
+		if v, ok := m.connections.Load(key); ok {
+			wc := v.(*WsConnection)
+			if canReuseConnection(wc) {
+				if m.probe(wc) {
+					pr := wc.session.AddPendingRequest(slotSession)
+					wc.Touch()
+					lock.Unlock()
+					return wc, pr, slotSession, nil
+				}
+				m.connections.Delete(key)
+				m.sessions.Delete(key)
+				wc.Close()
+			} else if !wc.IsConnected() || wc.IsExpired() {
+				m.connections.Delete(key)
+				m.sessions.Delete(key)
+				wc.Close()
+			}
+		}
+		lock.Unlock()
+	}
+	// 第二遍：在空槽位新建持久连接
+	for i := 0; i < slots; i++ {
+		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
+		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
+		lock := m.keyLock(key)
+		lock.Lock()
+		if _, ok := m.connections.Load(key); ok {
+			lock.Unlock()
+			continue
+		}
+		wc, err := m.createConnection(ctx, account, wsURL, slotSession, headers, proxyOverride)
+		if err != nil {
+			lock.Unlock()
+			return nil, nil, "", err
+		}
+		m.connections.Store(key, wc)
+		pr := wc.session.AddPendingRequest(slotSession)
+		lock.Unlock()
+		if fn := m.getOnConnected(); fn != nil {
+			fn(account.ID(), wc.session)
+		}
+		return wc, pr, slotSession, nil
+	}
+	// 槽位全忙：回退一次性连接
+	wc, pr, err := m.AcquireConnection(ctx, account, wsURL, fallbackKey, headers, proxyOverride)
+	return wc, pr, fallbackKey, err
+}
+
 func canReuseConnection(wc *WsConnection) bool {
 	if wc == nil {
 		return false

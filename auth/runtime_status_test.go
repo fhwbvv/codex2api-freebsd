@@ -78,3 +78,46 @@ func TestMarkCooldownWithErrorKeepsUnauthorizedStatusAndMessage(t *testing.T) {
 		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
 	}
 }
+
+func TestMarkUsage7dRateLimitedUsesActiveResetWindow(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{
+		DBID:        1,
+		AccessToken: "at-test",
+		PlanType:    "team",
+		Status:      StatusReady,
+		HealthTier:  HealthTierHealthy,
+	}
+	acc.SetUsagePercent7d(100)
+	acc.SetReset7dAt(time.Now().Add(time.Hour))
+
+	if !store.MarkUsage7dRateLimited(acc) {
+		t.Fatal("MarkUsage7dRateLimited() = false, want true")
+	}
+	if got := acc.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	}
+	if acc.IsAvailable() {
+		t.Fatal("IsAvailable() = true, want false for active 7d usage limit")
+	}
+}
+
+func TestMarkUsage7dRateLimitedSkipsExpiredResetWindow(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{
+		DBID:        1,
+		AccessToken: "at-test",
+		PlanType:    "team",
+		Status:      StatusReady,
+		HealthTier:  HealthTierHealthy,
+	}
+	acc.SetUsagePercent7d(100)
+	acc.SetReset7dAt(time.Now().Add(-time.Minute))
+
+	if store.MarkUsage7dRateLimited(acc) {
+		t.Fatal("MarkUsage7dRateLimited() = true, want false for expired reset")
+	}
+	if got := acc.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active after expired reset", got)
+	}
+}

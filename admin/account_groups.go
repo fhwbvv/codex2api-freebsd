@@ -20,26 +20,30 @@ const (
 )
 
 type accountGroupResponse struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Color       string `json:"color"`
-	SortOrder   int64  `json:"sort_order"`
-	MemberCount int64  `json:"member_count"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	ID                   int64   `json:"id"`
+	Name                 string  `json:"name"`
+	Description          string  `json:"description"`
+	Color                string  `json:"color"`
+	SortOrder            int64   `json:"sort_order"`
+	MemberCount          int64   `json:"member_count"`
+	AutoPause5hThreshold float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold float64 `json:"auto_pause_7d_threshold"`
+	CreatedAt            string  `json:"created_at"`
+	UpdatedAt            string  `json:"updated_at"`
 }
 
 func toAccountGroupResponse(g database.AccountGroup) accountGroupResponse {
 	return accountGroupResponse{
-		ID:          g.ID,
-		Name:        g.Name,
-		Description: g.Description,
-		Color:       g.Color,
-		SortOrder:   g.SortOrder,
-		MemberCount: g.MemberCount,
-		CreatedAt:   g.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:   g.UpdatedAt.Format(time.RFC3339),
+		ID:                   g.ID,
+		Name:                 g.Name,
+		Description:          g.Description,
+		Color:                g.Color,
+		SortOrder:            g.SortOrder,
+		MemberCount:          g.MemberCount,
+		AutoPause5hThreshold: g.AutoPause5hThreshold,
+		AutoPause7dThreshold: g.AutoPause7dThreshold,
+		CreatedAt:            g.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:            g.UpdatedAt.Format(time.RFC3339),
 	}
 }
 
@@ -59,10 +63,19 @@ func (h *Handler) ListAccountGroups(c *gin.Context) {
 }
 
 type createAccountGroupReq struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Color       string `json:"color"`
-	SortOrder   *int64 `json:"sort_order"`
+	Name                 string  `json:"name"`
+	Description          string  `json:"description"`
+	Color                string  `json:"color"`
+	SortOrder            *int64  `json:"sort_order"`
+	AutoPause5hThreshold float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold float64 `json:"auto_pause_7d_threshold"`
+}
+
+func validateAutoPauseThreshold(name string, value float64) error {
+	if value < 0 || value > 1 {
+		return errors.New(name + " 需在 0 到 1 之间")
+	}
+	return nil
 }
 
 func (h *Handler) CreateAccountGroup(c *gin.Context) {
@@ -90,6 +103,14 @@ func (h *Handler) CreateAccountGroup(c *gin.Context) {
 	if req.SortOrder != nil {
 		sortOrder = *req.SortOrder
 	}
+	if err := validateAutoPauseThreshold("auto_pause_5h_threshold", req.AutoPause5hThreshold); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateAutoPauseThreshold("auto_pause_7d_threshold", req.AutoPause7dThreshold); err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 	groups, err := h.db.ListAccountGroups(ctx)
@@ -101,7 +122,7 @@ func (h *Handler) CreateAccountGroup(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "分组数量已达上限")
 		return
 	}
-	id, err := h.db.CreateAccountGroup(ctx, name, description, color, sortOrder)
+	id, err := h.db.CreateAccountGroup(ctx, name, description, color, req.AutoPause5hThreshold, req.AutoPause7dThreshold, sortOrder)
 	if err != nil {
 		if errors.Is(err, database.ErrDuplicateAccountGroupName) {
 			writeError(c, http.StatusConflict, err.Error())
@@ -110,14 +131,19 @@ func (h *Handler) CreateAccountGroup(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	if h.store != nil && (req.AutoPause5hThreshold > 0 || req.AutoPause7dThreshold > 0) {
+		h.store.SetGroupAutoPauseThresholds(id, req.AutoPause5hThreshold, req.AutoPause7dThreshold)
+	}
 	c.JSON(http.StatusOK, gin.H{"id": id, "message": "分组已创建"})
 }
 
 type updateAccountGroupReq struct {
-	Name        *string `json:"name"`
-	Description *string `json:"description"`
-	Color       *string `json:"color"`
-	SortOrder   *int64  `json:"sort_order"`
+	Name                 *string  `json:"name"`
+	Description          *string  `json:"description"`
+	Color                *string  `json:"color"`
+	SortOrder            *int64   `json:"sort_order"`
+	AutoPause5hThreshold *float64 `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold *float64 `json:"auto_pause_7d_threshold"`
 }
 
 func (h *Handler) UpdateAccountGroup(c *gin.Context) {
@@ -155,9 +181,28 @@ func (h *Handler) UpdateAccountGroup(c *gin.Context) {
 		}
 		req.Color = &color
 	}
+	if req.AutoPause5hThreshold != nil {
+		if err := validateAutoPauseThreshold("auto_pause_5h_threshold", *req.AutoPause5hThreshold); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.AutoPause7dThreshold != nil {
+		if err := validateAutoPauseThreshold("auto_pause_7d_threshold", *req.AutoPause7dThreshold); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	var opts *database.UpdateAccountGroupOpts
+	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
+		opts = &database.UpdateAccountGroupOpts{
+			AutoPause5hThreshold: req.AutoPause5hThreshold,
+			AutoPause7dThreshold: req.AutoPause7dThreshold,
+		}
+	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
-	if err := h.db.UpdateAccountGroup(ctx, id, req.Name, req.Description, req.Color, req.SortOrder); err != nil {
+	if err := h.db.UpdateAccountGroup(ctx, id, req.Name, req.Description, req.Color, opts, req.SortOrder); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "分组不存在")
 			return
@@ -168,6 +213,16 @@ func (h *Handler) UpdateAccountGroup(c *gin.Context) {
 		}
 		writeInternalError(c, err)
 		return
+	}
+	if opts != nil && h.store != nil {
+		t5h, t7d := h.store.GetGroupAutoPauseThresholds(id)
+		if opts.AutoPause5hThreshold != nil {
+			t5h = *opts.AutoPause5hThreshold
+		}
+		if opts.AutoPause7dThreshold != nil {
+			t7d = *opts.AutoPause7dThreshold
+		}
+		h.store.SetGroupAutoPauseThresholds(id, t5h, t7d)
 	}
 	writeMessage(c, http.StatusOK, "分组已更新")
 }
@@ -194,6 +249,7 @@ func (h *Handler) DeleteAccountGroup(c *gin.Context) {
 		return
 	}
 	if h.store != nil {
+		h.store.DeleteGroupAutoPauseThresholds(id)
 		for _, acc := range h.store.Accounts() {
 			acc.Mu().RLock()
 			groups := removeInt64(acc.GroupIDs, id)

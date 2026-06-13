@@ -6,7 +6,7 @@ export interface ToastState {
   type: ToastType
 }
 
-export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | string
+export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
 
 export interface StatsResponse {
   total: number
@@ -110,6 +110,23 @@ export interface AccountRow {
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
 
+export interface RecycleBinAccountRow {
+  id: number
+  name: string
+  email: string
+  plan_type: string
+  at_only?: boolean
+  openai_responses_api?: boolean
+  base_url?: string
+  models?: string[]
+  created_at: ISODateString
+  deleted_at?: ISODateString
+  last_test_status?: string
+  last_test_at?: ISODateString
+}
+
+export type RecycleBinAccountsResponse = ApiListResponse<'accounts', RecycleBinAccountRow>
+
 export interface AddAccountRequest {
   name?: string
   refresh_token?: string
@@ -172,6 +189,8 @@ export interface AccountGroup {
   color: string
   sort_order: number
   member_count: number
+  auto_pause_5h_threshold: number
+  auto_pause_7d_threshold: number
   created_at: ISODateString
   updated_at: ISODateString
 }
@@ -185,6 +204,8 @@ export interface CreateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  auto_pause_5h_threshold?: number
+  auto_pause_7d_threshold?: number
 }
 
 export interface UpdateAccountGroupRequest {
@@ -192,15 +213,34 @@ export interface UpdateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  auto_pause_5h_threshold?: number
+  auto_pause_7d_threshold?: number
 }
 
 export interface AccountModelStat {
   model: string
   requests: number
   tokens: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cached_tokens: number
+  account_billed: number
+  user_billed: number
+}
+
+export interface AccountUsageDayStat {
+  date: string
+  label: string
+  requests: number
+  tokens: number
+  account_billed: number
+  user_billed: number
 }
 
 export interface AccountUsageDetail {
+  period_days: number
+  active_days: number
   total_requests: number
   total_tokens: number
   input_tokens: number
@@ -208,6 +248,27 @@ export interface AccountUsageDetail {
   reasoning_tokens: number
   cached_tokens: number
   cache_hit_rate: number
+  total_account_billed: number
+  total_user_billed: number
+  avg_daily_account_billed: number
+  avg_daily_user_billed: number
+  avg_daily_requests: number
+  avg_daily_tokens: number
+  avg_duration_ms: number
+  avg_first_token_ms: number
+  p95_duration_ms: number
+  error_requests: number
+  error_rate: number
+  retry_requests: number
+  first_token_samples: number
+  stream_requests: number
+  stream_rate: number
+  compact_requests: number
+  compact_rate: number
+  today: AccountUsageDayStat
+  highest_cost_day?: AccountUsageDayStat
+  highest_request_day?: AccountUsageDayStat
+  history: AccountUsageDayStat[]
   models: AccountModelStat[]
 }
 
@@ -576,6 +637,7 @@ export interface SystemSettings {
   usage_log_flush_interval_seconds: number
   stream_flush_policy: 'immediate' | 'coalesce' | string
   stream_flush_interval_ms: number
+  first_token_mode: 'strict' | 'loose' | string
   first_token_timeout_seconds: number
   billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
@@ -588,6 +650,8 @@ export interface SystemSettings {
   image_s3_secret_key_configured?: boolean
   image_s3_prefix: string
   image_s3_force_path_style: boolean
+  auto_pause_5h_threshold: number
+  auto_pause_7d_threshold: number
 }
 
 export interface SetupHintsResponse {
@@ -737,6 +801,8 @@ export interface UsageStats {
   today_requests: number
   today_tokens: number
   today_input_tokens?: number
+  today_prompt_tokens?: number
+  today_completion_tokens?: number
   today_cached_tokens?: number
   today_cache_rate?: number
   today_account_billed: number
@@ -811,6 +877,7 @@ export interface APIKeyTokenStat {
 export interface UsageLog {
   id: number
   account_id: number
+  client_ip: string
   endpoint: string
   model: string
   effective_model: string
@@ -909,6 +976,7 @@ export interface APIKeyLimits {
   model_deny?: string[]
   rpm?: number
   rpd?: number
+  max_concurrency?: number
   cost_limit_5h?: number
   cost_limit_7d?: number
   token_limit_5h?: number

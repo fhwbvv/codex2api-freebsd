@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -42,7 +43,11 @@ func (b *LocalBackend) Save(_ context.Context, key string, data []byte, _ string
 	if b.dir == "" {
 		return "", fmt.Errorf("imagestore.local: 未设置目录")
 	}
-	full := filepath.Join(b.dir, key)
+	name := filepath.Base(key)
+	if name != key || name == "." || name == ".." || strings.ContainsAny(key, `/\`) {
+		return "", fmt.Errorf("imagestore.local: key 不能包含路径分隔符: %q", key)
+	}
+	full := filepath.Join(b.dir, name)
 	if err := os.WriteFile(full, data, 0o644); err != nil {
 		return "", err
 	}
@@ -53,10 +58,24 @@ func (b *LocalBackend) Save(_ context.Context, key string, data []byte, _ string
 	return abs, nil
 }
 
+// validateLocalRef 做读/删侧的纵深防御：ref 由 Save 产出并保存在数据库里，正常数据
+// 不会含 ".." 段（Join/Abs 都会 Clean 掉）。这里只拦截遍历形式，不强制绝对路径也不
+// 强制落在当前 dir 内——LocalDir 是运行时设置，历史资源可能写在旧目录，且重构前的
+// 旧版本在 IMAGE_ASSET_DIR 为相对路径时会把相对 ref 存进数据库。
+func validateLocalRef(ref string) error {
+	if slices.Contains(strings.Split(filepath.ToSlash(ref), "/"), "..") {
+		return fmt.Errorf("imagestore.local: 非法 ref: %q", ref)
+	}
+	return nil
+}
+
 // Open 流式读取本地文件。
 func (b *LocalBackend) Open(_ context.Context, ref string) (io.ReadCloser, int64, error) {
 	if ref == "" {
 		return nil, 0, os.ErrNotExist
+	}
+	if err := validateLocalRef(ref); err != nil {
+		return nil, 0, err
 	}
 	f, err := os.Open(ref)
 	if err != nil {
@@ -75,6 +94,9 @@ func (b *LocalBackend) Read(_ context.Context, ref string) ([]byte, error) {
 	if ref == "" {
 		return nil, os.ErrNotExist
 	}
+	if err := validateLocalRef(ref); err != nil {
+		return nil, err
+	}
 	return os.ReadFile(ref)
 }
 
@@ -82,6 +104,9 @@ func (b *LocalBackend) Read(_ context.Context, ref string) ([]byte, error) {
 func (b *LocalBackend) Delete(_ context.Context, ref string) error {
 	if ref == "" {
 		return nil
+	}
+	if err := validateLocalRef(ref); err != nil {
+		return err
 	}
 	if err := os.Remove(ref); err != nil && !os.IsNotExist(err) {
 		return err

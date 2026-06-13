@@ -58,7 +58,8 @@ func RateLimitMiddleware(requests int, window time.Duration) gin.HandlerFunc {
 // RequestSizeLimiter limits request body size
 func RequestSizeLimiter(maxSize int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Read the request body
+		// Read the request body once, enforce the configured size limit, and cache it
+		// for downstream handlers that need raw JSON without re-reading c.Request.Body.
 		body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxSize+1))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
@@ -85,7 +86,8 @@ func RequestSizeLimiter(maxSize int64) gin.HandlerFunc {
 			return
 		}
 
-		// Replace the body so it can be read again
+		c.Set("raw_body", body)
+		// Replace the body so code paths using Gin binding/GetRawData can still read it.
 		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 		c.Next()
 	}

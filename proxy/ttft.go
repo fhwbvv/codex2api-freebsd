@@ -39,6 +39,24 @@ func isFirstTokenEvent(eventType string) bool {
 	return false
 }
 
+// isPreContentLifecycleEvent 判断一个 SSE 事件是否为纯前置生命周期帧
+// （response.created / response.in_progress）——它们不携带任何模型产出。
+//
+// 这是唯一可以在"流可见地开始"之前短暂缓冲的帧：缓冲它们，才能在首个真实
+// token 到来前遇到可重试的上游故障时，静默换号重试且客户端不会看到"假开始"。
+//
+// 除此之外的所有帧——包括标志响应已开始的结构帧 response.output_item.added /
+// response.content_part.added，以及随后的 reasoning 帧——都必须立即下发给客户端
+// 以保证响应及时性。把它们一直压到"首个内容 token"才下发（issue #207），会让
+// 推理型请求在整个思考阶段看起来像卡死。
+func isPreContentLifecycleEvent(eventType string) bool {
+	switch strings.TrimSpace(eventType) {
+	case "response.created", "response.in_progress":
+		return true
+	}
+	return false
+}
+
 func isFirstTokenPayload(data []byte) bool {
 	return isFirstTokenResult(gjson.ParseBytes(data))
 }
@@ -66,6 +84,32 @@ func isFirstTokenResult(parsed gjson.Result) bool {
 			isFirstTokenEvent(eventType)
 	}
 	return isFirstTokenEvent(eventType)
+}
+
+func isFirstTokenResultForMode(parsed gjson.Result, mode string) bool {
+	if NormalizeFirstTokenMode(mode) != FirstTokenModeLoose {
+		return isFirstTokenResult(parsed)
+	}
+	return isLooseFirstTokenResult(parsed)
+}
+
+func isLooseFirstTokenResult(parsed gjson.Result) bool {
+	eventType := strings.TrimSpace(parsed.Get("type").String())
+	if eventType == "" || isPreContentLifecycleEvent(eventType) {
+		return false
+	}
+	switch eventType {
+	case "error",
+		"response.error",
+		"response.completed",
+		"response.failed",
+		"response.incomplete",
+		"response.cancelled",
+		"response.canceled":
+		return false
+	default:
+		return true
+	}
 }
 
 func deltaEventHasContent(parsed gjson.Result) bool {

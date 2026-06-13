@@ -71,13 +71,16 @@ type Account struct {
 	UsagePercent5h        float64   // 5h 窗口使用率 0-100+
 	UsagePercent5hValid   bool
 	Reset5hAt             time.Time // 5h 窗口重置时间
-	UsageUpdatedAt        time.Time
+	UsageUpdatedAt        time.Time // 7d 用量快照刷新时间
+	UsageUpdatedAt5h      time.Time // 5h 用量快照刷新时间
 	usageProbeInFlight    bool
 	recoveryProbeInFlight bool
 	AutoPause5hThreshold  float64 // 0..1, 0 = disabled
 	AutoPause7dThreshold  float64 // 0..1, 0 = disabled
 	AutoPause5hDisabled   bool
 	AutoPause7dDisabled   bool
+	effectiveAutoPause5h  float64 // resolved: account > group > global
+	effectiveAutoPause7d  float64
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -950,10 +953,44 @@ func quotaAutoPausedByWindow(usage float64, valid bool, resetAt time.Time, thres
 }
 
 func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
-	if quotaAutoPausedByWindow(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, a.AutoPause5hThreshold, a.AutoPause5hDisabled, now) {
+	if quotaAutoPausedByWindow(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, a.effectiveAutoPause5h, a.AutoPause5hDisabled, now) {
 		return true
 	}
-	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.AutoPause7dThreshold, a.AutoPause7dDisabled, now)
+	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.effectiveAutoPause7d, a.AutoPause7dDisabled, now)
+}
+
+func (a *Account) recomputeEffectiveAutoPause(s *Store) {
+	a.effectiveAutoPause5h = resolveEffectiveThreshold(a.AutoPause5hThreshold, a.GroupIDs, s, true)
+	a.effectiveAutoPause7d = resolveEffectiveThreshold(a.AutoPause7dThreshold, a.GroupIDs, s, false)
+}
+
+func resolveEffectiveThreshold(accountThreshold float64, groupIDs []int64, s *Store, is5h bool) float64 {
+	if accountThreshold > 0 {
+		return accountThreshold
+	}
+	if s == nil {
+		return 0
+	}
+	var best float64
+	for _, gid := range groupIDs {
+		t5h, t7d := s.getGroupAutoPauseThresholds(gid)
+		var t float64
+		if is5h {
+			t = t5h
+		} else {
+			t = t7d
+		}
+		if t > 0 && (best == 0 || t < best) {
+			best = t
+		}
+	}
+	if best > 0 {
+		return best
+	}
+	if is5h {
+		return s.GetGlobalAutoPause5hThreshold()
+	}
+	return s.GetGlobalAutoPause7dThreshold()
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -1057,6 +1094,9 @@ func (a *Account) RuntimeStatus() string {
 			return "cooldown"
 		}
 		if a.hasDispatchCredentialLocked() {
+			if a.quotaAutoPausedLocked(now) {
+				return "quota_paused"
+			}
 			return "active" // 冷却过期，已恢复
 		}
 		if a.RefreshToken != "" {
@@ -1064,6 +1104,9 @@ func (a *Account) RuntimeStatus() string {
 		}
 		return "error"
 	default:
+		if a.hasDispatchCredentialLocked() && a.quotaAutoPausedLocked(now) {
+			return "quota_paused"
+		}
 		if a.hasDispatchCredentialLocked() {
 			return "active"
 		}
@@ -1095,6 +1138,32 @@ func (a *Account) GetUsagePercent7d() (float64, bool) {
 	return a.UsagePercent7d, a.UsagePercent7dValid
 }
 
+// MarkUsage7dRateLimited marks an account as rate-limited when its active 7d
+// usage window is exhausted. A future reset time is preferred; missing reset
+// metadata falls back to a full 7d cooldown, while stale reset times are ignored.
+func (s *Store) MarkUsage7dRateLimited(acc *Account) bool {
+	if s == nil || acc == nil || acc.IsBanned() {
+		return false
+	}
+
+	pct, ok := acc.GetUsagePercent7d()
+	if !ok || pct < 100 {
+		return false
+	}
+
+	duration := 7 * 24 * time.Hour
+	if resetAt := acc.GetReset7dAt(); !resetAt.IsZero() {
+		untilReset := time.Until(resetAt)
+		if untilReset <= 0 {
+			return false
+		}
+		duration = untilReset
+	}
+
+	s.MarkCooldown(acc, duration, "rate_limited")
+	return true
+}
+
 // usagePercentForScheduling 返回调度排序用的用量百分比（7d 窗口有效则返回，否则 0）。
 func (a *Account) usagePercentForScheduling() float64 {
 	a.mu.RLock()
@@ -1107,11 +1176,17 @@ func (a *Account) usagePercentForScheduling() float64 {
 
 // SetUsageSnapshot5h 更新 5h 用量快照
 func (a *Account) SetUsageSnapshot5h(pct float64, resetAt time.Time) {
+	a.SetUsageSnapshot5hAt(pct, resetAt, time.Now())
+}
+
+// SetUsageSnapshot5hAt 更新 5h 用量快照及刷新时间
+func (a *Account) SetUsageSnapshot5hAt(pct float64, resetAt time.Time, updatedAt time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.UsagePercent5h = pct
 	a.UsagePercent5hValid = true
 	a.Reset5hAt = resetAt
+	a.UsageUpdatedAt5h = updatedAt
 }
 
 // GetUsagePercent5h 获取 5h 用量百分比
@@ -1132,6 +1207,7 @@ func (a *Account) ClearUsageCache() {
 	a.UsagePercent5hValid = false
 	a.Reset5hAt = time.Time{}
 	a.UsageUpdatedAt = time.Time{}
+	a.UsageUpdatedAt5h = time.Time{}
 }
 
 // SetReset7dAt 设置 7d 窗口重置时间
@@ -1153,6 +1229,20 @@ func (a *Account) GetReset7dAt() time.Time {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.Reset7dAt
+}
+
+// GetUsageUpdatedAt 获取 7d 用量快照刷新时间
+func (a *Account) GetUsageUpdatedAt() time.Time {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.UsageUpdatedAt
+}
+
+// GetUsageUpdatedAt5h 获取 5h 用量快照刷新时间
+func (a *Account) GetUsageUpdatedAt5h() time.Time {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.UsageUpdatedAt5h
 }
 
 // GetPlanType 获取账号套餐类型
@@ -1454,10 +1544,18 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return false // 429 冷却期间不探活，避免加重限流
 	}
-	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() {
+	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() || now.Sub(a.UsageUpdatedAt) > maxAge {
 		return true
 	}
-	return time.Since(a.UsageUpdatedAt) > maxAge
+	if a.effectiveAutoPause5h > 0 && !a.AutoPause5hDisabled {
+		if !a.UsagePercent5hValid || a.UsageUpdatedAt5h.IsZero() {
+			return true
+		}
+		if a.Reset5hAt.IsZero() || a.Reset5hAt.After(now) {
+			return now.Sub(a.UsageUpdatedAt5h) > maxAge
+		}
+	}
+	return false
 }
 
 // TryBeginUsageProbe 尝试开始一次用量探针
@@ -1603,6 +1701,10 @@ type Store struct {
 	promptFilterConfig    atomic.Value // promptfilter.Config
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
+
+	globalAutoPause5hThreshold float64  // protected by mu
+	globalAutoPause7dThreshold float64  // protected by mu
+	groupAutoPauseThresholds   sync.Map // int64 -> [2]float64 {5h, 7d}
 }
 
 // sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
@@ -2043,6 +2145,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSHideUpstreamErrors.Store(settings.CodexWSHideUpstreamErrors)
 	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
 	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
+
+	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
+	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -2585,140 +2690,22 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 	}
 
 	for _, row := range rows {
-		rt := row.GetCredential("refresh_token")
-		st := row.GetCredential("session_token")
-		at := row.GetCredential("access_token")
-		upstreamType := row.GetCredential("upstream_type")
-		baseURL := row.GetCredential("base_url")
-		apiKey := row.GetCredential("api_key")
-		models := normalizeModelList(row.GetCredentialStringSlice("models"))
-		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
-		if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount {
-			log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
+		account := s.buildAccountFromRow(ctx, row, modelCooldowns)
+		if account == nil {
 			continue
 		}
-
-		account := &Account{
-			DBID:         row.ID,
-			RefreshToken: rt,
-			SessionToken: st,
-			ProxyURL:     strings.TrimSpace(row.ProxyURL),
-			HealthTier:   HealthTierWarm,
-			AddedAt:      row.CreatedAt.UnixNano(),
-			UpstreamType: upstreamType,
-			BaseURL:      strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-			APIKey:       strings.TrimSpace(apiKey),
-			Models:       models,
-		}
-		if isOpenAIResponsesAccount {
-			account.HealthTier = HealthTierHealthy
-			if account.PlanType == "" {
-				account.PlanType = "api"
-			}
-		}
-		account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
-		account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
-		account.setAllowedAPIKeyIDsLocked(row.GetCredentialInt64Slice("allowed_api_key_ids"))
-		account.Tags = cloneStringSlice(row.Tags)
-		if row.Locked {
-			atomic.StoreInt32(&account.Locked, 1)
-		}
-		if !row.Enabled {
-			atomic.StoreInt32(&account.DispatchPaused, 1)
-		}
-		account.CreditEnabled = row.CreditEnabled
-		account.CreditSkipUsageWindow = row.CreditSkipUsageWindow
-		account.SkipWarmTier = row.SkipWarmTier
-		if row.Status == "error" {
-			account.Status = StatusError
-			account.ErrorMsg = row.ErrorMessage
-			account.HealthTier = HealthTierRisky
-		}
-
-		// 尝试从 credentials 恢复已有的 AT
-		if at != "" {
-			account.AccessToken = at
-			account.AccountID = row.GetCredential("account_id")
-			account.Email = row.GetCredential("email")
-			account.PlanType = row.GetCredential("plan_type")
-			if account.Status != StatusError {
-				account.HealthTier = HealthTierHealthy
-			}
-			if expiresAt := row.GetCredential("expires_at"); expiresAt != "" {
-				if parsed, err := time.Parse(time.RFC3339, expiresAt); err == nil {
-					account.ExpiresAt = parsed
-				} else {
-					log.Printf("[账号 %d] 解析 expires_at 失败: %v", row.ID, err)
-				}
-			}
-		}
-		if subExp := row.GetCredential("subscription_expires_at"); subExp != "" {
-			if parsed, err := time.Parse(time.RFC3339, subExp); err == nil {
-				account.SubscriptionExpiresAt = parsed
-			}
-		}
-		if row.CooldownUntil.Valid {
-			if time.Now().Before(row.CooldownUntil.Time) {
-				account.SetCooldownUntil(row.CooldownUntil.Time, row.CooldownReason)
-			} else if row.CooldownReason != "" {
-				if err := s.db.ClearCooldown(ctx, row.ID); err != nil {
-					log.Printf("[账号 %d] 清理过期冷却状态失败: %v", row.ID, err)
-				}
-			}
-		}
-		if usagePct := row.GetCredential("codex_7d_used_percent"); usagePct != "" {
-			if parsed, err := strconv.ParseFloat(usagePct, 64); err == nil {
-				updatedAt := time.Time{}
-				if usageUpdatedAt := row.GetCredential("codex_usage_updated_at"); usageUpdatedAt != "" {
-					if parsedTime, err := time.Parse(time.RFC3339, usageUpdatedAt); err == nil {
-						updatedAt = parsedTime
-					} else {
-						log.Printf("[账号 %d] 解析 codex_usage_updated_at 失败: %v", row.ID, err)
-					}
-				}
-				account.SetUsageSnapshot(parsed, updatedAt)
-				// 恢复 7d 重置时间
-				if resetAt := row.GetCredential("codex_7d_reset_at"); resetAt != "" {
-					if t, err := time.Parse(time.RFC3339, resetAt); err == nil {
-						account.SetReset7dAt(t)
-					}
-				}
-			} else {
-				log.Printf("[账号 %d] 解析 codex_7d_used_percent 失败: %v", row.ID, err)
-			}
-		}
-		// 恢复 5h 用量快照
-		if usagePct5h := row.GetCredential("codex_5h_used_percent"); usagePct5h != "" {
-			if parsed, err := strconv.ParseFloat(usagePct5h, 64); err == nil {
-				resetAt := time.Time{}
-				if r := row.GetCredential("codex_5h_reset_at"); r != "" {
-					if t, err := time.Parse(time.RFC3339, r); err == nil {
-						resetAt = t
-					}
-				}
-				account.SetUsageSnapshot5h(parsed, resetAt)
-			}
-		}
-		if threshold, ok := row.GetCredentialFloat64("auto_pause_5h_threshold"); ok {
-			account.AutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(threshold)
-		}
-		if threshold, ok := row.GetCredentialFloat64("auto_pause_7d_threshold"); ok {
-			account.AutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(threshold)
-		}
-		account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
-		account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
-		for _, cooldown := range modelCooldowns[row.ID] {
-			account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
-		}
-		account.mu.Lock()
-		account.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-		account.mu.Unlock()
-
 		s.accounts = append(s.accounts, account)
 	}
 
 	s.rebuildAccountIndex()
 	log.Printf("从数据库加载了 %d 个账号", len(s.accounts))
+	if groups, err := s.db.ListAccountGroups(ctx); err == nil {
+		for _, g := range groups {
+			if g.AutoPause5hThreshold > 0 || g.AutoPause7dThreshold > 0 {
+				s.groupAutoPauseThresholds.Store(g.ID, [2]float64{g.AutoPause5hThreshold, g.AutoPause7dThreshold})
+			}
+		}
+	}
 	if memberships, err := s.db.ListAccountGroupMemberships(ctx); err == nil {
 		s.ApplyAccountGroupMemberships(memberships)
 	} else {
@@ -2727,6 +2714,179 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 	if err := s.LoadAPIKeyAllowedGroups(ctx); err != nil {
 		log.Printf("加载 API Key 分组限制失败: %v", err)
 	}
+	return nil
+}
+
+// buildAccountFromRow 将数据库账号行转换为运行时账号；凭据缺失或不可用时返回 nil。
+func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRow, modelCooldowns map[int64][]*database.AccountModelCooldownRow) *Account {
+	rt := row.GetCredential("refresh_token")
+	st := row.GetCredential("session_token")
+	at := row.GetCredential("access_token")
+	upstreamType := row.GetCredential("upstream_type")
+	baseURL := row.GetCredential("base_url")
+	apiKey := row.GetCredential("api_key")
+	models := normalizeModelList(row.GetCredentialStringSlice("models"))
+	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
+	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount {
+		log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
+		return nil
+	}
+
+	account := &Account{
+		DBID:         row.ID,
+		RefreshToken: rt,
+		SessionToken: st,
+		ProxyURL:     strings.TrimSpace(row.ProxyURL),
+		HealthTier:   HealthTierWarm,
+		AddedAt:      row.CreatedAt.UnixNano(),
+		UpstreamType: upstreamType,
+		BaseURL:      strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		APIKey:       strings.TrimSpace(apiKey),
+		Models:       models,
+	}
+	if isOpenAIResponsesAccount {
+		account.HealthTier = HealthTierHealthy
+		if account.PlanType == "" {
+			account.PlanType = "api"
+		}
+	}
+	account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
+	account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
+	account.setAllowedAPIKeyIDsLocked(row.GetCredentialInt64Slice("allowed_api_key_ids"))
+	account.Tags = cloneStringSlice(row.Tags)
+	if row.Locked {
+		atomic.StoreInt32(&account.Locked, 1)
+	}
+	if !row.Enabled {
+		atomic.StoreInt32(&account.DispatchPaused, 1)
+	}
+	account.CreditEnabled = row.CreditEnabled
+	account.CreditSkipUsageWindow = row.CreditSkipUsageWindow
+	account.SkipWarmTier = row.SkipWarmTier
+	if row.Status == "error" {
+		account.Status = StatusError
+		account.ErrorMsg = row.ErrorMessage
+		account.HealthTier = HealthTierRisky
+	}
+
+	// 尝试从 credentials 恢复已有的 AT
+	if at != "" {
+		account.AccessToken = at
+		account.AccountID = row.GetCredential("account_id")
+		account.Email = row.GetCredential("email")
+		account.PlanType = row.GetCredential("plan_type")
+		if account.Status != StatusError {
+			account.HealthTier = HealthTierHealthy
+		}
+		if expiresAt := row.GetCredential("expires_at"); expiresAt != "" {
+			if parsed, err := time.Parse(time.RFC3339, expiresAt); err == nil {
+				account.ExpiresAt = parsed
+			} else {
+				log.Printf("[账号 %d] 解析 expires_at 失败: %v", row.ID, err)
+			}
+		}
+	}
+	if subExp := row.GetCredential("subscription_expires_at"); subExp != "" {
+		if parsed, err := time.Parse(time.RFC3339, subExp); err == nil {
+			account.SubscriptionExpiresAt = parsed
+		}
+	}
+	if row.CooldownUntil.Valid {
+		if time.Now().Before(row.CooldownUntil.Time) {
+			account.SetCooldownUntil(row.CooldownUntil.Time, row.CooldownReason)
+		} else if row.CooldownReason != "" {
+			if err := s.db.ClearCooldown(ctx, row.ID); err != nil {
+				log.Printf("[账号 %d] 清理过期冷却状态失败: %v", row.ID, err)
+			}
+		}
+	}
+	if usagePct := row.GetCredential("codex_7d_used_percent"); usagePct != "" {
+		if parsed, err := strconv.ParseFloat(usagePct, 64); err == nil {
+			updatedAt := time.Time{}
+			if usageUpdatedAt := row.GetCredential("codex_usage_updated_at"); usageUpdatedAt != "" {
+				if parsedTime, err := time.Parse(time.RFC3339, usageUpdatedAt); err == nil {
+					updatedAt = parsedTime
+				} else {
+					log.Printf("[账号 %d] 解析 codex_usage_updated_at 失败: %v", row.ID, err)
+				}
+			}
+			account.SetUsageSnapshot(parsed, updatedAt)
+			// 恢复 7d 重置时间
+			if resetAt := row.GetCredential("codex_7d_reset_at"); resetAt != "" {
+				if t, err := time.Parse(time.RFC3339, resetAt); err == nil {
+					account.SetReset7dAt(t)
+				}
+			}
+		} else {
+			log.Printf("[账号 %d] 解析 codex_7d_used_percent 失败: %v", row.ID, err)
+		}
+	}
+	// 恢复 5h 用量快照
+	if usagePct5h := row.GetCredential("codex_5h_used_percent"); usagePct5h != "" {
+		if parsed, err := strconv.ParseFloat(usagePct5h, 64); err == nil {
+			resetAt := time.Time{}
+			if r := row.GetCredential("codex_5h_reset_at"); r != "" {
+				if t, err := time.Parse(time.RFC3339, r); err == nil {
+					resetAt = t
+				}
+			}
+			updatedAt := time.Time{}
+			if usageUpdatedAt5h := row.GetCredential("codex_5h_usage_updated_at"); usageUpdatedAt5h != "" {
+				if parsedTime, err := time.Parse(time.RFC3339, usageUpdatedAt5h); err == nil {
+					updatedAt = parsedTime
+				} else {
+					log.Printf("[账号 %d] 解析 codex_5h_usage_updated_at 失败: %v", row.ID, err)
+				}
+			}
+			account.SetUsageSnapshot5hAt(parsed, resetAt, updatedAt)
+		}
+	}
+	if threshold, ok := row.GetCredentialFloat64("auto_pause_5h_threshold"); ok {
+		account.AutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(threshold)
+	}
+	if threshold, ok := row.GetCredentialFloat64("auto_pause_7d_threshold"); ok {
+		account.AutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(threshold)
+	}
+	account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
+	account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
+	account.recomputeEffectiveAutoPause(s)
+	for _, cooldown := range modelCooldowns[row.ID] {
+		account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
+	}
+	account.mu.Lock()
+	account.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	account.mu.Unlock()
+	return account
+}
+
+// BuildTransientAccountByID 从数据库构建一个临时账号（包含回收站中的已删除账号），
+// 不加入运行时池、不参与调度，用于回收站的连通性测试。
+func (s *Store) BuildTransientAccountByID(ctx context.Context, dbID int64) (*Account, error) {
+	row, err := s.db.GetAccountByIDIncludingDeleted(ctx, dbID)
+	if err != nil {
+		return nil, err
+	}
+	account := s.buildAccountFromRow(ctx, row, nil)
+	if account == nil {
+		return nil, fmt.Errorf("账号 %d 缺少可用凭据", dbID)
+	}
+	return account, nil
+}
+
+// LoadAccountByID 从数据库加载单个账号并加入运行时池（用于回收站恢复等场景）。
+func (s *Store) LoadAccountByID(ctx context.Context, dbID int64) error {
+	if s.FindByID(dbID) != nil {
+		return nil
+	}
+	row, err := s.db.GetAccountByID(ctx, dbID)
+	if err != nil {
+		return err
+	}
+	account := s.buildAccountFromRow(ctx, row, nil)
+	if account == nil {
+		return fmt.Errorf("账号 %d 缺少可用凭据", dbID)
+	}
+	s.AddAccount(account)
 	return nil
 }
 
@@ -3705,6 +3865,60 @@ func (s *Store) GetPromptFilterConfig() promptfilter.Config {
 	return promptfilter.DefaultConfig()
 }
 
+func (s *Store) SetGlobalAutoPauseThresholds(t5h, t7d float64) {
+	s.mu.Lock()
+	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(t5h)
+	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(t7d)
+	s.mu.Unlock()
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) GetGlobalAutoPause5hThreshold() float64 {
+	s.mu.RLock()
+	v := s.globalAutoPause5hThreshold
+	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) GetGlobalAutoPause7dThreshold() float64 {
+	s.mu.RLock()
+	v := s.globalAutoPause7dThreshold
+	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) SetGroupAutoPauseThresholds(groupID int64, t5h, t7d float64) {
+	s.groupAutoPauseThresholds.Store(groupID, [2]float64{
+		normalizeQuotaAutoPauseThreshold(t5h),
+		normalizeQuotaAutoPauseThreshold(t7d),
+	})
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) DeleteGroupAutoPauseThresholds(groupID int64) {
+	s.groupAutoPauseThresholds.Delete(groupID)
+}
+
+func (s *Store) GetGroupAutoPauseThresholds(groupID int64) (float64, float64) {
+	return s.getGroupAutoPauseThresholds(groupID)
+}
+
+func (s *Store) getGroupAutoPauseThresholds(groupID int64) (float64, float64) {
+	if v, ok := s.groupAutoPauseThresholds.Load(groupID); ok {
+		t := v.([2]float64)
+		return t[0], t[1]
+	}
+	return 0, 0
+}
+
+func (s *Store) recomputeAllEffectiveAutoPause() {
+	for _, acc := range s.Accounts() {
+		acc.mu.Lock()
+		acc.recomputeEffectiveAutoPause(s)
+		acc.mu.Unlock()
+	}
+}
+
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
 func (s *Store) AddAccount(acc *Account) {
 	if acc == nil {
@@ -3827,6 +4041,7 @@ func (s *Store) ApplyAccountQuotaAutoPauseConfig(dbID int64, threshold5h, thresh
 	if disabled7d != nil {
 		acc.AutoPause7dDisabled = *disabled7d
 	}
+	acc.recomputeEffectiveAutoPause(s)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
@@ -3851,6 +4066,7 @@ func (s *Store) ApplyAccountGroups(dbID int64, groupIDs []int64) bool {
 	}
 	acc.mu.Lock()
 	acc.GroupIDs = cloneInt64Slice(groupIDs)
+	acc.recomputeEffectiveAutoPause(s)
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true
@@ -3885,6 +4101,7 @@ func (s *Store) ApplyAccountGroupMemberships(memberships map[int64][]int64) {
 	for _, acc := range s.Accounts() {
 		acc.mu.Lock()
 		acc.GroupIDs = cloneInt64Slice(memberships[acc.DBID])
+		acc.recomputeEffectiveAutoPause(s)
 		acc.mu.Unlock()
 		s.fastSchedulerUpdate(acc)
 	}
@@ -4429,7 +4646,7 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 		reset7dAt := acc.GetReset7dAt()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if err := s.db.UpdateUsageSnapshotFull(ctx, acc.DBID, pct7d, reset7dAt, pct5h, reset5hAt, now); err != nil {
+		if err := s.db.UpdateUsageSnapshotFull(ctx, acc.DBID, pct7d, reset7dAt, pct5h, reset5hAt, now, acc.GetUsageUpdatedAt5h()); err != nil {
 			log.Printf("[账号 %d] 持久化用量快照失败: %v", acc.DBID, err)
 		}
 		return

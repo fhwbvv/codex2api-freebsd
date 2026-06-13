@@ -7,7 +7,10 @@ import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
 import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
-import { useConfirmDialog } from "../hooks/useConfirmDialog";
+import {
+  useConfirmDialog,
+  type ConfirmDialogOptions,
+} from "../hooks/useConfirmDialog";
 import {
   DEFAULT_PAGE_SIZE_OPTIONS,
   usePersistedPageSize,
@@ -23,6 +26,7 @@ import type {
   OpsOverviewResponse,
   AccountGroup,
   SystemSettings,
+  RecycleBinAccountRow,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -77,12 +81,24 @@ import {
   SlidersHorizontal,
   LayoutGrid,
   Rows3,
+  Recycle,
+  ArchiveRestore,
+  ArrowLeft,
+  ToggleLeft,
+  ToggleRight,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
+import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import AccountGroupFilterSelect, {
+  EMPTY_ACCOUNT_GROUP_FILTER,
+  accountMatchesGroupFilter,
+  pruneAccountGroupFilter,
+  type AccountGroupFilterValue,
+} from "../components/AccountGroupFilterSelect";
 import ChipInput from "../components/ChipInput";
 
 const ACCOUNT_BATCH_CONCURRENCY = 6;
@@ -120,6 +136,8 @@ type AccountGroupDraft = {
   name: string;
   description: string;
   color: string;
+  auto_pause_5h_threshold: number;
+  auto_pause_7d_threshold: number;
 };
 
 function getDefaultAccountVisibleColumns(): Record<
@@ -127,10 +145,7 @@ function getDefaultAccountVisibleColumns(): Record<
   boolean
 > {
   return Object.fromEntries(
-    ACCOUNT_TABLE_COLUMNS.map((column) => [
-      column,
-      column !== "tags" && column !== "groups",
-    ]),
+    ACCOUNT_TABLE_COLUMNS.map((column) => [column, column !== "tags"]),
   ) as Record<AccountTableColumn, boolean>;
 }
 
@@ -148,9 +163,7 @@ function getInitialAccountVisibleColumns(): Record<
     return Object.fromEntries(
       ACCOUNT_TABLE_COLUMNS.map((column) => [
         column,
-        column === "tags" || column === "groups"
-          ? parsed[column] === true
-          : parsed[column] !== false,
+        column === "tags" ? parsed[column] === true : parsed[column] !== false,
       ]),
     ) as Record<AccountTableColumn, boolean>;
   } catch {
@@ -450,7 +463,7 @@ async function postAdminSSE(path: string, body?: unknown): Promise<Response> {
 }
 
 export default function Accounts() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [showAdd, setShowAdd] = useState(false);
   const [page, setPage] = useState(1);
@@ -466,6 +479,7 @@ export default function Accounts() {
     | "abnormal"
     | "banned"
     | "error"
+    | "unsampled"
     | "disabled"
     | "locked"
   >("all");
@@ -534,6 +548,7 @@ export default function Accounts() {
     number[]
   >([]);
   const [editProxyUrl, setEditProxyUrl] = useState("");
+  const [testingProxyKey, setTestingProxyKey] = useState<string | null>(null);
   const [editOpenAIForm, setEditOpenAIForm] =
     useState<UpdateOpenAIResponsesAccountRequest>({
       name: "",
@@ -556,6 +571,7 @@ export default function Accounts() {
   const [showAnalysisCharts, setShowAnalysisCharts] = useState(
     getInitialAnalysisVisibility,
   );
+  const [showRecycleBin, setShowRecycleBin] = useState(false);
   const [showEmailDomainTags, setShowEmailDomainTags] = useState(
     getInitialEmailDomainVisibility,
   );
@@ -581,7 +597,7 @@ export default function Accounts() {
   });
   const [addMethod, setAddMethod] = useState<
     "rt" | "st" | "at" | "openai" | "oauth"
-  >("rt");
+  >("oauth");
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
@@ -610,7 +626,9 @@ export default function Accounts() {
   const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
   const [tagFilter, setTagFilter] = useState<string>("");
   const [domainFilter, setDomainFilter] = useState<string>("");
-  const [groupFilter, setGroupFilter] = useState<number | null>(null);
+  const [groupFilter, setGroupFilter] = useState<AccountGroupFilterValue>(
+    EMPTY_ACCOUNT_GROUP_FILTER,
+  );
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
   const [showGroupManager, setShowGroupManager] = useState(false);
   const [groupDraft, setGroupDraft] = useState<AccountGroupDraft>({
@@ -618,6 +636,8 @@ export default function Accounts() {
     name: "",
     description: "",
     color: ACCOUNT_GROUP_COLORS[0],
+    auto_pause_5h_threshold: 0,
+    auto_pause_7d_threshold: 0,
   });
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [showBatchMetaEditor, setShowBatchMetaEditor] = useState(false);
@@ -652,6 +672,96 @@ export default function Accounts() {
   const lazyModeRef = useRef<boolean | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
+  const ipApiLang = i18n.language?.startsWith("zh") ? "zh-CN" : "en";
+
+  const handleTestProxyUrl = async (rawUrl: string, testKey: string) => {
+    const url = rawUrl.trim();
+    if (!url) {
+      showToast(t("accounts.proxyUrlRequired"), "error");
+      return;
+    }
+    if (testingProxyKey !== null) return;
+
+    setTestingProxyKey(testKey);
+    try {
+      const result = await api.testProxy(url, undefined, ipApiLang);
+      if (!result.success) {
+        showToast(
+          t("accounts.proxyTestFailed", {
+            error: result.error || t("accounts.proxyTestUnknownError"),
+          }),
+          "error",
+        );
+        return;
+      }
+
+      const location =
+        result.location ||
+        [result.country, result.region, result.city].filter(Boolean).join(" ");
+      showToast(
+        t("accounts.proxyTestSuccess", {
+          ip: result.ip || "-",
+          location: location || "-",
+          latency: result.latency_ms ?? 0,
+        }),
+      );
+    } catch (error) {
+      showToast(
+        t("accounts.proxyTestFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setTestingProxyKey((current) => (current === testKey ? null : current));
+    }
+  };
+
+  const renderProxyInput = ({
+    value,
+    onChange,
+    testKey,
+    label = t("accounts.proxyUrl"),
+    placeholder = t("accounts.proxyUrlPlaceholder"),
+    disabled = false,
+  }: {
+    value: string;
+    onChange: (value: string) => void;
+    testKey: string;
+    label?: string;
+    placeholder?: string;
+    disabled?: boolean;
+  }) => {
+    const isTesting = testingProxyKey === testKey;
+    const testDisabled = disabled || !value.trim() || testingProxyKey !== null;
+
+    return (
+      <div>
+        <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+          {label}
+        </label>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Input
+            className="min-w-0 flex-1"
+            placeholder={placeholder}
+            value={value}
+            disabled={disabled}
+            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+              onChange(event.target.value)
+            }
+          />
+          <Button
+            type="button"
+            variant="outline"
+            className="shrink-0 justify-center gap-1.5 sm:min-w-[108px]"
+            disabled={testDisabled}
+            onClick={() => void handleTestProxyUrl(value, testKey)}
+          >
+            <Zap className={`size-3.5 ${isTesting ? "animate-pulse" : ""}`} />
+            {isTesting ? t("accounts.testingProxy") : t("accounts.testProxy")}
+          </Button>
+        </div>
+      </div>
+    );
+  };
 
   useEffect(() => {
     return () => {
@@ -853,11 +963,8 @@ export default function Accounts() {
   }, [viewMode]);
 
   useEffect(() => {
-    if (groupFilter === null) return;
-    if (!allGroups.some((group) => group.id === groupFilter)) {
-      setGroupFilter(null);
-    }
-  }, [allGroups, groupFilter]);
+    setGroupFilter((current) => pruneAccountGroupFilter(current, allGroups));
+  }, [allGroups]);
 
   useEffect(() => {
     const needsUsageReload = (account: AccountRow) => {
@@ -920,8 +1027,7 @@ export default function Accounts() {
 
   const accountSummary = useMemo(() => {
     const rateLimitedWindowStats = getRateLimitedWindowStats(accounts);
-    // 互斥分类:每个账号只属于 异常 / 限流 / 正常 之一,三者相加等于总数。
-    // 优先级:异常(封禁/错误/禁用) > 限流 > 正常。locked 不影响分类,视为正常状态的一种子标记。
+    // 健康分类:异常(封禁/错误) > 限流 > 正常。禁用只是调度开关,保留独立计数但不影响健康分类。
     const bannedAccounts = accounts.filter(
       (account) => account.status === "unauthorized",
     ).length;
@@ -934,17 +1040,16 @@ export default function Accounts() {
     const abnormalAccounts = accounts.filter(
       (account) =>
         account.status === "unauthorized" ||
-        account.status === "error" ||
-        account.enabled === false,
+        account.status === "error",
     ).length;
     const rateLimitedExclusive = accounts.filter(
       (account) =>
         account.status !== "unauthorized" &&
         account.status !== "error" &&
-        account.enabled !== false &&
         isRateLimitedAccount(account),
     ).length;
     const normalAccounts = accounts.length - abnormalAccounts - rateLimitedExclusive;
+    const unsampledAccounts = accounts.filter(isUnsampledQuotaAccount).length;
     return {
       totalAccounts: accounts.length,
       normalAccounts,
@@ -954,6 +1059,7 @@ export default function Accounts() {
       abnormalAccounts,
       bannedAccounts,
       errorAccounts,
+      unsampledAccounts,
       disabledAccounts,
       lockedAccounts: accounts.filter((account) => account.locked).length,
       subscriptionAccountsToLock: accounts.filter(
@@ -978,6 +1084,7 @@ export default function Accounts() {
     abnormalAccounts,
     bannedAccounts,
     errorAccounts,
+    unsampledAccounts,
     disabledAccounts,
     lockedAccounts,
     subscriptionAccountsToLock,
@@ -1023,7 +1130,6 @@ export default function Accounts() {
           if (
             account.status === "unauthorized" ||
             account.status === "error" ||
-            account.enabled === false ||
             isRateLimitedAccount(account)
           )
             return false;
@@ -1033,8 +1139,7 @@ export default function Accounts() {
         case "rate_limited":
           if (
             account.status === "unauthorized" ||
-            account.status === "error" ||
-            account.enabled === false
+            account.status === "error"
           )
             return false;
           if (!isRateLimitedAccount(account)) return false;
@@ -1042,8 +1147,7 @@ export default function Accounts() {
         case "abnormal":
           if (
             account.status !== "unauthorized" &&
-            account.status !== "error" &&
-            account.enabled !== false
+            account.status !== "error"
           )
             return false;
           break;
@@ -1052,6 +1156,9 @@ export default function Accounts() {
           break;
         case "error":
           if (account.status !== "error") return false;
+          break;
+        case "unsampled":
+          if (!isUnsampledQuotaAccount(account)) return false;
           break;
         case "disabled":
           if (account.enabled !== false) return false;
@@ -1073,10 +1180,7 @@ export default function Accounts() {
       }
       if (tagFilter && !(account.tags ?? []).includes(tagFilter)) return false;
       if (domainFilter && getAccountEmailDomain(account) !== domainFilter) return false;
-      if (
-        groupFilter !== null &&
-        !(account.group_ids ?? []).includes(groupFilter)
-      )
+      if (!accountMatchesGroupFilter(account.group_ids ?? [], groupFilter))
         return false;
       return true;
     });
@@ -1192,6 +1296,22 @@ export default function Accounts() {
     }
     setSubmitting(true);
     try {
+      const credentialText =
+        credential === "st" ? payload.session_token ?? "" : payload.refresh_token ?? "";
+      const credentialCount = credentialText
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean).length;
+
+      if (credentialCount > 1) {
+        const res = await postAdminSSE("/accounts?stream=true", payload);
+        setShowAdd(false);
+        await readImportSSE(res);
+        showToast(t("accounts.addSuccess"));
+        setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
+        return;
+      }
+
       await api.addAccount(payload);
       showToast(t("accounts.addSuccess"));
       setShowAdd(false);
@@ -1374,12 +1494,18 @@ export default function Accounts() {
     }
   };
 
+  const startOAuthSession = async () => {
+    const result = await api.generateOAuthURL({ proxy_url: oauthProxyUrl });
+    setOauthSession(result);
+    setOauthCallbackUrl("");
+    setOauthStep("exchange");
+    return result;
+  };
+
   const handleOAuthGenerate = async () => {
     setOauthGenerating(true);
     try {
-      const result = await api.generateOAuthURL({ proxy_url: oauthProxyUrl });
-      setOauthSession(result);
-      setOauthStep("exchange");
+      await startOAuthSession();
     } catch (error) {
       showToast(
         t("accounts.oauthFailed", { error: getErrorMessage(error) }),
@@ -1387,6 +1513,33 @@ export default function Accounts() {
       );
     } finally {
       setOauthGenerating(false);
+    }
+  };
+
+  const handleOAuthRestart = async () => {
+    setOauthGenerating(true);
+    setOauthSession(null);
+    setOauthCallbackUrl("");
+    try {
+      await startOAuthSession();
+    } catch (error) {
+      setOauthStep("generate");
+      showToast(
+        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setOauthGenerating(false);
+    }
+  };
+
+  const handleOAuthCopyLink = async () => {
+    if (!oauthSession?.auth_url) return;
+    try {
+      await copyTextToClipboard(oauthSession.auth_url);
+      showToast(t("common.copied"));
+    } catch {
+      showToast(t("common.copyFailed"), "error");
     }
   };
 
@@ -1424,7 +1577,7 @@ export default function Accounts() {
           : t("accounts.oauthSuccessNoEmail"),
       );
       setShowAdd(false);
-      setAddMethod("rt");
+      setAddMethod("oauth");
       setOauthStep("generate");
       setOauthSession(null);
       setOauthCallbackUrl("");
@@ -1451,7 +1604,10 @@ export default function Accounts() {
       done: false,
     });
     const reader = res.body?.getReader();
-    if (!reader) return;
+    if (!reader) {
+      setImportProgress((p) => ({ ...p, done: true }));
+      return;
+    }
     const decoder = new TextDecoder();
     let buffer = "";
     for (;;) {
@@ -1493,6 +1649,15 @@ export default function Accounts() {
     format: "txt" | "json" | "json_at" | "at_txt",
   ) => {
     setImporting(true);
+    setImportProgress({
+      show: true,
+      current: 0,
+      total: 0,
+      success: 0,
+      duplicate: 0,
+      failed: 0,
+      done: false,
+    });
     try {
       const formData = new FormData();
       if (format !== "txt") formData.append("format", format);
@@ -1507,6 +1672,7 @@ export default function Accounts() {
       } else {
         const data = await res.json();
         if (!res.ok) {
+          setImportProgress((p) => ({ ...p, show: false }));
           showToast(
             data.error
               ? t("accounts.importFailedWithReason", { error: data.error })
@@ -1514,11 +1680,29 @@ export default function Accounts() {
             "error",
           );
         } else {
+          setImportProgress({
+            show: true,
+            current: data.total ?? 0,
+            total: data.total ?? 0,
+            success: data.success ?? 0,
+            duplicate: data.duplicate ?? 0,
+            failed: data.failed ?? 0,
+            done: true,
+          });
           showToast(t("accounts.importCompleted"));
           void reload();
         }
       }
     } catch (error) {
+      setImportProgress({
+        show: true,
+        current: 1,
+        total: 1,
+        success: 0,
+        duplicate: 0,
+        failed: 1,
+        done: true,
+      });
       showToast(
         t("accounts.importFailedWithReason", { error: getErrorMessage(error) }),
         "error",
@@ -2204,7 +2388,7 @@ export default function Accounts() {
           failed: result?.failed ?? 0,
         }),
       );
-      void reloadSilently();
+      await reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.batchTestFailed", { error: getErrorMessage(error) }),
@@ -2499,6 +2683,8 @@ export default function Accounts() {
       name: "",
       description: "",
       color: ACCOUNT_GROUP_COLORS[0],
+      auto_pause_5h_threshold: 0,
+      auto_pause_7d_threshold: 0,
     });
   };
 
@@ -2508,6 +2694,8 @@ export default function Accounts() {
       name: group.name,
       description: group.description ?? "",
       color: group.color || ACCOUNT_GROUP_COLORS[0],
+      auto_pause_5h_threshold: group.auto_pause_5h_threshold ?? 0,
+      auto_pause_7d_threshold: group.auto_pause_7d_threshold ?? 0,
     });
   };
 
@@ -2523,6 +2711,8 @@ export default function Accounts() {
         name,
         description: groupDraft.description.trim(),
         color: groupDraft.color.trim() || ACCOUNT_GROUP_COLORS[0],
+        auto_pause_5h_threshold: groupDraft.auto_pause_5h_threshold,
+        auto_pause_7d_threshold: groupDraft.auto_pause_7d_threshold,
       };
       if (groupDraft.id === null) {
         await api.createAccountGroup(payload);
@@ -2558,7 +2748,12 @@ export default function Accounts() {
       showToast(t("accounts.groupDeleted"));
       setEditGroupIds((current) => current.filter((id) => id !== group.id));
       setBatchGroupIds((current) => current.filter((id) => id !== group.id));
-      if (groupFilter === group.id) setGroupFilter(null);
+      setGroupFilter((current) =>
+        pruneAccountGroupFilter(
+          current,
+          allGroups.filter((item) => item.id !== group.id),
+        ),
+      );
       if (groupDraft.id === group.id) resetGroupDraft();
       await Promise.all([reload(), reloadGroups()]);
     } catch (error) {
@@ -2603,6 +2798,15 @@ export default function Accounts() {
         errorTitle={t("accounts.errorTitle")}
       >
         <>
+          {showRecycleBin ? (
+            <RecycleBinView
+              onClose={() => setShowRecycleBin(false)}
+              onChanged={() => void reloadSilently()}
+              confirm={confirm}
+              runStreamingOperation={runStreamingAccountOperation}
+            />
+          ) : null}
+          <div className={showRecycleBin ? "hidden" : "contents"}>
           <PageHeader
             title={t("accounts.title")}
             description={t("accounts.description")}
@@ -2739,6 +2943,14 @@ export default function Accounts() {
                     },
                   ]}
                 />
+                <Button
+                  variant="outline"
+                  onClick={() => setShowRecycleBin(true)}
+                  className="max-sm:w-full"
+                >
+                  <Recycle className="size-3.5" />
+                  {t("accounts.recycleBin")}
+                </Button>
                 <Button onClick={() => setShowAdd(true)}>
                   <Plus className="size-3.5" />
                   {t("accounts.addAccount")}
@@ -2820,7 +3032,6 @@ export default function Accounts() {
               details={[
                 { label: t("accounts.abnormalBannedShort"), value: bannedAccounts },
                 { label: t("accounts.abnormalErrorShort"), value: errorAccounts },
-                { label: t("accounts.abnormalDisabledShort"), value: disabledAccounts },
               ]}
             />
           </div>
@@ -2864,6 +3075,7 @@ export default function Accounts() {
                   ["abnormal", t("accounts.filterAbnormal")],
                   ["banned", t("accounts.filterBanned")],
                   ["error", t("accounts.filterError")],
+                  ["unsampled", t("accounts.filterUnsampled")],
                   ["disabled", t("accounts.filterDisabled")],
                   ["locked", t("accounts.filterLocked")],
                 ] as const
@@ -2893,9 +3105,11 @@ export default function Accounts() {
                             ? bannedAccounts
                             : key === "error"
                               ? errorAccounts
-                              : key === "disabled"
-                                ? disabledAccounts
-                                : lockedAccounts}
+                              : key === "unsampled"
+                                ? unsampledAccounts
+                                : key === "disabled"
+                                  ? disabledAccounts
+                                  : lockedAccounts}
                 </button>
               ))}
             </div>
@@ -3015,21 +3229,14 @@ export default function Accounts() {
                 ? t("accounts.hideEmailDomainTags")
                 : t("accounts.showEmailDomainTags")}
             </Button>
-            <Select
-              className="w-36 shrink-0"
-              compact
-              value={groupFilter === null ? "all" : String(groupFilter)}
-              onValueChange={(value) => {
-                setGroupFilter(value === "all" ? null : Number(value));
+            <AccountGroupFilterSelect
+              className="w-40 shrink-0"
+              groups={allGroups}
+              value={groupFilter}
+              onChange={(value) => {
+                setGroupFilter(value);
                 setPage(1);
               }}
-              options={[
-                { value: "all", label: t("accounts.groupsFilter") },
-                ...allGroups.map((group) => ({
-                  value: String(group.id),
-                  label: group.name,
-                })),
-              ]}
             />
             <Button
               type="button"
@@ -3269,7 +3476,11 @@ export default function Accounts() {
                 ) : null}
 
                 {shouldRenderDesktopTable ? (
-                  <div className="data-table-shell hidden lg:block">
+                  <div
+                    className={`data-table-shell hidden lg:block ${
+                      sortedAccounts.length <= pageSize ? "account-table-shell-fit-content" : ""
+                    }`}
+                  >
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -3791,7 +4002,7 @@ export default function Accounts() {
             contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
-              setAddMethod("rt");
+              setAddMethod("oauth");
               setOauthStep("generate");
               setOauthSession(null);
               setOauthCallbackUrl("");
@@ -3810,7 +4021,7 @@ export default function Accounts() {
                   variant="outline"
                   onClick={() => {
                     setShowAdd(false);
-                    setAddMethod("rt");
+                    setAddMethod("oauth");
                     setOauthStep("generate");
                     setOauthSession(null);
                     setOauthCallbackUrl("");
@@ -3883,6 +4094,22 @@ export default function Accounts() {
             {/* Tab switcher */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
+                onClick={() => {
+                  setAddMethod("oauth");
+                  setOauthStep("generate");
+                  setOauthSession(null);
+                  setOauthCallbackUrl("");
+                }}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "oauth"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <KeyRound className="size-3.5" />
+                {t("accounts.addMethodOAuth")}
+              </button>
+              <button
                 onClick={() => setAddMethod("rt")}
                 className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
                   addMethod === "rt"
@@ -3926,22 +4153,6 @@ export default function Accounts() {
                 <KeyRound className="size-3.5" />
                 {t("accounts.addMethodOpenAI")}
               </button>
-              <button
-                onClick={() => {
-                  setAddMethod("oauth");
-                  setOauthStep("generate");
-                  setOauthSession(null);
-                  setOauthCallbackUrl("");
-                }}
-                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
-                  addMethod === "oauth"
-                    ? "bg-background shadow-sm text-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                <KeyRound className="size-3.5" />
-                {t("accounts.addMethodOAuth")}
-              </button>
             </div>
 
             {addMethod === "rt" ? (
@@ -3963,21 +4174,15 @@ export default function Accounts() {
                     rows={6}
                   />
                 </div>
-                <div>
-                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
-                    {t("accounts.proxyUrl")}
-                  </label>
-                  <Input
-                    placeholder={t("accounts.proxyUrlPlaceholder")}
-                    value={addForm.proxy_url}
-                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      setAddForm((form) => ({
-                        ...form,
-                        proxy_url: event.target.value,
-                      }))
-                    }
-                  />
-                </div>
+                {renderProxyInput({
+                  value: addForm.proxy_url,
+                  testKey: "add-refresh-token",
+                  onChange: (value) =>
+                    setAddForm((form) => ({
+                      ...form,
+                      proxy_url: value,
+                    })),
+                })}
               </div>
             ) : addMethod === "st" ? (
               <div className="space-y-4">
@@ -3998,21 +4203,15 @@ export default function Accounts() {
                     rows={6}
                   />
                 </div>
-                <div>
-                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
-                    {t("accounts.proxyUrl")}
-                  </label>
-                  <Input
-                    placeholder={t("accounts.proxyUrlPlaceholder")}
-                    value={addForm.proxy_url}
-                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      setAddForm((form) => ({
-                        ...form,
-                        proxy_url: event.target.value,
-                      }))
-                    }
-                  />
-                </div>
+                {renderProxyInput({
+                  value: addForm.proxy_url,
+                  testKey: "add-session-token",
+                  onChange: (value) =>
+                    setAddForm((form) => ({
+                      ...form,
+                      proxy_url: value,
+                    })),
+                })}
               </div>
             ) : addMethod === "at" ? (
               <div className="space-y-4">
@@ -4036,21 +4235,15 @@ export default function Accounts() {
                     rows={6}
                   />
                 </div>
-                <div>
-                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
-                    {t("accounts.proxyUrl")}
-                  </label>
-                  <Input
-                    placeholder={t("accounts.proxyUrlPlaceholder")}
-                    value={atForm.proxy_url}
-                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      setAtForm((form) => ({
-                        ...form,
-                        proxy_url: event.target.value,
-                      }))
-                    }
-                  />
-                </div>
+                {renderProxyInput({
+                  value: atForm.proxy_url,
+                  testKey: "add-access-token",
+                  onChange: (value) =>
+                    setAtForm((form) => ({
+                      ...form,
+                      proxy_url: value,
+                    })),
+                })}
               </div>
             ) : addMethod === "openai" ? (
               <div className="space-y-4">
@@ -4170,21 +4363,15 @@ export default function Accounts() {
                     })}
                   </p>
                 </div>
-                <div>
-                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
-                    {t("accounts.proxyUrl")}
-                  </label>
-                  <Input
-                    placeholder={t("accounts.proxyUrlPlaceholder")}
-                    value={openAIForm.proxy_url}
-                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      setOpenAIForm((form) => ({
-                        ...form,
-                        proxy_url: event.target.value,
-                      }))
-                    }
-                  />
-                </div>
+                {renderProxyInput({
+                  value: openAIForm.proxy_url,
+                  testKey: "add-openai-responses",
+                  onChange: (value) =>
+                    setOpenAIForm((form) => ({
+                      ...form,
+                      proxy_url: value,
+                    })),
+                })}
               </div>
             ) : (
               <div className="space-y-5">
@@ -4208,18 +4395,13 @@ export default function Accounts() {
                         }
                       />
                     </div>
-                    <div>
-                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">
-                        {t("accounts.oauthProxyUrl")}
-                      </label>
-                      <Input
-                        placeholder={t("accounts.oauthProxyUrlPlaceholder")}
-                        value={oauthProxyUrl}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) =>
-                          setOauthProxyUrl(e.target.value)
-                        }
-                      />
-                    </div>
+                    {renderProxyInput({
+                      value: oauthProxyUrl,
+                      testKey: "oauth-generate",
+                      label: t("accounts.oauthProxyUrl"),
+                      placeholder: t("accounts.oauthProxyUrlPlaceholder"),
+                      onChange: setOauthProxyUrl,
+                    })}
                   </>
                 ) : (
                   <>
@@ -4234,15 +4416,29 @@ export default function Accounts() {
                         <p className="text-xs font-semibold text-muted-foreground mb-2">
                           {t("accounts.oauthOpenLink")}
                         </p>
-                        <a
-                          href={oauthSession.auth_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 text-sm font-semibold text-primary hover:underline break-all"
-                        >
-                          <ExternalLink className="size-3.5 shrink-0" />
-                          {t("accounts.oauthOpenLink")}
-                        </a>
+                        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start">
+                          <a
+                            href={oauthSession.auth_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title={oauthSession.auth_url}
+                            className="inline-flex min-h-10 min-w-0 max-w-full flex-1 items-start gap-1.5 overflow-hidden rounded-lg border bg-background px-3 py-2 text-sm font-semibold text-primary hover:bg-muted/50"
+                          >
+                            <ExternalLink className="mt-0.5 size-3.5 shrink-0" />
+                            <span className="block min-w-0 flex-1 break-all leading-relaxed [overflow-wrap:anywhere]">
+                              {oauthSession.auth_url}
+                            </span>
+                          </a>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => void handleOAuthCopyLink()}
+                            className="w-full shrink-0 sm:w-auto"
+                          >
+                            <Copy className="size-4" />
+                            {t("common.copy")}
+                          </Button>
+                        </div>
                       </div>
                     )}
                     <div>
@@ -4261,14 +4457,14 @@ export default function Accounts() {
                       </p>
                     </div>
                     <button
-                      onClick={() => {
-                        setOauthStep("generate");
-                        setOauthSession(null);
-                        setOauthCallbackUrl("");
-                      }}
+                      type="button"
+                      onClick={() => void handleOAuthRestart()}
+                      disabled={oauthGenerating}
                       className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
                     >
-                      {t("accounts.oauthRestart")}
+                      {oauthGenerating
+                        ? t("accounts.oauthGenerating")
+                        : t("accounts.oauthRestart")}
                     </button>
                   </>
                 )}
@@ -4781,21 +4977,15 @@ export default function Accounts() {
                         })}
                       </p>
                     </div>
-                    <div>
-                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">
-                        {t("accounts.proxyUrl")}
-                      </label>
-                      <Input
-                        placeholder={t("accounts.proxyUrlPlaceholder")}
-                        value={editOpenAIForm.proxy_url}
-                        onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                          setEditOpenAIForm((form) => ({
-                            ...form,
-                            proxy_url: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
+                    {renderProxyInput({
+                      value: editOpenAIForm.proxy_url,
+                      testKey: "edit-openai-responses",
+                      onChange: (value) =>
+                        setEditOpenAIForm((form) => ({
+                          ...form,
+                          proxy_url: value,
+                        })),
+                    })}
                   </div>
                 ) : (
                   <>
@@ -5011,18 +5201,11 @@ export default function Accounts() {
                     </div>
 
                     <div className="rounded-xl border border-border p-4">
-                      <div className="text-sm font-semibold text-foreground">
-                        {t("accounts.proxyUrl")}
-                      </div>
-                      <div className="mt-3">
-                        <Input
-                          placeholder={t("accounts.proxyUrlPlaceholder")}
-                          value={editProxyUrl}
-                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                            setEditProxyUrl(event.target.value)
-                          }
-                        />
-                      </div>
+                      {renderProxyInput({
+                        value: editProxyUrl,
+                        testKey: "edit-account-proxy",
+                        onChange: setEditProxyUrl,
+                      })}
                     </div>
 
                     <div className="grid gap-4 md:grid-cols-2">
@@ -5062,43 +5245,19 @@ export default function Accounts() {
                             {t("accounts.groupManage")}
                           </Button>
                         </div>
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          {allGroups.length === 0 ? (
-                            <span className="text-sm text-muted-foreground">
-                              {t("accounts.groupsNone")}
-                            </span>
-                          ) : (
-                            allGroups.map((group) => {
-                              const active = editGroupIds.includes(group.id);
-                              const color = normalizeGroupColor(group.color);
-                              return (
-                                <button
-                                  key={group.id}
-                                  type="button"
-                                  onClick={() =>
-                                    setEditGroupIds((current) =>
-                                      active
-                                        ? current.filter(
-                                            (id) => id !== group.id,
-                                          )
-                                        : [...current, group.id],
-                                    )
-                                  }
-                                  className="inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold transition-colors"
-                                  style={{
-                                    borderColor: active ? color : `${color}55`,
-                                    backgroundColor: active
-                                      ? color
-                                      : `${color}14`,
-                                    color: active ? "#ffffff" : color,
-                                  }}
-                                >
-                                  <span className="size-1.5 rounded-full bg-current" />
-                                  {group.name}
-                                </button>
-                              );
-                            })
-                          )}
+                        <div className="mt-3">
+                          <AccountGroupMultiSelect
+                            groups={allGroups}
+                            value={editGroupIds}
+                            onChange={setEditGroupIds}
+                            allLabel={t("accounts.groupsUnbound")}
+                            selectedLabel={t("accounts.groupsSelected", {
+                              count: editGroupIds.length,
+                            })}
+                            placeholder={t("accounts.groupsPlaceholder")}
+                            emptyLabel={t("accounts.groupsNone")}
+                            emptyHint={t("accounts.groupsSelectHint")}
+                          />
                         </div>
                       </div>
                     </div>
@@ -5182,39 +5341,19 @@ export default function Accounts() {
                 <div className="text-sm font-semibold text-foreground">
                   {t("accounts.groupsLabel")}
                 </div>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {allGroups.length === 0 ? (
-                    <span className="text-sm text-muted-foreground">
-                      {t("accounts.groupsNone")}
-                    </span>
-                  ) : (
-                    allGroups.map((group) => {
-                      const active = batchGroupIds.includes(group.id);
-                      const color = normalizeGroupColor(group.color);
-                      return (
-                        <button
-                          key={group.id}
-                          type="button"
-                          onClick={() =>
-                            setBatchGroupIds((current) =>
-                              active
-                                ? current.filter((id) => id !== group.id)
-                                : [...current, group.id],
-                            )
-                          }
-                          className="inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold transition-colors"
-                          style={{
-                            borderColor: active ? color : `${color}55`,
-                            backgroundColor: active ? color : `${color}14`,
-                            color: active ? "#ffffff" : color,
-                          }}
-                        >
-                          <span className="size-1.5 rounded-full bg-current" />
-                          {group.name}
-                        </button>
-                      );
-                    })
-                  )}
+                <div className="mt-3">
+                  <AccountGroupMultiSelect
+                    groups={allGroups}
+                    value={batchGroupIds}
+                    onChange={setBatchGroupIds}
+                    allLabel={t("accounts.groupsUnbound")}
+                    selectedLabel={t("accounts.groupsSelected", {
+                      count: batchGroupIds.length,
+                    })}
+                    placeholder={t("accounts.groupsPlaceholder")}
+                    emptyLabel={t("accounts.groupsNone")}
+                    emptyHint={t("accounts.groupsSelectHint")}
+                  />
                 </div>
               </div>
             </div>
@@ -5509,6 +5648,45 @@ export default function Accounts() {
                       maxLength={20}
                     />
                   </div>
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {t("accounts.groupAutoPause5hThreshold")}
+                    </span>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.1}
+                      inputMode="decimal"
+                      placeholder={t('settings.globalAutoPausePlaceholder')}
+                      value={groupDraft.auto_pause_5h_threshold > 0 ? (groupDraft.auto_pause_5h_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        const raw = e.target.value
+                        const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                        setGroupDraft(d => ({ ...d, auto_pause_5h_threshold: isNaN(ratio) ? 0 : ratio }))
+                      }}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {t("accounts.groupAutoPause7dThreshold")}
+                    </span>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={100}
+                      step={0.1}
+                      inputMode="decimal"
+                      placeholder={t('settings.globalAutoPausePlaceholder')}
+                      value={groupDraft.auto_pause_7d_threshold > 0 ? (groupDraft.auto_pause_7d_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                      onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                        const raw = e.target.value
+                        const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                        setGroupDraft(d => ({ ...d, auto_pause_7d_threshold: isNaN(ratio) ? 0 : ratio }))
+                      }}
+                    />
+                    <p className="text-[11px] text-muted-foreground">{t("accounts.groupAutoPauseHint")}</p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -5574,6 +5752,7 @@ export default function Accounts() {
               )}
             </div>
           </Modal>
+          </div>
 
           {confirmDialog}
         </>
@@ -5593,6 +5772,790 @@ function downloadBlob(blob: Blob, filename: string) {
   URL.revokeObjectURL(url);
 }
 
+function RecycleBinView({
+  onClose,
+  onChanged,
+  confirm,
+  runStreamingOperation,
+}: {
+  onClose: () => void;
+  onChanged: () => void;
+  confirm: (options: ConfirmDialogOptions) => Promise<boolean>;
+  runStreamingOperation: (
+    path: string,
+    body: unknown,
+    title: string,
+  ) => Promise<BatchOperationEvent | null>;
+}) {
+  const { t } = useTranslation();
+  const { showToast } = useToast();
+  const [rows, setRows] = useState<RecycleBinAccountRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [actingId, setActingId] = useState<number | null>(null);
+  const [batchActing, setBatchActing] = useState(false);
+  const [batchTesting, setBatchTesting] = useState(false);
+  const [emptying, setEmptying] = useState(false);
+  const [search, setSearch] = useState("");
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [testingRow, setTestingRow] = useState<RecycleBinAccountRow | null>(
+    null,
+  );
+  const [planFilter, setPlanFilter] = useState<
+    "all" | "pro" | "prolite" | "plus" | "team" | "free" | "api" | "unknown"
+  >("all");
+  const [showEmptyConfirm, setShowEmptyConfirm] = useState(false);
+  const [emptyConfirmText, setEmptyConfirmText] = useState("");
+  const [autoRestore, setAutoRestore] = useState(() => {
+    try {
+      return (
+        window.localStorage.getItem(RECYCLE_BIN_AUTO_RESTORE_KEY) === "1"
+      );
+    } catch {
+      return false;
+    }
+  });
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = usePersistedPageSize(
+    "recycle-bin",
+    20,
+    DEFAULT_PAGE_SIZE_OPTIONS,
+  );
+
+  const busy = batchActing || emptying || batchTesting;
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const resp = await api.getRecycleBinAccounts();
+      const next = resp.accounts ?? [];
+      setRows(next);
+      const validIds = new Set(next.map((row) => row.id));
+      setSelectedIds(
+        (prev) => new Set([...prev].filter((id) => validIds.has(id))),
+      );
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const stats = useMemo(() => {
+    const relay = rows.filter((row) => row.openai_responses_api).length;
+    const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const recent24h = rows.filter((row) => {
+      if (!row.deleted_at) return false;
+      const ts = new Date(row.deleted_at).getTime();
+      return Number.isFinite(ts) && ts >= dayAgo;
+    }).length;
+    const planCounts = new Map<string, number>();
+    for (const row of rows) {
+      const plan =
+        (row.plan_type || "").trim() || t("accounts.recycleBinPlanUnknown");
+      planCounts.set(plan, (planCounts.get(plan) ?? 0) + 1);
+    }
+    const plans = [...planCounts.entries()].sort((a, b) => b[1] - a[1]);
+    return {
+      total: rows.length,
+      oauth: rows.length - relay,
+      relay,
+      recent24h,
+      plans,
+    };
+  }, [rows, t]);
+
+  const planDetailItems = useMemo(
+    () => stats.plans.map(([label, value]) => ({ label, value })),
+    [stats.plans],
+  );
+
+  const filteredRows = useMemo(() => {
+    const keyword = search.trim().toLowerCase();
+    return rows.filter((row) => {
+      if (planFilter !== "all") {
+        const plan = (row.plan_type || "").toLowerCase().trim();
+        if (planFilter === "unknown") {
+          if (plan !== "") return false;
+        } else if (plan !== planFilter) {
+          return false;
+        }
+      }
+      if (!keyword) return true;
+      return [row.email, row.name, row.base_url, row.plan_type]
+        .filter(Boolean)
+        .some((field) => String(field).toLowerCase().includes(keyword));
+    });
+  }, [rows, search, planFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pagedRows = useMemo(
+    () =>
+      filteredRows.slice(
+        (currentPage - 1) * pageSize,
+        currentPage * pageSize,
+      ),
+    [filteredRows, currentPage, pageSize],
+  );
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, planFilter]);
+
+  const allPageSelected =
+    pagedRows.length > 0 && pagedRows.every((row) => selectedIds.has(row.id));
+
+  const toggleSelect = (id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allPageSelected) {
+        pagedRows.forEach((row) => next.delete(row.id));
+      } else {
+        pagedRows.forEach((row) => next.add(row.id));
+      }
+      return next;
+    });
+  };
+
+  const handleRestore = async (row: RecycleBinAccountRow) => {
+    setActingId(row.id);
+    try {
+      await api.restoreAccount(row.id);
+      showToast(t("accounts.recycleBinRestored"));
+      void load();
+      onChanged();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setActingId(null);
+    }
+  };
+
+  const handlePurge = async (row: RecycleBinAccountRow) => {
+    const confirmed = await confirm({
+      title: t("accounts.recycleBinPurgeTitle"),
+      description: t("accounts.recycleBinPurgeDesc", {
+        account: row.email || row.name || `ID ${row.id}`,
+      }),
+      confirmText: t("accounts.recycleBinPurge"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+    setActingId(row.id);
+    try {
+      await api.purgeAccount(row.id);
+      showToast(t("accounts.recycleBinPurged"));
+      void load();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setActingId(null);
+    }
+  };
+
+  const handleBatchRestore = async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    setBatchActing(true);
+    let success = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        await api.restoreAccount(id);
+        success++;
+      } catch {
+        failed++;
+      }
+    }
+    setBatchActing(false);
+    if (failed > 0) {
+      showToast(
+        `${t("accounts.recycleBinBatchRestored", { count: success })} · ${t("accounts.recycleBinBatchFailed", { count: failed })}`,
+        "error",
+      );
+    } else {
+      showToast(t("accounts.recycleBinBatchRestored", { count: success }));
+    }
+    void load();
+    onChanged();
+  };
+
+  const handleBatchPurge = async () => {
+    const ids = [...selectedIds];
+    if (ids.length === 0) return;
+    const confirmed = await confirm({
+      title: t("accounts.recycleBinPurgeSelectedTitle"),
+      description: t("accounts.recycleBinPurgeSelectedDesc", {
+        count: ids.length,
+      }),
+      confirmText: t("accounts.recycleBinPurgeSelected"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+    setBatchActing(true);
+    let success = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        await api.purgeAccount(id);
+        success++;
+      } catch {
+        failed++;
+      }
+    }
+    setBatchActing(false);
+    if (failed > 0) {
+      showToast(
+        `${t("accounts.recycleBinBatchPurged", { count: success })} · ${t("accounts.recycleBinBatchFailed", { count: failed })}`,
+        "error",
+      );
+    } else {
+      showToast(t("accounts.recycleBinBatchPurged", { count: success }));
+    }
+    void load();
+  };
+
+  const toggleAutoRestore = () => {
+    setAutoRestore((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(
+          RECYCLE_BIN_AUTO_RESTORE_KEY,
+          next ? "1" : "0",
+        );
+      } catch {
+        /* localStorage 不可用时仅保留会话内状态 */
+      }
+      return next;
+    });
+  };
+
+  const handleBatchTestRun = async (ids?: number[]) => {
+    if (ids && ids.length === 0) return;
+    setBatchTesting(true);
+    try {
+      const result = await runStreamingOperation(
+        "/accounts/recycle-bin/batch-test?stream=true",
+        { ...(ids ? { ids } : {}), restore_on_success: autoRestore },
+        t("accounts.recycleBinBatchTestProgressTitle"),
+      );
+      showToast(
+        t("accounts.batchTestDone", {
+          success: result?.success ?? 0,
+          banned: result?.banned ?? 0,
+          rateLimited: result?.rate_limited ?? 0,
+          failed: result?.failed ?? 0,
+        }),
+      );
+    } catch (error) {
+      showToast(
+        t("accounts.batchTestFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setBatchTesting(false);
+      void load();
+      if (autoRestore) {
+        onChanged();
+      }
+    }
+  };
+
+  const emptyKeyword = t("accounts.recycleBinEmptyKeyword");
+  const emptyConfirmMatched = emptyConfirmText.trim() === emptyKeyword;
+
+  const openEmptyConfirm = () => {
+    setEmptyConfirmText("");
+    setShowEmptyConfirm(true);
+  };
+
+  const handleEmpty = async () => {
+    if (!emptyConfirmMatched) return;
+    setShowEmptyConfirm(false);
+    setEmptying(true);
+    try {
+      await api.emptyRecycleBin();
+      showToast(t("accounts.recycleBinEmptied"));
+      void load();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setEmptying(false);
+    }
+  };
+
+  return (
+    <>
+      <PageHeader
+        title={t("accounts.recycleBinTitle")}
+        description={t("accounts.recycleBinDesc")}
+        onRefresh={() => void load()}
+        actions={
+          <div className="flex flex-wrap items-center justify-end gap-1.5">
+            <Button
+              variant="outline"
+              onClick={onClose}
+              className="max-sm:w-full"
+            >
+              <ArrowLeft className="size-3.5" />
+              {t("accounts.recycleBinBack")}
+            </Button>
+            <Button
+              variant="outline"
+              aria-pressed={autoRestore}
+              onClick={toggleAutoRestore}
+              className="max-sm:w-full"
+              title={t("accounts.recycleBinAutoRestoreHint")}
+            >
+              {autoRestore ? (
+                <ToggleRight className="size-4 text-emerald-500" />
+              ) : (
+                <ToggleLeft className="size-4 text-muted-foreground" />
+              )}
+              {t("accounts.recycleBinAutoRestore")}
+            </Button>
+            <Button
+              variant="outline"
+              disabled={busy || loading || rows.length === 0}
+              onClick={() => void handleBatchTestRun()}
+              className="max-sm:w-full"
+            >
+              <FlaskConical
+                className={`size-3.5 ${batchTesting ? "animate-pulse" : ""}`}
+              />
+              {batchTesting
+                ? t("accounts.batchTesting")
+                : t("accounts.recycleBinTestAll")}
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={busy || loading || rows.length === 0}
+              onClick={openEmptyConfirm}
+              className="max-sm:w-full"
+            >
+              <Trash2 className="size-3.5" />
+              {t("accounts.recycleBinEmptyBin")}
+            </Button>
+          </div>
+        }
+      />
+
+      <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <CompactStat
+          label={t("accounts.recycleBinStatTotal")}
+          value={stats.total}
+          tone="neutral"
+          details={[
+            { label: t("accounts.recycleBinTypeOauth"), value: stats.oauth },
+            { label: t("accounts.recycleBinTypeRelay"), value: stats.relay },
+          ]}
+        />
+        <CompactStat
+          label={t("accounts.recycleBinStatPlans")}
+          value={stats.plans.length}
+          tone="success"
+          details={planDetailItems}
+        />
+        <CompactStat
+          label={t("accounts.recycleBinStatRecent24h")}
+          value={stats.recent24h}
+          tone="danger"
+        />
+      </div>
+
+      <Card>
+        <CardContent className="p-0">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative w-full sm:w-72">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder={t("accounts.recycleBinSearchPlaceholder")}
+                  className="pl-8"
+                />
+              </div>
+              <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5 max-sm:w-full max-sm:flex-wrap">
+                {(
+                  [
+                    "all",
+                    "pro",
+                    "prolite",
+                    "plus",
+                    "team",
+                    "free",
+                    "api",
+                    "unknown",
+                  ] as const
+                ).map((key) => (
+                  <button
+                    key={key}
+                    onClick={() => setPlanFilter(key)}
+                    className={`whitespace-nowrap rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors ${
+                      planFilter === key
+                        ? "bg-background shadow-sm text-foreground"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    {key === "all"
+                      ? t("accounts.filterAll")
+                      : key === "unknown"
+                        ? t("accounts.recycleBinPlanUnknown")
+                        : key === "prolite"
+                          ? "ProLite"
+                          : key === "api"
+                            ? "API"
+                            : key.charAt(0).toUpperCase() + key.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {selectedIds.size > 0 ? (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-xs text-muted-foreground">
+                  {t("accounts.recycleBinSelected", {
+                    count: selectedIds.size,
+                  })}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void handleBatchTestRun([...selectedIds])}
+                >
+                  <FlaskConical className="size-3.5" />
+                  {t("accounts.recycleBinTestSelected")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void handleBatchRestore()}
+                >
+                  <ArchiveRestore className="size-3.5" />
+                  {t("accounts.recycleBinRestoreSelected")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={busy}
+                  onClick={() => void handleBatchPurge()}
+                >
+                  <Trash2 className="size-3.5" />
+                  {t("accounts.recycleBinPurgeSelected")}
+                </Button>
+              </div>
+            ) : null}
+          </div>
+
+          {loading ? (
+            <div className="px-6 py-10 text-center text-sm text-muted-foreground">
+              {t("common.loading")}
+            </div>
+          ) : error ? (
+            <div className="px-6 py-10 text-center text-sm text-destructive">
+              {error}
+            </div>
+          ) : rows.length === 0 ? (
+            <div className="px-6 py-10 text-center text-sm text-muted-foreground">
+              {t("accounts.recycleBinEmptyState")}
+            </div>
+          ) : filteredRows.length === 0 ? (
+            <div className="px-6 py-10 text-center text-sm text-muted-foreground">
+              {t("accounts.recycleBinNoMatch")}
+            </div>
+          ) : (
+            <>
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-10">
+                        <input
+                          type="checkbox"
+                          className="size-4 cursor-pointer accent-primary"
+                          checked={allPageSelected}
+                          onChange={toggleSelectAll}
+                        />
+                      </TableHead>
+                      <TableHead className="w-14">
+                        {t("accounts.sequence")}
+                      </TableHead>
+                      <TableHead>{t("accounts.recycleBinAccount")}</TableHead>
+                      <TableHead>{t("accounts.recycleBinPlan")}</TableHead>
+                      <TableHead>{t("accounts.recycleBinType")}</TableHead>
+                      <TableHead>
+                        {t("accounts.recycleBinImportedAt")}
+                      </TableHead>
+                      <TableHead>
+                        {t("accounts.recycleBinDeletedAt")}
+                      </TableHead>
+                      <TableHead>{t("accounts.recycleBinLastTest")}</TableHead>
+                      <TableHead className="text-right">
+                        {t("accounts.recycleBinActions")}
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {pagedRows.map((row, index) => (
+                      <TableRow key={row.id}>
+                        <TableCell>
+                          <input
+                            type="checkbox"
+                            className="size-4 cursor-pointer accent-primary"
+                            checked={selectedIds.has(row.id)}
+                            onChange={() => toggleSelect(row.id)}
+                          />
+                        </TableCell>
+                        <TableCell className="tabular-nums text-muted-foreground">
+                          {(currentPage - 1) * pageSize + index + 1}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex flex-col gap-0.5">
+                            <span className="font-medium">
+                              {row.email || row.name || `ID ${row.id}`}
+                            </span>
+                            {row.openai_responses_api && row.base_url ? (
+                              <span className="text-xs text-muted-foreground">
+                                {row.base_url}
+                              </span>
+                            ) : null}
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant="outline">
+                            {row.plan_type?.trim() ||
+                              t("accounts.recycleBinPlanUnknown")}
+                          </Badge>
+                        </TableCell>
+                        <TableCell>
+                          <Badge variant="secondary">
+                            {row.openai_responses_api
+                              ? t("accounts.recycleBinTypeRelay")
+                              : t("accounts.recycleBinTypeOauth")}
+                          </Badge>
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex flex-col gap-0.5">
+                            <span className="text-sm tabular-nums">
+                              {formatBeijingTime(row.created_at)}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {formatRelativeTime(row.created_at)}
+                            </span>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          {row.deleted_at ? (
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-sm tabular-nums">
+                                {formatBeijingTime(row.deleted_at)}
+                              </span>
+                              <span className="text-xs text-muted-foreground">
+                                {formatRelativeTime(row.deleted_at)}
+                              </span>
+                            </div>
+                          ) : (
+                            "-"
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {(() => {
+                            const st = row.last_test_status;
+                            if (!st) {
+                              return (
+                                <span className="text-muted-foreground">
+                                  -
+                                </span>
+                              );
+                            }
+                            const passed = st === "success";
+                            const limited = st === "rate_limited";
+                            const badgeClass = passed
+                              ? "border-emerald-300 text-emerald-600 dark:border-emerald-800 dark:text-emerald-400"
+                              : limited
+                                ? "border-amber-300 text-amber-600 dark:border-amber-800 dark:text-amber-400"
+                                : "border-red-300 text-red-600 dark:border-red-900 dark:text-red-400";
+                            const label = passed
+                              ? t("accounts.recycleBinTestPassed")
+                              : limited
+                                ? t("accounts.recycleBinTestRateLimited")
+                                : t("accounts.recycleBinTestFailedLabel");
+                            return (
+                              <div className="flex flex-col items-start gap-0.5">
+                                <Badge variant="outline" className={badgeClass}>
+                                  {label}
+                                </Badge>
+                                {row.last_test_at ? (
+                                  <span className="text-xs tabular-nums text-muted-foreground">
+                                    {formatBeijingTime(row.last_test_at)}
+                                  </span>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <div className="flex items-center justify-end gap-1.5">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={actingId === row.id || busy}
+                              onClick={() => setTestingRow(row)}
+                            >
+                              <FlaskConical className="size-3.5" />
+                              {t("accounts.recycleBinTest")}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={actingId === row.id || busy}
+                              onClick={() => void handleRestore(row)}
+                            >
+                              <ArchiveRestore className="size-3.5" />
+                              {t("accounts.recycleBinRestore")}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="destructive"
+                              disabled={actingId === row.id || busy}
+                              onClick={() => void handlePurge(row)}
+                            >
+                              <Trash2 className="size-3.5" />
+                              {t("accounts.recycleBinPurge")}
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+              <div className="border-t border-border px-4 py-3">
+                <Pagination
+                  page={currentPage}
+                  totalPages={totalPages}
+                  onPageChange={setPage}
+                  totalItems={filteredRows.length}
+                  pageSize={pageSize}
+                  pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS}
+                  onPageSizeChange={(nextPageSize) => {
+                    setPageSize(nextPageSize);
+                    setPage(1);
+                  }}
+                />
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {testingRow ? (
+        <TestConnectionModal
+          account={recycleBinRowToAccountRow(testingRow)}
+          onSettled={() => {
+            void load();
+            if (autoRestore) {
+              onChanged();
+            }
+          }}
+          onClose={() => setTestingRow(null)}
+          successHint={
+            autoRestore
+              ? t("accounts.recycleBinTestAutoRestoredHint")
+              : t("accounts.recycleBinTestSuccessHint")
+          }
+          restoreOnSuccess={autoRestore}
+        />
+      ) : null}
+
+      <Modal
+        show={showEmptyConfirm}
+        title={t("accounts.recycleBinEmptyTitle")}
+        onClose={() => setShowEmptyConfirm(false)}
+        footer={
+          <>
+            <Button
+              variant="outline"
+              onClick={() => setShowEmptyConfirm(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={!emptyConfirmMatched || busy}
+              onClick={() => void handleEmpty()}
+            >
+              <Trash2 className="size-3.5" />
+              {t("accounts.recycleBinEmptyBin")}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            {t("accounts.recycleBinEmptyConfirmPrompt", {
+              count: rows.length,
+            })}
+          </p>
+          <p className="text-sm">
+            {t("accounts.recycleBinEmptyTypeToConfirm")}
+            <code className="ml-1 rounded bg-muted px-1.5 py-0.5 font-semibold text-destructive">
+              {emptyKeyword}
+            </code>
+          </p>
+          <Input
+            value={emptyConfirmText}
+            onChange={(e) => setEmptyConfirmText(e.target.value)}
+            placeholder={emptyKeyword}
+            autoFocus
+          />
+        </div>
+      </Modal>
+    </>
+  );
+}
+
+const RECYCLE_BIN_AUTO_RESTORE_KEY = "codex2api_recycle_bin_auto_restore";
+
+// recycleBinRowToAccountRow 将回收站行转换为 TestConnectionModal 需要的最小 AccountRow。
+function recycleBinRowToAccountRow(row: RecycleBinAccountRow): AccountRow {
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    plan_type: row.plan_type,
+    status: "deleted",
+    openai_responses_api: row.openai_responses_api,
+    base_url: row.base_url,
+    models: row.models,
+    proxy_url: "",
+    created_at: row.created_at,
+    updated_at: row.deleted_at || row.created_at,
+  };
+}
+
 function formatJSONText(text: string) {
   try {
     return JSON.stringify(JSON.parse(text), null, 2);
@@ -5602,12 +6565,12 @@ function formatJSONText(text: string) {
 }
 
 async function copyTextToClipboard(text: string) {
-  if (navigator.clipboard?.writeText) {
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text);
       return;
     } catch {
-      // Fall back for non-secure contexts or browsers that block clipboard writes.
+      // Fall back for browsers that block clipboard writes.
     }
   }
 
@@ -5615,7 +6578,10 @@ async function copyTextToClipboard(text: string) {
   textarea.value = text;
   textarea.setAttribute("readonly", "true");
   textarea.style.position = "fixed";
-  textarea.style.top = "-1000px";
+  textarea.style.top = "0";
+  textarea.style.left = "0";
+  textarea.style.width = "1px";
+  textarea.style.height = "1px";
   textarea.style.opacity = "0";
   textarea.style.pointerEvents = "none";
   document.body.appendChild(textarea);
@@ -5964,6 +6930,24 @@ function isActiveUsageWindowExhausted(
   return isUsageWindowExhausted(value) && (!resetAt || isFutureTime(resetAt));
 }
 
+function isActiveAutoPauseWindowReached(
+  value?: number | null,
+  threshold?: number | null,
+  disabled?: boolean,
+  resetAt?: string,
+): boolean {
+  if (disabled || typeof threshold !== "number" || threshold <= 0) {
+    return false;
+  }
+  if (typeof value !== "number") {
+    return false;
+  }
+  if (resetAt && !isFutureTime(resetAt)) {
+    return false;
+  }
+  return value / 100 >= threshold;
+}
+
 function isPremiumUsagePlan(planType?: string): boolean {
   return ["plus", "pro", "team", "teamplus"].includes(
     normalizePlanType(planType),
@@ -5976,6 +6960,15 @@ function isRateLimitedAccount(account: AccountRow): boolean {
   return getAccountRateLimitWindow(account) !== null;
 }
 
+function isUnsampledQuotaAccount(account: AccountRow): boolean {
+  const status = (account.status || "").toLowerCase();
+  if (status === "unauthorized" || account.openai_responses_api) {
+    return false;
+  }
+  const value = account.usage_percent_7d;
+  return typeof value !== "number" || !Number.isFinite(value);
+}
+
 function getAccountRateLimitWindow(
   account: AccountRow,
 ): RateLimitWindow | null {
@@ -5984,6 +6977,7 @@ function getAccountRateLimitWindow(
   const explicitlyRateLimited =
     status === "rate_limited" ||
     status === "usage_exhausted" ||
+    status === "quota_paused" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d" ||
     reason === "rate_limited" ||
@@ -5996,6 +6990,18 @@ function getAccountRateLimitWindow(
   const has5hLimit =
     isPremiumUsagePlan(account.plan_type) &&
     isActiveUsageWindowExhausted(account.usage_percent_5h, account.reset_5h_at);
+  const has5hAutoPause = isActiveAutoPauseWindowReached(
+    account.usage_percent_5h,
+    account.auto_pause_5h_threshold,
+    account.auto_pause_5h_disabled,
+    account.reset_5h_at,
+  );
+  const has7dAutoPause = isActiveAutoPauseWindowReached(
+    account.usage_percent_7d,
+    account.auto_pause_7d_threshold,
+    account.auto_pause_7d_disabled,
+    account.reset_7d_at,
+  );
 
   // Prefer the longer 7d window when both windows are exhausted so each account
   // belongs to exactly one bucket and 5h + 7d stays equal to total limited.
@@ -6003,7 +7009,8 @@ function getAccountRateLimitWindow(
     status === "usage_exhausted" ||
     status === "rate_limited_7d" ||
     reason === "rate_limited_7d" ||
-    has7dLimit
+    has7dLimit ||
+    has7dAutoPause
   ) {
     return "7d";
   }
@@ -6011,7 +7018,8 @@ function getAccountRateLimitWindow(
   if (
     status === "rate_limited_5h" ||
     reason === "rate_limited_5h" ||
-    has5hLimit
+    has5hLimit ||
+    has5hAutoPause
   ) {
     return "5h";
   }
@@ -7202,10 +8210,14 @@ function TestConnectionModal({
   account,
   onClose,
   onSettled,
+  successHint,
+  restoreOnSuccess,
 }: {
   account: AccountRow;
   onClose: () => void;
   onSettled: () => void;
+  successHint?: string;
+  restoreOnSuccess?: boolean;
 }) {
   const { t } = useTranslation();
   const [output, setOutput] = useState<string[]>([]);
@@ -7326,6 +8338,9 @@ function TestConnectionModal({
 
       try {
         const params = new URLSearchParams({ model: selectedModel });
+        if (restoreOnSuccess) {
+          params.set("restore_on_success", "true");
+        }
         const res = await fetch(
           `/api/admin/accounts/${account.id}/test?${params.toString()}`,
           {
@@ -7438,7 +8453,14 @@ function TestConnectionModal({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [account.id, markSettled, modelOptionsReady, selectedModel, t]);
+  }, [
+    account.id,
+    markSettled,
+    modelOptionsReady,
+    restoreOnSuccess,
+    selectedModel,
+    t,
+  ]);
 
   useEffect(() => {
     outputEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -7534,7 +8556,7 @@ function TestConnectionModal({
         {status === "success" && (
           <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-400">
             <RotateCcw className="size-4 shrink-0" />
-            {t("accounts.testAutoReset")}
+            {successHint ?? t("accounts.testAutoReset")}
           </div>
         )}
       </div>
@@ -7542,13 +8564,22 @@ function TestConnectionModal({
   );
 }
 
-// 格式化重置时间为具体时间
-function formatResetAt(resetAt: string | undefined): string | null {
+interface ResetTimeLabel {
+  label: string;
+  title: string;
+}
+
+// 格式化重置时间为具体时间，列表显示到秒，tooltip 保留完整日期。
+function formatResetAt(resetAt: string | undefined): ResetTimeLabel | null {
   if (!resetAt) return null;
   const d = new Date(resetAt);
-  if (d.getTime() <= Date.now()) return null;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  if (Number.isNaN(d.getTime()) || d.getTime() <= Date.now()) return null;
+  const full = formatBeijingTime(resetAt, "");
+  if (!full) return null;
+  return {
+    label: full.slice(5),
+    title: full,
+  };
 }
 
 function formatCompactUsageNumber(value?: number): string {
@@ -7584,7 +8615,7 @@ function UsageBar({
   resetAt?: string;
   detail?: AccountRow["usage_5h_detail"];
 }) {
-  const resetText = formatResetAt(resetAt);
+  const resetTime = formatResetAt(resetAt);
   const { t } = useTranslation();
   const detailText = hasUsageWindowDetail(detail)
     ? `${formatCompactUsageNumber(detail?.requests)} ${t("accounts.usageReqUnit")} / ${formatCompactUsageNumber(detail?.tokens)} ${t("accounts.usageTokUnit")}`
@@ -7610,9 +8641,12 @@ function UsageBar({
           {detailText}
         </div>
       )}
-      {resetText && (
-        <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">
-          ⏱ {resetText}
+      {resetTime && (
+        <div
+          className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]"
+          title={resetTime.title}
+        >
+          ⏱ {resetTime.label}
         </div>
       )}
     </div>
@@ -7765,6 +8799,15 @@ function getAccountStatusCountdownUntil(
   ) {
     return account.cooldown_until;
   }
+  if (status === "quota_paused") {
+    const window = getAccountRateLimitWindow(account);
+    if (window === "7d") {
+      return account.reset_7d_at;
+    }
+    if (window === "5h") {
+      return account.reset_5h_at;
+    }
+  }
   if (status === "usage_exhausted") {
     return account.reset_7d_at;
   }
@@ -7780,6 +8823,7 @@ function AccountStatusCountdown({ account }: { account: AccountRow }) {
 // 冷却倒计时组件
 function CooldownTimer({ until }: { until: string }) {
   const [remaining, setRemaining] = useState("");
+  const title = formatBeijingTime(until);
 
   useEffect(() => {
     const target = new Date(until).getTime();
@@ -7811,7 +8855,10 @@ function CooldownTimer({ until }: { until: string }) {
 
   if (!remaining) return null;
   return (
-    <span className="inline-flex h-6 min-w-[112px] shrink-0 items-center justify-center gap-1.5 rounded-full bg-amber-50 px-2 text-[11px] font-mono leading-none tabular-nums text-amber-700 ring-1 ring-inset ring-amber-200/70 dark:bg-amber-950/40 dark:text-amber-300 dark:ring-amber-400/20">
+    <span
+      className="inline-flex h-6 min-w-[112px] shrink-0 items-center justify-center gap-1.5 rounded-full bg-amber-50 px-2 text-[11px] font-mono leading-none tabular-nums text-amber-700 ring-1 ring-inset ring-amber-200/70 dark:bg-amber-950/40 dark:text-amber-300 dark:ring-amber-400/20"
+      title={title}
+    >
       <Hourglass className="size-3 shrink-0" aria-hidden="true" />
       {remaining}
     </span>

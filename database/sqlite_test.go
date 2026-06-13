@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -375,15 +376,37 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 	}
 	defer db.Close()
 
-	columns, err := db.sqliteTableColumns(context.Background(), "usage_logs")
+	ctx := context.Background()
+	columns, err := db.sqliteTableColumns(ctx, "usage_logs")
 	if err != nil {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
+	}
+
+	rows, err := db.conn.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_logs'`)
+	if err != nil {
+		t.Fatalf("查询 usage_logs 索引返回错误: %v", err)
+	}
+	defer rows.Close()
+
+	indexes := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("读取 usage_logs 索引返回错误: %v", err)
+		}
+		indexes[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 usage_logs 索引返回错误: %v", err)
+	}
+	if !indexes["idx_usage_logs_account_created_at"] {
+		t.Fatal("usage_logs 缺少索引 idx_usage_logs_account_created_at")
 	}
 }
 
@@ -717,6 +740,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		UsageLogFlushIntervalSeconds:     5,
 		StreamFlushPolicy:                "immediate",
 		StreamFlushIntervalMS:            20,
+		FirstTokenMode:                   "loose",
 		FirstTokenTimeoutSeconds:         17,
 		BillingTierPolicy:                "requested",
 		ImageStorageConfig:               "{}",
@@ -741,6 +765,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
 	}
+	if settings.FirstTokenMode != "loose" {
+		t.Fatalf("FirstTokenMode = %q, want loose", settings.FirstTokenMode)
+	}
 	if !settings.ShowFullUsageNumbers {
 		t.Fatal("ShowFullUsageNumbers = false, want true")
 	}
@@ -764,6 +791,44 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 }
 
+func TestSystemSettingsNormalizeBlankBillingTierPolicy(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO system_settings (id, billing_tier_policy) VALUES (1, '')`); err != nil {
+		t.Fatalf("插入空 billing_tier_policy 失败: %v", err)
+	}
+
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings 返回错误: %v", err)
+	}
+	if settings == nil {
+		t.Fatal("GetSystemSettings 返回 nil")
+	}
+	if settings.BillingTierPolicy != "actual" {
+		t.Fatalf("BillingTierPolicy = %q, want actual", settings.BillingTierPolicy)
+	}
+
+	settings.BillingTierPolicy = ""
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
+	}
+	var stored string
+	if err := db.conn.QueryRowContext(ctx, `SELECT billing_tier_policy FROM system_settings WHERE id = 1`).Scan(&stored); err != nil {
+		t.Fatalf("读取 billing_tier_policy 返回错误: %v", err)
+	}
+	if stored != "actual" {
+		t.Fatalf("stored billing_tier_policy = %q, want actual", stored)
+	}
+}
+
 func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -774,11 +839,11 @@ func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
-	groupA, err := db.CreateAccountGroup(ctx, "Group A", "", "#2563eb", 0)
+	groupA, err := db.CreateAccountGroup(ctx, "Group A", "", "#2563eb", 0, 0, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup A 返回错误: %v", err)
 	}
-	groupB, err := db.CreateAccountGroup(ctx, "Group B", "", "#16a34a", 1)
+	groupB, err := db.CreateAccountGroup(ctx, "Group B", "", "#16a34a", 0, 0, 1)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup B 返回错误: %v", err)
 	}
@@ -1241,6 +1306,97 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 }
 
+func TestUsageStatsBreakdownsRespectExplicitRange(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	rangeStart := time.Now().Add(-2 * time.Hour)
+	rangeEnd := time.Now().Add(1 * time.Hour)
+	logs := []*UsageLogInput{
+		{
+			AccountID:          1,
+			Endpoint:           "/v1/responses",
+			InboundEndpoint:    "/v1/responses",
+			Model:              "range-model",
+			StatusCode:         200,
+			PromptTokens:       70,
+			CompletionTokens:   30,
+			InputTokens:        70,
+			OutputTokens:       30,
+			TotalTokens:        100,
+			Stream:             true,
+			BillingServiceTier: "fast",
+			APIKeyID:           10,
+			APIKeyName:         "Range Key",
+			APIKeyMasked:       "sk-...range",
+		},
+		{
+			AccountID:        2,
+			Endpoint:         "/v1/old",
+			InboundEndpoint:  "/v1/old",
+			Model:            "old-model",
+			StatusCode:       200,
+			PromptTokens:     40,
+			CompletionTokens: 10,
+			InputTokens:      40,
+			OutputTokens:     10,
+			TotalTokens:      50,
+			APIKeyID:         11,
+			APIKeyName:       "Old Key",
+			APIKeyMasked:     "sk-...old",
+		},
+	}
+	for _, usageLog := range logs {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	oldCreatedAt := rangeStart.Add(-24 * time.Hour)
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET created_at = $1 WHERE model = $2`, sqliteTimeParam(oldCreatedAt), "old-model"); err != nil {
+		t.Fatalf("更新旧日志时间失败: %v", err)
+	}
+
+	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd)
+	if err != nil {
+		t.Fatalf("GetUsageStats 返回错误: %v", err)
+	}
+	if stats.TodayRequests != 1 || stats.TodayTokens != 100 || stats.TodayPrompt != 70 || stats.TodayCompletion != 30 {
+		t.Fatalf("range stats = requests %d tokens %d prompt %d completion %d, want 1/100/70/30",
+			stats.TodayRequests, stats.TodayTokens, stats.TodayPrompt, stats.TodayCompletion)
+	}
+	if stats.TotalRequests != 2 || stats.TotalTokens != 150 {
+		t.Fatalf("total stats = requests %d tokens %d, want cumulative 2/150", stats.TotalRequests, stats.TotalTokens)
+	}
+	if len(stats.ModelStats) != 1 || stats.ModelStats[0].Model != "range-model" || stats.ModelStats[0].Requests != 1 {
+		t.Fatalf("ModelStats = %+v, want only range-model", stats.ModelStats)
+	}
+	if stats.FeatureStats.StreamRequests != 1 || stats.FeatureStats.SyncRequests != 0 || stats.FeatureStats.FastRequests != 1 {
+		t.Fatalf("FeatureStats = %+v, want selected range only", stats.FeatureStats)
+	}
+	endpoints := make(map[string]UsageEndpointStat)
+	for _, item := range stats.EndpointStats {
+		endpoints[item.Endpoint] = item
+	}
+	if _, ok := endpoints["/v1/old"]; ok || endpoints["/v1/responses"].Requests != 1 {
+		t.Fatalf("EndpointStats = %+v, want selected range only", stats.EndpointStats)
+	}
+	apiKeys := make(map[int64]UsageAPIKeyStat)
+	for _, item := range stats.APIKeyStats {
+		apiKeys[item.APIKeyID] = item
+	}
+	if _, ok := apiKeys[11]; ok || apiKeys[10].Requests != 1 {
+		t.Fatalf("APIKeyStats = %+v, want selected range only", stats.APIKeyStats)
+	}
+}
+
 func TestUsageStatsBaselinePreservesCacheRateAndFirstTokenAfterClear(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1575,6 +1731,26 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 			t.Fatal("Compact = false, want true in paged usage logs")
 		}
 	}
+
+	targetAccountID := int64(1)
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
+		Start:     now.Add(-1 * time.Hour),
+		End:       now.Add(1 * time.Hour),
+		Page:      1,
+		PageSize:  10,
+		AccountID: &targetAccountID,
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged account filter 返回错误: %v", err)
+	}
+	if page.Total != 2 {
+		t.Fatalf("account filter page.Total = %d, want %d", page.Total, 2)
+	}
+	for _, usageLog := range page.Logs {
+		if usageLog.AccountID != targetAccountID {
+			t.Fatalf("AccountID = %d, want %d", usageLog.AccountID, targetAccountID)
+		}
+	}
 }
 
 func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
@@ -1624,6 +1800,137 @@ func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
 	}
 }
 
+func TestGetAccountUsageStatsAggregatesRecentAccountSummary(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	insertUsage := func(accountID int64, model string, statusCode int, totalTokens, inputTokens, outputTokens, reasoningTokens, cachedTokens, durationMs int, accountBilled, userBilled float64, createdAt time.Time) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (
+				account_id, model, effective_model, status_code, total_tokens,
+				input_tokens, output_tokens, reasoning_tokens, cached_tokens,
+				duration_ms, account_billed, user_billed, created_at
+			)
+			VALUES ($1, $2, '', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		`, accountID, model, statusCode, totalTokens, inputTokens, outputTokens, reasoningTokens, cachedTokens, durationMs, accountBilled, userBilled, sqliteTimeParam(createdAt)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	insertUsage(7, "gpt-5.5", 200, 1000, 700, 300, 50, 100, 1000, 1.25, 0.50, todayStart.Add(1*time.Hour))
+	insertUsage(7, "gpt-5.5", 200, 2000, 1500, 500, 100, 0, 2000, 2.50, 1.00, todayStart.AddDate(0, 0, -1).Add(1*time.Hour))
+	insertUsage(7, "gpt-4.1", 500, 3000, 2000, 1000, 150, 250, 3000, 3.75, 1.50, todayStart.AddDate(0, 0, -1).Add(2*time.Hour))
+	insertUsage(7, "old-model", 200, 9000, 9000, 0, 0, 0, 5000, 9.99, 9.99, todayStart.AddDate(0, 0, -40))
+	insertUsage(7, "cancelled", 499, 8000, 8000, 0, 0, 0, 5000, 8.88, 8.88, todayStart.Add(2*time.Hour))
+	insertUsage(8, "other-account", 200, 7000, 7000, 0, 0, 0, 5000, 7.77, 7.77, todayStart.Add(2*time.Hour))
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 500, stream = 1 WHERE account_id = 7 AND total_tokens = 1000`); err != nil {
+		t.Fatalf("update first usage quality fields: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 1500, compact = 1 WHERE account_id = 7 AND total_tokens = 2000`); err != nil {
+		t.Fatalf("update second usage quality fields: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 2500, stream = 1, compact = 1, is_retry_attempt = 1, attempt_index = 1 WHERE account_id = 7 AND model = 'gpt-4.1'`); err != nil {
+		t.Fatalf("update third usage quality fields: %v", err)
+	}
+
+	got, err := db.GetAccountUsageStats(ctx, 7, 30)
+	if err != nil {
+		t.Fatalf("GetAccountUsageStats 返回错误: %v", err)
+	}
+
+	if got.PeriodDays != 30 {
+		t.Fatalf("PeriodDays = %d, want 30", got.PeriodDays)
+	}
+	if got.TotalRequests != 3 {
+		t.Fatalf("TotalRequests = %d, want 3", got.TotalRequests)
+	}
+	if got.TotalTokens != 6000 {
+		t.Fatalf("TotalTokens = %d, want 6000", got.TotalTokens)
+	}
+	if got.InputTokens != 4200 || got.OutputTokens != 1800 || got.ReasoningTokens != 300 || got.CachedTokens != 350 {
+		t.Fatalf("token breakdown = input %d output %d reasoning %d cached %d", got.InputTokens, got.OutputTokens, got.ReasoningTokens, got.CachedTokens)
+	}
+	if math.Abs(got.TotalAccountBilled-7.50) > 0.000001 {
+		t.Fatalf("TotalAccountBilled = %.4f, want 7.5000", got.TotalAccountBilled)
+	}
+	if math.Abs(got.TotalUserBilled-3.00) > 0.000001 {
+		t.Fatalf("TotalUserBilled = %.4f, want 3.0000", got.TotalUserBilled)
+	}
+	if got.Today.Requests != 1 || got.Today.Tokens != 1000 {
+		t.Fatalf("Today = %+v, want requests 1 tokens 1000", got.Today)
+	}
+	if got.ActiveDays < 2 {
+		t.Fatalf("ActiveDays = %d, want at least 2", got.ActiveDays)
+	}
+	if got.HighestCostDay == nil || math.Abs(got.HighestCostDay.AccountBilled-6.25) > 0.000001 {
+		t.Fatalf("HighestCostDay = %+v, want account billed 6.25", got.HighestCostDay)
+	}
+	if got.HighestRequestDay == nil || got.HighestRequestDay.Requests != 2 {
+		t.Fatalf("HighestRequestDay = %+v, want requests 2", got.HighestRequestDay)
+	}
+	if len(got.History) != 2 {
+		t.Fatalf("len(History) = %d, want 2", len(got.History))
+	}
+	if len(got.Models) != 2 {
+		t.Fatalf("len(Models) = %d, want 2", len(got.Models))
+	}
+	if got.Models[0].Model != "gpt-5.5" || got.Models[0].Requests != 2 {
+		t.Fatalf("Models[0] = %+v, want gpt-5.5 requests 2", got.Models[0])
+	}
+	if got.Models[0].Tokens != 3000 || got.Models[0].InputTokens != 2200 || got.Models[0].OutputTokens != 800 || got.Models[0].ReasoningTokens != 150 || got.Models[0].CachedTokens != 100 {
+		t.Fatalf("Models[0] token breakdown = %+v, want tokens 3000 input 2200 output 800 reasoning 150 cached 100", got.Models[0])
+	}
+	if math.Abs(got.Models[0].AccountBilled-3.75) > 0.000001 || math.Abs(got.Models[0].UserBilled-1.50) > 0.000001 {
+		t.Fatalf("Models[0] billed = account %.4f user %.4f, want 3.7500/1.5000", got.Models[0].AccountBilled, got.Models[0].UserBilled)
+	}
+	if got.ErrorRequests != 1 || math.Abs(got.ErrorRate-33.333333) > 0.001 {
+		t.Fatalf("error quality = requests %d rate %.4f, want 1/33.33", got.ErrorRequests, got.ErrorRate)
+	}
+	if got.RetryRequests != 1 {
+		t.Fatalf("RetryRequests = %d, want 1", got.RetryRequests)
+	}
+	if got.FirstTokenSamples != 3 || math.Abs(got.AvgFirstTokenMs-1500) > 0.001 {
+		t.Fatalf("first token quality = samples %d avg %.2f, want 3/1500", got.FirstTokenSamples, got.AvgFirstTokenMs)
+	}
+	if math.Abs(got.P95DurationMs-3000) > 0.001 {
+		t.Fatalf("P95DurationMs = %.2f, want 3000", got.P95DurationMs)
+	}
+	if got.StreamRequests != 2 || math.Abs(got.StreamRate-66.666667) > 0.001 {
+		t.Fatalf("stream quality = requests %d rate %.4f, want 2/66.67", got.StreamRequests, got.StreamRate)
+	}
+	if got.CompactRequests != 2 || math.Abs(got.CompactRate-66.666667) > 0.001 {
+		t.Fatalf("compact quality = requests %d rate %.4f, want 2/66.67", got.CompactRequests, got.CompactRate)
+	}
+
+	todayOnly, err := db.GetAccountUsageStats(ctx, 7, 1)
+	if err != nil {
+		t.Fatalf("GetAccountUsageStats today 返回错误: %v", err)
+	}
+	if todayOnly.TotalRequests != 1 || todayOnly.TotalTokens != 1000 {
+		t.Fatalf("todayOnly = requests %d tokens %d, want 1/1000", todayOnly.TotalRequests, todayOnly.TotalTokens)
+	}
+
+	allTime, err := db.GetAccountUsageStats(ctx, 7, 0)
+	if err != nil {
+		t.Fatalf("GetAccountUsageStats all-time 返回错误: %v", err)
+	}
+	if allTime.PeriodDays != 0 {
+		t.Fatalf("allTime.PeriodDays = %d, want 0", allTime.PeriodDays)
+	}
+	if allTime.TotalRequests != 4 || allTime.TotalTokens != 15000 {
+		t.Fatalf("allTime = requests %d tokens %d, want 4/15000", allTime.TotalRequests, allTime.TotalTokens)
+	}
+}
+
 func TestGetAccountsBilledSinceUsesPerAccountWindows(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1668,5 +1975,89 @@ func TestGetAccountsBilledSinceUsesPerAccountWindows(t *testing.T) {
 	}
 	if got[3] != 0 {
 		t.Fatalf("account 3 billed = %.2f, want 0", got[3])
+	}
+}
+
+func TestFlushLogsRequeuesBatchWhenSQLiteBeginFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	close(db.logStop)
+	db.logWg.Wait()
+
+	ctx := context.Background()
+	for _, endpoint := range []string{"/v1/responses", "/v1/chat/completions"} {
+		if err := db.InsertUsageLog(ctx, &UsageLogInput{
+			Endpoint:    endpoint,
+			Model:       "gpt-5.4",
+			StatusCode:  200,
+			InputTokens: 1000,
+		}); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	if err := db.conn.Close(); err != nil {
+		t.Fatalf("关闭 sqlite 连接返回错误: %v", err)
+	}
+
+	db.flushLogs()
+
+	db.logMu.Lock()
+	defer db.logMu.Unlock()
+	if len(db.logBuf) != 2 {
+		t.Fatalf("len(logBuf) = %d, want 2", len(db.logBuf))
+	}
+	if db.logBuf[0].Endpoint != "/v1/responses" || db.logBuf[1].Endpoint != "/v1/chat/completions" {
+		t.Fatalf("requeued endpoints = %q, %q", db.logBuf[0].Endpoint, db.logBuf[1].Endpoint)
+	}
+}
+
+func TestFlushLogsRollsBackAndRequeuesWhenQuotaUpdateFails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	close(db.logStop)
+	db.logWg.Wait()
+	defer db.conn.Close()
+
+	ctx := context.Background()
+	if _, err := db.conn.ExecContext(ctx, `ALTER TABLE api_keys RENAME TO api_keys_broken`); err != nil {
+		t.Fatalf("rename api_keys 返回错误: %v", err)
+	}
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		APIKeyID:    123,
+		Endpoint:    "/v1/responses",
+		Model:       "gpt-5.4",
+		StatusCode:  200,
+		InputTokens: 1000,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+
+	db.flushLogs()
+
+	db.logMu.Lock()
+	if len(db.logBuf) != 1 {
+		db.logMu.Unlock()
+		t.Fatalf("len(logBuf) = %d, want 1", len(db.logBuf))
+	}
+	if db.logBuf[0].APIKeyID != 123 {
+		db.logMu.Unlock()
+		t.Fatalf("requeued APIKeyID = %d, want 123", db.logBuf[0].APIKeyID)
+	}
+	db.logMu.Unlock()
+
+	var count int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_logs`).Scan(&count); err != nil {
+		t.Fatalf("count usage_logs 返回错误: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("usage_logs count = %d, want 0 after rolled-back flush", count)
 	}
 }

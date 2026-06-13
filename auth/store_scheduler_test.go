@@ -251,6 +251,63 @@ func TestNeedsUsageProbeAllowsReadyAccount(t *testing.T) {
 	}
 }
 
+func TestNeedsUsageProbeRequires5hSnapshotWhen5hAutoPauseEnabled(t *testing.T) {
+	acc := &Account{
+		AccessToken:          "token",
+		Status:               StatusReady,
+		UsagePercent7d:       12,
+		UsagePercent7dValid:  true,
+		UsageUpdatedAt:       time.Now(),
+		AutoPause5hThreshold: 0.95,
+	}
+	acc.recomputeEffectiveAutoPause(nil)
+
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = false, want true when 5h auto-pause is enabled but 5h snapshot is missing")
+	}
+}
+
+func TestPersistUsageSnapshotKeeps5hProbeRequiredWhen5hSnapshotMissing(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	acc := &Account{
+		DBID:                 1,
+		AccessToken:          "token",
+		Status:               StatusReady,
+		AutoPause5hThreshold: 0.95,
+		AutoPause7dThreshold: 0.95,
+		UsagePercent5hValid:  false,
+		UsagePercent7dValid:  false,
+	}
+	acc.recomputeEffectiveAutoPause(store)
+
+	store.PersistUsageSnapshot(acc, 20)
+
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = false, want true after 7d-only persistence when 5h snapshot is still missing")
+	}
+}
+
+func TestPersistUsageSnapshot5hOnlyDoesNotRefreshStale7dSnapshot(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "token",
+		Status:              StatusReady,
+		UsagePercent7d:      40,
+		UsagePercent7dValid: true,
+		UsageUpdatedAt:      time.Now().Add(-20 * time.Minute),
+		UsagePercent5h:      25,
+		UsagePercent5hValid: true,
+		Reset5hAt:           time.Now().Add(time.Hour),
+	}
+
+	store.PersistUsageSnapshot5hOnly(acc)
+
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = false, want true because 5h-only persistence must not refresh stale 7d freshness")
+	}
+}
+
 func TestTriggerUsageProbeAsyncRunsInLazyMode(t *testing.T) {
 	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	store.SetLazyMode(true)

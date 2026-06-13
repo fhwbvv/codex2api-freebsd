@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/codex2api/auth"
+	"github.com/tidwall/gjson"
 )
 
 func TestReadSSEStream_MergesMultilineData(t *testing.T) {
@@ -63,6 +64,13 @@ func TestClassifyStreamOutcome(t *testing.T) {
 			wantPenalize: true,
 		},
 		{
+			name:         "websocket message too big",
+			readErr:      errors.New("websocket read error: websocket: close 1009 (message too big)"),
+			wantStatus:   logStatusUpstreamStreamBreak,
+			wantKind:     upstreamErrorKindMessageTooBig,
+			wantPenalize: true,
+		},
+		{
 			name:         "upstream early eof",
 			wantStatus:   logStatusUpstreamStreamBreak,
 			wantKind:     "transport",
@@ -83,6 +91,28 @@ func TestClassifyStreamOutcome(t *testing.T) {
 				t.Fatalf("penalize mismatch: got %v want %v", outcome.penalize, tc.wantPenalize)
 			}
 		})
+	}
+}
+
+func TestShouldFallbackWebsocketMessageTooBigToHTTP(t *testing.T) {
+	outcome := streamOutcome{
+		logStatusCode:  logStatusUpstreamStreamBreak,
+		failureKind:    upstreamErrorKindMessageTooBig,
+		failureMessage: "上游流读取失败: websocket read error: websocket: close 1009 (message too big)",
+		penalize:       true,
+	}
+
+	if !shouldFallbackWebsocketMessageTooBigToHTTP(outcome, true, false, nil, nil) {
+		t.Fatal("expected websocket message-too-big before first downstream bytes to fall back to HTTP")
+	}
+	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, false, false, nil, nil) {
+		t.Fatal("HTTP upstream should not fall back again")
+	}
+	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, true, true, nil, nil) {
+		t.Fatal("should not fall back after downstream body has been written")
+	}
+	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, true, false, context.Canceled, nil) {
+		t.Fatal("should not fall back after downstream context is canceled")
 	}
 }
 
@@ -488,9 +518,11 @@ func TestExecuteRequestForcedWebsocketUsesStatelessSessionWhenMissing(t *testing
 
 	previousWS := WebsocketExecuteFunc
 	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
-	var gotSessionID string
+	var gotSessionIDs []string
+	var gotCacheKeys []string
 	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
-		gotSessionID = sessionID
+		gotSessionIDs = append(gotSessionIDs, sessionID)
+		gotCacheKeys = append(gotCacheKeys, gjson.GetBytes(requestBody, "prompt_cache_key").String())
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
@@ -498,12 +530,26 @@ func TestExecuteRequestForcedWebsocketUsesStatelessSessionWhenMissing(t *testing
 		}, nil
 	}
 
-	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, []byte(`{"model":"gpt-5.4"}`), "", "", "sk-local", nil, http.Header{})
-	if err != nil {
-		t.Fatalf("ExecuteRequest() error = %v", err)
+	for i := 0; i < 2; i++ {
+		resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, []byte(`{"model":"gpt-5.4"}`), "", "", "sk-local", nil, http.Header{})
+		if err != nil {
+			t.Fatalf("ExecuteRequest() error = %v", err)
+		}
+		resp.Body.Close()
 	}
-	defer resp.Body.Close()
-	if !strings.HasPrefix(gotSessionID, "stateless-") {
-		t.Fatalf("sessionID = %q, want stateless-*", gotSessionID)
+	for _, sessionID := range gotSessionIDs {
+		if !strings.HasPrefix(sessionID, "stateless-") {
+			t.Fatalf("sessionID = %q, want stateless-*", sessionID)
+		}
+	}
+	if gotSessionIDs[0] == gotSessionIDs[1] {
+		t.Fatalf("stateless sessionIDs should differ per request, both = %q", gotSessionIDs[0])
+	}
+	// prompt cache key 必须是确定性的：两次请求一致，且不等于一次性连接 ID
+	if gotCacheKeys[0] == "" || gotCacheKeys[0] != gotCacheKeys[1] {
+		t.Fatalf("prompt_cache_key = %q / %q, want identical deterministic key", gotCacheKeys[0], gotCacheKeys[1])
+	}
+	if strings.HasPrefix(gotCacheKeys[0], "stateless-") {
+		t.Fatalf("prompt_cache_key = %q, must not be a stateless connection ID", gotCacheKeys[0])
 	}
 }

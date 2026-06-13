@@ -181,6 +181,12 @@ func randInt() int {
 // BodyCacheMiddleware caches the request body for multiple reads
 func BodyCacheMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if body := GetRawBody(c); body != nil {
+			c.Request.Body = io.NopCloser(bytes.NewReader(body))
+			c.Next()
+			return
+		}
+
 		if c.Request.Body != nil && c.Request.Body != http.NoBody {
 			body, err := io.ReadAll(c.Request.Body)
 			if err != nil {

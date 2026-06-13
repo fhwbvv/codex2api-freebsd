@@ -113,6 +113,26 @@ func TestPrepareWebsocketBodyPreservesPreviousResponseID(t *testing.T) {
 	}
 }
 
+func TestPrepareWebsocketBodyKeepsCacheKeyForStatelessSession(t *testing.T) {
+	exec := NewExecutor()
+
+	got := exec.prepareWebsocketBody([]byte(`{"model":"gpt-5.4","prompt_cache_key":"deterministic-key","input":[]}`), "stateless-abc123")
+
+	if cacheKey := gjson.GetBytes(got, "prompt_cache_key").String(); cacheKey != "deterministic-key" {
+		t.Fatalf("prompt_cache_key = %q, want deterministic-key (stateless sessionID must not overwrite); body=%s", cacheKey, got)
+	}
+}
+
+func TestPrepareWebsocketBodyStatelessSessionWithoutCacheKey(t *testing.T) {
+	exec := NewExecutor()
+
+	got := exec.prepareWebsocketBody([]byte(`{"model":"gpt-5.4","input":[]}`), "stateless-abc123")
+
+	if cacheKey := gjson.GetBytes(got, "prompt_cache_key").String(); cacheKey != "" {
+		t.Fatalf("prompt_cache_key = %q, want empty (stateless sessionID must not be injected); body=%s", cacheKey, got)
+	}
+}
+
 func TestNormalizeWebsocketHandshakeResponse(t *testing.T) {
 	t.Run("switching protocols is successful websocket handshake", func(t *testing.T) {
 		statusCode, _, failed := normalizeWebsocketHandshakeResponse(&http.Response{

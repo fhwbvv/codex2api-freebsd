@@ -147,6 +147,24 @@ func TestValidateResponsesAPIRequestRejectsUnknownInputType(t *testing.T) {
 	}
 }
 
+func TestValidateResponsesAPIRequestAcceptsCompactV2InputTypes(t *testing.T) {
+	// 新版 Codex CLI（compact v2）发送 compaction_trigger 触发服务端压缩，
+	// 后续请求携带 context_compaction/compaction 加密上下文。
+	result := ValidateResponsesAPIRequest(
+		[]byte(`{"model":"gpt-5.4","input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"compaction_trigger"},
+			{"type":"context_compaction","encrypted_content":"opaque"},
+			{"type":"compaction","encrypted_content":"opaque"}
+		]}`),
+		[]string{"gpt-5.4"},
+	)
+
+	if !result.Valid {
+		t.Fatalf("expected compact v2 input types to be valid, got %#v", result.Errors)
+	}
+}
+
 func TestSendListIncludesOptionalHasMore(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

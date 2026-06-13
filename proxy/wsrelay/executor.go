@@ -88,6 +88,16 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 准备请求体
 	wsBody := e.prepareWebsocketBody(requestBody, sessionID)
 
+	// 握手头中的 Session_id/Conversation_id 会影响上游 prompt cache 路由，必须与
+	// 请求体的确定性 prompt_cache_key 一致；stateless 连接 ID 是每请求随机的，
+	// 发给上游会导致 prompt cache 永远 miss，它只用于本地连接池隔离。
+	headerSessionID := sessionID
+	if proxy.IsStatelessWebsocketSessionID(sessionID) {
+		if cacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String()); cacheKey != "" {
+			headerSessionID = cacheKey
+		}
+	}
+
 	// 构建 WebSocket URL
 	httpURL := proxy.CodexBaseURL + CodexWsEndpoint
 	wsURL, err := buildWebsocketURL(httpURL)
@@ -101,24 +111,33 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 
 	// 准备请求头
-	headers := e.prepareWebsocketHeaders(accessToken, accountIDStr, sessionID, apiKey, deviceCfg, ginHeaders)
+	headers := e.prepareWebsocketHeaders(accessToken, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders)
 
 	// Resin 反代：注入账号身份头
 	if proxy.IsResinEnabled() {
 		headers.Set("X-Resin-Account", proxy.ResinAccountID(account))
 	}
 
-	// 获取或创建连接
-	wc, pr, err := e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
-	if err != nil {
-		return nil, err
+	// 获取或创建连接。无显式会话的请求（stateless 连接 ID）在确定性 cache key
+	// 的槽位池内复用连接，避免持续高 RPM 下逐请求握手触发上游限流。
+	poolSessionID := sessionID
+	var wc *WsConnection
+	var pr *PendingRequest
+	var err2 error
+	if proxy.IsStatelessWebsocketSessionID(sessionID) && headerSessionID != sessionID {
+		wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, headerSessionID, sessionID, StatelessConnectionSlots, headers, proxyOverride)
+	} else {
+		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
+	}
+	if err2 != nil {
+		return nil, err2
 	}
 
 	// 发送请求，失败时最多重试 2 次（重建连接）
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
 	for retries := 0; sendErr != nil && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.RemoveConnection(account.ID(), wsURL, sessionID, proxyOverride)
+		e.manager.RemoveConnection(account.ID(), wsURL, poolSessionID, proxyOverride)
 
 		// 短暂退避，避免瞬间重连风暴
 		select {
@@ -127,9 +146,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		case <-time.After(time.Duration(retries+1) * 200 * time.Millisecond):
 		}
 
-		wc, pr, err = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
-		if err != nil {
-			return nil, err
+		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
+		if err2 != nil {
+			return nil, err2
 		}
 		sendErr = e.sendRequest(wc, wsBody, pr.RequestID)
 	}
@@ -145,7 +164,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	return &WsResponse{
 		conn:        wc,
 		pendingReq:  pr,
-		sessionID:   sessionID,
+		sessionID:   poolSessionID,
 		manager:     e.manager,
 		readErrChan: make(chan error, 1),
 	}, nil
@@ -171,8 +190,11 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	wsBody, _ = sjson.DeleteBytes(wsBody, "disable_response_storage")
 
 	// 3. 注入 prompt_cache_key
+	// stateless sessionID 只是连接池隔离用的一次性随机 ID，注入它会让上游
+	// prompt cache 每次请求都 miss；此时保留请求体中已有的确定性 cache key
+	//（由 proxy.ExecuteRequest 注入或客户端自带）。
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String())
-	if sessionID != "" {
+	if sessionID != "" && !proxy.IsStatelessWebsocketSessionID(sessionID) {
 		wsBody, _ = sjson.SetBytes(wsBody, "prompt_cache_key", sessionID)
 	} else if existingCacheKey != "" {
 		wsBody, _ = sjson.SetBytes(wsBody, "prompt_cache_key", existingCacheKey)

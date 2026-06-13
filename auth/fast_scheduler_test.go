@@ -170,6 +170,85 @@ func TestStoreNextExcludingRespectsAPIKeyAllowedGroups(t *testing.T) {
 	}
 }
 
+func TestStoreGroupUpdatesImmediatelyAffectAPIKeyScheduling(t *testing.T) {
+	groupA := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	groupA.GroupIDs = []int64{10}
+	groupB := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
+	groupB.GroupIDs = []int64{20}
+
+	store := &Store{
+		accounts:       []*Account{groupA, groupB},
+		maxConcurrency: 1,
+	}
+	store.rebuildAccountIndex()
+	store.SetAPIKeyAllowedGroups(1, []int64{20})
+
+	got := store.NextExcluding(1, nil)
+	if got == nil {
+		t.Fatal("NextExcluding() returned nil before group update")
+	}
+	if got.DBID != 2 {
+		t.Fatalf("NextExcluding() picked dbID=%d before group update, want 2", got.DBID)
+	}
+	store.Release(got)
+
+	store.ApplyAccountGroups(2, []int64{10})
+	if got := store.NextExcluding(1, nil); got != nil {
+		store.Release(got)
+		t.Fatalf("NextExcluding() picked dbID=%d after removing allowed group, want nil", got.DBID)
+	}
+
+	store.ApplyAccountGroups(1, []int64{20})
+	got = store.NextExcluding(1, nil)
+	if got == nil {
+		t.Fatal("NextExcluding() returned nil after moving groupA into allowed group")
+	}
+	defer store.Release(got)
+	if got.DBID != 1 {
+		t.Fatalf("NextExcluding() picked dbID=%d after moving groupA, want 1", got.DBID)
+	}
+}
+
+func TestFastSchedulerGroupUpdatesImmediatelyAffectAPIKeyScheduling(t *testing.T) {
+	groupA := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	groupA.GroupIDs = []int64{10}
+	groupB := newFastSchedulerTestAccount(2, HealthTierHealthy, 80, 1)
+	groupB.GroupIDs = []int64{20}
+
+	store := &Store{
+		accounts:       []*Account{groupA, groupB},
+		maxConcurrency: 1,
+	}
+	store.rebuildAccountIndex()
+	store.SetFastSchedulerEnabled(true)
+	store.SetAPIKeyAllowedGroups(1, []int64{20})
+
+	got := store.NextExcluding(1, nil)
+	if got == nil {
+		t.Fatal("NextExcluding() returned nil before group update")
+	}
+	if got.DBID != 2 {
+		t.Fatalf("NextExcluding() picked dbID=%d before group update, want 2", got.DBID)
+	}
+	store.Release(got)
+
+	store.ApplyAccountGroups(2, []int64{10})
+	if got := store.NextExcluding(1, nil); got != nil {
+		store.Release(got)
+		t.Fatalf("NextExcluding() picked dbID=%d after removing allowed group, want nil", got.DBID)
+	}
+
+	store.ApplyAccountGroups(1, []int64{20})
+	got = store.NextExcluding(1, nil)
+	if got == nil {
+		t.Fatal("NextExcluding() returned nil after moving groupA into allowed group")
+	}
+	defer store.Release(got)
+	if got.DBID != 1 {
+		t.Fatalf("NextExcluding() picked dbID=%d after moving groupA, want 1", got.DBID)
+	}
+}
+
 func TestStoreNextSkipsDispatchPausedAccount(t *testing.T) {
 	paused := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
 	atomic.StoreInt32(&paused.DispatchPaused, 1)
@@ -794,32 +873,32 @@ func TestFastSchedulerRelease(t *testing.T) {
 
 func TestFastSchedulerRemainingQuotaPicksLowestUsage(t *testing.T) {
 	highUsage := &Account{
-		DBID:                1,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      90,
-		UsagePercent7dValid: true,
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           90,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 4,
 		DynamicConcurrencyLimit:  4,
 	}
 	lowUsage := &Account{
-		DBID:                2,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      10,
-		UsagePercent7dValid: true,
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           10,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 4,
 		DynamicConcurrencyLimit:  4,
 	}
 	midUsage := &Account{
-		DBID:                3,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      50,
-		UsagePercent7dValid: true,
+		DBID:                     3,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           50,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 4,
 		DynamicConcurrencyLimit:  4,
 	}
@@ -840,32 +919,32 @@ func TestFastSchedulerRemainingQuotaPicksLowestUsage(t *testing.T) {
 
 func TestFastSchedulerRemainingQuotaSortOrder(t *testing.T) {
 	a1 := &Account{
-		DBID:                1,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      70,
-		UsagePercent7dValid: true,
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           70,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 1,
 		DynamicConcurrencyLimit:  1,
 	}
 	a2 := &Account{
-		DBID:                2,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      30,
-		UsagePercent7dValid: true,
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           30,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 1,
 		DynamicConcurrencyLimit:  1,
 	}
 	a3 := &Account{
-		DBID:                3,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      90,
-		UsagePercent7dValid: true,
+		DBID:                     3,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           90,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 1,
 		DynamicConcurrencyLimit:  1,
 	}
@@ -895,24 +974,24 @@ func TestFastSchedulerRemainingQuotaSortOrder(t *testing.T) {
 
 func TestFastSchedulerRemainingQuotaTieBreakProvenThenDBID(t *testing.T) {
 	unproven := &Account{
-		DBID:                1,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      50,
-		UsagePercent7dValid: true,
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           50,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 2,
 		DynamicConcurrencyLimit:  2,
 	}
 	unproven.TotalRequests = 0 // not proven
 
 	proven := &Account{
-		DBID:                2,
-		AccessToken:         "token",
-		Status:              StatusReady,
-		HealthTier:          HealthTierHealthy,
-		UsagePercent7d:      50,
-		UsagePercent7dValid: true,
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           50,
+		UsagePercent7dValid:      true,
 		BaseConcurrencyEffective: 2,
 		DynamicConcurrencyLimit:  2,
 	}

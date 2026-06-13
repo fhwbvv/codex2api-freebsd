@@ -624,8 +624,21 @@ func hasStructuredResponsesFormat(body map[string]any) bool {
 	return false
 }
 
+// responsesModelRejectsHostedImageTool 判断模型是否不支持 hosted image_generation
+// 工具。gpt-5.3-codex-spark 是 ChatGPT 账号下的纯文本 Codex 模型，上游会直接拒绝
+// 带 hosted 图片工具的请求（issue #230）。
+func responsesModelRejectsHostedImageTool(body map[string]any) bool {
+	model := strings.TrimSpace(firstNonEmptyAnyString(body["model"]))
+	return strings.EqualFold(model, proOnlySparkModel)
+}
+
 func shouldAutoInjectResponsesImageGenerationTool(body map[string]any) bool {
 	if len(body) == 0 || hasResponsesImageGenerationTool(body) {
+		return false
+	}
+	// 不为拒绝 hosted 图片工具的模型自动注入默认图片工具及桥接 instructions；
+	// 用户显式自带的图片工具仍由上面 hasResponsesImageGenerationTool 分支保留。
+	if responsesModelRejectsHostedImageTool(body) {
 		return false
 	}
 	if hasResponsesImageGenerationToolChoice(body) {
@@ -706,6 +719,10 @@ func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 // are dropped. Codex CLI compresses prior turns into compaction items expecting
 // them to be forwarded as conversation context; the upstream rejects the type
 // with "Invalid input type 'compaction' at index N", so we translate in place.
+//
+// Compact v2 (newer Codex CLI) items are left untouched: compaction items
+// carrying "encrypted_content" originate from the upstream itself and must be
+// forwarded verbatim, or the compacted conversation context is lost.
 func normalizeResponsesCompactionItems(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -726,6 +743,12 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			continue
 		}
 		if firstNonEmptyAnyString(itemMap["type"]) != "compaction" {
+			out = append(out, raw)
+			continue
+		}
+
+		// compact v2: 加密压缩项由上游生成并原生支持，必须原样透传
+		if firstNonEmptyAnyString(itemMap["encrypted_content"]) != "" {
 			out = append(out, raw)
 			continue
 		}
@@ -900,6 +923,9 @@ func isInvalidEncryptedContentError(statusCode int, body []byte) bool {
 	if statusCode != http.StatusBadRequest {
 		return false
 	}
+	if isMissingEncryptedContentError(body) {
+		return true
+	}
 	for _, path := range []string{"error.code", "detail.code", "code"} {
 		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, path).String()), "invalid_encrypted_content") {
 			return true
@@ -921,6 +947,16 @@ func isInvalidEncryptedContentError(statusCode int, body []byte) bool {
 		}
 	}
 	return false
+}
+
+func isMissingEncryptedContentError(body []byte) bool {
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	param := strings.TrimSpace(gjson.GetBytes(body, "error.param").String())
+	if !strings.EqualFold(code, "missing_required_parameter") || !strings.HasSuffix(param, ".encrypted_content") {
+		return false
+	}
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	return strings.Contains(msg, "encrypted_content")
 }
 
 func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
@@ -968,13 +1004,16 @@ func stripInvalidEncryptedContentValue(value any, arrayItem bool) (any, bool, bo
 	case map[string]any:
 		changed := false
 		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" {
-			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
-				if arrayItem {
-					return nil, true, false
-				}
-				delete(v, "encrypted_content")
-				changed = true
+			if arrayItem {
+				return nil, true, false
 			}
+			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
+				delete(v, "encrypted_content")
+			}
+			if len(v) == 1 {
+				return nil, true, false
+			}
+			changed = true
 		} else if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
 			delete(v, "encrypted_content")
 			changed = true
@@ -1002,6 +1041,51 @@ func responsesInputRaw(body []byte) string {
 		return ""
 	}
 	return input.Raw
+}
+
+func dropBareReasoningInputItems(body map[string]any) bool {
+	input, ok := body["input"]
+	if !ok {
+		return false
+	}
+	cleaned, changed, keep := dropBareReasoningInputValue(input)
+	if !changed {
+		return false
+	}
+	if keep {
+		body["input"] = cleaned
+	} else {
+		delete(body, "input")
+	}
+	return true
+}
+
+func dropBareReasoningInputValue(value any) (any, bool, bool) {
+	switch v := value.(type) {
+	case []any:
+		changed := false
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			cleaned, itemChanged, keep := dropBareReasoningInputValue(item)
+			if itemChanged {
+				changed = true
+			}
+			if !keep {
+				changed = true
+				continue
+			}
+			out = append(out, cleaned)
+		}
+		return out, changed, true
+	case map[string]any:
+		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" &&
+			firstNonEmptyAnyString(v["encrypted_content"]) == "" {
+			return nil, true, false
+		}
+		return v, false, true
+	default:
+		return value, false, true
+	}
 }
 
 func normalizeResponsesInputFileFields(item map[string]any) bool {
@@ -1283,11 +1367,32 @@ func normalizeResponsesFunctionTools(body map[string]any) bool {
 	}
 
 	modified := false
+	kept := make([]any, 0, len(tools))
 	for _, rawTool := range tools {
 		tool, ok := rawTool.(map[string]any)
-		if !ok || strings.TrimSpace(firstNonEmptyAnyString(tool["type"])) != "function" {
+		if !ok {
+			kept = append(kept, rawTool)
 			continue
 		}
+		toolType := strings.TrimSpace(firstNonEmptyAnyString(tool["type"]))
+		if toolType == "" {
+			// 上游对缺失或为 null 的工具 type 返回 400 "Unsupported tool
+			// type: None"（issue #219）。带 function 形态（function 子对象
+			// 或顶层 name）的工具按 OpenAI SDK 惯例视为 function；无法识别
+			// 形态的工具直接剔除，避免整个请求被上游拒绝。
+			function, _ := tool["function"].(map[string]any)
+			if function == nil &&
+				strings.TrimSpace(firstNonEmptyAnyString(tool["name"])) == "" {
+				modified = true
+				continue
+			}
+			tool["type"] = "function"
+			modified = true
+		} else if toolType != "function" {
+			kept = append(kept, tool)
+			continue
+		}
+		kept = append(kept, tool)
 		function, _ := tool["function"].(map[string]any)
 		if function == nil {
 			continue
@@ -1317,6 +1422,44 @@ func normalizeResponsesFunctionTools(body map[string]any) bool {
 			}
 		}
 		delete(tool, "function")
+		modified = true
+	}
+	if modified {
+		body["tools"] = kept
+	}
+	return modified
+}
+
+func normalizeResponsesToolChoice(body map[string]any) bool {
+	rawChoice, ok := body["tool_choice"]
+	if !ok {
+		return false
+	}
+	choice, ok := rawChoice.(map[string]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	toolType := strings.TrimSpace(firstNonEmptyAnyString(choice["type"]))
+	function, _ := choice["function"].(map[string]any)
+	name := strings.TrimSpace(firstNonEmptyAnyString(choice["name"]))
+	if toolType == "" && (function != nil || name != "") {
+		choice["type"] = "function"
+		toolType = "function"
+		modified = true
+	}
+	if toolType != "function" {
+		return modified
+	}
+	if name == "" && function != nil {
+		if nestedName := strings.TrimSpace(firstNonEmptyAnyString(function["name"])); nestedName != "" {
+			choice["name"] = nestedName
+			modified = true
+		}
+	}
+	if function != nil {
+		delete(choice, "function")
 		modified = true
 	}
 	return modified
@@ -1409,6 +1552,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 	normalizeResponsesStructuredOutputFormat(body)
 	normalizeResponsesFunctionTools(body)
+	normalizeResponsesToolChoice(body)
 	normalizeResponsesWebSearchTools(body)
 
 	// 5. 工具描述补充 + schema 清理 + 上游数量限制
@@ -1469,6 +1613,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	normalizeResponsesInputItemIDs(body)
+	dropBareReasoningInputItems(body)
 
 	// 保存展开后的 input 原始 JSON（用于响应缓存链路）
 	var expandedInputRaw string
@@ -1535,6 +1680,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 
 	normalizeResponsesStructuredOutputFormat(body)
 	normalizeResponsesFunctionTools(body)
+	normalizeResponsesToolChoice(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	if shouldInjectOpenAIResponsesImageGenerationTool(body) {
@@ -1748,12 +1894,29 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 			continue
 		}
 
-		if parsed.Type != "function" || parsed.Function == nil {
+		// type 缺失或为 null 时按 OpenAI SDK 惯例视为 function（前提是带
+		// function 对象）；上游对空 type 一律返回 400 "Unsupported tool
+		// type: None"（issue #219），无法识别形态的工具直接丢弃。
+		isFunction := parsed.Function != nil &&
+			(parsed.Type == "function" || parsed.Type == "")
+		if !isFunction {
+			if parsed.Type == "" {
+				// 无 function 对象但有顶层 name（Codex 格式缺 type）→ 补全
+				// type 后保留；其余直接丢弃。
+				var toolMap map[string]any
+				if json.Unmarshal(raw, &toolMap) == nil &&
+					strings.TrimSpace(firstNonEmptyAnyString(toolMap["name"])) != "" {
+					toolMap["type"] = "function"
+					normalizeFunctionToolParameters(toolMap)
+					tools = append(tools, toolMap)
+				}
+				continue
+			}
 			// 非 function 类型 → 透传原始 JSON
 			// 例外：把 web_search_preview 等变体归一为 web_search，
 			// Codex 上游只认裸 "web_search"。归一时保留白名单字段，
 			// 与 PrepareResponsesBody 路径行为一致。
-			if parsed.Type != "" && strings.HasPrefix(parsed.Type, "web_search") {
+			if strings.HasPrefix(parsed.Type, "web_search") {
 				var toolMap map[string]any
 				if json.Unmarshal(raw, &toolMap) == nil && toolMap != nil {
 					tools = append(tools, normalizeCodexWebSearchTool(toolMap))

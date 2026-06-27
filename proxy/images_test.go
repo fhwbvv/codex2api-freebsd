@@ -3,7 +3,10 @@ package proxy
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -11,11 +14,132 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imagestore"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
 const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+
+func TestBuildImagesAPIResponseCloudURL(t *testing.T) {
+	// 用本地 httptest 充当 S3 端点：PUT 返回 200 让上传成功；
+	// presign 是离线签名，生成的 GET 直链会指向该测试服务器。
+	fakeS3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"deadbeef"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(fakeS3.Close)
+
+	if err := imagestore.Configure(imagestore.Config{
+		Backend:        imagestore.BackendS3,
+		Endpoint:       fakeS3.URL,
+		Region:         "us-east-1",
+		Bucket:         "img-bucket",
+		AccessKey:      "AKIAEXAMPLE",
+		SecretKey:      "secretexample",
+		ForcePathStyle: true,
+	}); err != nil {
+		t.Fatalf("configure s3: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: t.TempDir()})
+	})
+
+	results := []imageCallResult{{Result: tinyPNGBase64, OutputFormat: "png", Model: "gpt-image-2"}}
+	out, err := buildImagesAPIResponse(context.Background(), results, 1710000000, nil, results[0], "url", cloudImageURLOnly)
+	if err != nil {
+		t.Fatalf("buildImagesAPIResponse: %v", err)
+	}
+	url := gjson.GetBytes(out, "data.0.url").String()
+	if !strings.HasPrefix(url, "http") || !strings.Contains(url, "X-Amz-Signature=") {
+		t.Fatalf("expected presigned cloud url, got %q", url)
+	}
+	if strings.HasPrefix(url, "data:") {
+		t.Fatalf("should not fall back to data url when S3 configured: %q", url)
+	}
+}
+
+func TestBuildImagesAPIResponseLocalFallsBackToDataURL(t *testing.T) {
+	if err := imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: t.TempDir()}); err != nil {
+		t.Fatalf("configure local: %v", err)
+	}
+	results := []imageCallResult{{Result: tinyPNGBase64, OutputFormat: "png"}}
+	out, err := buildImagesAPIResponse(context.Background(), results, 1710000000, nil, results[0], "url", nil)
+	if err != nil {
+		t.Fatalf("buildImagesAPIResponse: %v", err)
+	}
+	url := gjson.GetBytes(out, "data.0.url").String()
+	if !strings.HasPrefix(url, "data:image/png;base64,") {
+		t.Fatalf("expected data url fallback for local backend, got %q", url)
+	}
+}
+
+func TestImageGalleryPersisterRecordsAssetAndJob(t *testing.T) {
+	// 假 S3 端点：PUT 200 让上传成功；presign 离线签名生成直链。
+	fakeS3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"deadbeef"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(fakeS3.Close)
+	if err := imagestore.Configure(imagestore.Config{
+		Backend: imagestore.BackendS3, Endpoint: fakeS3.URL, Region: "us-east-1",
+		Bucket: "img-bucket", AccessKey: "AKIAEXAMPLE", SecretKey: "secretexample", ForcePathStyle: true,
+	}); err != nil {
+		t.Fatalf("configure s3: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: t.TempDir()})
+	})
+
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	p := &imageGalleryPersister{
+		h:        &Handler{db: db},
+		prompt:   "draw a cat",
+		apiKeyID: 7,
+		model:    "gpt-image-2",
+		start:    time.Now(),
+	}
+	image := imageCallResult{Result: tinyPNGBase64, OutputFormat: "png", Model: "gpt-image-2", Size: "1024x1024"}
+	url, ok := p.buildURL(ctx, image, 0)
+	if !ok || !strings.Contains(url, "X-Amz-Signature=") {
+		t.Fatalf("buildURL ok=%v url=%q", ok, url)
+	}
+	p.finalize(ctx)
+
+	// 应登记一条 asset，且 storage_path 为 s3:// ref。
+	assets, err := db.ListImageAssets(ctx, 1, 10)
+	if err != nil {
+		t.Fatalf("ListImageAssets: %v", err)
+	}
+	if assets.Total != 1 || len(assets.Assets) != 1 {
+		t.Fatalf("expected 1 asset, got total=%d len=%d", assets.Total, len(assets.Assets))
+	}
+	asset := assets.Assets[0]
+	if !imagestore.IsS3Ref(asset.StoragePath) {
+		t.Fatalf("asset storage_path not s3 ref: %q", asset.StoragePath)
+	}
+	if asset.JobID == 0 {
+		t.Fatalf("asset should be linked to a synthetic job, got job_id=0")
+	}
+
+	// synthetic job 应存在且标记为成功，携带 api_key_id。
+	job, err := db.GetImageGenerationJob(ctx, asset.JobID)
+	if err != nil {
+		t.Fatalf("GetImageGenerationJob: %v", err)
+	}
+	if job.Status != database.ImageJobSucceeded {
+		t.Fatalf("job status = %q, want succeeded", job.Status)
+	}
+	if job.APIKeyID != 7 {
+		t.Fatalf("job api_key_id = %d, want 7", job.APIKeyID)
+	}
+}
 
 func tinyPNGByteSize(t *testing.T) int {
 	t.Helper()
@@ -116,6 +240,87 @@ func TestExplicitlyRequestsImageGeneration(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := explicitlyRequestsImageGeneration(tc.body); got != tc.want {
 				t.Fatalf("explicitlyRequestsImageGeneration(%s) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResponsesBodyHasNaturalImageGenerationIntent(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{
+			name: "chinese_direct_generation",
+			body: []byte(`{"model":"gpt-5.5","input":"帮我生成一张赛博朋克风格的猫图片"}`),
+			want: true,
+		},
+		{
+			name: "prompt_compat_generation",
+			body: []byte(`{"model":"gpt-5.5","prompt":"画一张水彩风的山景"}`),
+			want: true,
+		},
+		{
+			name: "meme_generation_not_table",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张表情包"}`),
+			want: true,
+		},
+		{
+			name: "image_edit_text_part",
+			body: []byte(`{"model":"gpt-5.5","input":[{"role":"user","content":[{"type":"input_text","text":"edit this image to make the background blue"}]}]}`),
+			want: true,
+		},
+		{
+			name: "plain_chat",
+			body: []byte(`{"model":"gpt-5.5","input":"hello, explain this error"}`),
+			want: false,
+		},
+		{
+			name: "script_request",
+			body: []byte(`{"model":"gpt-5.5","input":"帮我写一个生成图片的 Python 脚本"}`),
+			want: false,
+		},
+		{
+			name: "api_question",
+			body: []byte(`{"model":"gpt-5.5","input":"介绍一下 image generation API 怎么调用"}`),
+			want: false,
+		},
+		{
+			name: "table_request",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张表格对比这些方案"}`),
+			want: false,
+		},
+		{
+			name: "diagram_code_request",
+			body: []byte(`{"model":"gpt-5.5","input":"生成一张架构图的 Mermaid 代码"}`),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := responsesBodyHasNaturalImageGenerationIntent(tc.body); got != tc.want {
+				t.Fatalf("responsesBodyHasNaturalImageGenerationIntent() = %v, want %v for %s", got, tc.want, tc.body)
+			}
+		})
+	}
+}
+
+func TestRawResponsesBodyShouldForceHTTPForImageGeneration(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want bool
+	}{
+		{"explicit_tool_choice", []byte(`{"model":"gpt-5.5","tool_choice":{"type":"image_generation"}}`), true},
+		{"natural_language_generation", []byte(`{"model":"gpt-5.5","input":"生成一张未来城市海报"}`), true},
+		{"plain_request", []byte(`{"model":"gpt-5.5","input":"hello"}`), false},
+		{"image_generation_code_request", []byte(`{"model":"gpt-5.5","input":"帮我写一个生成图片的 Python 脚本"}`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rawResponsesBodyShouldForceHTTPForImageGeneration(tc.body); got != tc.want {
+				t.Fatalf("rawResponsesBodyShouldForceHTTPForImageGeneration() = %v, want %v for %s", got, tc.want, tc.body)
 			}
 		})
 	}
@@ -377,7 +582,7 @@ func TestBuildImagesResponsesRequestIncludesEditImages(t *testing.T) {
 func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 	upstream := `data: {"type":"response.completed","response":{"created_at":1710000000,"usage":{"input_tokens":5,"output_tokens":9},"tool_usage":{"image_gen":{"images":1,"input_tokens":34,"output_tokens":1756}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","quality":"high","size":"1024x1024"}],"output":[{"type":"image_generation_call","result":"` + tinyPNGBase64 + `","revised_prompt":"draw a cat","output_format":"png"}]}}` + "\n\n"
 
-	out, usage, imageCount, imageLogInfo, err := collectImagesResponse(strings.NewReader(upstream), "b64_json", "gpt-image-2")
+	out, usage, imageCount, imageLogInfo, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
 	if err != nil {
 		t.Fatalf("collectImagesResponse returned error: %v", err)
 	}
@@ -413,12 +618,43 @@ func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
 	upstream := `data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"An error occurred while processing your request. Please include the request ID req-123."}}}` + "\n\n"
 
-	_, _, _, _, err := collectImagesResponse(strings.NewReader(upstream), "b64_json", "gpt-image-2")
+	_, _, _, _, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
 	if err == nil {
 		t.Fatal("collectImagesResponse returned nil error")
 	}
 	if got := err.Error(); !strings.Contains(got, "server_error") || !strings.Contains(got, "req-123") {
 		t.Fatalf("error = %q, want upstream code and request id", got)
+	}
+}
+
+func TestBuildImageErrorUsageLogRecordsFailure(t *testing.T) {
+	account := &auth.Account{DBID: 42, AccessToken: "token", PlanType: "plus"}
+	readErr := fmt.Errorf("upstream image generation failed: server_error")
+	usage := &UsageInfo{InputTokens: 12, OutputTokens: 3, TotalTokens: 15, PromptTokens: 12, CompletionTokens: 3}
+	imageLogInfo := imageUsageLogInfo{Count: 1, Width: 1024, Height: 1024, Bytes: 2048, Format: "png", Size: "1024x1024"}
+
+	logInput := buildImageErrorUsageLog(account, "/v1/images/generations", "gpt-image-2", "gpt-image-2", false, 1500, 1, true, readErr, usage, imageLogInfo)
+
+	if logInput.AccountID != 42 {
+		t.Fatalf("AccountID = %d, want 42", logInput.AccountID)
+	}
+	if logInput.StatusCode != http.StatusBadGateway {
+		t.Fatalf("StatusCode = %d, want %d", logInput.StatusCode, http.StatusBadGateway)
+	}
+	if logInput.DurationMs != 1500 {
+		t.Fatalf("DurationMs = %d, want 1500", logInput.DurationMs)
+	}
+	if !logInput.IsRetryAttempt || logInput.AttemptIndex != 2 {
+		t.Fatalf("retry fields = (%v, %d), want (true, 2)", logInput.IsRetryAttempt, logInput.AttemptIndex)
+	}
+	if logInput.ErrorMessage == "" {
+		t.Fatal("ErrorMessage is empty, want upstream failure detail")
+	}
+	if logInput.PromptTokens != 12 || logInput.CompletionTokens != 3 || logInput.TotalTokens != 15 {
+		t.Fatalf("token fields = (%d, %d, %d), want (12, 3, 15)", logInput.PromptTokens, logInput.CompletionTokens, logInput.TotalTokens)
+	}
+	if logInput.ImageCount != 1 || logInput.ImageWidth != 1024 || logInput.ImageFormat != "png" {
+		t.Fatalf("image fields = %#v, want count=1 width=1024 format=png", logInput)
 	}
 }
 

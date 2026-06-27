@@ -979,6 +979,49 @@ func TestPrepareResponsesBody_DefaultsIncludeForResponses(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_MergesReasoningInclude(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"reasoning":{"effort":"high"},
+		"include":["file_search_call.results"]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	include := gjson.GetBytes(got, "include").Array()
+	if len(include) != 2 {
+		t.Fatalf("include length = %d, want 2; body=%s", len(include), got)
+	}
+	if include[0].String() != "file_search_call.results" {
+		t.Fatalf("existing include not preserved first, got %s; body=%s", include[0].Raw, got)
+	}
+	if include[1].String() != codexReasoningEncryptedContentInclude {
+		t.Fatalf("reasoning include not appended, got %s; body=%s", include[1].Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_DoesNotDuplicateReasoningInclude(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"reasoning":{"effort":"high"},
+		"include":["reasoning.encrypted_content","file_search_call.results"]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	var count int
+	for _, item := range gjson.GetBytes(got, "include").Array() {
+		if item.String() == codexReasoningEncryptedContentInclude {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("reasoning include count = %d, want 1; body=%s", count, got)
+	}
+}
+
 func TestPrepareResponsesBody_ToolChoiceImageGenerationAutoInjectsTool(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -2132,6 +2175,73 @@ func TestStreamTranslator_FunctionCall(t *testing.T) {
 	}
 }
 
+func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
+
+	addedEvent := []byte(`{
+		"type":"response.output_item.added",
+		"output_index":0,
+		"item":{"type":"custom_tool_call","id":"ctc_001","call_id":"call_custom","name":"run_custom"}
+	}`)
+	chunk, done := st.Translate(addedEvent)
+	if done {
+		t.Fatal("should not be done after custom_tool_call added")
+	}
+	if chunk == nil {
+		t.Fatal("should emit chunk for custom_tool_call added")
+	}
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.id").String(); got != "call_custom" {
+		t.Fatalf("tool call id = %q, want call_custom; chunk=%s", got, chunk)
+	}
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.name").String(); got != "run_custom" {
+		t.Fatalf("tool call name = %q, want run_custom; chunk=%s", got, chunk)
+	}
+
+	deltaEvent := []byte(`{
+		"type":"response.custom_tool_call_input.delta",
+		"item_id":"ctc_001",
+		"delta":"{\"cmd\":"
+	}`)
+	chunk, done = st.Translate(deltaEvent)
+	if done {
+		t.Fatal("should not be done after custom_tool_call_input delta")
+	}
+	if chunk == nil {
+		t.Fatal("should emit chunk for custom_tool_call_input delta")
+	}
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `{"cmd":` {
+		t.Fatalf("custom tool input delta = %q, want arguments delta; chunk=%s", got, chunk)
+	}
+
+	callIDDeltaEvent := []byte(`{
+		"type":"response.custom_tool_call_input.delta",
+		"call_id":"call_custom",
+		"delta":"\"pwd\"}"
+	}`)
+	chunk, done = st.Translate(callIDDeltaEvent)
+	if done {
+		t.Fatal("should not be done after custom_tool_call_input call_id delta")
+	}
+	if chunk == nil {
+		t.Fatal("should emit chunk for custom_tool_call_input call_id delta")
+	}
+	if got := gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.function.arguments").String(); got != `"pwd"}` {
+		t.Fatalf("custom tool input call_id delta = %q, want arguments delta; chunk=%s", got, chunk)
+	}
+
+	completedEvent := []byte(`{
+		"type":"response.completed",
+		"response":{"usage":{"input_tokens":10,"output_tokens":5}}
+	}`)
+	chunk, done = st.Translate(completedEvent)
+	if !done {
+		t.Fatal("should be done after response.completed")
+	}
+	if finishReason := gjson.GetBytes(chunk, "choices.0.finish_reason").String(); finishReason != "tool_calls" {
+		t.Fatalf("expected finish_reason tool_calls, got %q", finishReason)
+	}
+}
+
 func TestStreamTranslator_TextOnly(t *testing.T) {
 	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 
@@ -2230,21 +2340,25 @@ func TestExtractToolCallsFromOutput(t *testing.T) {
 			"output":[
 				{"type":"message","content":[{"type":"output_text","text":"hi"}]},
 				{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"NYC\"}"},
-				{"type":"function_call","call_id":"call_2","name":"get_time","arguments":"{}"}
+				{"type":"function_call","call_id":"call_2","name":"get_time","arguments":"{}"},
+				{"type":"custom_tool_call","id":"call_3","name":"custom_exec","input":"{\"cmd\":\"pwd\"}"}
 			],
 			"usage":{"input_tokens":10,"output_tokens":5}
 		}
 	}`)
 
 	tcs := ExtractToolCallsFromOutput(event)
-	if len(tcs) != 2 {
-		t.Fatalf("expected 2 tool calls, got %d", len(tcs))
+	if len(tcs) != 3 {
+		t.Fatalf("expected 3 tool calls, got %d", len(tcs))
 	}
 	if tcs[0].ID != "call_1" || tcs[0].Name != "get_weather" {
 		t.Fatalf("first tool call mismatch: %+v", tcs[0])
 	}
 	if tcs[1].ID != "call_2" || tcs[1].Name != "get_time" {
 		t.Fatalf("second tool call mismatch: %+v", tcs[1])
+	}
+	if tcs[2].ID != "call_3" || tcs[2].Name != "custom_exec" || tcs[2].Arguments != `{"cmd":"pwd"}` {
+		t.Fatalf("custom tool call mismatch: %+v", tcs[2])
 	}
 }
 

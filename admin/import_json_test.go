@@ -448,6 +448,275 @@ func TestImportAccountsCommonDoesNotCollapseConflictingChatGPTAccountID(t *testi
 	}
 }
 
+func TestImportAccountsCommonUpdatesExistingOAuthIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	probed := make(chan int64, 1)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(_ context.Context, acc *auth.Account) error {
+			probed <- acc.DBID
+			return nil
+		},
+	}
+
+	existingID, err := db.InsertAccountWithCredentials(context.Background(), "existing", map[string]interface{}{
+		"refresh_token": "rt-old",
+		"email":         "import@example.com",
+		"account_id":    "acc-import",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken: "rt-new",
+		accessToken:  "at-new",
+		email:        "Import@Example.com",
+		accountID:    "acc-import",
+		planType:     "team",
+	}}, "")
+
+	select {
+	case id := <-probed:
+		if id != existingID {
+			t.Fatalf("probed account id = %d, want %d", id, existingID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered for updated OAuth identity")
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active rows = %d, want 1", len(rows))
+	}
+	row, err := db.GetAccountByID(context.Background(), existingID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("refresh_token"); got != "rt-new" {
+		t.Fatalf("refresh_token = %q, want rt-new", got)
+	}
+	if got := row.GetCredential("access_token"); got != "at-new" {
+		t.Fatalf("access_token = %q, want at-new", got)
+	}
+	if got := row.GetCredential("plan_type"); got != "team" {
+		t.Fatalf("plan_type = %q, want team", got)
+	}
+	if account := store.FindByID(existingID); account == nil {
+		t.Fatalf("runtime account %d not found after import update", existingID)
+	}
+}
+
+func TestImportAccountsCommonSkipsExistingOAuthIdentityWithSameCredentials(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			t.Fatal("usage probe should not run for unchanged duplicate import")
+			return nil
+		},
+	}
+
+	existingID, err := db.InsertAccountWithCredentials(context.Background(), "existing", map[string]interface{}{
+		"refresh_token": "rt-same",
+		"session_token": "st-same",
+		"access_token":  "at-same",
+		"email":         "same@example.com",
+		"account_id":    "acc-same",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken: "rt-same",
+		sessionToken: "st-same",
+		accessToken:  "at-same",
+		email:        "Same@Example.com",
+		accountID:    "acc-same",
+	}}, "")
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, recorder.Body.String())
+	}
+	if got := int(payload["success"].(float64)); got != 0 {
+		t.Fatalf("success = %d, want 0", got)
+	}
+	if got := int(payload["duplicate"].(float64)); got != 1 {
+		t.Fatalf("duplicate = %d, want 1", got)
+	}
+	if got := int(payload["total"].(float64)); got != 1 {
+		t.Fatalf("total = %d, want 1", got)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != existingID {
+		t.Fatalf("active rows = %+v, want only existing id %d", rows, existingID)
+	}
+}
+
+func TestImportAccountsCommonSkipsAmbiguousOAuthIdentityWithExistingAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	existingID, err := db.InsertAccountWithCredentials(context.Background(), "existing", map[string]interface{}{
+		"refresh_token": "rt-old",
+		"email":         "ambiguous@example.com",
+		"account_id":    "acc-ambiguous",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{refreshToken: "rt-new-1", email: "ambiguous@example.com", accountID: "acc-ambiguous"},
+		{refreshToken: "rt-new-2", email: "Ambiguous@Example.com", accountID: "acc-ambiguous"},
+	}, "")
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, recorder.Body.String())
+	}
+	if got := int(payload["success"].(float64)); got != 0 {
+		t.Fatalf("success = %d, want 0", got)
+	}
+	if got := int(payload["duplicate"].(float64)); got != 2 {
+		t.Fatalf("duplicate = %d, want 2", got)
+	}
+	if got := int(payload["total"].(float64)); got != 2 {
+		t.Fatalf("total = %d, want 2", got)
+	}
+
+	row, err := db.GetAccountByID(context.Background(), existingID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("refresh_token"); got != "rt-old" {
+		t.Fatalf("refresh_token = %q, want rt-old", got)
+	}
+}
+
+func TestImportAccountsCommonSkipsAmbiguousOAuthIdentityWithoutExistingAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{refreshToken: "rt-new-1", email: "new-ambiguous@example.com", accountID: "acc-new-ambiguous"},
+		{refreshToken: "rt-new-2", email: "New-Ambiguous@Example.com", accountID: "acc-new-ambiguous"},
+	}, "")
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v; body=%s", err, recorder.Body.String())
+	}
+	if got := int(payload["success"].(float64)); got != 0 {
+		t.Fatalf("success = %d, want 0", got)
+	}
+	if got := int(payload["duplicate"].(float64)); got != 2 {
+		t.Fatalf("duplicate = %d, want 2", got)
+	}
+	if got := int(payload["total"].(float64)); got != 2 {
+		t.Fatalf("total = %d, want 2", got)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("active rows = %d, want 0", len(rows))
+	}
+}
+
+func TestImportAccountsCommonCollapsesIdenticalOAuthIdentityInFile(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{
+		{refreshToken: "rt-same-file", accessToken: "at-same-file", email: "same-file@example.com", accountID: "acc-same-file"},
+		{refreshToken: "rt-same-file", accessToken: "at-same-file", email: "Same-File@Example.com", accountID: "acc-same-file"},
+	}, "")
+
+	if !strings.Contains(recorder.Body.String(), `"type":"complete"`) ||
+		!strings.Contains(recorder.Body.String(), `"success":1`) ||
+		!strings.Contains(recorder.Body.String(), `"total":1`) {
+		t.Fatalf("SSE payload = %q, want complete success=1 total=1", recorder.Body.String())
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active rows = %d, want 1", len(rows))
+	}
+	if got := rows[0].GetCredential("refresh_token"); got != "rt-same-file" {
+		t.Fatalf("refresh_token = %q, want rt-same-file", got)
+	}
+}
+
 func TestImportAccountsCommonTriggersUsageProbeForImportedAccountWithAccessToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -568,6 +837,66 @@ func TestImportAccountsCommonRefreshesAndProbesRTOnlyImport(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("usage probe was not triggered after RT-only import refresh")
+	}
+}
+
+func TestImportAccountsCommonRefreshesOAuthIdentityRTOnlyImport(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	refreshed := make(chan int64, 2)
+	probed := make(chan int64, 1)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		refreshAccount: func(_ context.Context, id int64) error {
+			refreshed <- id
+			acc := store.FindByID(id)
+			if acc == nil {
+				return fmt.Errorf("account %d not found", id)
+			}
+			acc.Mu().Lock()
+			acc.AccessToken = "at-oauth-identity-refreshed"
+			acc.Mu().Unlock()
+			return nil
+		},
+		probeUsage: func(_ context.Context, acc *auth.Account) error {
+			probed <- acc.DBID
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+
+	handler.importAccountsCommon(ctx, []importToken{{
+		refreshToken: "rt-oauth-identity-refresh-probe",
+		email:        "identity-refresh@example.com",
+		accountID:    "acc-identity-refresh",
+	}}, "")
+
+	select {
+	case id := <-probed:
+		if id == 0 {
+			t.Fatal("probed account id is zero")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered after OAuth identity RT-only import refresh")
+	}
+	select {
+	case id := <-refreshed:
+		if id == 0 {
+			t.Fatal("refreshed account id is zero")
+		}
+	default:
+		t.Fatal("refresh was not triggered")
+	}
+	select {
+	case id := <-refreshed:
+		t.Fatalf("refresh triggered more than once, second id=%d", id)
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 

@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+const pendingFirstTokenFlushBytes = 1024 * 1024
+
+var (
+	sseDataPrefix = []byte("data: ")
+	sseDataSuffix = []byte("\n\n")
+)
+
 type streamFlushWriter struct {
 	writer    io.Writer
 	flusher   http.Flusher
@@ -24,6 +31,44 @@ func newStreamFlushWriter(writer io.Writer, flusher http.Flusher) *streamFlushWr
 		policy:   settings.StreamFlushPolicy,
 		interval: currentStreamFlushInterval(),
 	}
+}
+
+func appendSSEData(buf *bytes.Buffer, data []byte) {
+	if buf == nil {
+		return
+	}
+	buf.Write(sseDataPrefix)
+	buf.Write(data)
+	buf.Write(sseDataSuffix)
+}
+
+func writeDeferredSSEData(streamWriter *streamFlushWriter, pending *bytes.Buffer, data []byte, shouldDefer bool) (bool, error) {
+	if streamWriter == nil {
+		return false, nil
+	}
+	if shouldDefer {
+		appendSSEData(pending, data)
+		if pending != nil && pending.Len() <= pendingFirstTokenFlushBytes {
+			return false, nil
+		}
+	}
+	if pending != nil && pending.Len() > 0 {
+		if !shouldDefer {
+			appendSSEData(pending, data)
+		}
+		if err := streamWriter.WriteBytes(pending.Bytes()); err != nil {
+			return false, err
+		}
+		pending.Reset()
+		return true, nil
+	}
+	if shouldDefer {
+		return false, nil
+	}
+	if err := streamWriter.WriteSSEData(data); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (w *streamFlushWriter) WriteString(data string) error {
@@ -47,10 +92,47 @@ func (w *streamFlushWriter) WriteString(data string) error {
 }
 
 func (w *streamFlushWriter) WriteBytes(data []byte) error {
-	if w == nil || len(data) == 0 {
+	if w == nil || w.writer == nil || len(data) == 0 {
 		return nil
 	}
-	return w.WriteString(string(data))
+	if w.policy != StreamFlushPolicyCoalesce {
+		if _, err := w.writer.Write(data); err != nil {
+			return err
+		}
+		w.flushTransport()
+		return nil
+	}
+	if _, err := w.buffer.Write(data); err != nil {
+		return err
+	}
+	if w.lastFlush.IsZero() || time.Since(w.lastFlush) >= w.interval {
+		return w.Flush()
+	}
+	return nil
+}
+
+func (w *streamFlushWriter) WriteSSEData(data []byte) error {
+	if w == nil || w.writer == nil {
+		return nil
+	}
+	if w.policy != StreamFlushPolicyCoalesce {
+		if _, err := w.writer.Write(sseDataPrefix); err != nil {
+			return err
+		}
+		if _, err := w.writer.Write(data); err != nil {
+			return err
+		}
+		if _, err := w.writer.Write(sseDataSuffix); err != nil {
+			return err
+		}
+		w.flushTransport()
+		return nil
+	}
+	appendSSEData(&w.buffer, data)
+	if w.lastFlush.IsZero() || time.Since(w.lastFlush) >= w.interval {
+		return w.Flush()
+	}
+	return nil
 }
 
 func (w *streamFlushWriter) Flush() error {

@@ -28,11 +28,13 @@ export interface AccountRow {
   name: string
   email: string
   email_domain?: string
+  chatgpt_account_id?: string
   plan_type: string
   subscription_expires_at?: string
   status: AccountStatus
   error_message?: string
   at_only?: boolean
+  access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
   base_url?: string
@@ -79,6 +81,7 @@ export interface AccountRow {
   rate_limit_attempts?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
+  rate_limit_reset_credits?: number | null
   auto_pause_5h_threshold?: number | null
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
@@ -110,12 +113,49 @@ export interface AccountRow {
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
 
+// AccountHealthBucket 是「健康状态」条单个时间窗口内的请求成败计数。
+export interface AccountHealthBucket {
+  success: number
+  failed: number
+}
+
+// AccountHealthBarsResponse 是 GET /api/accounts/health-bars 的响应。
+// buckets 按账号 ID（字符串）映射到由旧到新的 block_count 个时间桶。
+export interface AccountHealthBarsResponse {
+  buckets: Record<string, AccountHealthBucket[]>
+  block_count: number
+  block_minutes: number
+}
+
+export interface InviteItem {
+  referral_id?: string
+  email?: string
+  invite_url?: string
+}
+
+export interface InviteResult {
+  ok: boolean
+  status_code: number
+  request_id?: string
+  referral_key: string
+  emails: string[]
+  invites?: InviteItem[]
+  upstream?: unknown
+  upstream_raw?: string
+}
+
+export interface InviteResponse {
+  ok: boolean
+  result: InviteResult
+}
+
 export interface RecycleBinAccountRow {
   id: number
   name: string
   email: string
   plan_type: string
   at_only?: boolean
+  access_token_type?: string
   openai_responses_api?: boolean
   base_url?: string
   models?: string[]
@@ -180,6 +220,12 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
   auto_pause_7d_disabled?: boolean
+}
+
+export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
+  ids: number[]
+  enabled?: boolean
+  locked?: boolean
 }
 
 export interface AccountGroup {
@@ -630,6 +676,13 @@ export interface SystemSettings {
   prompt_filter_sensitive_words: string
   prompt_filter_custom_patterns: string
   prompt_filter_disabled_patterns: string
+  prompt_filter_review_enabled: boolean
+  prompt_filter_review_api_key?: string
+  prompt_filter_review_api_key_configured?: boolean
+  prompt_filter_review_base_url: string
+  prompt_filter_review_model: string
+  prompt_filter_review_timeout_seconds: number
+  prompt_filter_review_fail_closed: boolean
   client_compat_mode: 'preserve' | 'auto' | 'force' | string
   codex_min_cli_version: string
   usage_log_mode: 'full' | 'errors' | 'off' | string
@@ -641,6 +694,7 @@ export interface SystemSettings {
   first_token_timeout_seconds: number
   billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
+  public_key_usage_page_enabled: boolean
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
   image_s3_region: string
@@ -652,6 +706,8 @@ export interface SystemSettings {
   image_s3_force_path_style: boolean
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
+  auto_pause_5h_guard_band_percent: number
+  auto_pause_5h_guard_concurrency: number
 }
 
 export interface SetupHintsResponse {
@@ -681,8 +737,8 @@ export interface SetupHintsResponse {
 export interface PromptFilterMatch {
   name: string
   weight: number
-  category: string
-  strict: boolean
+  category?: string
+  strict?: boolean
 }
 
 export interface PromptFilterVerdict {
@@ -694,9 +750,13 @@ export interface PromptFilterVerdict {
   threshold: number
   strict_hit: boolean
   matched: PromptFilterMatch[]
-  text_preview: string
-  reason: string
+  text_preview?: string
+  reason?: string
   extracted_chars: number
+  reviewed?: boolean
+  review_flagged?: boolean
+  review_error?: string
+  review_model?: string
 }
 
 export interface PromptFilterLog {
@@ -711,11 +771,15 @@ export interface PromptFilterLog {
   threshold: number
   matched_patterns: string
   text_preview: string
+  full_text: string
   api_key_id: number
   api_key_name: string
   api_key_masked: string
   client_ip: string
   error_code: string
+  review_model: string
+  review_flagged: boolean
+  review_error: string
 }
 
 export interface PromptFilterLogsResponse {
@@ -727,6 +791,11 @@ export interface PromptFilterLogsResponse {
 
 export interface PromptFilterTestResponse {
   verdict: PromptFilterVerdict
+}
+
+export interface PromptFilterRulePatternTestResponse {
+  matched: boolean
+  error?: string
 }
 
 export interface PromptFilterRule {
@@ -979,8 +1048,19 @@ export interface APIKeyLimits {
   max_concurrency?: number
   cost_limit_5h?: number
   cost_limit_7d?: number
+  cost_limit_30d?: number
   token_limit_5h?: number
   token_limit_7d?: number
+  token_limit_30d?: number
+}
+
+export interface APIKeyWindowUsage {
+  requests?: number
+  tokens?: number
+  user_billed?: number
+  cost_5h: number
+  cost_7d: number
+  cost_30d: number
 }
 
 export interface APIKeyRow {
@@ -990,10 +1070,14 @@ export interface APIKeyRow {
   raw_key: string
   quota_limit: number
   quota_used: number
+  total_used: number
+  reset_count: number
+  last_reset_at?: ISODateString | null
   expires_at?: ISODateString | null
   status?: 'active' | 'expired' | 'quota_exhausted'
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
+  window_usage?: APIKeyWindowUsage
   created_at: ISODateString
 }
 
@@ -1014,10 +1098,115 @@ export interface UpdateAPIKeyRequest {
   name?: string
   quota_limit?: number | null
   quota?: number | null
+  reset_quota?: boolean
   expires_at?: string | null
   expires_in_days?: number
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
+}
+
+export interface PublicAPIKeyUsageKey {
+  name: string
+  key: string
+  quota_limit: number
+  quota_used: number
+  total_used: number
+  reset_count: number
+  last_reset_at?: ISODateString | null
+  expires_at?: ISODateString | null
+  limits: APIKeyLimits
+  status: 'active' | 'expired' | 'quota_exhausted'
+  created_at: ISODateString
+}
+
+export interface PublicAPIKeyUsageRange {
+  name: 'today' | '7d' | '30d' | 'all' | string
+  start?: ISODateString | null
+  end: ISODateString
+}
+
+export interface PublicAPIKeyWindowUsage {
+  requests: number
+  tokens: number
+  user_billed: number
+}
+
+export interface PublicAPIKeyUsageWindows {
+  last_5h: PublicAPIKeyWindowUsage
+  last_7d: PublicAPIKeyWindowUsage
+  last_30d: PublicAPIKeyWindowUsage
+}
+
+export interface PublicAPIKeyUsageSummary {
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  error_count: number
+  user_billed: number
+  avg_duration_ms: number
+  avg_first_token_ms: number
+  rpm: number
+  tpm: number
+}
+
+export interface PublicAPIKeyUsageBreakdown {
+  name: string
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  error_count: number
+  user_billed: number
+}
+
+export interface PublicAPIKeyUsageLog {
+  id: number
+  endpoint: string
+  model: string
+  effective_model: string
+  status_code: number
+  duration_ms: number
+  first_token_ms: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  total_tokens: number
+  user_billed: number
+  input_cost: number
+  output_cost: number
+  cache_read_cost: number
+  total_cost: number
+  input_price_per_mtoken: number
+  output_price_per_mtoken: number
+  cache_read_price_per_mtoken: number
+  rate_multiplier: number
+  long_context: boolean
+  service_tier: string
+  stream: boolean
+  compact: boolean
+  via_websocket: boolean
+  upstream_error_kind: string
+  created_at: ISODateString
+}
+
+export interface PublicAPIKeyUsageReport {
+  summary: PublicAPIKeyUsageSummary
+  windows: PublicAPIKeyUsageWindows
+  models: PublicAPIKeyUsageBreakdown[]
+  endpoints: PublicAPIKeyUsageBreakdown[]
+  recent_logs: PublicAPIKeyUsageLog[]
+  recent_logs_total: number
+  recent_logs_page: number
+  recent_logs_page_size: number
+}
+
+export interface PublicAPIKeyUsageResponse {
+  key: PublicAPIKeyUsageKey
+  range: PublicAPIKeyUsageRange
+  usage: PublicAPIKeyUsageReport
 }
 
 export interface CreateAPIKeyResponse {
@@ -1137,6 +1326,13 @@ export type ApiListResponse<K extends string, T> = {
 export interface OAuthURLResponse {
   auth_url: string
   session_id: string
+}
+
+export interface UpdateOAuthAccountRequest {
+  session_id: string
+  code: string
+  state: string
+  proxy_url?: string
 }
 
 export interface OAuthExchangeResponse {

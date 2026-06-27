@@ -54,20 +54,25 @@ type imagePromptTemplatePayload struct {
 }
 
 type imageGenerationJobPayload struct {
-	Prompt       string `json:"prompt"`
-	Model        string `json:"model"`
-	Size         string `json:"size"`
-	Quality      string `json:"quality"`
-	OutputFormat string `json:"output_format"`
-	Background   string `json:"background"`
-	Style        string `json:"style"`
-	Upscale      string `json:"upscale"`
-	APIKeyID     int64  `json:"api_key_id"`
+	Prompt       string   `json:"prompt"`
+	Model        string   `json:"model"`
+	Size         string   `json:"size"`
+	Quality      string   `json:"quality"`
+	OutputFormat string   `json:"output_format"`
+	Background   string   `json:"background"`
+	Style        string   `json:"style"`
+	Upscale      string   `json:"upscale"`
+	APIKeyID     int64    `json:"api_key_id"`
 	TemplateID   int64    `json:"template_id"`
 	InputImages  []string `json:"input_images"`
+	External     bool     `json:"-"`
 }
 
 type imageJobResponse struct {
+	Job *database.ImageGenerationJob `json:"job"`
+}
+
+type externalImageJobResponse struct {
 	Job *database.ImageGenerationJob `json:"job"`
 }
 
@@ -776,7 +781,7 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 		_ = h.db.MarkImageJobFailed(ctx, jobID, err.Error(), durationMs)
 		return
 	}
-	log.Printf("[image-studio] job=%d upstream request model=%s size=%s quality=%s format=%s body_bytes=%d prompt_chars=%d prompt=%q",
+	log.Printf("[image-studio] job=%d upstream request model=%s size=%s quality=%s format=%s body_bytes=%d prompt_chars=%d%s",
 		jobID,
 		imageLogValue(gjson.GetBytes(rawBody, "model").String()),
 		imageLogValue(gjson.GetBytes(rawBody, "size").String()),
@@ -784,7 +789,7 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 		imageLogValue(gjson.GetBytes(rawBody, "output_format").String()),
 		len(rawBody),
 		len([]rune(styledPrompt)),
-		imageLogPromptPreview(styledPrompt),
+		imageLogPromptSuffix(styledPrompt, req.External),
 	)
 	imageProxy := h.imageProxy
 	if imageProxy == nil {
@@ -803,7 +808,7 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 			return
 		}
 		fallbackStyledPrompt := proxy.AppendImageStyleToPrompt(fallbackReq.Prompt, fallbackReq.Style)
-		log.Printf("[image-studio] job=%d png_failed_retrying_jpeg upstream_status=%d error=%s fallback_size=%s fallback_quality=%s fallback_background=%s fallback_prompt_chars=%d fallback_prompt=%q",
+		log.Printf("[image-studio] job=%d png_failed_retrying_jpeg upstream_status=%d error=%s fallback_size=%s fallback_quality=%s fallback_background=%s fallback_prompt_chars=%d%s",
 			jobID,
 			pngStatus,
 			security.SanitizeLog(pngErr.Error()),
@@ -811,7 +816,7 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 			imageLogValue(fallbackReq.Quality),
 			imageLogValue(fallbackReq.Background),
 			len([]rune(fallbackStyledPrompt)),
-			imageLogPromptPreview(fallbackStyledPrompt),
+			imageLogPromptSuffix(fallbackStyledPrompt, req.External),
 		)
 		responseJSON, upstreamStatus, err = imageProxy.GenerateImageOnceForAdmin(ctx, fallbackBody, apiKey)
 		if err == nil {
@@ -1428,6 +1433,13 @@ func imageLogPromptPreview(prompt string) string {
 		prompt = string(runes[:96]) + "..."
 	}
 	return security.SanitizeLog(prompt)
+}
+
+func imageLogPromptSuffix(prompt string, redact bool) string {
+	if redact {
+		return ""
+	}
+	return fmt.Sprintf(" prompt=%q", imageLogPromptPreview(prompt))
 }
 
 func imageLogAPIKeyLabel(id int64, name string, masked string) string {

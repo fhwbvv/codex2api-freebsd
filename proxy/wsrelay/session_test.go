@@ -1,6 +1,9 @@
 package wsrelay
 
 import (
+	"bytes"
+	"log"
+	"strings"
 	"testing"
 	"time"
 )
@@ -129,5 +132,42 @@ func TestSessionConnectedState(t *testing.T) {
 	session.SetConnected(false)
 	if session.IsConnected() {
 		t.Error("session should not be connected after SetConnected(false)")
+	}
+}
+
+// TestSessionDeliverStreamChunkFullChannelNonBlocking verifies stream backpressure is observable and does not block.
+func TestSessionDeliverStreamChunkFullChannelNonBlocking(t *testing.T) {
+	session := NewSession(12345, nil)
+	session.ID = "test-session"
+	pr := session.AddPendingRequest("upstream-session")
+
+	for i := 0; i < cap(pr.StreamChan); i++ {
+		pr.StreamChan <- NewStreamChunkMessage(pr.RequestID, []byte("existing"))
+	}
+
+	var logBuf bytes.Buffer
+	originalOutput := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(originalOutput) })
+
+	start := time.Now()
+	delivered := session.DeliverStreamChunk(NewStreamChunkMessage(pr.RequestID, []byte("new")))
+	elapsed := time.Since(start)
+
+	if delivered {
+		t.Fatal("expected DeliverStreamChunk to return false when StreamChan is full")
+	}
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("DeliverStreamChunk blocked too long with full StreamChan: %v", elapsed)
+	}
+	if got := len(pr.StreamChan); got != cap(pr.StreamChan) {
+		t.Fatalf("expected StreamChan to remain full, len=%d cap=%d", got, cap(pr.StreamChan))
+	}
+
+	logOutput := logBuf.String()
+	for _, want := range []string{"stream channel full", "account=12345", "session=test-session", "requestID=" + pr.RequestID, "capacity=64", "length=64"} {
+		if !strings.Contains(logOutput, want) {
+			t.Fatalf("expected log output to contain %q, got %q", want, logOutput)
+		}
 	}
 }

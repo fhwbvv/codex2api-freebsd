@@ -3,7 +3,7 @@ package promptfilter
 import "regexp"
 
 var defaultPatternConfigs = []PatternConfig{
-	{Name: "credential_theft", Pattern: `(?i)\b(steal|dump|extract|exfiltrate)\s+(credentials?|passwords?|tokens?|cookies?)\b`, Weight: 100, Category: "malicious", Strict: true},
+	{Name: "credential_theft", Pattern: `(?i)(?:^|[.!?。！？]\s*)(steal|dump|extract|exfiltrate|harvest|grab)\b.{0,50}\b(?:credentials?|passwords?|tokens?|cookies?)\b|\b(write|generate|create|give|build|craft|make|show|provide|implement|code|script|tool|steps?|instructions?|how\s+to|how\s+(?:can|do)\s+i|help\s+me|i\s+want\s+to|please|can\s+you)\b.{0,100}\b(steal|dump|extract|exfiltrate|harvest|grab)\b.{0,50}\b(?:credentials?|passwords?|tokens?|cookies?)\b|(?:写|生成|给我|构造|制作|提供|实现).{0,50}(窃取|导出|转储|提取).{0,30}(凭证|密码|令牌|token|cookie)`, Weight: 100, Category: "malicious", Strict: true},
 	{Name: "malware_family", Pattern: `(?i)\b(keylogger|ransomware|trojan|backdoor|botnet|infostealer)\b`, Weight: 80, Category: "malware", Strict: true},
 	{Name: "evasion", Pattern: `(?i)\b(bypass|disable|evade)\s+(av|edr|defender|antivirus|endpoint\s+detection)\b|免杀|绕过\s*(杀软|edr)`, Weight: 80, Category: "evasion", Strict: true},
 	{Name: "persistence", Pattern: `(?i)\b(persistence|persist(?:ent)?\s+access|startup\s+persistence|registry\s+run\s+key)\b`, Weight: 35, Category: "post_exploitation"},
@@ -69,6 +69,18 @@ var defaultPatternConfigs = []PatternConfig{
 	{Name: "race_condition_exploit", Pattern: `(?i)\b(race\s+condition\s+exploit|toctou|time[-\s]?of[-\s]?check\s+time[-\s]?of[-\s]?use)\b|竞态条件漏洞`, Weight: 30, Category: "exploit"},
 	{Name: "hardware_implant", Pattern: `(?i)\b(hardware\s+implant|usb\s+rubber\s+ducky|malicious\s+usb|hardware\s+keylogger)\b|硬件植入|恶意usb`, Weight: 60, Category: "physical_attack", Strict: true},
 	{Name: "social_media_hijack", Pattern: `(?i)\b(account\s+takeover|social\s+media\s+hijacking|credential\s+stuffing)\b|账号接管|撞库攻击`, Weight: 40, Category: "credential_attack"},
+}
+
+var sensitiveRedactionPatterns = []struct {
+	re          *regexp.Regexp
+	replacement string
+}{
+	{regexp.MustCompile(`(?i)\b(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s,;]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)(["']?\b(?:password|passwd|pwd|token|api[_-]?key|secret|client[_-]?secret|access[_-]?token|refresh[_-]?token|session[_-]?id)\b["']?\s*[:=]\s*["']?)[^"',\s}]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)\b(cookie\s*[:=]\s*)[^\n]+`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`\bsk-[A-Za-z0-9][A-Za-z0-9_-]{7,}\b`), `[REDACTED_API_KEY]`},
+	{regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`), `[REDACTED_JWT]`},
+	{regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b`), `[REDACTED_EMAIL]`},
 }
 
 var defensiveContextPatterns = []*regexp.Regexp{

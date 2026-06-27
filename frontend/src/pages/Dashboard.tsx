@@ -7,6 +7,8 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import StatCard from '../components/StatCard'
 import UsageStatsSummary from '../components/UsageStatsSummary'
+import TimeRangeSelector from '../components/TimeRangeSelector'
+import SystemHealthBar from '../components/SystemHealthBar'
 import type { StatsResponse, SystemSettings, UsageStats, ChartAggregation } from '../types'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { Card, CardContent } from '@/components/ui/card'
@@ -153,6 +155,12 @@ export default function Dashboard() {
           title={t('dashboard.title')}
           description={t('dashboard.description')}
           onRefresh={() => { void reload(); void loadChartData() }}
+          actions={
+            <TimeRangeSelector
+              timeRange={timeRange}
+              onTimeRangeChange={setTimeRange}
+            />
+          }
         />
 
         {/* Account status */}
@@ -174,6 +182,11 @@ export default function Dashboard() {
           <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} />
         </div>
 
+        {/* System health */}
+        <div className="mb-6">
+          <SystemHealthBar chartData={chartData} timeRange={timeRange} loading={chartLoading} />
+        </div>
+
         {/* Usage stats */}
         {usageStats && (
           <div className="space-y-6">
@@ -188,7 +201,6 @@ export default function Dashboard() {
                 refreshedAt={chartRefreshedAt}
                 refreshIntervalMs={DASHBOARD_REFRESH_INTERVAL_MS}
                 timeRange={timeRange}
-                onTimeRangeChange={setTimeRange}
                 loading={chartLoading}
               />
             </Suspense>

@@ -26,6 +26,21 @@ var (
 )
 
 const defaultLogDir = "logs"
+const upstreamErrorLogBodyMaxBytes = 8 * 1024
+
+func upstreamErrorLogBody(body []byte) string {
+	truncated := false
+	if len(body) > upstreamErrorLogBodyMaxBytes {
+		body = body[:upstreamErrorLogBodyMaxBytes]
+		truncated = true
+	}
+	bodyStr := security.MaskSensitiveData(string(body))
+	bodyStr = security.SafeTruncate(bodyStr, 5000)
+	if truncated {
+		bodyStr += " ... [truncated]"
+	}
+	return bodyStr
+}
 
 func errorLogDir() string {
 	if dir := strings.TrimSpace(os.Getenv("LOG_DIR")); dir != "" {
@@ -73,11 +88,7 @@ func (fl *fileLogger) writeEntry(endpoint string, statusCode int, model string, 
 	// 脱敏日志内容
 	safeEndpoint := security.SanitizeLog(endpoint)
 	safeModel := security.SanitizeLog(model)
-	bodyStr := string(body)
-
-	// 检查并脱敏响应体中的敏感信息
-	bodyStr = security.MaskSensitiveData(bodyStr)
-	bodyStr = security.SafeTruncate(bodyStr, 5000) // 限制日志大小
+	bodyStr := upstreamErrorLogBody(body)
 
 	ts := time.Now().Format("2006/01/02 15:04:05")
 	l.Printf("========== %s ==========\nEndpoint: %s\nStatus: %d\nModel: %s\nAccount: %d\nResponse:\n%s\n",

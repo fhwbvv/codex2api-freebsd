@@ -62,11 +62,22 @@ func TestPremium5hRateLimitExpiresAndUsageProbeResumes(t *testing.T) {
 	}
 }
 
-func TestPremium5hRateLimitedSkipsUsageProbeBeforeReset(t *testing.T) {
+func TestPremium5hRateLimitedSkipsResponsesProbeButRefreshesResetCredits(t *testing.T) {
 	acc := newPremium5hTestAccount("pro", time.Now().Add(30*time.Minute))
 
+	// premium 5h 限流期间，重置次数过期时仍允许探针——但必须是 wham-only（InLimitedState=true），
+	// 不会发 /responses 加重限流。
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = false, want true to refresh stale reset credits during premium 5h limit")
+	}
+	if !acc.InLimitedState() {
+		t.Fatal("InLimitedState() = false, want true during premium 5h limit so the probe stays wham-only")
+	}
+
+	// 重置次数刚探测过：limit 未到期前不应再触发探针。
+	acc.MarkResetCreditsProbed(time.Now())
 	if acc.NeedsUsageProbe(10 * time.Minute) {
-		t.Fatal("NeedsUsageProbe() = true, want false before premium 5h reset time")
+		t.Fatal("NeedsUsageProbe() = true, want false before premium 5h reset once reset credits are fresh")
 	}
 }
 

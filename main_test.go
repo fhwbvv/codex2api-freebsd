@@ -11,6 +11,122 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func TestConfigureTrustedProxiesRejectsForwardedForSpoofing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	if err := configureTrustedProxies(r, nil); err != nil {
+		t.Fatalf("configureTrustedProxies() error = %v", err)
+	}
+	r.GET("/client-ip", func(c *gin.Context) {
+		c.String(http.StatusOK, c.ClientIP())
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/client-ip", nil)
+	req.RemoteAddr = "203.0.113.10:12345"
+	req.Header.Set("X-Forwarded-For", "127.0.0.1")
+	req.Header.Set("X-Real-IP", "127.0.0.1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "203.0.113.10" {
+		t.Fatalf("ClientIP() = %q, want remote addr and not spoofed loopback", got)
+	}
+}
+
+func TestConfigureTrustedProxiesHonorsTrustedProxyList(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	if err := configureTrustedProxies(r, []string{"10.0.0.0/8", "192.168.1.1"}); err != nil {
+		t.Fatalf("configureTrustedProxies() error = %v", err)
+	}
+	r.GET("/client-ip", func(c *gin.Context) {
+		c.String(http.StatusOK, c.ClientIP())
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/client-ip", nil)
+	req.RemoteAddr = "10.1.2.3:12345"
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	r.ServeHTTP(w, req)
+	if got := strings.TrimSpace(w.Body.String()); got != "198.51.100.7" {
+		t.Fatalf("trusted proxy ClientIP() = %q, want forwarded client 198.51.100.7", got)
+	}
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/client-ip", nil)
+	req.RemoteAddr = "203.0.113.10:12345"
+	req.Header.Set("X-Forwarded-For", "198.51.100.7")
+	r.ServeHTTP(w, req)
+	if got := strings.TrimSpace(w.Body.String()); got != "203.0.113.10" {
+		t.Fatalf("untrusted source ClientIP() = %q, want remote addr 203.0.113.10", got)
+	}
+}
+
+func TestConfigureTrustedProxiesRejectsInvalidEntry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	if err := configureTrustedProxies(r, []string{"not-an-ip"}); err == nil {
+		t.Fatal("configureTrustedProxies() error = nil, want error for invalid proxy entry")
+	}
+}
+
+func TestConfigureTrustedProxiesAllowsLoopbackWAF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	if err := configureTrustedProxies(r, []string{"127.0.0.1", "::1"}); err != nil {
+		t.Fatalf("configureTrustedProxies() error = %v", err)
+	}
+	r.GET("/client-ip", func(c *gin.Context) {
+		c.String(http.StatusOK, c.ClientIP())
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/client-ip", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.42")
+	req.Header.Set("X-Real-IP", "127.0.0.1")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "203.0.113.42" {
+		t.Fatalf("ClientIP() = %q, want forwarded client IP from trusted loopback proxy", got)
+	}
+}
+
+func TestConfigureTrustedProxiesAllowsDockerWAF(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	r := gin.New()
+	if err := configureTrustedProxies(r, []string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}); err != nil {
+		t.Fatalf("configureTrustedProxies() error = %v", err)
+	}
+	r.GET("/client-ip", func(c *gin.Context) {
+		c.String(http.StatusOK, c.ClientIP())
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/client-ip", nil)
+	req.RemoteAddr = "172.18.0.2:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.42")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "203.0.113.42" {
+		t.Fatalf("ClientIP() = %q, want forwarded client IP from trusted Docker proxy", got)
+	}
+}
+
 func TestLoggerMiddlewareRedactsSensitiveContext(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -54,5 +170,4 @@ func TestLoggerMiddlewareRedactsSensitiveContext(t *testing.T) {
 			t.Fatalf("log output missing %q: %s", expected, got)
 		}
 	}
-
 }

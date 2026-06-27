@@ -10,7 +10,7 @@ import StateShell from "../components/StateShell";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
 import { useDataLoader } from "../hooks/useDataLoader";
 import { useToast } from "../hooks/useToast";
-import type { AccountGroup, APIKeyLimits, APIKeyRow } from "../types";
+import type { AccountGroup, APIKeyLimits, APIKeyRow, APIKeyWindowUsage, SystemSettings } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
 import { Badge } from "@/components/ui/badge";
@@ -32,11 +32,13 @@ import {
   CircleDollarSign,
   Eye,
   EyeOff,
+  ExternalLink,
   Fingerprint,
   KeyRound,
   LockKeyhole,
   Pencil,
   Plus,
+  RotateCcw,
   ShieldCheck,
   Trash2,
 } from "lucide-react";
@@ -71,10 +73,13 @@ interface LimitsFormState {
   maxConcurrency: string;
   costLimit5h: string;
   costLimit7d: string;
+  costLimit30d: string;
   tokenLimit5h: string;
   tokenLimit5hUnit: TokenLimitUnit;
   tokenLimit7d: string;
   tokenLimit7dUnit: TokenLimitUnit;
+  tokenLimit30d: string;
+  tokenLimit30dUnit: TokenLimitUnit;
 }
 
 const TOKEN_LIMIT_UNIT_MULTIPLIERS: Record<TokenLimitUnit, number> = {
@@ -94,10 +99,13 @@ const emptyLimitsForm: LimitsFormState = {
   maxConcurrency: "",
   costLimit5h: "",
   costLimit7d: "",
+  costLimit30d: "",
   tokenLimit5h: "",
   tokenLimit5hUnit: "token",
   tokenLimit7d: "",
   tokenLimit7dUnit: "token",
+  tokenLimit30d: "",
+  tokenLimit30dUnit: "token",
 };
 
 const initialCreateForm: CreateKeyFormState = {
@@ -131,12 +139,14 @@ export default function APIKeys() {
   const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
+  const [editTab, setEditTab] = useState<"basic" | "limits">("basic");
   const [saving, setSaving] = useState(false);
+  const [savingPublicUsagePage, setSavingPublicUsagePage] = useState(false);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
 
   const loadKeys = useCallback(async () => {
-    const [keysResponse, groupsResponse, modelsResponse] = await Promise.all([
+    const [keysResponse, groupsResponse, modelsResponse, settingsResponse] = await Promise.all([
       api.getAPIKeys(),
       api.listAccountGroups().catch(() => ({ groups: [] })),
       api
@@ -144,11 +154,13 @@ export default function APIKeys() {
         .catch(() => ({ models: [] as string[] })) as Promise<{
         models?: string[];
       }>,
+      api.getSettings().catch((): SystemSettings | null => null),
     ]);
     return {
       keys: keysResponse.keys ?? [],
       groups: groupsResponse.groups ?? [],
       modelOptions: modelsResponse.models ?? [],
+      settings: settingsResponse,
     };
   }, []);
 
@@ -156,13 +168,20 @@ export default function APIKeys() {
     keys: APIKeyRow[];
     groups: AccountGroup[];
     modelOptions: string[];
+    settings: SystemSettings | null;
   }>({
-    initialData: { keys: [], groups: [], modelOptions: [] },
+    initialData: { keys: [], groups: [], modelOptions: [], settings: null },
     load: loadKeys,
   });
   const keys = data.keys;
   const groups = data.groups;
   const modelOptions = data.modelOptions;
+  const publicUsagePageEnabled = data.settings?.public_key_usage_page_enabled ?? true;
+
+  const keyUsageUrl = useMemo(() => {
+    if (typeof window === "undefined") return "/key-usage";
+    return `${window.location.origin}/key-usage`;
+  }, []);
 
   const latestKey = useMemo(() => {
     return keys
@@ -192,6 +211,25 @@ export default function APIKeys() {
   const closeCreateDialog = () => {
     if (creating) return;
     setCreateDialogOpen(false);
+  };
+
+  const handleTogglePublicUsagePage = async () => {
+    const nextEnabled = !publicUsagePageEnabled;
+    setSavingPublicUsagePage(true);
+    try {
+      await api.updateSettings({ public_key_usage_page_enabled: nextEnabled });
+      showToast(
+        nextEnabled
+          ? t("apiKeys.publicUsageEnabledToast")
+          : t("apiKeys.publicUsageDisabledToast"),
+        "success",
+      );
+      await reload();
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    } finally {
+      setSavingPublicUsagePage(false);
+    }
   };
 
   const handleCreateKey = async (event?: FormEvent<HTMLFormElement>) => {
@@ -273,6 +311,37 @@ export default function APIKeys() {
     }
   };
 
+  const [resettingIds, setResettingIds] = useState<Set<number>>(new Set());
+
+  const handleResetQuota = async (keyRow: APIKeyRow) => {
+    const confirmed = await confirm({
+      title: t("apiKeys.resetQuotaTitle"),
+      description: t("apiKeys.resetQuotaDesc"),
+      confirmText: t("apiKeys.resetQuotaConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+
+    setResettingIds((prev) => new Set(prev).add(keyRow.id));
+    try {
+      await api.updateAPIKey(keyRow.id, { reset_quota: true });
+      showToast(t("apiKeys.resetQuotaSuccess"));
+      void reload();
+    } catch (error) {
+      showToast(
+        `${t("apiKeys.resetQuotaFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setResettingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(keyRow.id);
+        return next;
+      });
+    }
+  };
+
   const handleCopy = async (text: string) => {
     try {
       if (navigator.clipboard?.writeText) {
@@ -325,6 +394,7 @@ export default function APIKeys() {
     if (saving) return;
     setEditingKey(null);
     setEditForm(initialEditForm);
+    setEditTab("basic");
   };
 
   const updateEditForm = (patch: Partial<EditKeyFormState>) => {
@@ -590,6 +660,19 @@ export default function APIKeys() {
                                     />
                                   </div>
                                 ) : null}
+                                {keyRow.total_used > 0 ? (
+                                  <div className="text-[11px] text-muted-foreground">
+                                    {t("apiKeys.totalUsedLabel", { amount: formatUSD(keyRow.total_used) })}
+                                    {keyRow.reset_count > 0 ? (
+                                      <span className="ml-1.5">
+                                        ({t("apiKeys.resetCountLabel", { count: keyRow.reset_count })})
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                ) : null}
+                                {keyRow.window_usage && keyRow.limits ? (
+                                  <WindowCostBars limits={keyRow.limits} usage={keyRow.window_usage} />
+                                ) : null}
                               </div>
                             </TableCell>
                             <TableCell className="text-muted-foreground">
@@ -602,6 +685,20 @@ export default function APIKeys() {
                             </TableCell>
                             <TableCell>
                               <div className="flex justify-end gap-1.5">
+                                {keyRow.quota_limit > 0 ? (
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={resettingIds.has(keyRow.id)}
+                                    onClick={() =>
+                                      void handleResetQuota(keyRow)
+                                    }
+                                    title={t("apiKeys.resetQuota")}
+                                  >
+                                    <RotateCcw className="size-3.5" />
+                                    {t("apiKeys.resetQuota")}
+                                  </Button>
+                                ) : null}
                                 <Button
                                   variant="outline"
                                   size="sm"
@@ -655,16 +752,76 @@ export default function APIKeys() {
                   <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
                     {t("apiKeys.keyAuthNote")}
                   </p>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <Badge
+                      variant={publicUsagePageEnabled ? "secondary" : "outline"}
+                      className={publicUsagePageEnabled ? "text-emerald-700 dark:text-emerald-400" : "text-muted-foreground"}
+                    >
+                      {publicUsagePageEnabled
+                        ? t("apiKeys.publicUsageEnabled")
+                        : t("apiKeys.publicUsageDisabled")}
+                    </Badge>
+                    <span className="text-xs text-muted-foreground">
+                      {t("apiKeys.publicUsageDesc")}
+                    </span>
+                  </div>
+                  {publicUsagePageEnabled ? (
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold text-muted-foreground">
+                        {t("apiKeys.publicUsageUrlLabel")}
+                      </span>
+                      <code
+                        className="min-w-0 max-w-full truncate rounded-md bg-muted px-2 py-1 font-mono text-[12px] text-foreground"
+                        title={keyUsageUrl}
+                      >
+                        {keyUsageUrl}
+                      </code>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        onClick={() => void handleCopy(keyUsageUrl)}
+                        title={t("apiKeys.publicUsageCopyUrl")}
+                      >
+                        <Copy className="size-3.5" />
+                      </Button>
+                      <a
+                        href={keyUsageUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:underline"
+                      >
+                        <ExternalLink className="size-3.5" />
+                        {t("apiKeys.publicUsageOpen")}
+                      </a>
+                    </div>
+                  ) : null}
                 </div>
               </div>
-              <Button
-                variant="outline"
-                onClick={() => setCreateDialogOpen(true)}
-                className="shrink-0"
-              >
-                <Plus className="size-3.5" />
-                {t("apiKeys.createKey")}
-              </Button>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <Button
+                  variant={publicUsagePageEnabled ? "outline" : "default"}
+                  onClick={() => void handleTogglePublicUsagePage()}
+                  disabled={savingPublicUsagePage}
+                >
+                  {publicUsagePageEnabled ? (
+                    <EyeOff className="size-3.5" />
+                  ) : (
+                    <Eye className="size-3.5" />
+                  )}
+                  {savingPublicUsagePage
+                    ? t("common.saving")
+                    : publicUsagePageEnabled
+                      ? t("apiKeys.disablePublicUsage")
+                      : t("apiKeys.enablePublicUsage")}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => setCreateDialogOpen(true)}
+                >
+                  <Plus className="size-3.5" />
+                  {t("apiKeys.createKey")}
+                </Button>
+              </div>
             </CardContent>
           </Card>
         </div>
@@ -847,97 +1004,127 @@ export default function APIKeys() {
                 </div>
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-2">
-                <FormField label={t("apiKeys.nameLabel")}>
-                  <Input
-                    placeholder={t("apiKeys.keyNamePlaceholder")}
-                    value={editForm.name}
-                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      updateEditForm({ name: event.target.value })
-                    }
-                    autoFocus
-                  />
-                </FormField>
-                <FormField
-                  label={t("apiKeys.quotaLimitLabel")}
-                  icon={<CircleDollarSign className="size-3.5" />}
+              <div className="flex gap-1 rounded-xl border border-border bg-muted/50 p-1">
+                <button
+                  type="button"
+                  onClick={() => setEditTab("basic")}
+                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
+                    editTab === "basic"
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
                 >
-                  <Input
-                    type="number"
-                    min="0"
-                    step="0.000001"
-                    inputMode="decimal"
-                    placeholder={t("apiKeys.quotaLimitPlaceholder")}
-                    value={editForm.quotaLimit}
-                    onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                      updateEditForm({ quotaLimit: event.target.value })
-                    }
-                  />
-                </FormField>
+                  {t("apiKeys.editTabBasic")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEditTab("limits")}
+                  className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
+                    editTab === "limits"
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {t("apiKeys.editTabLimits")}
+                </button>
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-2">
-                <FormField
-                  label={t("apiKeys.expireModeLabel")}
-                  icon={<CalendarClock className="size-3.5" />}
-                >
-                  <Select
-                    value={editForm.expireMode}
-                    onValueChange={(value) =>
-                      updateEditForm({ expireMode: value as ExpireMode })
-                    }
-                    options={expireOptions}
-                    compact
-                  />
-                </FormField>
-                {editForm.expireMode === "custom" ? (
-                  <FormField label={t("apiKeys.expiresAtLabel")}>
-                    <Input
-                      type="datetime-local"
-                      value={editForm.expiresAt}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
-                        updateEditForm({ expiresAt: event.target.value })
+              {editTab === "basic" ? (
+                <>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <FormField label={t("apiKeys.nameLabel")}>
+                      <Input
+                        placeholder={t("apiKeys.keyNamePlaceholder")}
+                        value={editForm.name}
+                        onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                          updateEditForm({ name: event.target.value })
+                        }
+                        autoFocus
+                      />
+                    </FormField>
+                    <FormField
+                      label={t("apiKeys.quotaLimitLabel")}
+                      icon={<CircleDollarSign className="size-3.5" />}
+                    >
+                      <Input
+                        type="number"
+                        min="0"
+                        step="0.000001"
+                        inputMode="decimal"
+                        placeholder={t("apiKeys.quotaLimitPlaceholder")}
+                        value={editForm.quotaLimit}
+                        onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                          updateEditForm({ quotaLimit: event.target.value })
+                        }
+                      />
+                    </FormField>
+                  </div>
+
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <FormField
+                      label={t("apiKeys.expireModeLabel")}
+                      icon={<CalendarClock className="size-3.5" />}
+                    >
+                      <Select
+                        value={editForm.expireMode}
+                        onValueChange={(value) =>
+                          updateEditForm({ expireMode: value as ExpireMode })
+                        }
+                        options={expireOptions}
+                        compact
+                      />
+                    </FormField>
+                    {editForm.expireMode === "custom" ? (
+                      <FormField label={t("apiKeys.expiresAtLabel")}>
+                        <Input
+                          type="datetime-local"
+                          value={editForm.expiresAt}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            updateEditForm({ expiresAt: event.target.value })
+                          }
+                        />
+                      </FormField>
+                    ) : editForm.expireMode === "never" ? (
+                      <div className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                        {t("apiKeys.clearExpirationHint")}
+                      </div>
+                    ) : (
+                      <div className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                        {t("apiKeys.relativeExpirationHint", {
+                          days: editForm.expireMode,
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <FormField
+                    label={t("apiKeys.allowedGroupsLabel")}
+                    icon={<ShieldCheck className="size-3.5" />}
+                    as="div"
+                  >
+                    <GroupMultiSelect
+                      groups={groups}
+                      value={editForm.allowedGroupIds}
+                      onChange={(allowedGroupIds) =>
+                        updateEditForm({ allowedGroupIds })
                       }
+                      allLabel={t("apiKeys.allowedGroupsAll")}
+                      placeholder={t("apiKeys.allowedGroupsPlaceholder")}
+                      emptyLabel={t("accounts.groupsNone")}
                     />
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      {t("apiKeys.allowedGroupsHint")}
+                    </p>
                   </FormField>
-                ) : editForm.expireMode === "never" ? (
-                  <div className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
-                    {t("apiKeys.clearExpirationHint")}
-                  </div>
-                ) : (
-                  <div className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
-                    {t("apiKeys.relativeExpirationHint", {
-                      days: editForm.expireMode,
-                    })}
-                  </div>
-                )}
-              </div>
-
-              <FormField
-                label={t("apiKeys.allowedGroupsLabel")}
-                icon={<ShieldCheck className="size-3.5" />}
-                as="div"
-              >
-                <GroupMultiSelect
-                  groups={groups}
-                  value={editForm.allowedGroupIds}
-                  onChange={(allowedGroupIds) =>
-                    updateEditForm({ allowedGroupIds })
-                  }
-                  allLabel={t("apiKeys.allowedGroupsAll")}
-                  placeholder={t("apiKeys.allowedGroupsPlaceholder")}
-                  emptyLabel={t("accounts.groupsNone")}
+                </>
+              ) : (
+                <LimitsEditor
+                  value={editForm.limits}
+                  onChange={(limits) => updateEditForm({ limits })}
+                  modelOptions={modelOptions}
+                  expanded
                 />
-                <p className="mt-1.5 text-xs text-muted-foreground">
-                  {t("apiKeys.allowedGroupsHint")}
-                </p>
-              </FormField>
-
-              <LimitsEditor
-                value={editForm.limits}
-                onChange={(limits) => updateEditForm({ limits })}
-                modelOptions={modelOptions}
-              />
+              )}
             </form>
           ) : null}
         </Modal>
@@ -987,6 +1174,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
   if (!limits) return emptyLimitsForm;
   const token5h = formatTokenLimitForForm(limits.token_limit_5h);
   const token7d = formatTokenLimitForForm(limits.token_limit_7d);
+  const token30d = formatTokenLimitForForm(limits.token_limit_30d);
   return {
     modelAllow: Array.isArray(limits.model_allow) ? limits.model_allow : [],
     modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
@@ -1004,10 +1192,16 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.cost_limit_7d && limits.cost_limit_7d > 0
         ? String(limits.cost_limit_7d)
         : "",
+    costLimit30d:
+      limits.cost_limit_30d && limits.cost_limit_30d > 0
+        ? String(limits.cost_limit_30d)
+        : "",
     tokenLimit5h: token5h.value,
     tokenLimit5hUnit: token5h.unit,
     tokenLimit7d: token7d.value,
     tokenLimit7dUnit: token7d.unit,
+    tokenLimit30d: token30d.value,
+    tokenLimit30dUnit: token30d.unit,
   };
 }
 
@@ -1058,8 +1252,10 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     max_concurrency: intNum(form.maxConcurrency),
     cost_limit_5h: num(form.costLimit5h),
     cost_limit_7d: num(form.costLimit7d),
+    cost_limit_30d: num(form.costLimit30d),
     token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
+    token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
   };
 }
 
@@ -1111,6 +1307,50 @@ function formatUSD(value: number) {
   if (value >= 1) return `$${value.toFixed(2)}`;
   if (value >= 0.01) return `$${value.toFixed(4)}`;
   return `$${value.toFixed(6)}`;
+}
+
+function WindowCostBars({
+  limits,
+  usage,
+}: {
+  limits: APIKeyLimits;
+  usage: APIKeyWindowUsage;
+}) {
+  const bars: { label: string; used: number; limit: number }[] = [];
+  if (limits.cost_limit_5h && limits.cost_limit_5h > 0) {
+    bars.push({ label: "5h", used: usage.cost_5h, limit: limits.cost_limit_5h });
+  }
+  if (limits.cost_limit_7d && limits.cost_limit_7d > 0) {
+    bars.push({ label: "7d", used: usage.cost_7d, limit: limits.cost_limit_7d });
+  }
+  if (limits.cost_limit_30d && limits.cost_limit_30d > 0) {
+    bars.push({ label: "30d", used: usage.cost_30d, limit: limits.cost_limit_30d });
+  }
+  if (bars.length === 0) return null;
+  return (
+    <div className="mt-1.5 space-y-1">
+      {bars.map((bar) => {
+        const pct = Math.min(100, Math.max(0, (bar.used / bar.limit) * 100));
+        const isOver = pct >= 100;
+        return (
+          <div key={bar.label} className="flex items-center gap-1.5">
+            <span className="w-6 text-[10px] font-medium text-muted-foreground">
+              {bar.label}
+            </span>
+            <div className="h-1.5 w-20 overflow-hidden rounded-full bg-muted">
+              <div
+                className={`h-full rounded-full ${isOver ? "bg-destructive" : "bg-primary/70"}`}
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            <span className="text-[10px] text-muted-foreground">
+              {formatUSD(bar.used)}/{formatUSD(bar.limit)}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function AllowedGroupsDisplay({
@@ -1235,10 +1475,12 @@ function LimitsEditor({
   value,
   onChange,
   modelOptions,
+  expanded,
 }: {
   value: LimitsFormState;
   onChange: (next: LimitsFormState) => void;
   modelOptions: string[];
+  expanded?: boolean;
 }) {
   const { t } = useTranslation();
   const hasAny =
@@ -1249,9 +1491,11 @@ function LimitsEditor({
     value.maxConcurrency !== "" ||
     value.costLimit5h !== "" ||
     value.costLimit7d !== "" ||
+    value.costLimit30d !== "" ||
     value.tokenLimit5h !== "" ||
-    value.tokenLimit7d !== "";
-  const [open, setOpen] = useState(hasAny);
+    value.tokenLimit7d !== "" ||
+    value.tokenLimit30d !== "";
+  const [open, setOpen] = useState(hasAny || !!expanded);
   const tokenUnitOptions = useMemo(
     () =>
       (["token", "k", "m", "b"] as TokenLimitUnit[]).map((unit) => ({
@@ -1265,30 +1509,11 @@ function LimitsEditor({
   const patch = (next: Partial<LimitsFormState>) =>
     onChange({ ...value, ...next });
 
-  return (
-    <div className="rounded-lg border border-border">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between px-3 py-2.5 text-left text-sm font-medium hover:bg-muted/30 transition-colors"
-      >
-        <span className="flex items-center gap-2">
-          <span>{t("apiKeys.limits.title")}</span>
-          {hasAny && (
-            <span className="inline-flex items-center rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
-              {t("apiKeys.limits.active")}
-            </span>
-          )}
-        </span>
-        <span className="text-xs text-muted-foreground">
-          {open ? t("apiKeys.limits.hide") : t("apiKeys.limits.show")}
-        </span>
-      </button>
-      {open && (
-        <div className="space-y-3 border-t border-border p-3">
-          <p className="text-[11px] text-muted-foreground">
-            {t("apiKeys.limits.desc")}
-          </p>
+  const limitsContent = (
+    <div className={expanded ? "space-y-3" : "space-y-3 border-t border-border p-3"}>
+      <p className="text-[11px] text-muted-foreground">
+        {t("apiKeys.limits.desc")}
+      </p>
           <div className="space-y-2">
             <label className="text-xs font-medium">
               {t("apiKeys.limits.modelAllow")}
@@ -1350,25 +1575,39 @@ function LimitsEditor({
               suffix="$"
               step="0.01"
             />
-            <TokenLimitField
-              label={t("apiKeys.limits.tokens5h")}
-              value={value.tokenLimit5h}
-              unit={value.tokenLimit5hUnit}
-              unitOptions={tokenUnitOptions}
-              onValueChange={(tokenLimit5h) => patch({ tokenLimit5h })}
-              onUnitChange={(tokenLimit5hUnit) => patch({ tokenLimit5hUnit })}
-            />
-            <TokenLimitField
-              label={t("apiKeys.limits.tokens7d")}
-              value={value.tokenLimit7d}
-              unit={value.tokenLimit7dUnit}
-              unitOptions={tokenUnitOptions}
-              onValueChange={(tokenLimit7d) => patch({ tokenLimit7d })}
-              onUnitChange={(tokenLimit7dUnit) => patch({ tokenLimit7dUnit })}
+            <LimitNumberField
+              label={t("apiKeys.limits.cost30d")}
+              value={value.costLimit30d}
+              onChange={(costLimit30d) => patch({ costLimit30d })}
+              suffix="$"
+              step="0.01"
             />
           </div>
         </div>
-      )}
+    );
+
+  if (expanded) return limitsContent;
+
+  return (
+    <div className="rounded-lg border border-border">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between px-3 py-2.5 text-left text-sm font-medium hover:bg-muted/30 transition-colors"
+      >
+        <span className="flex items-center gap-2">
+          <span>{t("apiKeys.limits.title")}</span>
+          {hasAny && (
+            <span className="inline-flex items-center rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+              {t("apiKeys.limits.active")}
+            </span>
+          )}
+        </span>
+        <span className="text-xs text-muted-foreground">
+          {open ? t("apiKeys.limits.hide") : t("apiKeys.limits.show")}
+        </span>
+      </button>
+      {open && limitsContent}
     </div>
   );
 }

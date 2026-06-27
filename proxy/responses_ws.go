@@ -182,6 +182,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	}
 
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
+	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
@@ -270,7 +271,6 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 		downstreamHeaders := c.Request.Header.Clone()
-		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
 
 		if lastUpstreamCancel != nil {
 			lastUpstreamCancel()
@@ -279,9 +279,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		useWebsocket := !forceHTTPAfterWSMessageTooBig
-		// 显式生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
-		// 图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
+		// 生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
+		// 图片数据会卡死（issue #220）；自然语言生图意图也需保留图片工具（issue #288）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
 		}
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死。
@@ -289,6 +289,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if useWebsocket {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
+		// 在 useWebsocket 最终确定后再派生上游身份键：与 handler.go 的
+		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
+		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。
+		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionID, explicitSessionID, useWebsocket)
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -374,7 +378,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
-			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
@@ -585,6 +589,9 @@ func (h *Handler) streamResponsesWSUpstream(
 		if responseFailedDecision.Reason != "" {
 			outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 		}
+		// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
+		// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
+		h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload))
 	}
 	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, viaWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 		resp.Body.Close()
@@ -728,6 +735,10 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	}
 	cfg := h.store.GetPromptFilterConfig()
 	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	if shouldReviewPromptFilterVerdict(verdict, cfg) {
+		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
+	}
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action != promptfilter.ActionBlock {
 		return false

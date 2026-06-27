@@ -237,7 +237,10 @@ var codexAllowedForwardHeaders = []string{
 }
 
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
-var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error)
+// poolRouteKey：本地连接池路由键（仅本地、永不发上游）。非空时 wsrelay 用它作 8 槽池的
+// baseKey，从而把"上游会话身份(每请求唯一)"与"连接复用(按 API Key 稳定)"解耦；空时沿用
+// headerSessionID 作 baseKey（显式会话 / per-api-key 模式的原有行为）。
+var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error)
 
 func IsolateCodexSessionID(apiKeyID int64, raw string) string {
 	raw = strings.TrimSpace(raw)
@@ -246,6 +249,25 @@ func IsolateCodexSessionID(apiKeyID int64, raw string) string {
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("api-key:%d:%s", apiKeyID, raw)))
 	return hex.EncodeToString(sum[:8])
+}
+
+// resolveUpstreamSessionID 决定传给上游的会话/缓存身份键。
+//   - 显式会话（用户带了 Session_id/Conversation_id/Idempotency-Key/prompt_cache_key）：
+//     保持 IsolateCodexSessionID 的确定性隔离行为，命中缓存、粘定会话。
+//   - 无显式会话 + 默认隔离(isolated)：HTTP 返回每请求唯一 UUID（隔离上游 prompt_cache_key/
+//     Session_id），WS 返回 ""（交给 ExecuteRequest 的 stateless 路径，连接池键单独稳定）。
+//   - 无显式会话 + per-api-key：WS 返回 ""、HTTP 走 IsolateCodexSessionID（恢复旧的按 Key 共享）。
+//
+// 注意：账号粘性键(affinityKey)在 handler 中由独立的 sessionID(ResolveSessionID) 派生，
+// 不经过本函数，因此隔离上游身份不会影响账号选择 / token 刷新行为。
+func resolveUpstreamSessionID(apiKeyID int64, sessionID, explicitSessionID string, useWebsocket bool) string {
+	if useWebsocket && explicitSessionID == "" {
+		return ""
+	}
+	if explicitSessionID == "" && CurrentRuntimeSettings().IsolateRequestsByDefault() {
+		return uuid.NewString()
+	}
+	return IsolateCodexSessionID(apiKeyID, sessionID)
 }
 
 // ExecuteRequest 向 Codex 上游发送请求
@@ -257,23 +279,37 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if len(useWebsocket) > 0 {
 		wantWebsocket = useWebsocket[0]
 	}
+	poolRouteKey := ""
 	if wantWebsocket {
 		sessionID = strings.TrimSpace(sessionID)
 		if sessionID == "" {
 			// stateless 连接 ID 仅用于 WS 连接池隔离，保证同一 API Key 的并发请求
-			// 不挤在一条连接上排队。prompt cache key 必须保持确定性：若请求体没有
-			// 显式 prompt_cache_key，这里注入与 HTTP 路径同源的确定性 key，否则
-			// 上游 prompt cache 每次请求都会 miss（v2.2.7 引入的回归）。
+			// 不挤在一条连接上排队。
 			sessionID = statelessWebsocketSessionID()
 			if strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String()) == "" {
-				if cacheKey := deterministicPromptCacheKey(apiKey, account); cacheKey != "" {
-					requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
+				det := deterministicPromptCacheKey(apiKey, account)
+				if CurrentRuntimeSettings().IsolateRequestsByDefault() {
+					// 默认隔离：每请求唯一的 prompt_cache_key 写入 response.create 帧体，实现上游
+					// 身份隔离（互不串味）；连接池 baseKey 用稳定的确定性键单独传，保住 8 槽复用与
+					// 抗握手限流(503)。注意：上游会话隔离靠帧体 prompt_cache_key，而非握手头
+					// Session_id/Conversation_id（后者对复用连接是逐连接、非逐请求）。
+					requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", uuid.NewString())
+					poolRouteKey = det
+					if poolRouteKey == "" {
+						// det 仅在既无 API Key 又无账号 ID 时为空（生产路径不可达）；用固定哨兵兜底，
+						// 避免 baseKey 退化为每请求唯一键而触发握手风暴。
+						poolRouteKey = "ws-pool-default"
+					}
+				} else if det != "" {
+					// per-api-key：保留与 HTTP 路径同源的确定性 prompt cache key（既是上游身份也是
+					// baseKey），否则上游 prompt cache 每次请求都会 miss（v2.2.7 引入的回归）。
+					requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", det)
 				}
 			}
 		}
 	}
 	if wantWebsocket && WebsocketExecuteFunc != nil {
-		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers)
+		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	}
 	if wantWebsocket && WebsocketExecuteFunc == nil {
 		// 请求/配置要求走 WebSocket，但 WS 执行器未注册（如嵌入式调用或初始化顺序问题）。

@@ -3,11 +3,99 @@ package wsrelay
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
 )
+
+func TestManagerStopIdempotent(t *testing.T) {
+	manager := NewManager()
+
+	for i := 0; i < 3; i++ {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Stop call %d panicked: %v", i+1, r)
+				}
+			}()
+			manager.Stop()
+		}()
+	}
+}
+
+func TestManagerStopConcurrent(t *testing.T) {
+	manager := NewManager()
+
+	const callers = 32
+	start := make(chan struct{})
+	panicCh := make(chan any, callers)
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(callers)
+
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicCh <- r
+				}
+			}()
+			<-start
+			manager.Stop()
+		}()
+	}
+
+	close(start)
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent Stop calls timed out")
+	}
+	close(panicCh)
+
+	for r := range panicCh {
+		t.Fatalf("concurrent Stop panicked: %v", r)
+	}
+}
+
+func TestRemoveConnectionUsesEffectiveProxyKey(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	account := &auth.Account{DBID: 42, ProxyURL: " http://proxy-a.example:8080 "}
+	wsURL := "wss://example.test/responses"
+	sessionKey := "session-1"
+	proxyURL := effectiveProxyURL(account, "")
+	key := manager.poolKey(account.ID(), wsURL, sessionKey, proxyURL)
+
+	session := NewSession(account.ID(), manager)
+	session.SetConnected(true)
+	conn := &WsConnection{session: session, URL: wsURL, PoolKey: key}
+	conn.SetState(StateConnected)
+	conn.Touch()
+	manager.connections.Store(key, conn)
+	manager.sessions.Store(key, session)
+
+	manager.RemoveConnection(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, ""))
+
+	if _, ok := manager.connections.Load(key); ok {
+		t.Fatal("expected connection stored under effective proxy key to be removed")
+	}
+	if _, ok := manager.sessions.Load(key); ok {
+		t.Fatal("expected session stored under effective proxy key to be removed")
+	}
+	if conn.IsConnected() {
+		t.Fatal("expected removed connection to be closed")
+	}
+}
 
 func TestAcquireConnectionReusesIdleConnectedConnection(t *testing.T) {
 	manager := NewManager()

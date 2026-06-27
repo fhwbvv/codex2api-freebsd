@@ -18,14 +18,13 @@ import {
 import { Card, CardContent } from '@/components/ui/card'
 import StateShell from './StateShell'
 import type { ChartAggregation } from '../types'
-import { TIME_RANGE_OPTIONS, getBucketConfig, type TimeRangeKey } from '../lib/timeRange'
+import { getBucketConfig, type TimeRangeKey } from '../lib/timeRange'
 
 interface DashboardUsageChartsProps {
   chartData: ChartAggregation | null
   refreshedAt: number | null
   refreshIntervalMs: number
   timeRange: TimeRangeKey
-  onTimeRangeChange: (range: TimeRangeKey) => void
   loading?: boolean
 }
 
@@ -70,7 +69,6 @@ export default function DashboardUsageCharts({
   refreshedAt,
   refreshIntervalMs,
   timeRange,
-  onTimeRangeChange,
   loading = false,
 }: DashboardUsageChartsProps) {
   const { t } = useTranslation()
@@ -130,30 +128,6 @@ export default function DashboardUsageCharts({
               })}
             </p>
           )}
-        </div>
-        <div className="flex items-center gap-2">
-          {isLive && (
-            <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-600 dark:text-emerald-300 mr-2">
-              <span className="size-2 rounded-full bg-current animate-pulse" />
-              <span>{t('dashboard.liveBadge')}</span>
-            </div>
-          )}
-          <div className="inline-flex rounded-lg border border-border bg-muted/50 p-0.5">
-            {TIME_RANGE_OPTIONS.map((key) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => onTimeRangeChange(key)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all duration-200 ${
-                  timeRange === key
-                    ? 'bg-background text-foreground shadow-sm border border-border'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {t(`dashboard.timeRange${key.toUpperCase()}`)}
-              </button>
-            ))}
-          </div>
         </div>
       </div>
 

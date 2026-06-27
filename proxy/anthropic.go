@@ -578,7 +578,7 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		return t.handleThinkingDelta(eventData)
 
-	case "response.function_call_arguments.delta":
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		return t.handleToolInputDelta(eventData)
 
 	case "response.output_text.done", "response.reasoning_summary_text.done",
@@ -645,9 +645,12 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 			},
 		})
 
-	case "function_call":
+	case "function_call", "custom_tool_call":
 		events = append(events, t.closeCurrentBlock()...)
 		callID := fromCodexCallID(gjson.GetBytes(data, "item.call_id").String())
+		if callID == "" {
+			callID = fromCodexCallID(gjson.GetBytes(data, "item.id").String())
+		}
 		name := gjson.GetBytes(data, "item.name").String()
 		idx := t.contentBlockIndex
 		t.contentBlockIndex++
@@ -794,9 +797,12 @@ func (t *anthropicStreamTranslator) handleCompleted(data []byte) []anthropicStre
 	// 提取 usage
 	usage := gjson.GetBytes(data, "response.usage")
 	if usage.Exists() {
-		t.inputTokens = int(usage.Get("input_tokens").Int())
-		t.outputTokens = int(usage.Get("output_tokens").Int())
+		// OpenAI Responses 的 input_tokens 含缓存命中部分，而 Anthropic Messages
+		// 的 input_tokens 不含缓存（缓存另计在 cache_read_input_tokens）。
+		// 直接透传会把缓存 token 重复计入，导致费用偏高，因此这里扣除缓存部分。
 		t.cachedTokens = int(usage.Get("input_tokens_details.cached_tokens").Int())
+		t.inputTokens = max(int(usage.Get("input_tokens").Int())-t.cachedTokens, 0)
+		t.outputTokens = int(usage.Get("output_tokens").Int())
 	}
 
 	// 确定 stop_reason
@@ -879,31 +885,6 @@ func (t *anthropicStreamTranslator) closeCurrentBlock() []anthropicStreamEvent {
 		Index: &idx,
 	})
 	return events
-}
-
-// sanitizeToolInputJSON 清洗工具调用 arguments JSON。
-// 只处理 Claude Code Read 工具已知兼容问题：上游 gpt-5.5 偶尔会给
-// Read 工具加 "pages":""，导致 claudecode 看到无效空字段。
-// 其他工具的空字符串和 null 参数可能有合法语义，不能泛化删除。
-func sanitizeToolInputJSON(toolName string, raw string) string {
-	raw = strings.TrimSpace(raw)
-	if toolName != "Read" || raw == "" {
-		return raw
-	}
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		return raw
-	}
-	pages, ok := obj["pages"]
-	if !ok || strings.TrimSpace(string(pages)) != `""` {
-		return raw
-	}
-	delete(obj, "pages")
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return raw
-	}
-	return string(out)
 }
 
 // finalize 在流结束时补齐缺失的事件
@@ -1099,11 +1080,17 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 				return true
 			})
 
-		case "function_call":
-			// function_call → tool_use block
+		case "function_call", "custom_tool_call":
+			// function_call/custom_tool_call → tool_use block
 			callID := fromCodexCallID(item.Get("call_id").String())
+			if callID == "" {
+				callID = fromCodexCallID(item.Get("id").String())
+			}
 			name := item.Get("name").String()
 			args := item.Get("arguments").String()
+			if itemType == "custom_tool_call" {
+				args = item.Get("input").String()
+			}
 			if cleaned := sanitizeToolInputJSON(name, args); cleaned != "" {
 				args = cleaned
 			} else {
@@ -1143,10 +1130,13 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 	// usage
 	usage := gjson.GetBytes(completedData, "response.usage")
 	if usage.Exists() {
+		// 见流式分支说明：扣除缓存命中部分，避免缓存 token 被重复计入。
+		cached := int(usage.Get("input_tokens_details.cached_tokens").Int())
+		input := max(int(usage.Get("input_tokens").Int())-cached, 0)
 		resp.Usage = anthropicUsage{
-			InputTokens:          int(usage.Get("input_tokens").Int()),
+			InputTokens:          input,
 			OutputTokens:         int(usage.Get("output_tokens").Int()),
-			CacheReadInputTokens: int(usage.Get("input_tokens_details.cached_tokens").Int()),
+			CacheReadInputTokens: cached,
 		}
 	}
 

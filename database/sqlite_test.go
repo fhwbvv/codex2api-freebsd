@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math"
 	"path/filepath"
 	"sync"
@@ -176,6 +177,236 @@ func TestSQLiteUpdateCredentialsMergesAtomically(t *testing.T) {
 	}
 	if got := row.GetCredential("codex_7d_used_percent"); got != "42.5" {
 		t.Fatalf("codex_7d_used_percent = %q, want 42.5", got)
+	}
+}
+
+func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAccountWithCredentials(ctx, "identity", map[string]interface{}{
+		"refresh_token":      "rt-identity",
+		"email":              "User@Example.COM",
+		"chatgpt_account_id": "acc-identity",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
+	}
+
+	got, err := db.FindActiveAccountByOAuthIdentity(ctx, " user@example.com ", "acc-identity")
+	if err != nil {
+		t.Fatalf("FindActiveAccountByOAuthIdentity 返回错误: %v", err)
+	}
+	if got != id {
+		t.Fatalf("matched id = %d, want %d", got, id)
+	}
+
+	otherID, err := db.InsertAccountWithCredentials(ctx, "identity-other", map[string]interface{}{
+		"refresh_token": "rt-identity-other",
+		"email":         "user@example.com",
+		"account_id":    "acc-identity",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials other 返回错误: %v", err)
+	}
+	got, err = db.FindActiveAccountByOAuthIdentity(ctx, "user@example.com", "acc-identity", id)
+	if err != nil {
+		t.Fatalf("FindActiveAccountByOAuthIdentity with exclude 返回错误: %v", err)
+	}
+	if got != otherID {
+		t.Fatalf("matched id with exclude = %d, want %d", got, otherID)
+	}
+
+	if err := db.SoftDeleteAccount(ctx, id); err != nil {
+		t.Fatalf("SoftDeleteAccount 返回错误: %v", err)
+	}
+	if err := db.SoftDeleteAccount(ctx, otherID); err != nil {
+		t.Fatalf("SoftDeleteAccount other 返回错误: %v", err)
+	}
+	if _, err := db.FindActiveAccountByOAuthIdentity(ctx, "user@example.com", "acc-identity"); err == nil {
+		t.Fatal("FindActiveAccountByOAuthIdentity 应该排除已删除账号")
+	} else if err != sql.ErrNoRows {
+		t.Fatalf("FindActiveAccountByOAuthIdentity err = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	ctx := context.Background()
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationOAuthIdentityDedupeV1); err != nil {
+		t.Fatalf("清理 data migration 标记返回错误: %v", err)
+	}
+
+	oldTime := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
+	midTime := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Second)
+	newTime := time.Now().UTC().Truncate(time.Second)
+
+	oldID, err := db.InsertAccountWithCredentials(ctx, "old-duplicate", map[string]interface{}{
+		"refresh_token": "rt-old-duplicate",
+		"email":         "User@Example.com",
+		"account_id":    "acc-dedupe",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert old duplicate 返回错误: %v", err)
+	}
+	midID, err := db.InsertAccountWithCredentials(ctx, "mid-duplicate", map[string]interface{}{
+		"access_token":        "at-mid-duplicate",
+		"email":               "user@example.com",
+		"chatgpt_account_id":  "acc-dedupe",
+		"codex_7d_reset_at":   newTime.Format(time.RFC3339),
+		"codex_5h_reset_at":   newTime.Format(time.RFC3339),
+		"codex_usage_marker":  "keep-credentials-intact",
+		"codex_usage_updated": "true",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert mid duplicate 返回错误: %v", err)
+	}
+	winnerID, err := db.InsertAccountWithCredentials(ctx, "new-duplicate", map[string]interface{}{
+		"session_token": "st-new-duplicate",
+		"email":         " user@example.com ",
+		"account_id":    "acc-dedupe",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert winner 返回错误: %v", err)
+	}
+	otherID, err := db.InsertAccountWithCredentials(ctx, "other-workspace", map[string]interface{}{
+		"refresh_token": "rt-other-workspace",
+		"email":         "user@example.com",
+		"account_id":    "acc-other",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert other 返回错误: %v", err)
+	}
+	bridgeOldID, err := db.InsertAccountWithCredentials(ctx, "bridge-old", map[string]interface{}{
+		"refresh_token":      "rt-bridge-old",
+		"email":              "bridge@example.com",
+		"account_id":         "acc-bridge-old",
+		"chatgpt_account_id": "acc-bridge",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert bridge old 返回错误: %v", err)
+	}
+	bridgeWinnerID, err := db.InsertAccountWithCredentials(ctx, "bridge-winner", map[string]interface{}{
+		"access_token": "at-bridge-winner",
+		"email":        "Bridge@Example.com",
+		"account_id":   "acc-bridge",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert bridge winner 返回错误: %v", err)
+	}
+	deletedID, err := db.InsertAccountWithCredentials(ctx, "deleted-duplicate", map[string]interface{}{
+		"refresh_token": "rt-deleted-duplicate",
+		"email":         "user@example.com",
+		"account_id":    "acc-dedupe",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert deleted 返回错误: %v", err)
+	}
+	if err := db.SoftDeleteAccount(ctx, deletedID); err != nil {
+		t.Fatalf("SoftDeleteAccount 返回错误: %v", err)
+	}
+
+	for id, ts := range map[int64]time.Time{
+		oldID:          oldTime,
+		midID:          midTime,
+		winnerID:       newTime,
+		otherID:        midTime,
+		bridgeOldID:    oldTime,
+		bridgeWinnerID: newTime,
+	} {
+		if _, err := db.conn.ExecContext(ctx, `UPDATE accounts SET updated_at = $1 WHERE id = $2`, sqliteTimeParam(ts), id); err != nil {
+			t.Fatalf("设置账号 %d updated_at 返回错误: %v", id, err)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close 返回错误: %v", err)
+	}
+
+	db, err = New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("reopen New(sqlite) 返回错误: %v", err)
+	}
+
+	activeRows, err := db.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive 返回错误: %v", err)
+	}
+	activeIDs := map[int64]bool{}
+	for _, row := range activeRows {
+		activeIDs[row.ID] = true
+	}
+	if !activeIDs[winnerID] || !activeIDs[otherID] || !activeIDs[bridgeWinnerID] {
+		t.Fatalf("active ids = %v, want winner %d, other %d and bridge winner %d", activeIDs, winnerID, otherID, bridgeWinnerID)
+	}
+	if activeIDs[oldID] || activeIDs[midID] || activeIDs[bridgeOldID] {
+		t.Fatalf("active ids = %v, want duplicates %d/%d/%d soft-deleted", activeIDs, oldID, midID, bridgeOldID)
+	}
+
+	deletedRows, err := db.ListDeleted(ctx)
+	if err != nil {
+		t.Fatalf("ListDeleted 返回错误: %v", err)
+	}
+	deletedIDs := map[int64]bool{}
+	for _, row := range deletedRows {
+		deletedIDs[row.ID] = true
+	}
+	for _, id := range []int64{oldID, midID, bridgeOldID, deletedID} {
+		if !deletedIDs[id] {
+			t.Fatalf("deleted ids = %v, want id %d", deletedIDs, id)
+		}
+	}
+
+	var migrationCount int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM data_migrations WHERE version = $1`, dataMigrationOAuthIdentityDedupeV1).Scan(&migrationCount); err != nil {
+		t.Fatalf("查询 data_migrations 返回错误: %v", err)
+	}
+	if migrationCount != 1 {
+		t.Fatalf("migration count = %d, want 1", migrationCount)
+	}
+
+	var eventCount int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_events WHERE source = 'oauth_identity_dedupe_v1' AND account_id IN ($1, $2, $3)`, oldID, midID, bridgeOldID).Scan(&eventCount); err != nil {
+		t.Fatalf("查询 account_events 返回错误: %v", err)
+	}
+	if eventCount != 3 {
+		t.Fatalf("dedupe event count = %d, want 3", eventCount)
+	}
+
+	postMigrationDuplicateID, err := db.InsertAccountWithCredentials(ctx, "post-migration-duplicate", map[string]interface{}{
+		"refresh_token": "rt-post-migration-duplicate",
+		"email":         "user@example.com",
+		"account_id":    "acc-dedupe",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert post migration duplicate 返回错误: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close after post migration duplicate 返回错误: %v", err)
+	}
+
+	db, err = New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("second reopen New(sqlite) 返回错误: %v", err)
+	}
+
+	if _, err := db.GetAccountByID(ctx, postMigrationDuplicateID); err != nil {
+		t.Fatalf("post migration duplicate should remain active because migration is one-shot: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("final Close 返回错误: %v", err)
 	}
 }
 
@@ -733,6 +964,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		PromptFilterMaxTextLength:        81920,
 		PromptFilterCustomPatterns:       "[]",
 		PromptFilterDisabledPatterns:     "[]",
+		PromptFilterReviewEnabled:        true,
+		PromptFilterReviewAPIKey:         "sk-review-test",
+		PromptFilterReviewBaseURL:        "https://review.example.com",
+		PromptFilterReviewModel:          "review-model",
+		PromptFilterReviewTimeoutSeconds: 7,
+		PromptFilterReviewFailClosed:     false,
 		ClientCompatMode:                 "preserve",
 		CodexMinCLIVersion:               "0.118.0",
 		UsageLogMode:                     "full",
@@ -748,6 +985,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		AffinityMode:                     "bounded",
 		BackgroundConfig:                 "{}",
 		ShowFullUsageNumbers:             true,
+		PublicKeyUsagePageEnabled:        true,
 		CodexWSHideUpstreamErrors:        true,
 		CodexWSSilentRetryEnabled:        true,
 		CodexWSSilentMaxRetries:          4,
@@ -771,6 +1009,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if !settings.ShowFullUsageNumbers {
 		t.Fatal("ShowFullUsageNumbers = false, want true")
 	}
+	if !settings.PublicKeyUsagePageEnabled {
+		t.Fatal("PublicKeyUsagePageEnabled = false, want true")
+	}
 	if settings.BillingTierPolicy != "requested" {
 		t.Fatalf("BillingTierPolicy = %q, want requested", settings.BillingTierPolicy)
 	}
@@ -780,6 +1021,24 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if settings.ReasoningEffortModels != `[{"model":"gpt-5.5","effort":"xhigh"}]` {
 		t.Fatalf("ReasoningEffortModels = %q, want gpt-5.5 xhigh entry", settings.ReasoningEffortModels)
 	}
+	if !settings.PromptFilterReviewEnabled {
+		t.Fatal("PromptFilterReviewEnabled = false, want true")
+	}
+	if settings.PromptFilterReviewAPIKey != "sk-review-test" {
+		t.Fatalf("PromptFilterReviewAPIKey = %q, want sk-review-test", settings.PromptFilterReviewAPIKey)
+	}
+	if settings.PromptFilterReviewBaseURL != "https://review.example.com" {
+		t.Fatalf("PromptFilterReviewBaseURL = %q, want https://review.example.com", settings.PromptFilterReviewBaseURL)
+	}
+	if settings.PromptFilterReviewModel != "review-model" {
+		t.Fatalf("PromptFilterReviewModel = %q, want review-model", settings.PromptFilterReviewModel)
+	}
+	if settings.PromptFilterReviewTimeoutSeconds != 7 {
+		t.Fatalf("PromptFilterReviewTimeoutSeconds = %d, want 7", settings.PromptFilterReviewTimeoutSeconds)
+	}
+	if settings.PromptFilterReviewFailClosed {
+		t.Fatal("PromptFilterReviewFailClosed = true, want false")
+	}
 	if !settings.CodexWSHideUpstreamErrors {
 		t.Fatal("CodexWSHideUpstreamErrors = false, want true")
 	}
@@ -788,6 +1047,18 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CodexWSSilentMaxRetries != 4 {
 		t.Fatalf("CodexWSSilentMaxRetries = %d, want 4", settings.CodexWSSilentMaxRetries)
+	}
+
+	settings.PublicKeyUsagePageEnabled = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false PublicKeyUsagePageEnabled 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false PublicKeyUsagePageEnabled 返回错误: %v", err)
+	}
+	if settings.PublicKeyUsagePageEnabled {
+		t.Fatal("PublicKeyUsagePageEnabled = true, want false")
 	}
 }
 
@@ -1303,6 +1574,134 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 	if apiKeys[8].Requests != 1 || apiKeys[8].ErrorCount != 1 {
 		t.Fatalf("APIKeyStats[8] = %+v, want requests=1 errors=1", apiKeys[8])
+	}
+}
+
+func TestAPIKeySelfUsageReportScopesToSingleKey(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	keyID, err := db.InsertAPIKey(ctx, "Client A", "sk-self-usage-a-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey A 返回错误: %v", err)
+	}
+	otherKeyID, err := db.InsertAPIKey(ctx, "Client B", "sk-self-usage-b-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey B 返回错误: %v", err)
+	}
+	now := time.Now()
+	insertUsage := func(apiKeyID int64, model string, endpoint string, statusCode int, totalTokens int, userBilled float64) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (
+				api_key_id, api_key_name, api_key_masked, endpoint, inbound_endpoint, model,
+				status_code, total_tokens, input_tokens, output_tokens, user_billed, created_at
+			)
+			VALUES ($1, 'client', 'sk-...test', $2, $2, $3, $4, $5, $6, $7, $8, $9)
+		`, apiKeyID, endpoint, model, statusCode, totalTokens, totalTokens/2, totalTokens/2, userBilled, sqliteTimeParam(now)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	insertUsage(keyID, "gpt-5.5", "/v1/responses", 200, 120, 0.12)
+	insertUsage(keyID, "gpt-5.5", "/v1/responses", 500, 80, 0.08)
+	insertUsage(keyID, "cancelled", "/v1/responses", 499, 1000, 9.99)
+	insertUsage(otherKeyID, "other", "/v1/messages", 200, 900, 7.77)
+
+	report, err := db.GetAPIKeySelfUsageReport(ctx, keyID, now.Add(-time.Hour), now.Add(time.Hour), 1, 10)
+	if err != nil {
+		t.Fatalf("GetAPIKeySelfUsageReport 返回错误: %v", err)
+	}
+	if report.Summary.Requests != 2 || report.Summary.Tokens != 200 || report.Summary.ErrorCount != 1 {
+		t.Fatalf("summary = %+v, want requests=2 tokens=200 errors=1", report.Summary)
+	}
+	if math.Abs(report.Summary.UserBilled-0.20) > 0.000001 {
+		t.Fatalf("summary.UserBilled = %.6f, want 0.20", report.Summary.UserBilled)
+	}
+	if report.Windows.Last30d.Requests != 2 || report.Windows.Last30d.Tokens != 200 {
+		t.Fatalf("last30d = %+v, want current key only", report.Windows.Last30d)
+	}
+	if len(report.Models) != 1 || report.Models[0].Name != "gpt-5.5" || report.Models[0].Requests != 2 {
+		t.Fatalf("models = %+v, want one gpt-5.5 bucket", report.Models)
+	}
+	if len(report.RecentLogs) != 2 {
+		t.Fatalf("recent logs = %d, want 2", len(report.RecentLogs))
+	}
+	if report.RecentLogsTotal != 2 || report.RecentLogsPage != 1 || report.RecentLogsPageSize != 10 {
+		t.Fatalf("recent log pagination = total %d page %d page_size %d, want 2/1/10", report.RecentLogsTotal, report.RecentLogsPage, report.RecentLogsPageSize)
+	}
+	for _, logRow := range report.RecentLogs {
+		if logRow.Model == "other" || logRow.StatusCode == 499 {
+			t.Fatalf("recent log leaked unrelated/cancelled row: %+v", logRow)
+		}
+	}
+}
+
+func TestAPIKeySelfUsageReportPaginatesRecentLogs(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	keyID, err := db.InsertAPIKey(ctx, "Client A", "sk-self-usage-page-a-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey A 返回错误: %v", err)
+	}
+	otherKeyID, err := db.InsertAPIKey(ctx, "Client B", "sk-self-usage-page-b-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey B 返回错误: %v", err)
+	}
+
+	now := time.Now()
+	insertUsage := func(apiKeyID int64, model string, statusCode int, totalTokens int) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (
+				api_key_id, api_key_name, api_key_masked, endpoint, inbound_endpoint, model,
+				status_code, total_tokens, input_tokens, output_tokens, user_billed, created_at
+			)
+			VALUES ($1, 'client', 'sk-...test', '/v1/responses', '/v1/responses', $2, $3, $4, $5, $6, 0, $7)
+		`, apiKeyID, model, statusCode, totalTokens, totalTokens/2, totalTokens/2, sqliteTimeParam(now)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	for i := 1; i <= 5; i++ {
+		insertUsage(keyID, fmt.Sprintf("model-%d", i), 200, i*10)
+	}
+	insertUsage(keyID, "cancelled", 499, 999)
+	insertUsage(otherKeyID, "other", 200, 777)
+
+	report, err := db.GetAPIKeySelfUsageReport(ctx, keyID, now.Add(-time.Hour), now.Add(time.Hour), 2, 2)
+	if err != nil {
+		t.Fatalf("GetAPIKeySelfUsageReport 返回错误: %v", err)
+	}
+	if report.RecentLogsTotal != 5 || report.RecentLogsPage != 2 || report.RecentLogsPageSize != 2 {
+		t.Fatalf("recent log pagination = total %d page %d page_size %d, want 5/2/2", report.RecentLogsTotal, report.RecentLogsPage, report.RecentLogsPageSize)
+	}
+	if len(report.RecentLogs) != 2 {
+		t.Fatalf("recent logs = %d, want 2", len(report.RecentLogs))
+	}
+	if report.RecentLogs[0].Model != "model-3" || report.RecentLogs[1].Model != "model-2" {
+		t.Fatalf("page 2 logs = %+v, want model-3 then model-2", report.RecentLogs)
+	}
+
+	clamped, err := db.GetAPIKeySelfUsageReport(ctx, keyID, now.Add(-time.Hour), now.Add(time.Hour), 99, 2)
+	if err != nil {
+		t.Fatalf("GetAPIKeySelfUsageReport clamped 返回错误: %v", err)
+	}
+	if clamped.RecentLogsPage != 3 || len(clamped.RecentLogs) != 1 || clamped.RecentLogs[0].Model != "model-1" {
+		t.Fatalf("clamped page logs = page %d rows %+v, want page 3 with model-1", clamped.RecentLogsPage, clamped.RecentLogs)
 	}
 }
 
@@ -2059,5 +2458,45 @@ func TestFlushLogsRollsBackAndRequeuesWhenQuotaUpdateFails(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("usage_logs count = %d, want 0 after rolled-back flush", count)
+	}
+}
+
+func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
+		Source:          "local_filter",
+		Endpoint:        "/v1/responses",
+		Model:           "gpt-5.4",
+		Action:          "allow",
+		Mode:            "block",
+		Score:           100,
+		Threshold:       50,
+		MatchedPatterns: `[{"name":"credential_theft","weight":100}]`,
+		TextPreview:     "preview",
+		ReviewModel:     "omni-moderation-latest",
+		ReviewFlagged:   false,
+		ReviewError:     "temporary failure",
+	}); err != nil {
+		t.Fatalf("InsertPromptFilterLog 返回错误: %v", err)
+	}
+
+	logs, total, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Query: "temporary"})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage 返回错误: %v", err)
+	}
+	if total != 1 || len(logs) != 1 {
+		t.Fatalf("logs total=%d len=%d, want 1", total, len(logs))
+	}
+	got := logs[0]
+	if got.ReviewModel != "omni-moderation-latest" || got.ReviewFlagged || got.ReviewError != "temporary failure" {
+		t.Fatalf("review metadata = %+v", got)
 	}
 }

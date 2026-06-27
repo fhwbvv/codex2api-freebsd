@@ -72,6 +72,10 @@ type Handler struct {
 	resetRadarHookMu     sync.Mutex
 	resetRadarHookState  resetRadarHookState
 	resetRadarHookRunner func(context.Context, string) resetRadarHookResult
+
+	// 「主动重置次数」消耗操作的账号级互斥锁（dbID -> *sync.Mutex），
+	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
+	resetCreditLocks sync.Map
 }
 
 type chartCacheEntry struct {
@@ -269,6 +273,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.HEAD("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.GET("/api/branding", h.GetBranding)
+	keyUsage := r.Group("/api/key-usage")
+	keyUsage.GET("/summary", h.GetPublicAPIKeyUsageSummary)
+	keyUsage.GET("/me", h.GetPublicAPIKeyUsageSummary)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
@@ -284,11 +291,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
+	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
 	api.POST("/accounts/sub2api/import", h.ImportFromSub2API)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
+	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
 	api.DELETE("/accounts/recycle-bin", h.EmptyRecycleBin)
 	api.POST("/accounts/recycle-bin/batch-test", h.RecycleBinBatchTest)
@@ -298,13 +307,17 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/enable", h.ToggleAccountEnabled)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
 	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
+	api.POST("/accounts/:id/reset-credits", h.ResetCredits)
+	api.POST("/accounts/:id/invite", h.SendInvite)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
+	api.POST("/accounts/:id/usage/refresh", h.RefreshAccountUsage)
 	api.GET("/accounts/:id/auth-json", h.GetAccountAuthJSON)
 	api.PATCH("/accounts/:id/credit", h.UpdateAccountCredit)
 	api.POST("/accounts/batch-test", h.BatchTest)
 	api.POST("/accounts/batch-refresh", h.BatchRefreshAccounts)
 	api.POST("/accounts/batch-delete", h.BatchDeleteAccounts)
+	api.POST("/accounts/batch-update", h.BatchUpdateAccounts)
 	api.POST("/accounts/batch-reset-status", h.BatchResetStatus)
 	api.POST("/accounts/clean-banned", h.CleanBanned)
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
@@ -340,8 +353,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
+	api.GET("/prompt-filter/logs/match", h.MatchPromptFilterLog)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
+	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
@@ -542,6 +557,7 @@ type accountResponse struct {
 	Name                     string                     `json:"name"`
 	Email                    string                     `json:"email"`
 	EmailDomain              string                     `json:"email_domain,omitempty"`
+	ChatGPTAccountID         string                     `json:"chatgpt_account_id,omitempty"`
 	PlanType                 string                     `json:"plan_type"`
 	SubscriptionExpiresAt    string                     `json:"subscription_expires_at,omitempty"`
 	Status                   string                     `json:"status"`
@@ -551,6 +567,7 @@ type accountResponse struct {
 	CreditSkipUsageWindow    bool                       `json:"credit_skip_usage_window"`
 	SkipWarmTier             bool                       `json:"skip_warm_tier"`
 	AccountType              string                     `json:"account_type,omitempty"`
+	AccessTokenType          string                     `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
 	BaseURL                  string                     `json:"base_url,omitempty"`
 	Models                   []string                   `json:"models,omitempty"`
@@ -576,6 +593,7 @@ type accountResponse struct {
 	RateLimitAttempts        int64                      `json:"rate_limit_attempts"`
 	UsagePercent7d           *float64                   `json:"usage_percent_7d"`
 	UsagePercent5h           *float64                   `json:"usage_percent_5h"`
+	RateLimitResetCredits    *int                       `json:"rate_limit_reset_credits"`
 	AutoPause5hThreshold     *float64                   `json:"auto_pause_5h_threshold"`
 	AutoPause7dThreshold     *float64                   `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled      bool                       `json:"auto_pause_5h_disabled"`
@@ -636,6 +654,16 @@ func accountEmailDomain(email string) string {
 	return domain
 }
 
+func accountAccessTokenType(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	if tokenType := strings.TrimSpace(row.GetCredential("access_token_type")); tokenType != "" {
+		return tokenType
+	}
+	return accessTokenTypeForToken(row.GetCredential("access_token"))
+}
+
 type schedulerBreakdownResponse struct {
 	UnauthorizedPenalty float64 `json:"unauthorized_penalty"`
 	RateLimitPenalty    float64 `json:"rate_limit_penalty"`
@@ -692,6 +720,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Name:                     row.Name,
 			Email:                    email,
 			EmailDomain:              accountEmailDomain(email),
+			ChatGPTAccountID:         row.GetCredential("account_id"),
 			PlanType:                 planType,
 			SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 			Status:                   row.Status,
@@ -701,6 +730,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
 			SkipWarmTier:             row.SkipWarmTier,
 			AccountType:              row.Type,
+			AccessTokenType:          accountAccessTokenType(row),
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
@@ -760,6 +790,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 			if usagePct5h, ok := acc.GetUsagePercent5h(); ok {
 				resp.UsagePercent5h = &usagePct5h
+			}
+			if credits, ok := acc.GetRateLimitResetCredits(); ok {
+				resp.RateLimitResetCredits = &credits
 			}
 			if t := acc.GetReset5hAt(); !t.IsZero() {
 				resp.Reset5hAt = t.Format(time.RFC3339)
@@ -879,7 +912,122 @@ type updateAccountSchedulerReq struct {
 	AutoPause7dThreshold    json.RawMessage `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled     json.RawMessage `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled     json.RawMessage `json:"auto_pause_7d_disabled"`
-	ProxyURL                *string         `json:"proxy_url"`
+	ProxyURL                json.RawMessage `json:"proxy_url"`
+}
+
+type accountSchedulerUpdate struct {
+	ScoreBiasOverride       database.OptionalNullInt64
+	BaseConcurrencyOverride database.OptionalNullInt64
+	SkipWarmTier            database.OptionalBool
+	AllowedAPIKeyIDs        database.OptionalInt64Slice
+	Tags                    optionalStringSlice
+	GroupIDs                database.OptionalInt64Slice
+	AutoPause5hThreshold    optionalFloat64
+	AutoPause7dThreshold    optionalFloat64
+	AutoPause5hDisabled     database.OptionalBool
+	AutoPause7dDisabled     database.OptionalBool
+	ProxyURL                database.OptionalString
+	CredentialUpdates       map[string]interface{}
+}
+
+func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedulerUpdate, error) {
+	scoreBiasOverride, err := parseOptionalIntegerField(req.ScoreBiasOverride, "score_bias_override", -200, 200)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, 50)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	tags, err := parseOptionalStringSliceField(req.Tags, "tags")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	groupIDs, err := parseOptionalIntegerSliceField(req.GroupIDs, "group_ids")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	autoPause5hThreshold, err := parseOptionalRatioField(req.AutoPause5hThreshold, "auto_pause_5h_threshold")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	autoPause7dThreshold, err := parseOptionalRatioField(req.AutoPause7dThreshold, "auto_pause_7d_threshold")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	autoPause5hDisabled, err := parseOptionalBoolField(req.AutoPause5hDisabled, "auto_pause_5h_disabled")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	autoPause7dDisabled, err := parseOptionalBoolField(req.AutoPause7dDisabled, "auto_pause_7d_disabled")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+
+	proxyURL, err := parseOptionalStringField(req.ProxyURL, "proxy_url", security.ValidateProxyURL)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	credentialUpdates := make(map[string]interface{})
+	if autoPause5hThreshold.Set {
+		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
+	}
+	if autoPause7dThreshold.Set {
+		credentialUpdates["auto_pause_7d_threshold"] = autoPause7dThreshold.Value
+	}
+	if autoPause5hDisabled.Set {
+		credentialUpdates["auto_pause_5h_disabled"] = autoPause5hDisabled.Value
+	}
+	if autoPause7dDisabled.Set {
+		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
+	}
+	if len(credentialUpdates) == 0 {
+		credentialUpdates = nil
+	}
+
+	return accountSchedulerUpdate{
+		ScoreBiasOverride:       scoreBiasOverride,
+		BaseConcurrencyOverride: baseConcurrencyOverride,
+		SkipWarmTier:            skipWarmTier,
+		AllowedAPIKeyIDs:        allowedAPIKeyIDs,
+		Tags:                    tags,
+		GroupIDs:                groupIDs,
+		AutoPause5hThreshold:    autoPause5hThreshold,
+		AutoPause7dThreshold:    autoPause7dThreshold,
+		AutoPause5hDisabled:     autoPause5hDisabled,
+		AutoPause7dDisabled:     autoPause7dDisabled,
+		ProxyURL:                proxyURL,
+		CredentialUpdates:       credentialUpdates,
+	}, nil
+}
+
+func (u accountSchedulerUpdate) hasChanges() bool {
+	return u.ScoreBiasOverride.Set ||
+		u.BaseConcurrencyOverride.Set ||
+		u.SkipWarmTier.Set ||
+		u.AllowedAPIKeyIDs.Set ||
+		u.Tags.Set ||
+		u.GroupIDs.Set ||
+		u.AutoPause5hThreshold.Set ||
+		u.AutoPause7dThreshold.Set ||
+		u.AutoPause5hDisabled.Set ||
+		u.AutoPause7dDisabled.Set ||
+		u.ProxyURL.Set
+}
+
+func optionalBoolFromPtr(value *bool) database.OptionalBool {
+	if value == nil {
+		return database.OptionalBool{}
+	}
+	return database.OptionalBool{Set: true, Value: *value}
 }
 
 // UpdateAccountScheduler 更新账号调度配置。
@@ -937,52 +1085,7 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		return
 	}
 
-	scoreBiasOverride, err := parseOptionalIntegerField(req.ScoreBiasOverride, "score_bias_override", -200, 200)
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, 50)
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	allowedAPIKeyIDs, err := parseOptionalIntegerSliceField(req.AllowedAPIKeyIDs, "allowed_api_key_ids")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	tags, err := parseOptionalStringSliceField(req.Tags, "tags")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	groupIDs, err := parseOptionalIntegerSliceField(req.GroupIDs, "group_ids")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	autoPause5hThreshold, err := parseOptionalRatioField(req.AutoPause5hThreshold, "auto_pause_5h_threshold")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	autoPause7dThreshold, err := parseOptionalRatioField(req.AutoPause7dThreshold, "auto_pause_7d_threshold")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	autoPause5hDisabled, err := parseOptionalBoolField(req.AutoPause5hDisabled, "auto_pause_5h_disabled")
-	if err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	autoPause7dDisabled, err := parseOptionalBoolField(req.AutoPause7dDisabled, "auto_pause_7d_disabled")
+	update, err := parseAccountSchedulerUpdate(req)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
@@ -991,8 +1094,8 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	if allowedAPIKeyIDs.Set {
-		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, allowedAPIKeyIDs.Values)
+	if update.AllowedAPIKeyIDs.Set {
+		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, update.AllowedAPIKeyIDs.Values)
 		if err != nil {
 			writeError(c, http.StatusInternalServerError, "校验 API Key 失败: "+err.Error())
 			return
@@ -1006,8 +1109,8 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 			return
 		}
 	}
-	if groupIDs.Set {
-		missingGroupIDs, err := h.db.VerifyAccountGroupIDs(ctx, groupIDs.Values)
+	if update.GroupIDs.Set {
+		missingGroupIDs, err := h.db.VerifyAccountGroupIDs(ctx, update.GroupIDs.Values)
 		if err != nil {
 			writeError(c, http.StatusInternalServerError, "校验账号分组失败: "+err.Error())
 			return
@@ -1022,27 +1125,7 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		}
 	}
 
-	proxyURL := database.OptionalString{}
-	if req.ProxyURL != nil {
-		proxyURL = database.OptionalString{Set: true, Value: *req.ProxyURL}
-	}
-	credentialUpdates := make(map[string]interface{})
-	if autoPause5hThreshold.Set {
-		credentialUpdates["auto_pause_5h_threshold"] = autoPause5hThreshold.Value
-	}
-	if autoPause7dThreshold.Set {
-		credentialUpdates["auto_pause_7d_threshold"] = autoPause7dThreshold.Value
-	}
-	if autoPause5hDisabled.Set {
-		credentialUpdates["auto_pause_5h_disabled"] = autoPause5hDisabled.Value
-	}
-	if autoPause7dDisabled.Set {
-		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
-	}
-	if len(credentialUpdates) == 0 {
-		credentialUpdates = nil
-	}
-	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, scoreBiasOverride, baseConcurrencyOverride, skipWarmTier, allowedAPIKeyIDs, database.OptionalStringSlice{Set: tags.Set, Values: tags.Values}, groupIDs, proxyURL, credentialUpdates); err != nil {
+	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
 			return
@@ -1050,61 +1133,46 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "更新账号调度配置失败: "+err.Error())
 		return
 	}
-	if h.store != nil {
-		if scoreBiasOverride.Set || baseConcurrencyOverride.Set || skipWarmTier.Set {
-			current := h.store.FindByID(id)
-			var score *int64
-			var concurrency *int64
-			var skipWarm *bool
-			if current != nil {
-				current.Mu().RLock()
-				if current.ScoreBiasOverride != nil {
-					value := *current.ScoreBiasOverride
-					score = &value
-				}
-				if current.BaseConcurrencyOverride != nil {
-					value := *current.BaseConcurrencyOverride
-					concurrency = &value
-				}
-				skipValue := current.SkipWarmTier
-				skipWarm = &skipValue
-				current.Mu().RUnlock()
-			}
-			if scoreBiasOverride.Set {
-				score = nullableInt64Pointer(scoreBiasOverride.Value)
-			}
-			if baseConcurrencyOverride.Set {
-				concurrency = nullableInt64Pointer(baseConcurrencyOverride.Value)
-			}
-			if skipWarmTier.Set {
-				skipWarm = &skipWarmTier.Value
-			}
-			h.store.ApplyAccountSchedulerOverrides(id, score, concurrency, skipWarm)
-		}
-		if allowedAPIKeyIDs.Set {
-			h.store.ApplyAccountAllowedAPIKeys(id, allowedAPIKeyIDs.Values)
-		}
-		if autoPause5hThreshold.Set || autoPause7dThreshold.Set || autoPause5hDisabled.Set || autoPause7dDisabled.Set {
-			h.store.ApplyAccountQuotaAutoPauseConfig(
-				id,
-				optionalFloat64Ptr(autoPause5hThreshold),
-				optionalFloat64Ptr(autoPause7dThreshold),
-				optionalBoolPtr(autoPause5hDisabled),
-				optionalBoolPtr(autoPause7dDisabled),
-			)
-		}
-	}
-	if h.store != nil && tags.Set {
-		h.store.ApplyAccountTags(id, tags.Values)
-	}
-	if h.store != nil && groupIDs.Set {
-		h.store.ApplyAccountGroups(id, groupIDs.Values)
-	}
-	if h.store != nil && req.ProxyURL != nil {
-		h.store.ApplyAccountProxyURL(id, *req.ProxyURL)
-	}
+	h.applyAccountSchedulerRuntimeUpdate(id, update)
 
 	writeMessage(c, http.StatusOK, "账号调度配置已更新")
+}
+
+func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSchedulerUpdate) {
+	if h.store == nil {
+		return
+	}
+	if update.ScoreBiasOverride.Set || update.BaseConcurrencyOverride.Set || update.SkipWarmTier.Set {
+		h.store.ApplyAccountSchedulerOverridePatch(
+			id,
+			update.ScoreBiasOverride.Set,
+			nullableInt64Pointer(update.ScoreBiasOverride.Value),
+			update.BaseConcurrencyOverride.Set,
+			nullableInt64Pointer(update.BaseConcurrencyOverride.Value),
+			optionalBoolPtr(update.SkipWarmTier),
+		)
+	}
+	if update.AllowedAPIKeyIDs.Set {
+		h.store.ApplyAccountAllowedAPIKeys(id, update.AllowedAPIKeyIDs.Values)
+	}
+	if update.AutoPause5hThreshold.Set || update.AutoPause7dThreshold.Set || update.AutoPause5hDisabled.Set || update.AutoPause7dDisabled.Set {
+		h.store.ApplyAccountQuotaAutoPauseConfig(
+			id,
+			optionalFloat64Ptr(update.AutoPause5hThreshold),
+			optionalFloat64Ptr(update.AutoPause7dThreshold),
+			optionalBoolPtr(update.AutoPause5hDisabled),
+			optionalBoolPtr(update.AutoPause7dDisabled),
+		)
+	}
+	if update.Tags.Set {
+		h.store.ApplyAccountTags(id, update.Tags.Values)
+	}
+	if update.GroupIDs.Set {
+		h.store.ApplyAccountGroups(id, update.GroupIDs.Values)
+	}
+	if update.ProxyURL.Set {
+		h.store.ApplyAccountProxyURL(id, update.ProxyURL.Value)
+	}
 }
 
 type optionalStringSlice struct {
@@ -1160,6 +1228,27 @@ func parseOptionalStringSliceField(raw json.RawMessage, field string) (optionalS
 		return optionalStringSlice{}, fmt.Errorf("%s 最多 32 个标签", field)
 	}
 	return optionalStringSlice{Set: true, Values: out}, nil
+}
+
+func parseOptionalStringField(raw json.RawMessage, field string, validator func(string) error) (database.OptionalString, error) {
+	if len(raw) == 0 {
+		return database.OptionalString{}, nil
+	}
+	if string(raw) == "null" {
+		return database.OptionalString{Set: true, Value: ""}, nil
+	}
+
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return database.OptionalString{}, fmt.Errorf("%s 必须是字符串或 null", field)
+	}
+	value = strings.TrimSpace(value)
+	if validator != nil {
+		if err := validator(value); err != nil {
+			return database.OptionalString{}, fmt.Errorf("%s 无效: %w", field, err)
+		}
+	}
+	return database.OptionalString{Set: true, Value: value}, nil
 }
 
 func parseOptionalIntegerField(raw json.RawMessage, field string, minValue, maxValue int64) (database.OptionalNullInt64, error) {
@@ -1710,6 +1799,21 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
+		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
+			accessToken: at,
+		})
+		if seed.email != "" && seed.accountID != "" {
+			id, _, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+			if err != nil {
+				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+				failCount++
+				continue
+			}
+			successCount++
+			log.Printf("AT 账号 %d 已加入或更新号池 (id=%d)", i+1, id)
+			continue
+		}
+
 		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
 		if err != nil {
 			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
@@ -1720,40 +1824,13 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 
-		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
-		atInfo := auth.ParseAccessToken(at)
-
-		// 热加载到内存池（AT-only，无 RT）
-		newAcc := &auth.Account{
-			DBID:        id,
-			AccessToken: at,
-			ExpiresAt:   time.Now().Add(1 * time.Hour),
-			ProxyURL:    req.ProxyURL,
-		}
-		if atInfo != nil {
-			newAcc.Email = atInfo.Email
-			newAcc.AccountID = atInfo.ChatGPTAccountID
-			newAcc.PlanType = atInfo.PlanType
-			if !atInfo.ExpiresAt.IsZero() {
-				newAcc.ExpiresAt = atInfo.ExpiresAt
-			}
-			if !atInfo.SubscriptionExpiresAt.IsZero() {
-				newAcc.SubscriptionExpiresAt = atInfo.SubscriptionExpiresAt
-			}
-		}
+		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
+		// 身份信息后续由 wham 用量查询补齐。
+		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
-		// 将解析到的信息持久化到数据库
-		if atInfo != nil {
-			creds := map[string]interface{}{
-				"email":      atInfo.Email,
-				"account_id": atInfo.ChatGPTAccountID,
-				"plan_type":  atInfo.PlanType,
-				"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
-			}
-			if !atInfo.SubscriptionExpiresAt.IsZero() {
-				creds["subscription_expires_at"] = atInfo.SubscriptionExpiresAt.Format(time.RFC3339)
-			}
+		// 将解析/识别到的信息持久化到数据库。
+		if creds := tokenCredentialMap(seed); len(creds) > 0 {
 			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
 				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
 			}
@@ -2326,6 +2403,26 @@ func importTokenCredentialIdentity(t importToken) string {
 	}
 }
 
+func importCredentialFingerprint(refreshToken, sessionToken, accessToken string) string {
+	return strings.TrimSpace(refreshToken) + "\x00" + strings.TrimSpace(sessionToken) + "\x00" + strings.TrimSpace(accessToken)
+}
+
+func importTokenCredentialFingerprint(t importToken, conflicts map[string]bool) string {
+	seed := importTokenSeed(t, conflicts)
+	return importCredentialFingerprint(seed.refreshToken, seed.sessionToken, seed.accessToken)
+}
+
+func importAccountCredentialFingerprint(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	return importCredentialFingerprint(
+		row.GetCredential("refresh_token"),
+		row.GetCredential("session_token"),
+		row.GetCredential("access_token"),
+	)
+}
+
 func conflictingImportChatGPTIDs(tokens []importToken) map[string]bool {
 	identitiesByID := make(map[string]map[string]struct{})
 	for _, t := range tokens {
@@ -2367,6 +2464,38 @@ func importStoredAccountID(t importToken, conflicts map[string]bool) string {
 		return strings.TrimSpace(t.accountID)
 	}
 	return reliableImportChatGPTID(t, conflicts)
+}
+
+func importTokenSeed(t importToken, conflicts map[string]bool) tokenCredentialSeed {
+	return normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken:          t.refreshToken,
+		sessionToken:          t.sessionToken,
+		accessToken:           t.accessToken,
+		idToken:               t.idToken,
+		accountID:             importStoredAccountID(t, conflicts),
+		email:                 t.email,
+		planType:              t.planType,
+		expiresAtRaw:          t.expiresAt,
+		codex7DUsedPercent:    t.codex7DUsedPercent,
+		codex7DResetAt:        t.codex7DResetAt,
+		codex5HUsedPercent:    t.codex5HUsedPercent,
+		codex5HResetAt:        t.codex5HResetAt,
+		codex5HUsageUpdatedAt: t.codex5HUsageUpdatedAt,
+		codexUsageUpdatedAt:   t.codexUsageUpdatedAt,
+	})
+}
+
+func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) string {
+	seed := importTokenSeed(t, conflicts)
+	email := strings.ToLower(strings.TrimSpace(seed.email))
+	accountID := strings.TrimSpace(seed.accountID)
+	if accountID == "" && strings.TrimSpace(t.accountID) == "" {
+		accountID = strings.TrimSpace(t.chatgptAccountID)
+	}
+	if email == "" || accountID == "" {
+		return ""
+	}
+	return email + "\x00" + accountID
 }
 
 // ImportAccounts 批量导入账号（支持 TXT / JSON）
@@ -2606,25 +2735,52 @@ func sendSSEJSON(c *gin.Context, event any) {
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
 func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
 	// 文件内去重：
-	// 1) 当 chatgpt_account_id 在本批次内与凭据一一对应时，以它作为唯一键。
-	//    如果同一个 chatgpt_account_id 对应多个不同 RT / ST / AT，说明导出工具把非账号唯一字段写进了这里，
-	//    此时把它视为不可靠并回退到 RT / ST / AT 去重。
-	// 2) 没有 chatgpt_account_id 时，退回到 RT / ST / AT 顺序去重（兼容旧导出格式）。
+	// 1) 当条目可解析出 email + account_id 时，以它作为 OAuth 身份键；
+	//    同身份同 RT/ST/AT 折叠，同身份不同 RT/ST/AT 整组跳过，避免任选一个覆盖。
+	// 2) 没有 OAuth 身份时，退回到 RT / ST / AT 顺序去重（兼容旧导出格式）。
 	// 3) 同一份文件内若出现"同一个 RT 对应多个不同 chatgpt_account_id"，
 	//    会被全部保留为独立账号；数据库层面 refresh_token 没有 UNIQUE 约束，因此安全。
 	conflictingChatGPTIDs := conflictingImportChatGPTIDs(tokens)
-	seenChatGPTID := make(map[string]bool)
+	type oauthIdentityImportState struct {
+		count        int
+		fingerprints map[string]struct{}
+	}
+	oauthIdentityStates := make(map[string]*oauthIdentityImportState)
+	for _, t := range tokens {
+		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+		if oauthIdentity == "" {
+			continue
+		}
+		state := oauthIdentityStates[oauthIdentity]
+		if state == nil {
+			state = &oauthIdentityImportState{fingerprints: make(map[string]struct{}, 1)}
+			oauthIdentityStates[oauthIdentity] = state
+		}
+		state.count++
+		state.fingerprints[importTokenCredentialFingerprint(t, conflictingChatGPTIDs)] = struct{}{}
+	}
+
+	seenOAuthIdentity := make(map[string]bool)
 	seenRT := make(map[string]bool)
 	seenST := make(map[string]bool)
 	seenAT := make(map[string]bool)
 	var unique []importToken
+	ambiguousOAuthIdentityCount := 0
 	for _, t := range tokens {
-		reliableChatGPTID := reliableImportChatGPTID(t, conflictingChatGPTIDs)
-		if reliableChatGPTID != "" {
-			if seenChatGPTID[reliableChatGPTID] {
+		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+		if oauthIdentity != "" {
+			state := oauthIdentityStates[oauthIdentity]
+			if state != nil && len(state.fingerprints) > 1 {
+				if !seenOAuthIdentity[oauthIdentity] {
+					ambiguousOAuthIdentityCount += state.count
+					seenOAuthIdentity[oauthIdentity] = true
+				}
 				continue
 			}
-			seenChatGPTID[reliableChatGPTID] = true
+			if seenOAuthIdentity[oauthIdentity] {
+				continue
+			}
+			seenOAuthIdentity[oauthIdentity] = true
 			if t.refreshToken != "" {
 				seenRT[t.refreshToken] = true
 			}
@@ -2668,7 +2824,11 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	dedupeCtx, dedupeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer dedupeCancel()
 
-	log.Printf("导入解析: 文件内 %d 条, 去重后 %d 条（%d 条文件内重复）", len(tokens), len(unique), len(tokens)-len(unique))
+	fileDuplicateCount := len(tokens) - len(unique) - ambiguousOAuthIdentityCount
+	if fileDuplicateCount < 0 {
+		fileDuplicateCount = 0
+	}
+	log.Printf("导入解析: 文件内 %d 条, 去重后 %d 条（%d 条文件内重复，%d 条 OAuth 身份冲突跳过）", len(tokens), len(unique), fileDuplicateCount, ambiguousOAuthIdentityCount)
 
 	existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
 	if err != nil {
@@ -2696,42 +2856,33 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		}
 	}
 
-	// 当导入条目带 chatgpt_account_id 时，按它查数据库已有账号 —— 这是 ChatGPT 端真实的账号唯一标识。
-	hasChatGPTID := false
-	for _, t := range unique {
-		if reliableImportChatGPTID(t, conflictingChatGPTIDs) != "" {
-			hasChatGPTID = true
-			break
-		}
-	}
-	var existingChatGPTIDs map[string]bool
-	if hasChatGPTID {
-		existingChatGPTIDs, err = h.db.GetAllChatGPTAccountIDs(dedupeCtx)
-		if err != nil {
-			log.Printf("查询已有 chatgpt_account_id 失败: %v", err)
-			existingChatGPTIDs = make(map[string]bool)
-		}
-	}
-
 	var newTokens []importToken
-	duplicateCount := 0
+	duplicateCount := ambiguousOAuthIdentityCount
 	for _, t := range unique {
-		reliableChatGPTID := reliableImportChatGPTID(t, conflictingChatGPTIDs)
-		// 优先按 chatgpt_account_id 判定数据库内是否已存在该账号；
-		// 命中则跳过，避免同一账号被重复导入。
-		if reliableChatGPTID != "" && existingChatGPTIDs[reliableChatGPTID] {
-			duplicateCount++
+		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+		if oauthIdentity != "" {
+			seed := importTokenSeed(t, conflictingChatGPTIDs)
+			if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
+				log.Printf("查询已有 OAuth 身份失败: %v", err)
+			} else if duplicateID > 0 {
+				row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
+				if err != nil {
+					log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
+				} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
+					duplicateCount++
+					continue
+				}
+			}
+			newTokens = append(newTokens, t)
 			continue
 		}
 		switch {
 		case t.refreshToken != "":
-			// 已经按 chatgpt_account_id 排除过重复账号；此处仅当条目没有 chatgpt_account_id 时才回退到 RT 去重，
-			// 否则当多个不同账号共享同一 RT（部分导出工具的常见格式）时会被错误判定为重复。
-			if reliableChatGPTID == "" && existingRTs[t.refreshToken] {
+			if existingRTs[t.refreshToken] {
 				duplicateCount++
-			} else if reliableChatGPTID == "" && t.sessionToken != "" && existingSTs[t.sessionToken] {
+			} else if t.sessionToken != "" && existingSTs[t.sessionToken] {
 				duplicateCount++
-			} else if reliableChatGPTID == "" && t.accessToken != "" && existingATs[t.accessToken] {
+			} else if t.accessToken != "" && existingATs[t.accessToken] {
 				duplicateCount++
 			} else {
 				newTokens = append(newTokens, t)
@@ -2753,13 +2904,13 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 		}
 	}
 
-	total := len(unique)
+	total := len(unique) + ambiguousOAuthIdentityCount
 
 	log.Printf("导入去重: 总计 %d 条, 数据库已存在 %d 条, 待导入 %d 条", total, duplicateCount, len(newTokens))
 
 	if len(newTokens) == 0 {
 		c.JSON(http.StatusOK, gin.H{
-			"message":   fmt.Sprintf("所有 %d 个 Token 已存在，无需导入", total),
+			"message":   fmt.Sprintf("所有 %d 个 Token 已存在或已跳过，无需导入", total),
 			"success":   0,
 			"duplicate": duplicateCount,
 			"failed":    0,
@@ -2807,6 +2958,43 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 			name := tok.name
 
+			seed := importTokenSeed(tok, conflictingChatGPTIDs)
+			importSource := "import"
+			if tok.accessToken != "" && tok.refreshToken == "" {
+				importSource = "import_at"
+			}
+			if seed.email != "" && seed.accountID != "" {
+				if name == "" {
+					if importSource == "import_at" {
+						name = fmt.Sprintf("at-import-%d", idx+1)
+					} else {
+						name = fmt.Sprintf("import-%d", idx+1)
+					}
+				}
+
+				upsertCtx, upsertCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				id, _, err := h.upsertOAuthIdentityAccount(upsertCtx, name, proxyURL, seed, importSource)
+				upsertCancel()
+				if err != nil {
+					log.Printf("导入账号 %d/%d 更新或写入失败: %v", idx+1, len(newTokens), err)
+					atomic.AddInt64(&failCount, 1)
+					atomic.AddInt64(&current, 1)
+					return
+				}
+
+				atomic.AddInt64(&successCount, 1)
+				atomic.AddInt64(&current, 1)
+				if h.store != nil {
+					if acc := h.store.FindByID(id); acc != nil {
+						h.applyImportedAccountUsageState(acc, importSource)
+						if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
+							go h.refreshImportedAccountAndProbe(id, importSource+"_refresh")
+						}
+					}
+				}
+				return
+			}
+
 			if tok.accessToken != "" && tok.refreshToken == "" {
 				// AT-only 导入路径
 				if name == "" {
@@ -2828,21 +3016,6 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
-				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-					sessionToken:          tok.sessionToken,
-					accessToken:           tok.accessToken,
-					idToken:               tok.idToken,
-					accountID:             importStoredAccountID(tok, conflictingChatGPTIDs),
-					email:                 tok.email,
-					planType:              tok.planType,
-					expiresAtRaw:          tok.expiresAt,
-					codex7DUsedPercent:    tok.codex7DUsedPercent,
-					codex7DResetAt:        tok.codex7DResetAt,
-					codex5HUsedPercent:    tok.codex5HUsedPercent,
-					codex5HResetAt:        tok.codex5HResetAt,
-					codex5HUsageUpdatedAt: tok.codex5HUsageUpdatedAt,
-					codexUsageUpdatedAt:   tok.codexUsageUpdatedAt,
-				})
 				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
 				if len(tokenCredentialMap(seed)) > 0 {
 					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -2866,21 +3039,6 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				if tok.refreshToken != "" {
 					id, err = h.db.InsertAccount(insertCtx, name, tok.refreshToken, proxyURL)
 				} else {
-					seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-						sessionToken:          tok.sessionToken,
-						accessToken:           tok.accessToken,
-						idToken:               tok.idToken,
-						accountID:             importStoredAccountID(tok, conflictingChatGPTIDs),
-						email:                 tok.email,
-						planType:              tok.planType,
-						expiresAtRaw:          tok.expiresAt,
-						codex7DUsedPercent:    tok.codex7DUsedPercent,
-						codex7DResetAt:        tok.codex7DResetAt,
-						codex5HUsedPercent:    tok.codex5HUsedPercent,
-						codex5HResetAt:        tok.codex5HResetAt,
-						codex5HUsageUpdatedAt: tok.codex5HUsageUpdatedAt,
-						codexUsageUpdatedAt:   tok.codexUsageUpdatedAt,
-					})
 					id, err = h.db.InsertAccountWithCredentials(insertCtx, name, tokenCredentialMap(seed), proxyURL)
 				}
 				insertCancel()
@@ -2896,22 +3054,6 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import")
 
-				seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-					refreshToken:          tok.refreshToken,
-					sessionToken:          tok.sessionToken,
-					accessToken:           tok.accessToken,
-					idToken:               tok.idToken,
-					accountID:             importStoredAccountID(tok, conflictingChatGPTIDs),
-					email:                 tok.email,
-					planType:              tok.planType,
-					expiresAtRaw:          tok.expiresAt,
-					codex7DUsedPercent:    tok.codex7DUsedPercent,
-					codex7DResetAt:        tok.codex7DResetAt,
-					codex5HUsedPercent:    tok.codex5HUsedPercent,
-					codex5HResetAt:        tok.codex5HResetAt,
-					codex5HUsageUpdatedAt: tok.codex5HUsageUpdatedAt,
-					codexUsageUpdatedAt:   tok.codexUsageUpdatedAt,
-				})
 				if len(tokenCredentialMap(seed)) > 0 {
 					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
 					if err := h.db.UpdateCredentials(credCtx, id, tokenCredentialMap(seed)); err != nil {
@@ -2994,8 +3136,55 @@ func (h *Handler) GetAccountUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, detail)
 }
 
+// RefreshAccountUsage 同步刷新单个账号的用量快照（优先走零成本的 wham 端点），
+// 完成后返回该账号最新的 5h/7d 用量字段，供前端用量列即时更新进度条。
+// POST /api/admin/accounts/:id/usage/refresh
+func (h *Handler) RefreshAccountUsage(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	account := h.store.FindByID(id)
+	if account == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	if err := h.ProbeUsageSnapshot(ctx, account); err != nil {
+		writeError(c, http.StatusBadGateway, fmt.Sprintf("刷新用量失败: %s", err.Error()))
+		return
+	}
+
+	resp := gin.H{"refreshed": true}
+	if pct, ok := account.GetUsagePercent5h(); ok {
+		resp["usage_percent_5h"] = pct
+	}
+	if pct, ok := account.GetUsagePercent7d(); ok {
+		resp["usage_percent_7d"] = pct
+	}
+	if t := account.GetReset5hAt(); !t.IsZero() {
+		resp["reset_5h_at"] = t.Format(time.RFC3339)
+	}
+	if t := account.GetReset7dAt(); !t.IsZero() {
+		resp["reset_7d_at"] = t.Format(time.RFC3339)
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 type batchAccountIDsRequest struct {
 	IDs []int64 `json:"ids"`
+}
+
+type batchUpdateAccountsReq struct {
+	updateAccountSchedulerReq
+	IDs     []int64 `json:"ids"`
+	Enabled *bool   `json:"enabled"`
+	Locked  *bool   `json:"locked"`
 }
 
 // DeleteAccount 删除账号
@@ -3038,6 +3227,7 @@ type recycleBinAccountResponse struct {
 	Email              string   `json:"email"`
 	PlanType           string   `json:"plan_type"`
 	ATOnly             bool     `json:"at_only"`
+	AccessTokenType    string   `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI bool     `json:"openai_responses_api"`
 	BaseURL            string   `json:"base_url,omitempty"`
 	Models             []string `json:"models,omitempty"`
@@ -3077,6 +3267,7 @@ func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
 			Email:              email,
 			PlanType:           planType,
 			ATOnly:             !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			AccessTokenType:    accountAccessTokenType(row),
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			BaseURL:            baseURL,
 			Models:             row.GetCredentialStringSlice("models"),
@@ -3113,6 +3304,10 @@ func (h *Handler) RestoreAccount(c *gin.Context) {
 			writeError(c, http.StatusNotFound, "回收站中不存在该账号")
 			return
 		}
+		if errors.Is(err, errDuplicateOAuthIdentity) {
+			writeError(c, http.StatusConflict, "恢复失败: "+err.Error())
+			return
+		}
 		writeError(c, http.StatusInternalServerError, "恢复失败: "+err.Error())
 		return
 	}
@@ -3121,14 +3316,50 @@ func (h *Handler) RestoreAccount(c *gin.Context) {
 
 // restoreAccountByID 将回收站账号恢复为 active 并重新加入运行时池。
 func (h *Handler) restoreAccountByID(ctx context.Context, id int64) error {
+	row, err := h.db.GetAccountByIDIncludingDeleted(ctx, id)
+	if err != nil {
+		return err
+	}
+	seed := tokenCredentialSeedFromAccountRow(row)
+	if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id); err != nil {
+		return err
+	} else if duplicateID > 0 {
+		return fmt.Errorf("%w: 已存在相同 OAuth 账号 (id=%d)，请先删除正常账号或清理回收站账号", errDuplicateOAuthIdentity, duplicateID)
+	}
+
 	if err := h.db.RestoreAccount(ctx, id); err != nil {
 		return err
 	}
-	if err := h.store.LoadAccountByID(ctx, id); err != nil {
-		log.Printf("恢复账号 %d 后加载运行时失败: %v", id, err)
+	if h.store != nil {
+		if err := h.store.LoadAccountByID(ctx, id); err != nil {
+			log.Printf("恢复账号 %d 后加载运行时失败: %v", id, err)
+			return fmt.Errorf("恢复账号后加载运行时失败: %w", err)
+		}
 	}
 	h.db.InsertAccountEventAsync(id, "restored", "recycle_bin")
 	return nil
+}
+
+func tokenCredentialSeedFromAccountRow(row *database.AccountRow) tokenCredentialSeed {
+	if row == nil {
+		return tokenCredentialSeed{}
+	}
+	return normalizeTokenCredentialSeed(tokenCredentialSeed{
+		refreshToken:          row.GetCredential("refresh_token"),
+		sessionToken:          row.GetCredential("session_token"),
+		accessToken:           row.GetCredential("access_token"),
+		idToken:               row.GetCredential("id_token"),
+		accountID:             firstNonEmpty(row.GetCredential("account_id"), row.GetCredential("chatgpt_account_id")),
+		email:                 row.GetCredential("email"),
+		planType:              row.GetCredential("plan_type"),
+		expiresAtRaw:          row.GetCredential("expires_at"),
+		codex7DUsedPercent:    row.GetCredential("codex_7d_used_percent"),
+		codex7DResetAt:        row.GetCredential("codex_7d_reset_at"),
+		codex5HUsedPercent:    row.GetCredential("codex_5h_used_percent"),
+		codex5HResetAt:        row.GetCredential("codex_5h_reset_at"),
+		codex5HUsageUpdatedAt: row.GetCredential("codex_5h_usage_updated_at"),
+		codexUsageUpdatedAt:   row.GetCredential("codex_usage_updated_at"),
+	})
 }
 
 // PurgeAccount 从回收站彻底删除账号（物理删除）
@@ -3296,6 +3527,113 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 	}
 
 	return success, fail
+}
+
+// BatchUpdateAccounts 批量更新账号启用、锁定和调度元信息。
+// POST /api/admin/accounts/batch-update
+func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
+	var req batchUpdateAccountsReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	ids := uniqueAccountIDs(req.IDs)
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "请提供要更新的账号 ID 列表")
+		return
+	}
+
+	schedulerUpdate, err := parseAccountSchedulerUpdate(req.updateAccountSchedulerReq)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	enabled := optionalBoolFromPtr(req.Enabled)
+	locked := optionalBoolFromPtr(req.Locked)
+	if !enabled.Set && !locked.Set && !schedulerUpdate.hasChanges() {
+		writeError(c, http.StatusBadRequest, "请提供要更新的字段")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	if schedulerUpdate.AllowedAPIKeyIDs.Set {
+		missingAPIKeyIDs, err := h.findMissingAPIKeyIDs(ctx, schedulerUpdate.AllowedAPIKeyIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验 API Key 失败: "+err.Error())
+			return
+		}
+		if len(missingAPIKeyIDs) > 0 {
+			values := make([]string, 0, len(missingAPIKeyIDs))
+			for _, value := range missingAPIKeyIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "allowed_api_key_ids 包含不存在的 API Key ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
+	if schedulerUpdate.GroupIDs.Set {
+		missingGroupIDs, err := h.db.VerifyAccountGroupIDs(ctx, schedulerUpdate.GroupIDs.Values)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "校验账号分组失败: "+err.Error())
+			return
+		}
+		if len(missingGroupIDs) > 0 {
+			values := make([]string, 0, len(missingGroupIDs))
+			for _, value := range missingGroupIDs {
+				values = append(values, strconv.FormatInt(value, 10))
+			}
+			writeError(c, http.StatusBadRequest, "group_ids 包含不存在的分组 ID: "+strings.Join(values, ", "))
+			return
+		}
+	}
+
+	updatedIDs, err := h.db.BatchUpdateAccountMetadata(ctx, ids, database.BatchAccountMetadataUpdate{
+		Enabled:                 enabled,
+		Locked:                  locked,
+		ScoreBiasOverride:       schedulerUpdate.ScoreBiasOverride,
+		BaseConcurrencyOverride: schedulerUpdate.BaseConcurrencyOverride,
+		SkipWarmTier:            schedulerUpdate.SkipWarmTier,
+		AllowedAPIKeyIDs:        schedulerUpdate.AllowedAPIKeyIDs,
+		Tags:                    database.OptionalStringSlice{Set: schedulerUpdate.Tags.Set, Values: schedulerUpdate.Tags.Values},
+		GroupIDs:                schedulerUpdate.GroupIDs,
+		ProxyURL:                schedulerUpdate.ProxyURL,
+		CredentialUpdates:       schedulerUpdate.CredentialUpdates,
+	})
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "批量更新账号失败: "+err.Error())
+		return
+	}
+
+	if h.store != nil {
+		for _, id := range updatedIDs {
+			if enabled.Set {
+				h.store.ApplyAccountEnabled(id, enabled.Value)
+			}
+			if locked.Set {
+				if acc := h.store.FindByID(id); acc != nil {
+					if locked.Value {
+						atomic.StoreInt32(&acc.Locked, 1)
+					} else {
+						atomic.StoreInt32(&acc.Locked, 0)
+					}
+				}
+			}
+			h.applyAccountSchedulerRuntimeUpdate(id, schedulerUpdate)
+		}
+	}
+
+	success := int64(len(updatedIDs))
+	failed := int64(len(ids)) - success
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("已更新 %d 个账号，失败 %d 个", success, failed),
+		"success": success,
+		"failed":  failed,
+	})
 }
 
 // RefreshAccount 手动刷新账号 AT
@@ -4327,10 +4665,50 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		return
 	}
 
+	// 检查是否有任何 key 配置了窗口 cost limit
+	var need5h, need7d, need30d bool
+	for _, k := range keys {
+		if k.Limits.CostLimit5h > 0 {
+			need5h = true
+		}
+		if k.Limits.CostLimit7d > 0 {
+			need7d = true
+		}
+		if k.Limits.CostLimit30d > 0 {
+			need30d = true
+		}
+	}
+
+	// 按需批量查询窗口用量
+	var cost5h, cost7d, cost30d map[int64]float64
+	if need5h {
+		cost5h, _ = h.db.GetAllAPIKeysWindowCost(ctx, 5*time.Hour)
+	}
+	if need7d {
+		cost7d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 7*24*time.Hour)
+	}
+	if need30d {
+		cost30d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 30*24*time.Hour)
+	}
+
 	// 转换为脱敏响应
 	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
 	for _, k := range keys {
-		maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
+		mk := NewMaskedAPIKeyRow(k)
+		if k.Limits.CostLimit5h > 0 || k.Limits.CostLimit7d > 0 || k.Limits.CostLimit30d > 0 {
+			detail := &APIKeyWindowUsageDetail{}
+			if cost5h != nil {
+				detail.Cost5h = cost5h[k.ID]
+			}
+			if cost7d != nil {
+				detail.Cost7d = cost7d[k.ID]
+			}
+			if cost30d != nil {
+				detail.Cost30d = cost30d[k.ID]
+			}
+			mk.WindowUsage = detail
+		}
+		maskedKeys = append(maskedKeys, mk)
 	}
 
 	c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
@@ -4484,6 +4862,7 @@ type updateAPIKeyReq struct {
 	Name            *string                `json:"name"`
 	QuotaLimit      json.RawMessage        `json:"quota_limit"`
 	Quota           json.RawMessage        `json:"quota"`
+	ResetQuota      *bool                  `json:"reset_quota"`
 	ExpiresAt       json.RawMessage        `json:"expires_at"`
 	ExpiresInDays   *int                   `json:"expires_in_days"`
 	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
@@ -4571,6 +4950,7 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	update := database.APIKeyUpdate{
 		QuotaLimit:         quotaLimit,
 		QuotaLimitSet:      quotaLimitSet,
+		ResetQuota:         req.ResetQuota != nil && *req.ResetQuota,
 		ExpiresAt:          expiresAt,
 		ExpiresAtSet:       expiresAtSet,
 		AllowedGroupIDs:    allowedGroupValues,
@@ -4626,8 +5006,10 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		MaxConcurrency: maxInt(in.MaxConcurrency, 0),
 		CostLimit5h:    maxFloat(in.CostLimit5h, 0),
 		CostLimit7d:    maxFloat(in.CostLimit7d, 0),
+		CostLimit30d:   maxFloat(in.CostLimit30d, 0),
 		TokenLimit5h:   maxInt64(in.TokenLimit5h, 0),
 		TokenLimit7d:   maxInt64(in.TokenLimit7d, 0),
+		TokenLimit30d:  maxInt64(in.TokenLimit30d, 0),
 	}
 	return out
 }
@@ -4819,6 +5201,12 @@ type settingsResponse struct {
 	PromptFilterSensitiveWords         string  `json:"prompt_filter_sensitive_words"`
 	PromptFilterCustomPatterns         string  `json:"prompt_filter_custom_patterns"`
 	PromptFilterDisabledPatterns       string  `json:"prompt_filter_disabled_patterns"`
+	PromptFilterReviewEnabled          bool    `json:"prompt_filter_review_enabled"`
+	PromptFilterReviewAPIKeyConfigured bool    `json:"prompt_filter_review_api_key_configured"`
+	PromptFilterReviewBaseURL          string  `json:"prompt_filter_review_base_url"`
+	PromptFilterReviewModel            string  `json:"prompt_filter_review_model"`
+	PromptFilterReviewTimeoutSeconds   int     `json:"prompt_filter_review_timeout_seconds"`
+	PromptFilterReviewFailClosed       bool    `json:"prompt_filter_review_fail_closed"`
 	ClientCompatMode                   string  `json:"client_compat_mode"`
 	CodexMinCLIVersion                 string  `json:"codex_min_cli_version"`
 	UsageLogMode                       string  `json:"usage_log_mode"`
@@ -4830,6 +5218,7 @@ type settingsResponse struct {
 	FirstTokenTimeoutSeconds           int     `json:"first_token_timeout_seconds"`
 	BillingTierPolicy                  string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               bool    `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled          bool    `json:"public_key_usage_page_enabled"`
 	ImageStorageBackend                string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    string  `json:"image_s3_endpoint"`
 	ImageS3Region                      string  `json:"image_s3_region"`
@@ -4840,6 +5229,8 @@ type settingsResponse struct {
 	ImageS3ForcePathStyle              bool    `json:"image_s3_force_path_style"`
 	AutoPause5hThreshold               float64 `json:"auto_pause_5h_threshold"`
 	AutoPause7dThreshold               float64 `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent        float64 `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency        int     `json:"auto_pause_5h_guard_concurrency"`
 }
 
 type updateSettingsReq struct {
@@ -4896,6 +5287,12 @@ type updateSettingsReq struct {
 	PromptFilterSensitiveWords         *string  `json:"prompt_filter_sensitive_words"`
 	PromptFilterCustomPatterns         *string  `json:"prompt_filter_custom_patterns"`
 	PromptFilterDisabledPatterns       *string  `json:"prompt_filter_disabled_patterns"`
+	PromptFilterReviewEnabled          *bool    `json:"prompt_filter_review_enabled"`
+	PromptFilterReviewAPIKey           *string  `json:"prompt_filter_review_api_key"`
+	PromptFilterReviewBaseURL          *string  `json:"prompt_filter_review_base_url"`
+	PromptFilterReviewModel            *string  `json:"prompt_filter_review_model"`
+	PromptFilterReviewTimeoutSeconds   *int     `json:"prompt_filter_review_timeout_seconds"`
+	PromptFilterReviewFailClosed       *bool    `json:"prompt_filter_review_fail_closed"`
 	ClientCompatMode                   *string  `json:"client_compat_mode"`
 	CodexMinCLIVersion                 *string  `json:"codex_min_cli_version"`
 	UsageLogMode                       *string  `json:"usage_log_mode"`
@@ -4907,6 +5304,7 @@ type updateSettingsReq struct {
 	FirstTokenTimeoutSeconds           *int     `json:"first_token_timeout_seconds"`
 	BillingTierPolicy                  *string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               *bool    `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled          *bool    `json:"public_key_usage_page_enabled"`
 	ImageStorageBackend                *string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    *string  `json:"image_s3_endpoint"`
 	ImageS3Region                      *string  `json:"image_s3_region"`
@@ -4917,6 +5315,8 @@ type updateSettingsReq struct {
 	ImageS3ForcePathStyle              *bool    `json:"image_s3_force_path_style"`
 	AutoPause5hThreshold               *float64 `json:"auto_pause_5h_threshold"`
 	AutoPause7dThreshold               *float64 `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent        *float64 `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency        *int     `json:"auto_pause_5h_guard_concurrency"`
 }
 
 type brandingResponse struct {
@@ -5391,6 +5791,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	var resinURL, resinPlatformName string
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
+	publicKeyUsagePageEnabled := true
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -5398,6 +5799,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
+		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -5466,6 +5868,12 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
 		PromptFilterCustomPatterns:         promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
 		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
+		PromptFilterReviewAPIKeyConfigured: promptFilterCfg.Review.APIKey != "",
+		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
+		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
+		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
+		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
 		UsageLogMode:                       h.db.GetUsageLogMode(),
@@ -5477,6 +5885,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
 		ImageS3Region:                      imgCfg.Region,
@@ -5487,6 +5896,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
 	})
 }
 
@@ -5510,11 +5921,25 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
+	if req.AutoPause5hGuardBandPercent != nil {
+		if *req.AutoPause5hGuardBandPercent < 0 || *req.AutoPause5hGuardBandPercent > 100 {
+			writeError(c, http.StatusBadRequest, "auto_pause_5h_guard_band_percent 需在 0 到 100 之间")
+			return
+		}
+	}
+	if req.AutoPause5hGuardConcurrency != nil {
+		if *req.AutoPause5hGuardConcurrency < 0 || *req.AutoPause5hGuardConcurrency > 1000 {
+			writeError(c, http.StatusBadRequest, "auto_pause_5h_guard_concurrency 需在 0 到 1000 之间")
+			return
+		}
+	}
+
 	currentAdminSecret := ""
 	siteName := database.DefaultSiteName
 	siteLogo := ""
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
+	publicKeyUsagePageEnabled := true
 	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
@@ -5522,6 +5947,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
+		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -5884,6 +6310,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
 	}
+	if req.PublicKeyUsagePageEnabled != nil {
+		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
+		log.Printf("设置已更新: public_key_usage_page_enabled = %t", publicKeyUsagePageEnabled)
+	}
 	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
 		t5h := h.store.GetGlobalAutoPause5hThreshold()
 		t7d := h.store.GetGlobalAutoPause7dThreshold()
@@ -5895,6 +6325,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetGlobalAutoPauseThresholds(t5h, t7d)
 		log.Printf("设置已更新: auto_pause thresholds 5h=%.4f 7d=%.4f", t5h, t7d)
+	}
+	if req.AutoPause5hGuardBandPercent != nil {
+		h.store.SetAutoPause5hGuardBandPercent(*req.AutoPause5hGuardBandPercent)
+		log.Printf("设置已更新: auto_pause_5h_guard_band_percent = %.2f", *req.AutoPause5hGuardBandPercent)
+	}
+	if req.AutoPause5hGuardConcurrency != nil {
+		h.store.SetAutoPause5hGuardConcurrency(*req.AutoPause5hGuardConcurrency)
+		log.Printf("设置已更新: auto_pause_5h_guard_concurrency = %d", *req.AutoPause5hGuardConcurrency)
 	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
@@ -5969,8 +6407,42 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		promptFilterCfg.DisabledPatterns = disabled
 		promptFilterChanged = true
 	}
+	if req.PromptFilterReviewEnabled != nil {
+		promptFilterCfg.Review.Enabled = *req.PromptFilterReviewEnabled
+		promptFilterChanged = true
+	}
+	if req.PromptFilterReviewAPIKey != nil {
+		if key := strings.TrimSpace(*req.PromptFilterReviewAPIKey); key != "" {
+			promptFilterCfg.Review.APIKey = key
+			promptFilterChanged = true
+		}
+	}
+	if req.PromptFilterReviewBaseURL != nil {
+		promptFilterCfg.Review.BaseURL = strings.TrimSpace(*req.PromptFilterReviewBaseURL)
+		promptFilterChanged = true
+	}
+	if req.PromptFilterReviewModel != nil {
+		promptFilterCfg.Review.Model = strings.TrimSpace(*req.PromptFilterReviewModel)
+		promptFilterChanged = true
+	}
+	if req.PromptFilterReviewTimeoutSeconds != nil {
+		promptFilterCfg.Review.TimeoutSeconds = *req.PromptFilterReviewTimeoutSeconds
+		promptFilterChanged = true
+	}
+	if req.PromptFilterReviewFailClosed != nil {
+		promptFilterCfg.Review.FailClosed = *req.PromptFilterReviewFailClosed
+		promptFilterChanged = true
+	}
 	if promptFilterChanged {
 		promptFilterCfg = promptfilter.NormalizeConfig(promptFilterCfg)
+		if promptFilterCfg.Review.Enabled && strings.TrimSpace(promptFilterCfg.Review.APIKey) == "" {
+			writeError(c, http.StatusBadRequest, "Prompt 检查二次审查已启用时必须填写审查 API Key")
+			return
+		}
+		if err := promptfilter.ValidateReviewConfig(promptFilterCfg.Review); err != nil {
+			writeError(c, http.StatusBadRequest, "Prompt 检查审查配置无效: "+err.Error())
+			return
+		}
 		if _, err := promptfilter.NewEngine(promptFilterCfg); err != nil {
 			writeError(c, http.StatusBadRequest, "Prompt 检查规则无效: "+err.Error())
 			return
@@ -6109,6 +6581,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
 		PromptFilterCustomPatterns:         promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
 		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
+		PromptFilterReviewAPIKey:           promptFilterCfg.Review.APIKey,
+		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
+		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
+		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
+		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
 		UsageLogMode:                       usageLogMode,
@@ -6120,10 +6598,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
 		ImageStorageConfig:                 imgConfigJSON,
 		BackgroundConfig:                   encodeBackgroundConfig(bgCfg),
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -6202,6 +6683,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
 		PromptFilterCustomPatterns:         promptfilter.MarshalCustomPatterns(promptFilterCfg.CustomPatterns),
 		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
+		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
+		PromptFilterReviewAPIKeyConfigured: promptFilterCfg.Review.APIKey != "",
+		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
+		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
+		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
+		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
 		UsageLogMode:                       usageLogMode,
@@ -6211,6 +6698,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		StreamFlushIntervalMS:              runtimeCfg.StreamFlushIntervalMS,
 		FirstTokenMode:                     runtimeCfg.FirstTokenMode,
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
+		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
@@ -6222,6 +6710,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
 	})
 }
 

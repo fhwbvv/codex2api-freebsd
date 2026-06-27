@@ -26,6 +26,59 @@ func TestBuildErrorEvent_UpstreamErrorBecomesFailedEvent(t *testing.T) {
 	}
 }
 
+// TestBuildErrorEvent_UpstreamStatusBecomesResponseStatusCode verifies an upstream
+// top-level status is copied to response.status_code even when the preserved
+// upstream error object does not contain status_code itself.
+func TestBuildErrorEvent_UpstreamStatusBecomesResponseStatusCode(t *testing.T) {
+	r := &WsResponse{}
+	upstream := []byte(`{"type":"error","status":429,"error":{"type":"rate_limit_error","message":"too many requests","param":"input"}}`)
+
+	event, isErr := r.buildErrorEvent(upstream)
+	if !isErr {
+		t.Fatal("expected error frame to be detected")
+	}
+	if statusCode := gjson.GetBytes(event, "response.status_code").Int(); statusCode != 429 {
+		t.Fatalf("response.status_code = %d, want 429; event=%s", statusCode, event)
+	}
+	if gjson.GetBytes(event, "response.error.status_code").Exists() {
+		t.Fatalf("response.error should preserve upstream error object without injecting status_code: %s", event)
+	}
+	if msg := gjson.GetBytes(event, "response.error.message").String(); msg != "too many requests" {
+		t.Fatalf("response.error.message = %q, want preserved upstream message", msg)
+	}
+	if typ := gjson.GetBytes(event, "response.error.type").String(); typ != "rate_limit_error" {
+		t.Fatalf("response.error.type = %q, want preserved upstream type", typ)
+	}
+	if param := gjson.GetBytes(event, "response.error.param").String(); param != "input" {
+		t.Fatalf("response.error.param = %q, want preserved upstream param", param)
+	}
+}
+
+// TestBuildErrorEvent_UpstreamStatusCodeBecomesResponseStatusCode verifies an
+// upstream top-level status_code is copied to response.status_code while the
+// original response.error payload remains unchanged.
+func TestBuildErrorEvent_UpstreamStatusCodeBecomesResponseStatusCode(t *testing.T) {
+	r := &WsResponse{}
+	upstream := []byte(`{"type":"error","status_code":503,"error":{"message":"service unavailable","code":"server_error"}}`)
+
+	event, isErr := r.buildErrorEvent(upstream)
+	if !isErr {
+		t.Fatal("expected error frame to be detected")
+	}
+	if statusCode := gjson.GetBytes(event, "response.status_code").Int(); statusCode != 503 {
+		t.Fatalf("response.status_code = %d, want 503; event=%s", statusCode, event)
+	}
+	if gjson.GetBytes(event, "response.error.status_code").Exists() {
+		t.Fatalf("response.error should preserve upstream error object without injecting status_code: %s", event)
+	}
+	if msg := gjson.GetBytes(event, "response.error.message").String(); msg != "service unavailable" {
+		t.Fatalf("response.error.message = %q, want preserved upstream message", msg)
+	}
+	if code := gjson.GetBytes(event, "response.error.code").String(); code != "server_error" {
+		t.Fatalf("response.error.code = %q, want preserved upstream code", code)
+	}
+}
+
 // TestBuildErrorEvent_NonErrorPassthrough 验证非错误帧不被识别为错误。
 func TestBuildErrorEvent_NonErrorPassthrough(t *testing.T) {
 	r := &WsResponse{}

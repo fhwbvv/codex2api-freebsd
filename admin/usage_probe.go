@@ -30,12 +30,17 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 		return nil
 	}
 
+	// 限流/冷却（429 或 premium 5h 限流）状态下只做 wham（零成本），
+	// 失败也不回退 /responses，避免加重限流或额外消耗额度。
+	limited := account.InLimitedState()
+	whamOnly := limited || h.store.GetLazyMode() || !h.store.UsageProbeResponsesFallbackEnabled()
+
 	// 1) 优先用 wham（零成本）
-	if err := h.probeUsageViaWham(ctx, account); err == nil {
+	if err := h.probeUsageViaWham(ctx, account, limited); err == nil {
 		return nil
 	} else {
-		if h.store.GetLazyMode() || !h.store.UsageProbeResponsesFallbackEnabled() {
-			log.Printf("[账号 %d] wham 用量探测失败，已按配置跳过 /responses 探针: %v", account.DBID, err)
+		if whamOnly {
+			log.Printf("[账号 %d] wham 用量探测失败，已按配置/限流状态跳过 /responses 探针: %v", account.DBID, err)
 			return err
 		}
 		log.Printf("[账号 %d] wham 用量探测失败，回退到 /responses 探针: %v", account.DBID, err)
@@ -47,7 +52,11 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 
 // probeUsageViaWham 通过 /backend-api/wham/usage 拉取用量，
 // 不消耗任何 token 额度。
-func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account) error {
+//
+// limited=true 表示账号正处于 429 冷却 / premium 5h 限流状态：本次仅为零成本刷新
+// 「主动重置次数」与用量快照，不上报成功、也不清除冷却（冷却解除交给恢复探针/到期判断），
+// 避免把一次额度查询误判为账号已恢复。
+func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, limited bool) error {
 	usage, resp, err := proxy.QueryWhamUsage(ctx, account, h.store.ResolveProxyForAccount(account))
 	if resp != nil {
 		// QueryWhamUsage 在非 200 时不会读 body；这里读取一小段用于账号错误详情。
@@ -69,6 +78,10 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account) 
 	}
 
 	state := proxy.ApplyWhamUsage(h.store, account, usage)
+	if limited {
+		// 限流/冷却状态：只刷新数据，不动账号健康状态与冷却。
+		return nil
+	}
 	h.store.ReportRequestSuccess(account, 0)
 	// 用量未耗尽时重置冷却
 	if !applyUsageLimitedAccountState(h.store, account, state) {

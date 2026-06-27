@@ -2,8 +2,7 @@ import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { api, getAdminKey, resetAdminAuthState } from "../api";
 import Modal from "../components/Modal";
-import PageHeader from "../components/PageHeader";
-import Pagination from "../components/Pagination";
+import PageHeader from "../components/PageHeader";import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
 import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
@@ -18,6 +17,7 @@ import {
 import { useToast } from "../hooks/useToast";
 import type {
   AccountRow,
+  AccountHealthBucket,
   AddAccountRequest,
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
@@ -74,6 +74,7 @@ import {
   ChevronDown,
   Copy,
   Cookie,
+  Coins,
   Power,
   PowerOff,
   Hourglass,
@@ -82,6 +83,7 @@ import {
   LayoutGrid,
   Rows3,
   Recycle,
+  Mail,
   ArchiveRestore,
   ArrowLeft,
   ToggleLeft,
@@ -89,6 +91,8 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
+import AccountHealthBar from "../components/AccountHealthBar";
+import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
@@ -101,7 +105,6 @@ import AccountGroupFilterSelect, {
 } from "../components/AccountGroupFilterSelect";
 import ChipInput from "../components/ChipInput";
 
-const ACCOUNT_BATCH_CONCURRENCY = 6;
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
@@ -210,6 +213,33 @@ function persistAccountViewMode(mode: AccountViewMode) {
   }
 }
 
+// 账号管理页面级模式：号池模式（pool，默认，完整管理布局）/ 自用模式
+// （personal，主体列表改为每行 2 列卡片）。
+const ACCOUNT_PAGE_MODE_KEY = "codex2api:accounts:page-mode";
+type AccountPageMode = "pool" | "personal";
+
+// 自用模式自动判定阈值：用户从未手动设置过时，号池账号数 < 该值则默认自用模式。
+const ACCOUNT_PERSONAL_MODE_AUTO_THRESHOLD = 10;
+
+// 返回用户保存过的页面模式；从未设置过返回 null（用于触发按账号数自动判定）。
+function getStoredAccountPageMode(): AccountPageMode | null {
+  try {
+    const raw = window.localStorage.getItem(ACCOUNT_PAGE_MODE_KEY);
+    if (raw === "pool" || raw === "personal") return raw;
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function persistAccountPageMode(mode: AccountPageMode) {
+  try {
+    window.localStorage.setItem(ACCOUNT_PAGE_MODE_KEY, mode);
+  } catch {
+    // ignore
+  }
+}
+
 function getAccountEmailDomain(account: AccountRow): string {
   return (account.email_domain || "").trim().toLowerCase();
 }
@@ -220,6 +250,10 @@ function emailDomainTag(domain: string): string {
 
 function formatAccountListEmail(account: AccountRow): string {
   return account.email?.trim() || account.name || `ID ${account.id}`;
+}
+
+function formatAccessTokenBadge(account: AccountRow): string {
+  return account.access_token_type === "codex_at" ? "codex_at" : "AT";
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -299,6 +333,28 @@ function formatAccountName(account: AccountRow): string {
   return account.email || account.name || `ID ${account.id}`;
 }
 
+function isOAuthAccount(account: AccountRow | null): boolean {
+  return account?.account_type === "oauth";
+}
+
+function parseOAuthCallbackParams(rawUrl: string): { code: string; state: string } {
+  const raw = rawUrl.trim();
+  try {
+    const url = new URL(raw);
+    return {
+      code: url.searchParams.get("code") ?? "",
+      state: url.searchParams.get("state") ?? "",
+    };
+  } catch {
+    const qs = raw.includes("?") ? raw.split("?")[1] : raw;
+    const params = new URLSearchParams(qs);
+    return {
+      code: params.get("code") ?? "",
+      state: params.get("state") ?? "",
+    };
+  }
+}
+
 function formatQuotaAutoPausePercentInput(value?: number | null): string {
   if (typeof value !== "number" || value <= 0) return "";
   const percent = value * 100;
@@ -343,34 +399,6 @@ function useMediaQuery(query: string) {
   }, [query]);
 
   return matches;
-}
-
-async function runAccountBatch(
-  ids: number[],
-  action: (id: number) => Promise<unknown>,
-  concurrency = ACCOUNT_BATCH_CONCURRENCY,
-) {
-  let success = 0;
-  let fail = 0;
-  let cursor = 0;
-  const workerCount = Math.min(concurrency, ids.length);
-
-  await Promise.all(
-    Array.from({ length: workerCount }, async () => {
-      while (cursor < ids.length) {
-        const id = ids[cursor];
-        cursor += 1;
-        try {
-          await action(id);
-          success += 1;
-        } catch {
-          fail += 1;
-        }
-      }
-    }),
-  );
-
-  return { success, fail };
 }
 
 type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh";
@@ -572,6 +600,7 @@ export default function Accounts() {
     getInitialAnalysisVisibility,
   );
   const [showRecycleBin, setShowRecycleBin] = useState(false);
+  const [showInvite, setShowInvite] = useState(false);
   const [showEmailDomainTags, setShowEmailDomainTags] = useState(
     getInitialEmailDomainVisibility,
   );
@@ -622,6 +651,17 @@ export default function Accounts() {
   const [oauthName, setOauthName] = useState("");
   const [oauthGenerating, setOauthGenerating] = useState(false);
   const [oauthCompleting, setOauthCompleting] = useState(false);
+  const [editOAuthStep, setEditOAuthStep] = useState<"generate" | "exchange">(
+    "generate",
+  );
+  const [editOAuthSession, setEditOAuthSession] = useState<{
+    session_id: string;
+    auth_url: string;
+  } | null>(null);
+  const [editOAuthProxyUrl, setEditOAuthProxyUrl] = useState("");
+  const [editOAuthCallbackUrl, setEditOAuthCallbackUrl] = useState("");
+  const [editOAuthGenerating, setEditOAuthGenerating] = useState(false);
+  const [editOAuthUpdating, setEditOAuthUpdating] = useState(false);
   const [editTags, setEditTags] = useState<string[]>([]);
   const [editGroupIds, setEditGroupIds] = useState<number[]>([]);
   const [tagFilter, setTagFilter] = useState<string>("");
@@ -662,6 +702,13 @@ export default function Accounts() {
   const [viewMode, setViewMode] = useState<AccountViewMode>(
     getInitialAccountViewMode,
   );
+  const [pageMode, setPageMode] = useState<AccountPageMode>(
+    () => getStoredAccountPageMode() ?? "pool",
+  );
+  // 用户是否手动设置过页面模式（设置过则一律尊重用户，不再按账号数自动判定）。
+  const pageModeUserSetRef = useRef(getStoredAccountPageMode() !== null);
+  // 自动判定只在首次（账号加载完成后）应用一次。
+  const pageModeAutoAppliedRef = useRef(false);
   const isDesktopLayout = useMediaQuery("(min-width: 1024px)");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
@@ -904,6 +951,7 @@ export default function Accounts() {
       opsOverview,
       groupsResponse,
       settings,
+      healthBars,
     ] =
       await Promise.all([
         api.getAccounts(),
@@ -913,6 +961,10 @@ export default function Accounts() {
         shouldLoadSettings
           ? api.getSettings().catch((): SystemSettings | null => null)
           : Promise.resolve<SystemSettings | null>(null),
+        api
+          .getAccountHealthBars()
+          .then((res) => res.buckets)
+          .catch((): Record<string, AccountHealthBucket[]> | null => null),
       ]);
     if (settings) {
       lazyModeRef.current = settings.lazy_mode;
@@ -923,6 +975,7 @@ export default function Accounts() {
       apiKeys: apiKeysResponse.keys ?? [],
       opsOverview,
       lazyMode: lazyModeRef.current ?? false,
+      healthBars: healthBars ?? {},
     };
   }, []);
 
@@ -931,12 +984,14 @@ export default function Accounts() {
     apiKeys: APIKeyRow[];
     opsOverview: OpsOverviewResponse | null;
     lazyMode: boolean;
+    healthBars: Record<string, AccountHealthBucket[]>;
   }>({
     initialData: {
       accounts: [],
       apiKeys: [],
       opsOverview: null,
       lazyMode: false,
+      healthBars: {},
     },
     load: loadAccounts,
   });
@@ -944,7 +999,11 @@ export default function Accounts() {
   const apiKeys = data.apiKeys;
   const opsOverview = data.opsOverview;
   const lazyMode = data.lazyMode;
+  const healthBars = data.healthBars;
   const usageReloadAttemptsRef = useRef<Map<number, number>>(new Map());
+  // 测试连接后需要强制刷新用量的账号 id：即使其用量数据已存在（如已显示 100%），
+  // 也要在后台探针跑完后重新拉取，确保进度条更新为最新值。
+  const forceUsageReloadRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     persistAnalysisVisibility(showAnalysisCharts);
@@ -961,6 +1020,21 @@ export default function Accounts() {
   useEffect(() => {
     persistAccountViewMode(viewMode);
   }, [viewMode]);
+
+  // 首次升级（用户从未手动设置过页面模式）时，按号池账号数自动判定：
+  // 账号数 < 阈值则默认开启自用模式。等账号加载完成后只应用一次；之后用户在
+  // 下拉里手动切换才会持久化并一律尊重用户选择。
+  useEffect(() => {
+    if (pageModeUserSetRef.current) return;
+    if (pageModeAutoAppliedRef.current) return;
+    if (loading) return;
+    pageModeAutoAppliedRef.current = true;
+    setPageMode(
+      accounts.length < ACCOUNT_PERSONAL_MODE_AUTO_THRESHOLD
+        ? "personal"
+        : "pool",
+    );
+  }, [loading, accounts.length]);
 
   useEffect(() => {
     setGroupFilter((current) => pruneAccountGroupFilter(current, allGroups));
@@ -997,14 +1071,22 @@ export default function Accounts() {
     const missingUsageIds = accounts
       .filter(needsUsageReload)
       .map((account) => account.id);
-    const missingUsageIdSet = new Set(missingUsageIds);
+    // 测试连接后被标记强制刷新的账号也要参与重拉，即使其用量数据已存在。
+    // 仅保留仍在当前列表中的 id，避免泄漏。
+    const accountIdSet = new Set(accounts.map((account) => account.id));
+    const forceIds = Array.from(forceUsageReloadRef.current).filter((id) =>
+      accountIdSet.has(id),
+    );
+    forceUsageReloadRef.current = new Set(forceIds);
+    const reloadIds = Array.from(new Set([...missingUsageIds, ...forceIds]));
+    const reloadIdSet = new Set(reloadIds);
     for (const id of Array.from(usageReloadAttemptsRef.current.keys())) {
-      if (!missingUsageIdSet.has(id)) {
+      if (!reloadIdSet.has(id)) {
         usageReloadAttemptsRef.current.delete(id);
       }
     }
 
-    const retryIds = missingUsageIds.filter(
+    const retryIds = reloadIds.filter(
       (id) => (usageReloadAttemptsRef.current.get(id) ?? 0) < 6,
     );
     if (retryIds.length === 0) {
@@ -1016,6 +1098,11 @@ export default function Accounts() {
         id,
         (usageReloadAttemptsRef.current.get(id) ?? 0) + 1,
       );
+    }
+    // 强制刷新的账号已安排本轮重拉，移除标记，避免无谓地反复重拉到上限。
+    // 若重拉后数据仍未更新且该账号确实缺数据，会由 needsUsageReload 接管继续重试。
+    for (const id of forceIds) {
+      forceUsageReloadRef.current.delete(id);
     }
 
     const timer = window.setTimeout(() => {
@@ -1133,8 +1220,6 @@ export default function Accounts() {
             isRateLimitedAccount(account)
           )
             return false;
-          if (account.status !== "active" && account.status !== "ready")
-            return false;
           break;
         case "rate_limited":
           if (
@@ -1220,8 +1305,12 @@ export default function Accounts() {
     () => pagedAccounts.map((account) => account.id),
     [pagedAccounts],
   );
-  const shouldRenderMobileCards = viewMode === "grid" || !isDesktopLayout;
-  const shouldRenderDesktopTable = viewMode !== "grid" && isDesktopLayout;
+  // 自用模式（personal）下，主体列表强制走每行 2 列卡片，桌面端也不渲染表格。
+  const isPersonalMode = pageMode === "personal";
+  const shouldRenderMobileCards =
+    isPersonalMode || viewMode === "grid" || !isDesktopLayout;
+  const shouldRenderDesktopTable =
+    !isPersonalMode && viewMode !== "grid" && isDesktopLayout;
   const pageSelectedCount = useMemo(
     () =>
       pagedAccountIds.reduce(
@@ -1545,19 +1634,7 @@ export default function Accounts() {
 
   const handleOAuthComplete = async () => {
     if (!oauthSession) return;
-    let code = "";
-    let state = "";
-    const raw = oauthCallbackUrl.trim();
-    try {
-      const url = new URL(raw);
-      code = url.searchParams.get("code") ?? "";
-      state = url.searchParams.get("state") ?? "";
-    } catch {
-      const qs = raw.includes("?") ? raw.split("?")[1] : raw;
-      const params = new URLSearchParams(qs);
-      code = params.get("code") ?? "";
-      state = params.get("state") ?? "";
-    }
+    const { code, state } = parseOAuthCallbackParams(oauthCallbackUrl);
     if (!code || !state) {
       showToast(t("accounts.oauthParseError"), "error");
       return;
@@ -1590,6 +1667,96 @@ export default function Accounts() {
       );
     } finally {
       setOauthCompleting(false);
+    }
+  };
+
+  const startEditOAuthSession = async () => {
+    const result = await api.generateOAuthURL({
+      proxy_url: editOAuthProxyUrl.trim() || undefined,
+    });
+    setEditOAuthSession(result);
+    setEditOAuthCallbackUrl("");
+    setEditOAuthStep("exchange");
+    return result;
+  };
+
+  const handleEditOAuthGenerate = async () => {
+    setEditOAuthGenerating(true);
+    try {
+      await startEditOAuthSession();
+    } catch (error) {
+      showToast(
+        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setEditOAuthGenerating(false);
+    }
+  };
+
+  const handleEditOAuthRestart = async () => {
+    setEditOAuthGenerating(true);
+    setEditOAuthSession(null);
+    setEditOAuthCallbackUrl("");
+    try {
+      await startEditOAuthSession();
+    } catch (error) {
+      setEditOAuthStep("generate");
+      showToast(
+        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setEditOAuthGenerating(false);
+    }
+  };
+
+  const handleEditOAuthCopyLink = async () => {
+    if (!editOAuthSession?.auth_url) return;
+    try {
+      await copyTextToClipboard(editOAuthSession.auth_url);
+      showToast(t("common.copied"));
+    } catch {
+      showToast(t("common.copyFailed"), "error");
+    }
+  };
+
+  const handleUpdateOAuthAccount = async () => {
+    if (!editingAccount || !isOAuthAccount(editingAccount)) return;
+    if (!editOAuthSession) {
+      showToast(t("accounts.oauthGenerateFirst"), "error");
+      return;
+    }
+    const { code, state } = parseOAuthCallbackParams(editOAuthCallbackUrl);
+    if (!code || !state) {
+      showToast(t("accounts.oauthParseError"), "error");
+      return;
+    }
+
+    setEditSubmitting(true);
+    setEditOAuthUpdating(true);
+    try {
+      const result = await api.updateOAuthAccount(editingAccount.id, {
+        session_id: editOAuthSession.session_id,
+        code,
+        state,
+        proxy_url: editOAuthProxyUrl.trim() || undefined,
+      });
+      showToast(
+        result.email
+          ? t("accounts.oauthUpdateSuccess", { email: result.email })
+          : t("accounts.oauthUpdateSuccessNoEmail"),
+      );
+      await reload();
+      closeSchedulerEditor(true);
+    } catch (error) {
+      showToast(
+        t("accounts.oauthFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setEditOAuthUpdating(false);
+      setEditSubmitting(false);
     }
   };
 
@@ -2118,12 +2285,22 @@ export default function Accounts() {
     setBatchLoading(true);
     setLockingSubscriptionAccounts(true);
     try {
-      const { success, fail } = await runAccountBatch(
-        candidates.map((account) => account.id),
-        (id) => api.toggleAccountLock(id, true),
+      const result = await api.batchUpdateAccounts({
+        ids: candidates.map((account) => account.id),
+        locked: true,
+      });
+      showToast(
+        t("accounts.lockSubscriptionAccountsDone", {
+          success: result.success,
+          fail: result.failed,
+        }),
       );
-      showToast(t("accounts.lockSubscriptionAccountsDone", { success, fail }));
       void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.lockFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
     } finally {
       setBatchLoading(false);
       setLockingSubscriptionAccounts(false);
@@ -2212,17 +2389,20 @@ export default function Accounts() {
     if (ids.length === 0) return;
     setBatchLoading(true);
     try {
-      const { success, fail } = await runAccountBatch(ids, (id) =>
-        api.toggleAccountLock(id, locked),
-      );
+      const result = await api.batchUpdateAccounts({ ids, locked });
       showToast(
         t(locked ? "accounts.batchLockDone" : "accounts.batchUnlockDone", {
-          success,
-          fail,
+          success: result.success,
+          fail: result.failed,
         }),
       );
       setSelected(new Set());
       void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.lockFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
     } finally {
       setBatchLoading(false);
     }
@@ -2233,17 +2413,20 @@ export default function Accounts() {
     if (ids.length === 0) return;
     setBatchLoading(true);
     try {
-      const { success, fail } = await runAccountBatch(ids, (id) =>
-        api.toggleAccountEnabled(id, enabled),
-      );
+      const result = await api.batchUpdateAccounts({ ids, enabled });
       showToast(
         t(enabled ? "accounts.batchEnableDone" : "accounts.batchDisableDone", {
-          success,
-          fail,
+          success: result.success,
+          fail: result.failed,
         }),
       );
       setSelected(new Set());
       void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.enableFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
     } finally {
       setBatchLoading(false);
     }
@@ -2259,6 +2442,24 @@ export default function Accounts() {
         t("accounts.resetStatusFailed", { error: getErrorMessage(error) }),
         "error",
       );
+    }
+  };
+
+  // 主动重置额度：消耗 1 次「主动重置次数」立即重置该账号额度（带二次确认）。
+  const handleResetCredits = async (account: AccountRow) => {
+    const confirmed = await confirm({
+      title: t("accounts.resetCreditsButton"),
+      description: t("accounts.resetCreditsConfirmMessage"),
+      confirmText: t("accounts.resetCreditsConfirmButton"),
+      tone: "warning",
+    });
+    if (!confirmed) return;
+    try {
+      await api.resetCredits(account.id);
+      showToast(t("accounts.resetCreditsSuccess"));
+      void reload();
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
     }
   };
 
@@ -2306,13 +2507,17 @@ export default function Accounts() {
     if (ids.length === 0) return;
     setBatchMetaSubmitting(true);
     try {
-      const { success, fail } = await runAccountBatch(ids, (id) =>
-        api.updateAccountScheduler(id, {
-          tags: batchTags,
-          group_ids: batchGroupIds,
+      const result = await api.batchUpdateAccounts({
+        ids,
+        tags: batchTags,
+        group_ids: batchGroupIds,
+      });
+      showToast(
+        t("accounts.batchMetaDone", {
+          success: result.success,
+          fail: result.failed,
         }),
       );
-      showToast(t("accounts.batchMetaDone", { success, fail }));
       setShowBatchMetaEditor(false);
       await Promise.all([reload(), reloadGroups()]);
     } catch (error) {
@@ -2355,10 +2560,13 @@ export default function Accounts() {
         auto_pause_5h_disabled: batchAutoPause5hDisabled,
         auto_pause_7d_disabled: batchAutoPause7dDisabled,
       };
-      const { success, fail } = await runAccountBatch(ids, (id) =>
-        api.updateAccountScheduler(id, payload),
+      const result = await api.batchUpdateAccounts({ ids, ...payload });
+      showToast(
+        t("accounts.batchAutoPauseDone", {
+          success: result.success,
+          fail: result.failed,
+        }),
       );
-      showToast(t("accounts.batchAutoPauseDone", { success, fail }));
       setShowBatchQuotaAutoPauseEditor(false);
       await reload();
     } catch (error) {
@@ -2518,6 +2726,12 @@ export default function Accounts() {
       proxy_url: account.proxy_url ?? "",
     });
     setEditOpenAIModelDraft("");
+    setEditOAuthStep("generate");
+    setEditOAuthSession(null);
+    setEditOAuthProxyUrl(account.proxy_url ?? "");
+    setEditOAuthCallbackUrl("");
+    setEditOAuthGenerating(false);
+    setEditOAuthUpdating(false);
   };
 
   const closeSchedulerEditor = (force = false) => {
@@ -2545,6 +2759,12 @@ export default function Accounts() {
       proxy_url: "",
     });
     setEditOpenAIModelDraft("");
+    setEditOAuthStep("generate");
+    setEditOAuthSession(null);
+    setEditOAuthProxyUrl("");
+    setEditOAuthCallbackUrl("");
+    setEditOAuthGenerating(false);
+    setEditOAuthUpdating(false);
   };
 
   const parsedScoreBias =
@@ -2667,6 +2887,10 @@ export default function Accounts() {
   const handleSaveAccountEditor = async () => {
     if (editingAccount?.openai_responses_api && editTab === "account") {
       await handleSaveOpenAIAccountSettings();
+      return;
+    }
+    if (isOAuthAccount(editingAccount) && editTab === "account") {
+      await handleUpdateOAuthAccount();
       return;
     }
     await handleSaveScheduler();
@@ -2806,11 +3030,35 @@ export default function Accounts() {
               runStreamingOperation={runStreamingAccountOperation}
             />
           ) : null}
-          <div className={showRecycleBin ? "hidden" : "contents"}>
+          {showInvite ? (
+            <CodexInviteView
+              accounts={accounts}
+              onClose={() => setShowInvite(false)}
+            />
+          ) : null}
+          <div className={showRecycleBin || showInvite ? "hidden" : "contents"}>
           <PageHeader
             title={t("accounts.title")}
             description={t("accounts.description")}
             onRefresh={() => void reload()}
+            titleAdornment={
+              <Select
+                className="w-32"
+                compact
+                value={pageMode}
+                onValueChange={(value) => {
+                  const mode = value === "personal" ? "personal" : "pool";
+                  // 用户手动选择：标记并持久化，之后一律尊重用户、不再自动判定。
+                  pageModeUserSetRef.current = true;
+                  persistAccountPageMode(mode);
+                  setPageMode(mode);
+                }}
+                options={[
+                  { value: "pool", label: t("accounts.pageModePool") },
+                  { value: "personal", label: t("accounts.pageModePersonal") },
+                ]}
+              />
+            }
             actions={
               <div className="flex flex-wrap items-center justify-end gap-1.5">
                 <Button
@@ -2950,6 +3198,14 @@ export default function Accounts() {
                 >
                   <Recycle className="size-3.5" />
                   {t("accounts.recycleBin")}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => setShowInvite(true)}
+                  className="max-sm:w-full"
+                >
+                  <Mail className="size-3.5" />
+                  {t("invite.entry")}
                 </Button>
                 <Button onClick={() => setShowAdd(true)}>
                   <Plus className="size-3.5" />
@@ -3248,6 +3504,7 @@ export default function Accounts() {
               <FolderOpen className="size-3.5" />
               {t("accounts.groupManage")}
             </Button>
+            {!isPersonalMode && (
             <div className="flex w-full shrink-0 items-center gap-1.5 @min-[1600px]/accounts:ml-auto @min-[1600px]/accounts:w-auto">
               <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
                 <button
@@ -3310,6 +3567,7 @@ export default function Accounts() {
                 title={t("accounts.columnSettings")}
               />
             </div>
+            )}
           </div>
 
           {selected.size > 0 && (
@@ -3436,9 +3694,11 @@ export default function Accounts() {
                 {shouldRenderMobileCards ? (
                   <div
                     className={
-                      viewMode === "grid"
-                        ? "grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5"
-                        : "grid gap-3 lg:hidden"
+                      isPersonalMode
+                        ? "grid gap-3 grid-cols-1 md:grid-cols-2"
+                        : viewMode === "grid"
+                          ? "grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4"
+                          : "grid gap-3 lg:hidden"
                     }
                   >
                     {pagedAccounts.map((account, index) => {
@@ -3452,8 +3712,10 @@ export default function Accounts() {
                           allGroups={allGroups}
                           lazyMode={lazyMode}
                           showEmailDomainTags={showEmailDomainTags}
+                          healthBuckets={healthBars[String(account.id)]}
                           refreshing={refreshingIds.has(account.id)}
                           authJsonExporting={authJsonExportingIds.has(account.id)}
+                          variant={isPersonalMode ? "personal" : "mobile"}
                           t={t}
                           onToggleSelect={() => toggleSelect(account.id)}
                           onEdit={() => openSchedulerEditor(account)}
@@ -3468,7 +3730,11 @@ export default function Accounts() {
                           }
                           onToggleLock={() => void handleToggleLock(account)}
                           onResetStatus={() => void handleResetStatus(account)}
+                          onResetCredits={() =>
+                            void handleResetCredits(account)
+                          }
                           onDelete={() => void handleDelete(account)}
+                          onUsageRefreshed={() => void reloadSilently()}
                         />
                       );
                     })}
@@ -3641,6 +3907,14 @@ export default function Accounts() {
                                       ? formatAccountName(account)
                                       : formatAccountListEmail(account)}
                                   </span>
+                                  {account.chatgpt_account_id && (
+                                    <span
+                                      className="max-w-full truncate font-mono text-[10px] leading-tight text-muted-foreground/70"
+                                      title={account.chatgpt_account_id}
+                                    >
+                                      {account.chatgpt_account_id}
+                                    </span>
+                                  )}
                                   {showEmailDomainTags &&
                                     getAccountEmailDomain(account) && (
                                     <EmailDomainBadge
@@ -3651,11 +3925,13 @@ export default function Accounts() {
                                   {(account.at_only ||
                                     account.openai_responses_api ||
                                     account.enabled === false ||
-                                    account.locked) && (
+                                    account.locked ||
+                                    (account.rate_limit_reset_credits ?? 0) >
+                                      0) && (
                                     <div className="flex flex-wrap gap-1">
                                       {account.at_only && (
                                         <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
-                                          AT
+                                          {formatAccessTokenBadge(account)}
                                         </span>
                                       )}
                                       {account.openai_responses_api && (
@@ -3674,6 +3950,25 @@ export default function Accounts() {
                                           <Lock className="mr-0.5 size-2.5" />
                                           {t("accounts.lock")}
                                         </span>
+                                      )}
+                                      {(account.rate_limit_reset_credits ??
+                                        0) > 0 && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setUsageAccount(account);
+                                          }}
+                                          className="inline-flex items-center rounded-md bg-violet-50 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 ring-1 ring-inset ring-violet-600/20 transition-colors hover:bg-violet-100 dark:bg-violet-950 dark:text-violet-400 dark:ring-violet-400/20 dark:hover:bg-violet-900"
+                                          title={t("accounts.resetCreditsBadge", {
+                                            count:
+                                              account.rate_limit_reset_credits ??
+                                              0,
+                                          })}
+                                        >
+                                          <RotateCcw className="mr-0.5 size-2.5" />
+                                          {account.rate_limit_reset_credits ?? 0}
+                                        </button>
                                       )}
                                     </div>
                                   )}
@@ -3731,6 +4026,20 @@ export default function Accounts() {
                                       errorMessage={account.error_message}
                                     />
                                     <AccountStatusCountdown account={account} />
+                                    {(account.active_requests ?? 0) > 0 && (
+                                      <span
+                                        className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                                        title={t("accounts.activeRequestsTooltip", {
+                                          count: account.active_requests ?? 0,
+                                        })}
+                                      >
+                                        <span
+                                          className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
+                                          aria-hidden
+                                        />
+                                        {account.active_requests}
+                                      </span>
+                                    )}
                                   </div>
                                   {account.status === "error" &&
                                     account.error_message && (
@@ -3766,6 +4075,14 @@ export default function Accounts() {
                                         "-",
                                     })}
                                   </div>
+                                  <div className="space-y-0.5 pt-0.5">
+                                    <div className="text-[10px] text-muted-foreground/70">
+                                      {t("accounts.healthBarLabel")}
+                                    </div>
+                                    <AccountHealthBar
+                                      buckets={healthBars[String(account.id)]}
+                                    />
+                                  </div>
                                 </div>
                               </TableCell>
                             )}
@@ -3795,7 +4112,10 @@ export default function Accounts() {
                             )}
                             {visibleColumns.usage && (
                               <TableCell>
-                                <UsageCell account={account} />
+                                <UsageCell
+                                  account={account}
+                                  onRefreshed={() => void reloadSilently()}
+                                />
                               </TableCell>
                             )}
                             {visibleColumns.billed && (
@@ -3960,6 +4280,21 @@ export default function Accounts() {
                                     title={t("accounts.resetStatusHint")}
                                   >
                                     <RotateCcw className="size-3.5" />
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    className="h-7 w-8 px-0"
+                                    disabled={
+                                      (account.rate_limit_reset_credits ?? 0) <=
+                                      0
+                                    }
+                                    onClick={() =>
+                                      void handleResetCredits(account)
+                                    }
+                                    title={t("accounts.resetCreditsButton")}
+                                  >
+                                    <Timer className="size-3.5" />
                                   </Button>
                                   <Button
                                     variant="destructive"
@@ -4780,6 +5115,9 @@ export default function Accounts() {
             <TestConnectionModal
               account={testingAccount}
               onSettled={() => {
+                // 标记该账号强制刷新用量，配合后台探针确保进度条更新为最新值。
+                forceUsageReloadRef.current.add(testingAccount.id);
+                usageReloadAttemptsRef.current.delete(testingAccount.id);
                 void reloadSilently();
               }}
               onClose={() => setTestingAccount(null)}
@@ -4790,6 +5128,7 @@ export default function Accounts() {
             <AccountUsageModal
               account={usageAccount}
               onClose={() => setUsageAccount(null)}
+              onCreditsReset={() => void reload()}
             />
           )}
 
@@ -4803,24 +5142,48 @@ export default function Accounts() {
                 <Button
                   variant="outline"
                   onClick={() => closeSchedulerEditor()}
-                  disabled={editSubmitting}
+                  disabled={editSubmitting || editOAuthGenerating}
                 >
                   {t("common.cancel")}
                 </Button>
-                <Button
-                  onClick={() => void handleSaveAccountEditor()}
-                  disabled={
-                    editSubmitting ||
-                    (editTab === "scheduler" &&
-                      (scoreInputInvalid ||
-                        concurrencyInputInvalid ||
-                        editAutoPause5hThresholdInvalid ||
-                        editAutoPause7dThresholdInvalid)) ||
-                    openAIAccountInputInvalid
-                  }
-                >
-                  {editSubmitting ? t("common.saving") : t("common.save")}
-                </Button>
+                {isOAuthAccount(editingAccount) && editTab === "account" ? (
+                  <Button
+                    onClick={() =>
+                      editOAuthStep === "generate"
+                        ? void handleEditOAuthGenerate()
+                        : void handleUpdateOAuthAccount()
+                    }
+                    disabled={
+                      editOAuthGenerating ||
+                      editOAuthUpdating ||
+                      (editOAuthStep === "exchange" &&
+                        !editOAuthCallbackUrl.trim())
+                    }
+                  >
+                    {editOAuthStep === "generate"
+                      ? editOAuthGenerating
+                        ? t("accounts.oauthGenerating")
+                        : t("accounts.oauthGenerateBtn")
+                      : editOAuthUpdating
+                        ? t("accounts.oauthCompleting")
+                        : t("accounts.oauthUpdateAuth")}
+                  </Button>
+                ) : (
+                  <Button
+                    onClick={() => void handleSaveAccountEditor()}
+                    disabled={
+                      editSubmitting ||
+                      (editTab === "scheduler" &&
+                        (scoreInputInvalid ||
+                          concurrencyInputInvalid ||
+                          editAutoPause5hThresholdInvalid ||
+                          editAutoPause7dThresholdInvalid)) ||
+                      openAIAccountInputInvalid
+                    }
+                  >
+                    {editSubmitting ? t("common.saving") : t("common.save")}
+                  </Button>
+                )}
               </>
             }
           >
@@ -4837,7 +5200,8 @@ export default function Accounts() {
                   </div>
                 </div>
 
-                {editingAccount.openai_responses_api && (
+                {(editingAccount.openai_responses_api ||
+                  isOAuthAccount(editingAccount)) && (
                   <div className="flex gap-1 rounded-xl border border-border bg-muted/50 p-1">
                     <button
                       type="button"
@@ -4986,6 +5350,104 @@ export default function Accounts() {
                           proxy_url: value,
                         })),
                     })}
+                  </div>
+                ) : editTab === "account" && isOAuthAccount(editingAccount) ? (
+                  <div className="space-y-4">
+                    <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                      <p className="font-semibold text-foreground mb-1">
+                        {t("accounts.oauthEditIntroTitle")}
+                      </p>
+                      <p>{t("accounts.oauthEditIntroDesc")}</p>
+                    </div>
+                    <div>
+                      <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                        {t("accounts.oauthCurrentAccount")}
+                      </label>
+                      <div className="rounded-lg border border-dashed border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                        {formatAccountName(editingAccount)}
+                      </div>
+                    </div>
+                    {editOAuthStep === "generate" ? (
+                      <>
+                        <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                          <p className="font-semibold text-foreground mb-1">
+                            {t("accounts.oauthStep1Title")}
+                          </p>
+                          <p>{t("accounts.oauthStep1Desc")}</p>
+                        </div>
+                        {renderProxyInput({
+                          value: editOAuthProxyUrl,
+                          testKey: "edit-oauth-generate",
+                          label: t("accounts.oauthProxyUrl"),
+                          placeholder: t("accounts.oauthProxyUrlPlaceholder"),
+                          onChange: setEditOAuthProxyUrl,
+                        })}
+                      </>
+                    ) : (
+                      <>
+                        <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                          <p className="font-semibold text-foreground mb-1">
+                            {t("accounts.oauthStep2Title")}
+                          </p>
+                          <p>{t("accounts.oauthStep2Desc")}</p>
+                        </div>
+                        {editOAuthSession && (
+                          <div className="rounded-xl border border-primary/30 bg-primary/5 px-4 py-3">
+                            <p className="text-xs font-semibold text-muted-foreground mb-2">
+                              {t("accounts.oauthAuthLinkLabel")}
+                            </p>
+                            <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start">
+                              <a
+                                href={editOAuthSession.auth_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={editOAuthSession.auth_url}
+                                className="inline-flex min-h-10 min-w-0 max-w-full flex-1 items-start gap-1.5 overflow-hidden rounded-lg border bg-background px-3 py-2 text-sm font-semibold text-primary hover:bg-muted/50"
+                              >
+                                <ExternalLink className="mt-0.5 size-3.5 shrink-0" />
+                                <span className="block min-w-0 flex-1 break-all leading-relaxed [overflow-wrap:anywhere]">
+                                  {editOAuthSession.auth_url}
+                                </span>
+                              </a>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                onClick={() => void handleEditOAuthCopyLink()}
+                                className="w-full shrink-0 sm:w-auto"
+                              >
+                                <Copy className="size-4" />
+                                {t("common.copy")}
+                              </Button>
+                            </div>
+                          </div>
+                        )}
+                        <div>
+                          <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                            {t("accounts.oauthCallbackUrlLabel")}
+                          </label>
+                          <Input
+                            placeholder={t("accounts.oauthCallbackUrlPlaceholder")}
+                            value={editOAuthCallbackUrl}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                              setEditOAuthCallbackUrl(event.target.value)
+                            }
+                          />
+                          <p className="mt-1.5 text-xs text-muted-foreground">
+                            {t("accounts.oauthCallbackUrlHint")}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void handleEditOAuthRestart()}
+                          disabled={editOAuthGenerating}
+                          className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
+                        >
+                          {editOAuthGenerating
+                            ? t("accounts.oauthGenerating")
+                            : t("accounts.oauthRestart")}
+                        </button>
+                      </>
+                    )}
                   </div>
                 ) : (
                   <>
@@ -7374,7 +7836,8 @@ function PlanBadge({ planType }: { planType?: string }) {
 
   return (
     <span
-      className={`inline-flex items-center rounded-md px-2.5 py-1 text-[13px] font-semibold ring-1 ring-inset ${cls}`}
+      className={`inline-flex min-w-0 max-w-full items-center truncate rounded-md px-2.5 py-1 text-[13px] font-semibold ring-1 ring-inset ${cls}`}
+      title={label}
     >
       {label}
     </span>
@@ -7751,8 +8214,10 @@ function AccountMobileCard({
   allGroups,
   lazyMode,
   showEmailDomainTags,
+  healthBuckets,
   refreshing,
   authJsonExporting,
+  variant = "mobile",
   t,
   onToggleSelect,
   onEdit,
@@ -7763,7 +8228,9 @@ function AccountMobileCard({
   onToggleEnabled,
   onToggleLock,
   onResetStatus,
+  onResetCredits,
   onDelete,
+  onUsageRefreshed,
 }: {
   account: AccountRow;
   sequence: number;
@@ -7771,8 +8238,10 @@ function AccountMobileCard({
   allGroups: AccountGroup[];
   lazyMode: boolean;
   showEmailDomainTags: boolean;
+  healthBuckets: AccountHealthBucket[] | undefined;
   refreshing: boolean;
   authJsonExporting: boolean;
+  variant?: "mobile" | "personal";
   t: ReturnType<typeof useTranslation>["t"];
   onToggleSelect: () => void;
   onEdit: () => void;
@@ -7783,7 +8252,9 @@ function AccountMobileCard({
   onToggleEnabled: () => void;
   onToggleLock: () => void;
   onResetStatus: () => void;
+  onResetCredits: () => void;
   onDelete: () => void;
+  onUsageRefreshed?: () => void;
 }) {
   const displayName = account.openai_responses_api
     ? formatAccountName(account)
@@ -7794,11 +8265,376 @@ function AccountMobileCard({
     refreshing || account.at_only || account.openai_responses_api;
   const authJsonDisabled =
     authJsonExporting || account.at_only || account.openai_responses_api;
+  // 自用模式用独立的信息架构：更强调账号身份、用量、健康和少量高频操作。
+  const isPersonal = variant === "personal";
+  const avatarInitial = (displayName.trim()[0] || "?").toUpperCase();
+  const chatgptAccountId = account.chatgpt_account_id?.trim() ?? "";
+  const resetCredits = account.rate_limit_reset_credits ?? 0;
+  const hasStateBadges =
+    account.at_only ||
+    account.openai_responses_api ||
+    account.enabled === false ||
+    account.locked;
+  const modelCooldownCount = account.model_cooldowns?.length ?? 0;
+
+  if (isPersonal) {
+    return (
+      <article
+        className={`group flex h-full min-w-0 flex-col overflow-hidden rounded-lg border bg-card shadow-sm transition-all hover:-translate-y-0.5 hover:shadow-lg ${
+          selected
+            ? "border-primary/40 bg-primary/5 ring-1 ring-primary/20"
+            : "border-border"
+        }`}
+      >
+        <div className="flex min-w-0 items-start gap-4 p-5 pb-4">
+          <input
+            type="checkbox"
+            className="mt-2 size-4 shrink-0 cursor-pointer accent-primary"
+            checked={selected}
+            onChange={onToggleSelect}
+            aria-label={fullName}
+          />
+
+          <div className="flex shrink-0 flex-col items-center gap-2">
+            <div className="flex size-12 items-center justify-center rounded-lg bg-sky-50 text-lg font-semibold text-sky-700 ring-1 ring-inset ring-sky-200 dark:bg-sky-950/70 dark:text-sky-300 dark:ring-sky-800">
+              {avatarInitial}
+            </div>
+            {resetCredits > 0 && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onUsage();
+                }}
+                className="inline-flex items-center gap-1 rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 transition-colors hover:bg-amber-100 dark:bg-amber-950 dark:text-amber-300 dark:ring-amber-400/20 dark:hover:bg-amber-900"
+                title={t("accounts.resetCreditsBadge", { count: resetCredits })}
+              >
+                <RotateCcw className="size-2.5" />
+                {resetCredits}
+              </button>
+            )}
+          </div>
+
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
+                #{sequence}
+              </span>
+              <PlanBadge planType={account.plan_type} />
+              <AccountStatusCountdown account={account} />
+              <ExpiryBadge
+                expiresAt={account.subscription_expires_at}
+                planType={account.plan_type}
+              />
+              {showEmailDomainTags && getAccountEmailDomain(account) && (
+                <EmailDomainBadge domain={getAccountEmailDomain(account)} t={t} />
+              )}
+            </div>
+
+            <div className="mt-2 flex min-w-0 flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div
+                  className="break-all text-lg font-semibold leading-tight text-foreground"
+                  title={fullName}
+                >
+                  {displayName}
+                </div>
+                {chatgptAccountId && (
+                  <div
+                    className="mt-1 max-w-full truncate font-mono text-[10px] leading-tight text-muted-foreground/70"
+                    title={chatgptAccountId}
+                  >
+                    {chatgptAccountId}
+                  </div>
+                )}
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {t("accounts.healthSummary", {
+                    health: formatHealthTier(account.health_tier, t),
+                    score: Math.round(getDispatchScore(account)),
+                    concurrency: account.dynamic_concurrency_limit ?? "-",
+                  })}
+                </div>
+              </div>
+              <div className="shrink-0">
+                <StatusBadge
+                  status={account.status}
+                  detail={getAccountRateLimitWindow(account) ?? undefined}
+                  errorMessage={account.error_message}
+                />
+              </div>
+            </div>
+
+            {hasStateBadges && (
+              <div className="mt-3 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
+                {account.at_only && (
+                  <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
+                    {formatAccessTokenBadge(account)}
+                  </span>
+                )}
+                {account.openai_responses_api && (
+                  <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
+                    Responses API
+                  </span>
+                )}
+                {account.enabled === false && (
+                  <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
+                    <PowerOff className="mr-0.5 size-2.5" />
+                    {t("accounts.disabled")}
+                  </span>
+                )}
+                {account.locked && (
+                  <span className="inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                    <Lock className="mr-0.5 size-2.5" />
+                    {t("accounts.lock")}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {(account.status === "error" && account.error_message) ||
+        modelCooldownCount > 0 ? (
+          <div className="mx-5 space-y-2 border-t border-border/70 pt-3">
+            {account.status === "error" && account.error_message && (
+              <div
+                className="flex min-w-0 items-start gap-2 rounded-md bg-red-50 px-3 py-2 text-xs leading-snug text-red-700 ring-1 ring-inset ring-red-500/20 dark:bg-red-950/40 dark:text-red-300 dark:ring-red-400/20"
+                title={account.error_message}
+              >
+                <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                <span className="line-clamp-3 break-words">
+                  {account.error_message}
+                </span>
+              </div>
+            )}
+            {modelCooldownCount > 0 && (
+              <div className="rounded-md bg-amber-50 px-3 py-2 text-xs leading-snug text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:bg-amber-950/40 dark:text-amber-300 dark:ring-amber-400/20">
+                model {account.model_cooldowns?.[0]?.model}
+                {modelCooldownCount > 1 ? ` +${modelCooldownCount - 1}` : ""}
+              </div>
+            )}
+          </div>
+        ) : null}
+
+        <div className="grid min-w-0 gap-4 px-5 py-4 xl:grid-cols-[minmax(0,1.25fr)_minmax(220px,0.75fr)]">
+          <div className="min-w-0 space-y-3">
+            <div className="border-t border-border/70 pt-3">
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-muted-foreground">
+                  <BarChart3 className="size-3.5 shrink-0 text-sky-600 dark:text-sky-400" />
+                  <span className="truncate">{t("accounts.usage")}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={onUsage}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium text-primary transition-colors hover:bg-primary/10"
+                >
+                  <ExternalLink className="size-3" />
+                  {t("accounts.actionUsageDetail")}
+                </button>
+              </div>
+              <UsageCell account={account} wide onRefreshed={onUsageRefreshed} />
+            </div>
+
+            <div className="grid min-w-0 gap-2 sm:grid-cols-2">
+              <AccountPersonalMetric
+                label={t("accounts.requests")}
+                icon={<Zap className="size-3.5" />}
+                tone="emerald"
+              >
+                <div className="flex items-baseline gap-2 text-[13px]">
+                  <span className="text-base font-semibold text-emerald-600 dark:text-emerald-400">
+                    {account.success_requests ?? 0}
+                  </span>
+                  <span className="text-muted-foreground">/</span>
+                  <span className="font-semibold text-red-500">
+                    {account.error_requests ?? 0}
+                  </span>
+                </div>
+                {((account.retry_error_requests ?? 0) > 0 ||
+                  (account.rate_limit_attempts ?? 0) > 0) && (
+                  <div className="mt-1 text-[11px] text-muted-foreground">
+                    retry {account.retry_error_requests ?? 0} · 429 {" "}
+                    {account.rate_limit_attempts ?? 0}
+                  </div>
+                )}
+              </AccountPersonalMetric>
+              <AccountPersonalMetric
+                label={t("accounts.billed")}
+                icon={<Coins className="size-3.5" />}
+                tone="amber"
+              >
+                <BilledCell account={account} />
+              </AccountPersonalMetric>
+            </div>
+          </div>
+
+          <div className="min-w-0 space-y-3">
+            <div className="border-t border-border/70 pt-3">
+              <div className="mb-2 flex items-center justify-between gap-2 text-xs font-semibold text-muted-foreground">
+                <span>{t("accounts.healthBarLabel")}</span>
+                <span className="shrink-0">
+                  {formatHealthTier(account.health_tier, t)}
+                </span>
+              </div>
+              <AccountHealthBar buckets={healthBuckets} />
+            </div>
+
+            <div className="grid min-w-0 gap-2 sm:grid-cols-2 xl:grid-cols-1">
+              <AccountPersonalMetric
+                label={t("accounts.updatedAt")}
+                icon={<RefreshCw className="size-3.5" />}
+                tone="sky"
+              >
+                {lazyMode ? (
+                  <div className="space-y-0.5">
+                    <div>
+                      <span className="mr-1 text-muted-foreground/70">
+                        {t("accounts.recordUpdatedAtShort")}
+                      </span>
+                      {formatRelativeTime(account.updated_at)}
+                    </div>
+                    <div>
+                      <span className="mr-1 text-muted-foreground/70">
+                        {t("accounts.usageUpdatedAtShort")}
+                      </span>
+                      {account.codex_usage_updated_at
+                        ? formatRelativeTime(account.codex_usage_updated_at)
+                        : t("accounts.noUsageUpdatedAt")}
+                    </div>
+                  </div>
+                ) : (
+                  formatRelativeTime(account.updated_at)
+                )}
+              </AccountPersonalMetric>
+              <AccountPersonalMetric
+                label={t("accounts.importTime")}
+                icon={<FolderOpen className="size-3.5" />}
+                tone="zinc"
+              >
+                {formatBeijingTime(account.created_at)}
+              </AccountPersonalMetric>
+            </div>
+          </div>
+        </div>
+
+        {((account.tags ?? []).length > 0 || groups.length > 0) && (
+          <div className="mx-5 space-y-1.5 border-t border-border/70 py-3">
+            <ChipList items={account.tags ?? []} tone="purple" />
+            <GroupChipList groups={groups} />
+          </div>
+        )}
+
+        <div className="mt-auto border-t border-border/70 bg-muted/15 p-4">
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            <AccountMobileActionButton
+              title={t("accounts.editScheduler")}
+              label={t("accounts.editScheduler")}
+              onClick={onEdit}
+              icon={<Pencil className="size-3.5" />}
+            />
+            <AccountMobileActionButton
+              title={t("accounts.testConnection")}
+              label={t("accounts.testConnection")}
+              onClick={onTest}
+              icon={<Zap className="size-3.5" />}
+            />
+            <AccountMobileActionButton
+              title={
+                account.at_only || account.openai_responses_api
+                  ? t("accounts.atRefreshDisabled")
+                  : t("accounts.refreshAccessToken")
+              }
+              label={t("accounts.actionRefreshAT")}
+              disabled={refreshDisabled}
+              onClick={onRefresh}
+              icon={
+                <RefreshCw
+                  className={`size-3.5 ${refreshing ? "animate-spin" : ""}`}
+                />
+              }
+            />
+            <AccountMobileActionButton
+              title={
+                account.at_only || account.openai_responses_api
+                  ? t("accounts.authJsonDisabled")
+                  : t("accounts.generateAuthJson")
+              }
+              label={t("accounts.actionAuthJson")}
+              disabled={authJsonDisabled}
+              onClick={onGenerateAuthJson}
+              icon={<FileJson className="size-3.5" />}
+            />
+            <AccountMobileActionButton
+              title={
+                account.enabled === false
+                  ? t("accounts.enableHint")
+                  : t("accounts.disableHint")
+              }
+              label={
+                account.enabled === false
+                  ? t("accounts.actionEnableScheduling")
+                  : t("accounts.actionDisableScheduling")
+              }
+              variant={account.enabled === false ? "default" : "outline"}
+              onClick={onToggleEnabled}
+              icon={
+                account.enabled === false ? (
+                  <Power className="size-3.5" />
+                ) : (
+                  <PowerOff className="size-3.5" />
+                )
+              }
+            />
+            <AccountMobileActionButton
+              title={
+                account.locked ? t("accounts.unlockHint") : t("accounts.lockHint")
+              }
+              label={
+                account.locked
+                  ? t("accounts.actionUnlockAccount")
+                  : t("accounts.actionLockAccount")
+              }
+              variant={account.locked ? "default" : "outline"}
+              onClick={onToggleLock}
+              icon={
+                account.locked ? (
+                  <Lock className="size-3.5" />
+                ) : (
+                  <Unlock className="size-3.5" />
+                )
+              }
+            />
+            <AccountMobileActionButton
+              title={t("accounts.resetStatusHint")}
+              label={t("accounts.resetStatus")}
+              onClick={onResetStatus}
+              icon={<RotateCcw className="size-3.5" />}
+            />
+            <AccountMobileActionButton
+              title={t("accounts.resetCreditsButton")}
+              label={t("accounts.resetCreditsButton")}
+              disabled={resetCredits <= 0}
+              onClick={onResetCredits}
+              icon={<Timer className="size-3.5" />}
+            />
+            <AccountMobileActionButton
+              title={t("accounts.deleteAccount")}
+              label={t("accounts.deleteAccount")}
+              variant="destructive"
+              onClick={onDelete}
+              icon={<Trash2 className="size-3.5" />}
+            />
+          </div>
+        </div>
+      </article>
+    );
+  }
 
   return (
     <article
       className={`min-w-0 rounded-lg border bg-card p-3 shadow-sm ${
-        selected ? "border-primary/35 bg-primary/5" : "border-border"
+        selected ? "border-primary/40 bg-primary/5 ring-1 ring-primary/20" : "border-border"
       }`}
     >
       <div className="flex min-w-0 items-start gap-3">
@@ -7813,41 +8649,52 @@ function AccountMobileCard({
           <div className="flex min-w-0 items-start justify-between gap-2">
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
-                  #{sequence}
-                </span>
-                <PlanBadge planType={account.plan_type} />
-                <ExpiryBadge
-                  expiresAt={account.subscription_expires_at}
-                  planType={account.plan_type}
-                />
-                {showEmailDomainTags && getAccountEmailDomain(account) && (
-                  <EmailDomainBadge
-                    domain={getAccountEmailDomain(account)}
-                    t={t}
+                  <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
+                    #{sequence}
+                  </span>
+                  <PlanBadge planType={account.plan_type} />
+                  <ExpiryBadge
+                    expiresAt={account.subscription_expires_at}
+                    planType={account.plan_type}
                   />
+                  {showEmailDomainTags && getAccountEmailDomain(account) && (
+                    <EmailDomainBadge
+                      domain={getAccountEmailDomain(account)}
+                      t={t}
+                    />
+                  )}
+                </div>
+                <div
+                  className="mt-1 break-all text-[15px] font-semibold leading-tight text-foreground"
+                  title={fullName}
+                >
+                  {displayName}
+                </div>
+                {chatgptAccountId && (
+                  <div
+                    className="mt-1 min-h-[14px] max-w-full truncate font-mono text-[10px] leading-tight text-muted-foreground/70"
+                    title={chatgptAccountId}
+                  >
+                    {chatgptAccountId}
+                  </div>
                 )}
               </div>
-              <div
-                className="mt-1 break-all text-[15px] font-semibold leading-tight text-foreground"
-                title={fullName}
-              >
-                {displayName}
+              <div className="flex min-w-[112px] shrink-0 flex-col items-end">
+                <StatusBadge
+                  status={account.status}
+                  detail={getAccountRateLimitWindow(account) ?? undefined}
+                  errorMessage={account.error_message}
+                />
+                <div className="mt-1 flex min-h-6 items-center justify-end">
+                  <AccountStatusCountdown account={account} />
+                </div>
               </div>
             </div>
-            <div className="shrink-0">
-              <StatusBadge
-                status={account.status}
-                detail={getAccountRateLimitWindow(account) ?? undefined}
-                errorMessage={account.error_message}
-              />
-            </div>
-          </div>
 
-          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+          <div className="mt-2 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
             {account.at_only && (
               <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
-                AT
+                {formatAccessTokenBadge(account)}
               </span>
             )}
             {account.openai_responses_api && (
@@ -7867,7 +8714,6 @@ function AccountMobileCard({
                 {t("accounts.lock")}
               </span>
             )}
-            <AccountStatusCountdown account={account} />
           </div>
 
           {account.status === "error" && account.error_message && (
@@ -7893,11 +8739,19 @@ function AccountMobileCard({
               concurrency: account.dynamic_concurrency_limit ?? "-",
             })}
           </div>
+          <div className="mt-1.5 space-y-0.5">
+            <div className="text-[10px] text-muted-foreground/70">
+              {t("accounts.healthBarLabel")}
+            </div>
+            <AccountHealthBar buckets={healthBuckets} />
+          </div>
         </div>
       </div>
 
-      <div className="mt-3 grid min-w-0 grid-cols-2 gap-2 max-[380px]:grid-cols-1">
-        <AccountMobileMetric label={t("accounts.requests")}>
+      <div
+        className="mt-3 grid min-w-0 grid-cols-2 gap-2 max-[380px]:grid-cols-1"
+      >
+        <AccountMobileMetric label={t("accounts.requests")} className="min-h-[84px]">
           <div className="flex items-center gap-2 text-[13px]">
             <span className="font-medium text-emerald-600">
               {account.success_requests ?? 0}
@@ -7915,16 +8769,10 @@ function AccountMobileCard({
             </div>
           )}
         </AccountMobileMetric>
-        <AccountMobileMetric label={t("accounts.billed")}>
+        <AccountMobileMetric label={t("accounts.billed")} className="min-h-[84px]">
           <BilledCell account={account} />
         </AccountMobileMetric>
-        <AccountMobileMetric
-          label={t("accounts.usage")}
-          className="col-span-2 max-[380px]:col-span-1"
-        >
-          <UsageCell account={account} />
-        </AccountMobileMetric>
-        <AccountMobileMetric label={t("accounts.updatedAt")}>
+        <AccountMobileMetric label={t("accounts.updatedAt")} className="min-h-[84px]">
           {lazyMode ? (
             <div className="space-y-0.5">
               <div>
@@ -7946,17 +8794,23 @@ function AccountMobileCard({
             formatRelativeTime(account.updated_at)
           )}
         </AccountMobileMetric>
-        <AccountMobileMetric label={t("accounts.importTime")}>
+        <AccountMobileMetric label={t("accounts.importTime")} className="min-h-[84px]">
           {formatBeijingTime(account.created_at)}
+        </AccountMobileMetric>
+        <AccountMobileMetric
+          label={t("accounts.usage")}
+          className="col-span-2 min-h-[116px] max-[380px]:col-span-1"
+        >
+          <UsageCell account={account} onRefreshed={onUsageRefreshed} />
         </AccountMobileMetric>
       </div>
 
       {((account.tags ?? []).length > 0 ||
-        (showEmailDomainTags && getAccountEmailDomain(account)) ||
+        (!isPersonal && showEmailDomainTags && getAccountEmailDomain(account)) ||
         groups.length > 0) && (
         <div className="mt-3 space-y-1.5 border-t border-border pt-2">
           <ChipList items={account.tags ?? []} tone="purple" />
-          {showEmailDomainTags && getAccountEmailDomain(account) && (
+          {!isPersonal && showEmailDomainTags && getAccountEmailDomain(account) && (
             <div className="mt-1.5 flex flex-wrap gap-1">
               <EmailDomainBadge domain={getAccountEmailDomain(account)} t={t} />
             </div>
@@ -7965,7 +8819,9 @@ function AccountMobileCard({
         </div>
       )}
 
-      <div className="mt-3 grid grid-cols-5 gap-1.5 max-[380px]:grid-cols-4">
+      <div
+        className="mt-3 grid grid-cols-5 gap-1.5 max-[380px]:grid-cols-4"
+      >
         <AccountMobileActionButton
           title={t("accounts.editScheduler")}
           onClick={onEdit}
@@ -8041,6 +8897,12 @@ function AccountMobileCard({
           icon={<RotateCcw className="size-3.5" />}
         />
         <AccountMobileActionButton
+          title={t("accounts.resetCreditsButton")}
+          disabled={(account.rate_limit_reset_credits ?? 0) <= 0}
+          onClick={onResetCredits}
+          icon={<Timer className="size-3.5" />}
+        />
+        <AccountMobileActionButton
           title={t("accounts.deleteAccount")}
           variant="destructive"
           onClick={onDelete}
@@ -8055,17 +8917,74 @@ function AccountMobileMetric({
   label,
   children,
   className = "",
+  premium = false,
 }: {
   label: string;
   children: ReactNode;
   className?: string;
+  premium?: boolean;
 }) {
   return (
     <div
-      className={`min-w-0 rounded-lg border border-border bg-muted/20 p-2 ${className}`}
+      className={`min-w-0 ${
+        premium
+          ? "rounded-xl bg-muted/40 p-3 ring-1 ring-inset ring-border/40"
+          : "rounded-lg border border-border bg-muted/20 p-2"
+      } ${className}`}
     >
-      <div className="mb-1 text-[11px] font-bold uppercase text-muted-foreground">
+      <div
+        className={`mb-1 font-bold uppercase text-muted-foreground ${
+          premium ? "text-[10px] tracking-wider" : "text-[11px]"
+        }`}
+      >
         {label}
+      </div>
+      <div className="min-w-0 break-words text-[12px] leading-snug text-foreground">
+        {children}
+      </div>
+    </div>
+  );
+}
+
+type AccountPersonalMetricTone = "emerald" | "amber" | "sky" | "zinc";
+
+function AccountPersonalMetric({
+  label,
+  icon,
+  children,
+  tone = "zinc",
+}: {
+  label: string;
+  icon: ReactNode;
+  children: ReactNode;
+  tone?: AccountPersonalMetricTone;
+}) {
+  const borderClass: Record<AccountPersonalMetricTone, string> = {
+    emerald: "border-emerald-500/70",
+    amber: "border-amber-500/70",
+    sky: "border-sky-500/70",
+    zinc: "border-zinc-400/70",
+  };
+  const iconClass: Record<AccountPersonalMetricTone, string> = {
+    emerald:
+      "text-emerald-600 ring-emerald-600/15 dark:text-emerald-400 dark:ring-emerald-400/15",
+    amber:
+      "text-amber-600 ring-amber-600/15 dark:text-amber-400 dark:ring-amber-400/15",
+    sky: "text-sky-600 ring-sky-600/15 dark:text-sky-400 dark:ring-sky-400/15",
+    zinc: "text-zinc-500 ring-zinc-500/15 dark:text-zinc-400 dark:ring-zinc-400/15",
+  };
+
+  return (
+    <div className={`min-w-0 border-l-2 pl-3 ${borderClass[tone]}`}>
+      <div className="mb-1 flex min-w-0 items-center gap-2">
+        <span
+          className={`inline-flex size-5 shrink-0 items-center justify-center rounded-md bg-background/80 ring-1 ring-inset ${iconClass[tone]}`}
+        >
+          {icon}
+        </span>
+        <span className="min-w-0 truncate text-[11px] font-semibold text-muted-foreground">
+          {label}
+        </span>
       </div>
       <div className="min-w-0 break-words text-[12px] leading-snug text-foreground">
         {children}
@@ -8077,16 +8996,35 @@ function AccountMobileMetric({
 function AccountMobileActionButton({
   title,
   icon,
+  label,
   onClick,
   disabled,
   variant = "outline",
 }: {
   title: string;
   icon: ReactNode;
+  label?: string;
   onClick: () => void;
   disabled?: boolean;
   variant?: "default" | "outline" | "destructive";
 }) {
+  // 带 label 时图标在上、文字在下，按钮等高等宽（自用模式用）；否则纯图标。
+  if (label) {
+    return (
+      <Button
+        type="button"
+        variant={variant}
+        className="flex h-auto w-full flex-col items-center justify-center gap-1 px-1 py-2 text-[11px] font-medium leading-none"
+        disabled={disabled}
+        onClick={onClick}
+        title={title}
+        aria-label={title}
+      >
+        {icon}
+        <span className="max-w-full truncate">{label}</span>
+      </Button>
+    );
+  }
   return (
     <Button
       type="button"
@@ -8706,7 +9644,48 @@ function UsageWindowStat({
 // 后端已经返回 5h 窗口数据时,只看 plan_type 会把 5h 吞掉。
 // 因此这里以"是否真的存在 5h / 7d 数据(含 reset 时间)"作为主判据,
 // plan_type 仅作为 5h 数据缺位时的辅助提示。
-function UsageCell({ account }: { account: AccountRow }) {
+function UsageCell({
+  account,
+  wide = false,
+  onRefreshed,
+}: {
+  account: AccountRow;
+  wide?: boolean;
+  onRefreshed?: () => void;
+}) {
+  const { t } = useTranslation();
+  const { showToast } = useToast();
+  const [refreshing, setRefreshing] = useState(false);
+
+  const handleRefresh = useCallback(async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await api.refreshAccountUsage(account.id);
+      onRefreshed?.();
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : t("accounts.usageRefreshFailed"),
+        "error",
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  }, [account.id, onRefreshed, refreshing, showToast, t]);
+
+  const refreshButton = (
+    <button
+      type="button"
+      onClick={handleRefresh}
+      disabled={refreshing}
+      title={t("accounts.refreshUsage")}
+      aria-label={t("accounts.refreshUsage")}
+      className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+    >
+      <RefreshCw className={`size-3 ${refreshing ? "animate-spin" : ""}`} />
+    </button>
+  );
+
   const plan = normalizePlanType(account.plan_type);
   const has7d =
     account.usage_percent_7d !== null && account.usage_percent_7d !== undefined;
@@ -8731,44 +9710,50 @@ function UsageCell({ account }: { account: AccountRow }) {
     if (!has5h && !has7d && !has5hDetail && !has7dDetail && !has5hReset && !has7dReset)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
-      <div className="w-52 space-y-1.5">
-        {has5h ? (
-          <UsageBar
-            label="5h"
-            pct={account.usage_percent_5h!}
-            resetAt={account.reset_5h_at}
-            detail={account.usage_5h_detail}
-          />
-        ) : (
-          <UsageWindowStat label="5h" detail={account.usage_5h_detail} />
-        )}
-        {has7d ? (
-          <UsageBar
-            label="7d"
-            pct={account.usage_percent_7d!}
-            resetAt={account.reset_7d_at}
-            detail={account.usage_7d_detail}
-          />
-        ) : (
-          <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
-        )}
+      <div className={`${wide ? "w-full" : "w-52"} flex items-start gap-1`}>
+        <div className="flex-1 space-y-1.5">
+          {has5h ? (
+            <UsageBar
+              label="5h"
+              pct={account.usage_percent_5h!}
+              resetAt={account.reset_5h_at}
+              detail={account.usage_5h_detail}
+            />
+          ) : (
+            <UsageWindowStat label="5h" detail={account.usage_5h_detail} />
+          )}
+          {has7d ? (
+            <UsageBar
+              label="7d"
+              pct={account.usage_percent_7d!}
+              resetAt={account.reset_7d_at}
+              detail={account.usage_7d_detail}
+            />
+          ) : (
+            <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
+          )}
+        </div>
+        {refreshButton}
       </div>
     );
   }
 
   if (sevenDayPresent) {
     return (
-      <div className="w-48">
-        {has7d ? (
-          <UsageBar
-            label="7d"
-            pct={account.usage_percent_7d!}
-            resetAt={account.reset_7d_at}
-            detail={account.usage_7d_detail}
-          />
-        ) : (
-          <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
-        )}
+      <div className={`${wide ? "w-full" : "w-48"} flex items-start gap-1`}>
+        <div className="flex-1">
+          {has7d ? (
+            <UsageBar
+              label="7d"
+              pct={account.usage_percent_7d!}
+              resetAt={account.reset_7d_at}
+              detail={account.usage_7d_detail}
+            />
+          ) : (
+            <UsageWindowStat label="7d" detail={account.usage_7d_detail} />
+          )}
+        </div>
+        {refreshButton}
       </div>
     );
   }

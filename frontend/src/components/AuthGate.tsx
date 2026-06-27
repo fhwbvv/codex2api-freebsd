@@ -351,10 +351,20 @@ export default function AuthGate({ children }: PropsWithChildren) {
       if (key) headers['X-Admin-Key'] = key
       const res = await fetch('/api/admin/health', { headers })
       if (res.status === 401) {
+        // 仅 401 才代表密钥确实无效，此时才清除并要求重新登录
         setAdminKey('')
         setStatus('need_login')
       } else if (res.status === 503) {
         setStatus('need_bootstrap')
+      } else if (!res.ok) {
+        // 5xx/网关错误等多为服务重启或反代瞬时故障，保留密钥不强制登出；
+        // 有密钥时乐观地维持登录态（下一轮轮询若返回 401 会纠正），
+        // 无密钥则停留在登录页。
+        if (key) {
+          setStatus('authenticated')
+        } else {
+          setStatus('need_login')
+        }
       } else {
         if (key && shouldShowSetupReview()) {
           await loadSetupReview()
@@ -363,7 +373,13 @@ export default function AuthGate({ children }: PropsWithChildren) {
         }
       }
     } catch {
-      setStatus('authenticated')
+      // 网络异常（断网、连接中断、标签页休眠唤醒等）不应清除密钥；
+      // 有密钥时乐观维持登录态，无密钥则停留登录页。
+      if (getAdminKey()) {
+        setStatus('authenticated')
+      } else {
+        setStatus('need_login')
+      }
     }
   }, [loadSetupReview])
 
@@ -491,6 +507,10 @@ export default function AuthGate({ children }: PropsWithChildren) {
         headers: { 'X-Admin-Key': inputKey.trim() },
       })
       if (res.status === 401) {
+        setError(copy.loginError)
+      } else if (res.status === 503) {
+        setStatus('need_bootstrap')
+      } else if (!res.ok) {
         setError(copy.loginError)
       } else {
         setAdminKey(inputKey.trim())

@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +22,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -260,6 +263,288 @@ func TestDeleteImageGenerationJobRouteDeletesAssetsAndFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("asset file stat err = %v, want not exist", err)
+	}
+}
+
+func TestExternalImageJobRoutesCreateAndQueryOwnJob(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	imageProxy := proxy.NewHandler(store, db, nil, nil)
+	imageProxy.SetRuntimeCache(tc)
+	router := gin.New()
+	handler.RegisterExternalImageRoutes(router, imageProxy)
+
+	keyID, err := db.InsertAPIKey(context.Background(), "external", "sk-external")
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+
+	body := strings.NewReader(`{"prompt":"draw a cat","model":"gpt-image-2","size":"auto","quality":"auto","output_format":"png"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/jobs", body)
+	req.Header.Set("Authorization", "Bearer sk-external")
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var created imageJobResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if created.Job == nil || created.Job.ID <= 0 || created.Job.APIKeyID != keyID || created.Job.APIKeyName != "external" {
+		t.Fatalf("created job = %#v, want api key metadata", created.Job)
+	}
+	if created.Job.Status != database.ImageJobQueued {
+		t.Fatalf("job status = %q, want queued", created.Job.Status)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/images/jobs/"+strconv.FormatInt(created.Job.ID, 10), nil)
+	getReq.Header.Set("Authorization", "Bearer sk-external")
+	getRecorder := httptest.NewRecorder()
+	router.ServeHTTP(getRecorder, getReq)
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("get status = %d, want 200 body=%s", getRecorder.Code, getRecorder.Body.String())
+	}
+}
+
+func TestExternalImageJobRouteRejectsOtherAPIKeyJob(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	imageProxy := proxy.NewHandler(store, db, nil, nil)
+	imageProxy.SetRuntimeCache(tc)
+	router := gin.New()
+	handler.RegisterExternalImageRoutes(router, imageProxy)
+
+	ownerID, err := db.InsertAPIKey(context.Background(), "owner", "sk-owner")
+	if err != nil {
+		t.Fatalf("InsertAPIKey owner 返回错误: %v", err)
+	}
+	if _, err := db.InsertAPIKey(context.Background(), "other", "sk-other"); err != nil {
+		t.Fatalf("InsertAPIKey other 返回错误: %v", err)
+	}
+	jobID, err := db.InsertImageGenerationJob(context.Background(), database.ImageGenerationJobInput{
+		Prompt:       "private job",
+		ParamsJSON:   `{}`,
+		APIKeyID:     ownerID,
+		APIKeyName:   "owner",
+		APIKeyMasked: "sk-o...wner",
+	})
+	if err != nil {
+		t.Fatalf("InsertImageGenerationJob 返回错误: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/images/jobs/"+strconv.FormatInt(jobID, 10), nil)
+	req.Header.Set("Authorization", "Bearer sk-other")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestExternalImageJobRouteRequiresAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	imageProxy := proxy.NewHandler(store, db, nil, nil)
+	imageProxy.SetRuntimeCache(tc)
+	router := gin.New()
+	handler.RegisterExternalImageRoutes(router, imageProxy)
+	if _, err := db.InsertAPIKey(context.Background(), "existing", "sk-existing"); err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/jobs", strings.NewReader(`{"prompt":"draw"}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestExternalImageJobRouteEnforcesModelAllowList(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	imageProxy := proxy.NewHandler(store, db, nil, nil)
+	imageProxy.SetRuntimeCache(tc)
+	router := gin.New()
+	handler.RegisterExternalImageRoutes(router, imageProxy)
+
+	if _, err := db.InsertAPIKeyWithOptions(context.Background(), database.APIKeyInput{
+		Name: "limited",
+		Key:  "sk-limited",
+		Limits: database.APIKeyLimits{
+			ModelAllow: []string{"gpt-5.4"},
+		},
+	}); err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions 返回错误: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/jobs", strings.NewReader(`{"prompt":"draw","model":"gpt-image-2"}`))
+	req.Header.Set("Authorization", "Bearer sk-limited")
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestExternalImageJobRouteNormalizesEditPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	imageProxy := proxy.NewHandler(store, db, nil, nil)
+	imageProxy.SetRuntimeCache(tc)
+	router := gin.New()
+	handler.RegisterExternalImageRoutes(router, imageProxy)
+
+	keyID, err := db.InsertAPIKey(context.Background(), "external-edit", "sk-external-edit")
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+
+	body := strings.NewReader(`{"prompt":" edit this ","model":"unknown-model","input_images":["","data:image/png;base64,aGk="],"output_format":""}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/jobs", body)
+	req.Header.Set("Authorization", "Bearer sk-external-edit")
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var created imageJobResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if created.Job == nil || created.Job.APIKeyID != keyID {
+		t.Fatalf("created job = %#v, want api key id %d", created.Job, keyID)
+	}
+	var params imageGenerationJobPayload
+	if err := json.Unmarshal([]byte(created.Job.ParamsJSON), &params); err != nil {
+		t.Fatalf("decode params_json: %v", err)
+	}
+	if params.Prompt != "edit this" || params.Model != "gpt-image-2" || params.OutputFormat != "png" {
+		t.Fatalf("params = %#v, want normalized prompt/model/output format", params)
+	}
+	if len(params.InputImages) != 1 || params.InputImages[0] != "data:image/png;base64,aGk=" {
+		t.Fatalf("input_images = %#v, want trimmed single image", params.InputImages)
+	}
+}
+
+func TestExternalImageJobRouteRejectsPrivateInputImageURL(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	imageProxy := proxy.NewHandler(store, db, nil, nil)
+	imageProxy.SetRuntimeCache(tc)
+	router := gin.New()
+	handler.RegisterExternalImageRoutes(router, imageProxy)
+
+	if _, err := db.InsertAPIKey(context.Background(), "external-private-url", "sk-private-url"); err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/jobs", strings.NewReader(`{"prompt":"edit","input_images":["http://127.0.0.1/private.png"]}`))
+	req.Header.Set("Authorization", "Bearer sk-private-url")
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestExternalImageJobRouteFetchesPublicInputImageAsDataURL(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tiny := tinyPNG(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(tiny)
+	}))
+	defer server.Close()
+
+	serverURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+	oldDialer := dialPublicExternalInputImageAddress
+	dialPublicExternalInputImageAddress = func(ctx context.Context, network, address string) (net.Conn, error) {
+		_, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(serverURL.Hostname(), port))
+	}
+	defer func() { dialPublicExternalInputImageAddress = oldDialer }()
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(1)
+	defer tc.Close()
+	store := auth.NewStore(db, tc, nil)
+	handler := NewHandler(store, db, tc, nil, "admin-secret")
+	imageProxy := proxy.NewHandler(store, db, nil, nil)
+	imageProxy.SetRuntimeCache(tc)
+	router := gin.New()
+	handler.RegisterExternalImageRoutes(router, imageProxy)
+
+	if _, err := db.InsertAPIKey(context.Background(), "external-fetch-url", "sk-fetch-url"); err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"prompt":"edit","input_images":["http://example.com:%s/source.png"]}`, serverURL.Port())
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/jobs", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer sk-fetch-url")
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
+	}
+	var created imageJobResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if created.Job == nil {
+		t.Fatalf("created job is nil")
+	}
+	var params imageGenerationJobPayload
+	if err := json.Unmarshal([]byte(created.Job.ParamsJSON), &params); err != nil {
+		t.Fatalf("decode params_json: %v", err)
+	}
+	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tiny)
+	if len(params.InputImages) != 1 || params.InputImages[0] != want {
+		t.Fatalf("input_images = %#v, want fetched data URL", params.InputImages)
 	}
 }
 

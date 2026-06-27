@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,6 +73,20 @@ func TestAccountEmailDomain(t *testing.T) {
 				t.Fatalf("accountEmailDomain(%q) = %q, want %q", tt.email, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAccountAccessTokenTypeInfersCodexAT(t *testing.T) {
+	row := &database.AccountRow{Credentials: map[string]interface{}{
+		"access_token": "at-opaque-codex-token",
+	}}
+	if got := accountAccessTokenType(row); got != accessTokenTypeCodexAT {
+		t.Fatalf("accountAccessTokenType() = %q, want %q", got, accessTokenTypeCodexAT)
+	}
+
+	row.Credentials["access_token_type"] = "custom"
+	if got := accountAccessTokenType(row); got != "custom" {
+		t.Fatalf("accountAccessTokenType() with stored type = %q, want custom", got)
 	}
 }
 
@@ -1349,6 +1364,36 @@ func TestUpdateAccountSchedulerKeepsAllowedAPIKeyIDsWhenFieldOmitted(t *testing.
 	}
 }
 
+func TestUpdateAccountSchedulerClearsProxyURLOnNull(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID, err := db.InsertAccount(context.Background(), "proxy-account", "rt_proxy", "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("InsertAccount: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"proxy_url":null}`))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if rows[0].ProxyURL != "" {
+		t.Fatalf("proxy_url = %q, want empty", rows[0].ProxyURL)
+	}
+}
+
 func TestUpdateAccountSchedulerRejectsMissingAllowedAPIKeyID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1427,6 +1472,154 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	if runtimeAccount.AutoPause7dDisabled {
 		t.Fatal("runtime auto_pause_7d_disabled = true, want false")
 	}
+}
+
+func TestUpdateAccountSchedulerRuntimePatchPreservesOmittedOverrides(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	runtimeAccount := &auth.Account{
+		DBID:                    accountID,
+		AccessToken:             "token",
+		Status:                  auth.StatusReady,
+		PlanType:                "pro",
+		ScoreBiasOverride:       int64Ptr(10),
+		BaseConcurrencyOverride: int64Ptr(4),
+	}
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(runtimeAccount)
+
+	handler := &Handler{db: db, store: store}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"score_bias_override":20}`))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	scoreBias, ok := runtimeAccount.GetScoreBiasOverride()
+	if !ok || scoreBias != 20 {
+		t.Fatalf("runtime score_bias_override = (%d, %t), want (20, true)", scoreBias, ok)
+	}
+	baseConcurrency, ok := runtimeAccount.GetBaseConcurrencyOverride()
+	if !ok || baseConcurrency != 4 {
+		t.Fatalf("runtime base_concurrency_override = (%d, %t), want (4, true)", baseConcurrency, ok)
+	}
+}
+
+func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	accountID1, err := db.InsertAccount(ctx, "batch-1", "rt_batch_1", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 1: %v", err)
+	}
+	accountID2, err := db.InsertAccount(ctx, "batch-2", "rt_batch_2", "")
+	if err != nil {
+		t.Fatalf("InsertAccount 2: %v", err)
+	}
+	groupID, err := db.CreateAccountGroup(ctx, "Batch Group", "", "#2563eb", 0, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateAccountGroup: %v", err)
+	}
+
+	runtimeAccount1 := &auth.Account{DBID: accountID1, AccessToken: "token-1", Status: auth.StatusReady, PlanType: "pro"}
+	runtimeAccount2 := &auth.Account{DBID: accountID2, AccessToken: "token-2", Status: auth.StatusReady, PlanType: "pro"}
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(runtimeAccount1)
+	store.AddAccount(runtimeAccount2)
+	handler := &Handler{db: db, store: store}
+
+	body := fmt.Sprintf(`{"ids":[%d,%d,%d,%d],"enabled":false,"locked":true,"tags":["Ops","ops","blue"],"group_ids":[%d],"auto_pause_5h_threshold":0.8,"auto_pause_7d_disabled":true}`,
+		accountID1, accountID2, accountID1, accountID2+1000, groupID)
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-update", strings.NewReader(body))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.BatchUpdateAccounts(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload["success"] != float64(2) || payload["failed"] != float64(1) {
+		t.Fatalf("payload = %#v, want success=2 failed=1", payload)
+	}
+
+	rows, err := db.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	byID := make(map[int64]*database.AccountRow, len(rows))
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	for _, id := range []int64{accountID1, accountID2} {
+		row := byID[id]
+		if row == nil {
+			t.Fatalf("account %d missing from ListActive", id)
+		}
+		if row.Enabled || !row.Locked {
+			t.Fatalf("account %d enabled/locked = %v/%v, want false/true", id, row.Enabled, row.Locked)
+		}
+		if len(row.Tags) != 2 || row.Tags[0] != "Ops" || row.Tags[1] != "blue" {
+			t.Fatalf("account %d tags = %v, want [Ops blue]", id, row.Tags)
+		}
+		threshold5h, ok := row.GetCredentialFloat64("auto_pause_5h_threshold")
+		if !ok || threshold5h != 0.8 {
+			t.Fatalf("account %d auto_pause_5h_threshold = (%v, %t), want (0.8, true)", id, threshold5h, ok)
+		}
+		if !row.GetCredentialBool("auto_pause_7d_disabled") {
+			t.Fatalf("account %d auto_pause_7d_disabled = false, want true", id)
+		}
+		groupIDs, err := db.GetAccountGroupIDs(ctx, id)
+		if err != nil {
+			t.Fatalf("GetAccountGroupIDs(%d): %v", id, err)
+		}
+		if len(groupIDs) != 1 || groupIDs[0] != groupID {
+			t.Fatalf("account %d group ids = %v, want [%d]", id, groupIDs, groupID)
+		}
+	}
+
+	if atomic.LoadInt32(&runtimeAccount1.DispatchPaused) != 1 || atomic.LoadInt32(&runtimeAccount2.DispatchPaused) != 1 {
+		t.Fatal("runtime dispatch pause flags were not updated")
+	}
+	if atomic.LoadInt32(&runtimeAccount1.Locked) != 1 || atomic.LoadInt32(&runtimeAccount2.Locked) != 1 {
+		t.Fatal("runtime locked flags were not updated")
+	}
+	runtimeAccount1.Mu().RLock()
+	if len(runtimeAccount1.Tags) != 2 || runtimeAccount1.Tags[0] != "Ops" || runtimeAccount1.Tags[1] != "blue" || len(runtimeAccount1.GroupIDs) != 1 || runtimeAccount1.GroupIDs[0] != groupID {
+		t.Fatalf("runtime account 1 metadata tags=%v groups=%v", runtimeAccount1.Tags, runtimeAccount1.GroupIDs)
+	}
+	runtimeAccount1.Mu().RUnlock()
+}
+
+func TestBatchUpdateAccountsRejectsMissingUpdateFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{}
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/batch-update", strings.NewReader(`{"ids":[1,2]}`))
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.BatchUpdateAccounts(ginCtx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	assertErrorMessage(t, recorder, "请提供要更新的字段")
 }
 
 // AT-only 账号(没有 refresh_token,只靠 access_token)是规避 Codex Plus "add
@@ -1665,6 +1858,83 @@ func TestForceUsageProbeTriggersInLazyMode(t *testing.T) {
 	}
 }
 
+func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	handler := &Handler{db: db}
+
+	activeID, err := db.InsertAccountWithCredentials(context.Background(), "active", map[string]interface{}{
+		"refresh_token": "rt-active",
+		"email":         "restore@example.com",
+		"account_id":    "acc-restore",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert active: %v", err)
+	}
+	deletedID, err := db.InsertAccountWithCredentials(context.Background(), "deleted", map[string]interface{}{
+		"refresh_token": "rt-deleted",
+		"email":         "Restore@Example.com",
+		"account_id":    "acc-restore",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert deleted: %v", err)
+	}
+	if err := db.SoftDeleteAccount(context.Background(), deletedID); err != nil {
+		t.Fatalf("SoftDeleteAccount: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", deletedID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/admin/accounts/%d/restore", deletedID), nil)
+
+	handler.RestoreAccount(ctx)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusConflict, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), fmt.Sprintf("%d", activeID)) {
+		t.Fatalf("response = %s, want active duplicate id %d", recorder.Body.String(), activeID)
+	}
+	if _, err := db.GetAccountByID(context.Background(), deletedID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted account should remain outside active pool, err=%v", err)
+	}
+}
+
+func TestRestoreAccountReportsRuntimeLoadFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{db: db, store: store}
+
+	deletedID, err := db.InsertAccountWithCredentials(context.Background(), "deleted-empty", map[string]interface{}{}, "")
+	if err != nil {
+		t.Fatalf("Insert deleted-empty: %v", err)
+	}
+	if err := db.SoftDeleteAccount(context.Background(), deletedID); err != nil {
+		t.Fatalf("SoftDeleteAccount: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", deletedID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/admin/accounts/%d/restore", deletedID), nil)
+
+	handler.RestoreAccount(ctx)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "加载运行时失败") {
+		t.Fatalf("response = %s, want runtime load failure", recorder.Body.String())
+	}
+	if account := store.FindByID(deletedID); account != nil {
+		t.Fatalf("account %d should not be in runtime store", deletedID)
+	}
+}
+
 func newTestAdminDB(t *testing.T) *database.DB {
 	t.Helper()
 
@@ -1699,6 +1969,10 @@ func insertTestAPIKey(t *testing.T, db *database.DB, name string) int64 {
 		t.Fatalf("insert api key: %v", err)
 	}
 	return id
+}
+
+func int64Ptr(v int64) *int64 {
+	return &v
 }
 
 func assertErrorMessage(t *testing.T, recorder *httptest.ResponseRecorder, want string) {

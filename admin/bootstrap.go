@@ -364,8 +364,11 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		FirstTokenTimeoutSeconds:         0,
 		BillingTierPolicy:                proxy.BillingTierPolicyActual,
 		AffinityMode:                     "bounded",
+		PublicKeyUsagePageEnabled:        true,
 		CodexWSHideUpstreamErrors:        true,
 		CodexWSSilentRetryEnabled:        true,
 		CodexWSSilentMaxRetries:          2,
+		AutoPause5hGuardBandPercent:      5,
+		AutoPause5hGuardConcurrency:      1,
 	}
 }

@@ -6,12 +6,13 @@ import { api } from '../api'
 import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
+import Modal from '../components/Modal'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
-import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats } from '../types'
+import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog } from '../types'
 import { formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
@@ -27,7 +28,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -822,6 +823,82 @@ function StatusCodeBadge({ log }: { log: UsageLog }) {
         </div>
       </TooltipContent>
     </Tooltip>
+  )
+}
+
+// CyberPolicyDetailButton: 对 cyber_policy 报错的请求，点击关联到提示词过滤日志，
+// 展示触发拦截的完整请求内容（为什么 & 是什么）。
+function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [detail, setDetail] = useState<PromptFilterLog | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [loaded, setLoaded] = useState(false)
+
+  const handleOpen = async () => {
+    setOpen(true)
+    if (loaded || loading) return
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await api.matchPromptFilterLog({
+        at: log.created_at,
+        endpoint: log.endpoint,
+        apiKeyId: log.api_key_id || undefined,
+      })
+      setDetail(res.log)
+      setLoaded(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const content = (detail?.full_text || detail?.text_preview || '').trim()
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => void handleOpen()}
+        title={t('usage.cyberPolicyViewContent')}
+        className="inline-flex items-center gap-1 rounded-md border border-red-500/30 bg-red-500/10 px-1.5 py-0.5 text-[11px] font-medium text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-300"
+      >
+        <ShieldAlert className="size-3" />
+        cyber_policy
+      </button>
+      <Modal show={open} title={t('usage.cyberPolicyDetailTitle')} onClose={() => setOpen(false)}>
+        <div className="space-y-3">
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span className="font-mono text-foreground">{log.endpoint || '-'}</span>
+            <span className="font-mono text-foreground">{log.model || '-'}</span>
+            <span>{formatBeijingTime(log.created_at)}</span>
+          </div>
+          {log.error_message ? (
+            <div className="rounded-md border border-red-500/20 bg-red-500/5 px-3 py-2 text-xs leading-relaxed text-red-700 dark:text-red-300">
+              {log.error_message}
+            </div>
+          ) : null}
+          {loading ? (
+            <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
+          ) : error ? (
+            <div className="py-4 text-sm text-red-500">{error}</div>
+          ) : content ? (
+            <div>
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyRequestContent')}</span>
+                <button type="button" onClick={() => void navigator.clipboard?.writeText(content)} className="text-xs font-medium text-primary hover:underline">{t('common.copy')}</button>
+              </div>
+              <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground">{content}</pre>
+            </div>
+          ) : (
+            <div className="py-4 text-sm text-muted-foreground">{t('usage.cyberPolicyNoDetail')}</div>
+          )}
+        </div>
+      </Modal>
+    </>
   )
 }
 
@@ -1682,7 +1759,10 @@ export default function Usage() {
                       return (
                       <TableRow key={log.id}>
                         {visibleColumns.status && <TableCell>
-                          <StatusCodeBadge log={log} />
+                          <div className="flex items-center gap-1.5">
+                            <StatusCodeBadge log={log} />
+                            {log.upstream_error_kind === 'cyber_policy' ? <CyberPolicyDetailButton log={log} /> : null}
+                          </div>
                         </TableCell>}
                         {visibleColumns.model && <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">

@@ -480,7 +480,7 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 		if baseConcurrencyEffective <= 0 {
 			baseConcurrencyEffective = a.effectiveBaseConcurrencyLocked(baseLimit)
 		}
-		limit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
+		limit = a.quotaAutoPause5hGuardConcurrencyLimitLocked(concurrencyLimitForTier(baseConcurrencyEffective, tier), now)
 	}
 
 	available := a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()

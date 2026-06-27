@@ -610,8 +610,8 @@ func scanAPIKeyRow(scanner interface {
 	Scan(dest ...interface{}) error
 }) (*APIKeyRow, error) {
 	row := &APIKeyRow{}
-	var createdAtRaw, expiresAtRaw, allowedGroupsRaw, limitsRaw interface{}
-	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw, &row.QuotaLimit, &row.QuotaUsed, &expiresAtRaw, &allowedGroupsRaw, &limitsRaw); err != nil {
+	var createdAtRaw, expiresAtRaw, lastResetAtRaw, allowedGroupsRaw, limitsRaw interface{}
+	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw, &row.QuotaLimit, &row.QuotaUsed, &row.TotalUsed, &row.ResetCount, &lastResetAtRaw, &expiresAtRaw, &allowedGroupsRaw, &limitsRaw); err != nil {
 		return nil, err
 	}
 	createdAt, err := parseDBTimeValue(createdAtRaw)
@@ -622,8 +622,13 @@ func scanAPIKeyRow(scanner interface {
 	if err != nil {
 		return nil, fmt.Errorf("解析 API Key 过期时间失败: %w", err)
 	}
+	lastResetAt, err := parseDBNullTimeValue(lastResetAtRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 API Key 重置时间失败: %w", err)
+	}
 	row.CreatedAt = createdAt
 	row.ExpiresAt = expiresAt
+	row.LastResetAt = lastResetAt
 	row.AllowedGroupIDs = decodeInt64SliceValue(allowedGroupsRaw)
 	row.Limits = decodeAPIKeyLimits(limitsRaw)
 	return row, nil

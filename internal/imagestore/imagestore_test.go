@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestConfigNormalizeAndValidate(t *testing.T) {
@@ -351,5 +353,47 @@ func TestApplyFromJSONFallbackOnInvalid(t *testing.T) {
 	}
 	if _, statErr := os.Stat(ref); statErr != nil {
 		t.Fatalf("file should exist: %v", statErr)
+	}
+}
+
+func TestPresignURLS3(t *testing.T) {
+	// Presign 是离线本地签名，无需真实网络/桶，可纯单测。
+	cfg := Config{
+		Backend:        BackendS3,
+		Endpoint:       "https://s3.example.com",
+		Region:         "us-east-1",
+		Bucket:         "my-bucket",
+		AccessKey:      "AKIAEXAMPLE",
+		SecretKey:      "secretexample",
+		Prefix:         "images/",
+		ForcePathStyle: true,
+	}
+	if err := Configure(cfg); err != nil {
+		t.Fatalf("configure s3: %v", err)
+	}
+
+	ref := buildS3Ref("my-bucket", "images/api/123-01-abcd.png")
+	url, err := PresignURL(context.Background(), ref, time.Hour)
+	if err != nil {
+		t.Fatalf("PresignURL: %v", err)
+	}
+	if !strings.Contains(url, "my-bucket") || !strings.Contains(url, "images/api/123-01-abcd.png") {
+		t.Fatalf("presigned url missing bucket/key: %s", url)
+	}
+	if !strings.Contains(url, "X-Amz-Signature=") {
+		t.Fatalf("presigned url not signed: %s", url)
+	}
+	if !strings.Contains(url, "X-Amz-Expires=3600") {
+		t.Fatalf("presigned url missing/incorrect expiry: %s", url)
+	}
+}
+
+func TestPresignURLLocalUnsupported(t *testing.T) {
+	if err := Configure(Config{Backend: BackendLocal, LocalDir: t.TempDir()}); err != nil {
+		t.Fatalf("configure local: %v", err)
+	}
+	_, err := PresignURL(context.Background(), "/tmp/x.png", time.Hour)
+	if !errors.Is(err, ErrPresignUnsupported) {
+		t.Fatalf("expected ErrPresignUnsupported, got %v", err)
 	}
 }

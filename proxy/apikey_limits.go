@@ -33,6 +33,7 @@ const (
 	apiKeyRPDWindow            = 24 * time.Hour
 	apiKey5hWindow             = 5 * time.Hour
 	apiKey7dWindow             = 7 * 24 * time.Hour
+	apiKey30dWindow            = 30 * 24 * time.Hour
 )
 
 // apiKeyRowFromContext 从 gin context 中取出鉴权时已存的 APIKeyRow。
@@ -47,6 +48,16 @@ func apiKeyRowFromContext(c *gin.Context) *database.APIKeyRow {
 	}
 	row, _ := v.(*database.APIKeyRow)
 	return row
+}
+
+// APIKeyRowFromContext returns the API key metadata stored by the /v1 auth middleware.
+func APIKeyRowFromContext(c *gin.Context) *database.APIKeyRow {
+	return apiKeyRowFromContext(c)
+}
+
+// EnforceAPIKeyLimits checks API key scoped model and rate/cost limits.
+func (h *Handler) EnforceAPIKeyLimits(c *gin.Context, model string) (int, string) {
+	return h.enforceAPIKeyLimits(c, model)
 }
 
 // enforceAPIKeyLimits 检查 API Key 的所有限制条件。
@@ -127,8 +138,34 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 			}
 		}
 	}
+	if limits.CostLimit30d > 0 || limits.TokenLimit30d > 0 {
+		usage, err := h.apiKeyWindowUsage(ctx, row.ID, "30d", apiKey30dWindow)
+		if err == nil && usage != nil {
+			if limits.CostLimit30d > 0 && usage.UserBilled >= limits.CostLimit30d {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key cost limit exceeded: $%.2f / $%.2f in last 30d",
+						usage.UserBilled, limits.CostLimit30d)
+			}
+			if limits.TokenLimit30d > 0 && usage.Tokens >= limits.TokenLimit30d {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key token limit exceeded: %d / %d in last 30d",
+						usage.Tokens, limits.TokenLimit30d)
+			}
+		}
+	}
 
 	return 0, ""
+}
+
+// SendAPIKeyLimitError writes a standard /v1 API key limit error response.
+func SendAPIKeyLimitError(c *gin.Context, status int, msg string) {
+	errType := api.ErrorTypeRateLimit
+	errCode := api.ErrCodeRateLimitReached
+	if status == http.StatusForbidden {
+		errType = api.ErrorTypePermission
+		errCode = api.ErrCodeInvalidRequest
+	}
+	api.SendErrorWithStatus(c, api.NewAPIError(errCode, msg, errType), status)
 }
 
 // enforceAPIKeyLimitsAndReply 在请求转发前调用,命中限制时已向客户端写入响应并返回 true。
@@ -138,13 +175,7 @@ func (h *Handler) enforceAPIKeyLimitsAndReply(c *gin.Context, model string) bool
 	if status == 0 {
 		return false
 	}
-	errType := api.ErrorTypeRateLimit
-	errCode := api.ErrCodeRateLimitReached
-	if status == http.StatusForbidden {
-		errType = api.ErrorTypePermission
-		errCode = api.ErrCodeInvalidRequest
-	}
-	api.SendErrorWithStatus(c, api.NewAPIError(errCode, msg, errType), status)
+	SendAPIKeyLimitError(c, status, msg)
 	return true
 }
 

@@ -219,8 +219,8 @@ export function buildEndpointSpecs(
       title: copy(locale, "生成图片", "Generate images"),
       description: copy(
         locale,
-        "OpenAI Images 兼容端点，底层使用 Codex Responses 的 image_generation 能力。",
-        "OpenAI Images compatible endpoint backed by Codex Responses image_generation.",
+        "OpenAI Images 兼容端点，底层使用 Codex Responses 的 image_generation 能力。response_format 默认 b64_json；当系统设置里配置了 S3 兼容云存储后，传 response_format=\"url\" 会把图片上传到对象存储并返回限时（1 小时）预签名直链，否则 url 退回为 base64 data URL。",
+        "OpenAI Images compatible endpoint backed by Codex Responses image_generation. response_format defaults to b64_json; once an S3-compatible cloud storage is configured in system settings, response_format=\"url\" uploads the image to object storage and returns a time-limited (1h) presigned link, otherwise url falls back to a base64 data URL.",
       ),
       defaultBody: `{
   "model": "gpt-image-2",
@@ -244,6 +244,16 @@ export function buildEndpointSpecs(
   "created": 1710000000,
   "model": "gpt-image-2",
   "data": [{"b64_json": "..."}],
+  "usage": {"images": 1}
+}`,
+        },
+        {
+          code: 200,
+          body: `// response_format="url" + 已配置云存储
+{
+  "created": 1710000000,
+  "model": "gpt-image-2",
+  "data": [{"url": "https://<bucket-endpoint>/images/api/...png?X-Amz-Expires=3600&X-Amz-Signature=..."}],
   "usage": {"images": 1}
 }`,
         },

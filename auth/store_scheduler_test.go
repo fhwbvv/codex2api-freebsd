@@ -218,14 +218,26 @@ func TestAccountSkipWarmTierDoesNotPromoteRiskyOrBanned(t *testing.T) {
 	}
 }
 
-func TestNeedsUsageProbeSkipsRateLimited(t *testing.T) {
+func TestNeedsUsageProbeRateLimitedAllowsResetCreditsRefresh(t *testing.T) {
+	// 429 冷却 + 重置次数从未探测过（stale）：应允许探针（wham-only）刷新「主动重置次数」。
 	acc := &Account{
 		AccessToken:    "token",
 		Status:         StatusCooldown,
 		CooldownReason: "rate_limited",
 	}
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe should return true when reset credits are stale, even during rate_limited cooldown")
+	}
+
+	// 该状态应被标记为 limited，以保证探针只走 wham、不回退 /responses。
+	if !acc.InLimitedState() {
+		t.Fatal("InLimitedState should be true for rate_limited cooldown")
+	}
+
+	// 重置次数刚探测过（fresh）：429 冷却期间不应再发探针（避免 /responses 加重限流）。
+	acc.MarkResetCreditsProbed(time.Now())
 	if acc.NeedsUsageProbe(10 * time.Minute) {
-		t.Fatal("NeedsUsageProbe should return false for rate_limited cooldown")
+		t.Fatal("NeedsUsageProbe should return false during rate_limited cooldown once reset credits are fresh")
 	}
 }
 
@@ -251,6 +263,28 @@ func TestNeedsUsageProbeAllowsReadyAccount(t *testing.T) {
 	}
 }
 
+func TestNeedsUsageProbeRefreshesStaleResetCreditsDespiteFreshUsage(t *testing.T) {
+	now := time.Now()
+	// 核心修复：账号用量快照很新鲜（活跃账号被业务流量持续刷新），
+	// 但「主动重置次数」从未/很久没探测过，仍应触发 wham 探针刷新它。
+	acc := &Account{
+		AccessToken:         "token",
+		Status:              StatusReady,
+		UsagePercent7d:      30,
+		UsagePercent7dValid: true,
+		UsageUpdatedAt:      now, // 用量刚刷新
+	}
+	if !acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe should return true when reset credits are stale even if usage snapshot is fresh")
+	}
+
+	// 重置次数也刚探测过：用量与重置次数都新鲜，则无需探针。
+	acc.MarkResetCreditsProbed(now)
+	if acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe should return false when both usage and reset credits are fresh")
+	}
+}
+
 func TestNeedsUsageProbeRequires5hSnapshotWhen5hAutoPauseEnabled(t *testing.T) {
 	acc := &Account{
 		AccessToken:          "token",
@@ -261,6 +295,7 @@ func TestNeedsUsageProbeRequires5hSnapshotWhen5hAutoPauseEnabled(t *testing.T) {
 		AutoPause5hThreshold: 0.95,
 	}
 	acc.recomputeEffectiveAutoPause(nil)
+	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响，专测 5h 快照缺失路径
 
 	if !acc.NeedsUsageProbe(10 * time.Minute) {
 		t.Fatal("NeedsUsageProbe() = false, want true when 5h auto-pause is enabled but 5h snapshot is missing")
@@ -281,6 +316,7 @@ func TestPersistUsageSnapshotKeeps5hProbeRequiredWhen5hSnapshotMissing(t *testin
 	acc.recomputeEffectiveAutoPause(store)
 
 	store.PersistUsageSnapshot(acc, 20)
+	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响，专测 5h 快照缺失路径
 
 	if !acc.NeedsUsageProbe(10 * time.Minute) {
 		t.Fatal("NeedsUsageProbe() = false, want true after 7d-only persistence when 5h snapshot is still missing")
@@ -302,6 +338,7 @@ func TestPersistUsageSnapshot5hOnlyDoesNotRefreshStale7dSnapshot(t *testing.T) {
 	}
 
 	store.PersistUsageSnapshot5hOnly(acc)
+	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响，专测 7d 新鲜度不被 5h-only 持久化刷新
 
 	if !acc.NeedsUsageProbe(10 * time.Minute) {
 		t.Fatal("NeedsUsageProbe() = false, want true because 5h-only persistence must not refresh stale 7d freshness")

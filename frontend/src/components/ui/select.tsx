@@ -17,6 +17,7 @@ interface SelectProps {
   disabled?: boolean
   className?: string
   compact?: boolean
+  triggerClassName?: string
 }
 
 interface DropdownPosition {
@@ -39,6 +40,7 @@ export function Select({
   disabled = false,
   className,
   compact = false,
+  triggerClassName,
 }: SelectProps) {
   const [open, setOpen] = useState(false)
   const [position, setPosition] = useState<DropdownPosition | null>(null)
@@ -128,7 +130,8 @@ export function Select({
           'hover:border-primary/30 hover:bg-accent/50',
           'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/20',
           'disabled:cursor-not-allowed disabled:opacity-60',
-          open && 'border-primary/35 ring-[3px] ring-primary/10'
+          open && 'border-primary/35 ring-[3px] ring-primary/10',
+          triggerClassName
         )}
         onClick={() => {
           if (!disabled) {

@@ -708,6 +708,13 @@ export default function Settings() {
     prompt_filter_sensitive_words: '',
     prompt_filter_custom_patterns: '[]',
     prompt_filter_disabled_patterns: '[]',
+    prompt_filter_review_enabled: false,
+    prompt_filter_review_api_key: '',
+    prompt_filter_review_api_key_configured: false,
+    prompt_filter_review_base_url: 'https://api.openai.com',
+    prompt_filter_review_model: 'omni-moderation-latest',
+    prompt_filter_review_timeout_seconds: 10,
+    prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
     codex_min_cli_version: '0.118.0',
     usage_log_mode: 'full',
@@ -719,6 +726,7 @@ export default function Settings() {
     first_token_timeout_seconds: 0,
     billing_tier_policy: 'actual',
     show_full_usage_numbers: false,
+    public_key_usage_page_enabled: true,
     image_storage_backend: 'local',
     image_s3_endpoint: '',
     image_s3_region: '',
@@ -729,6 +737,8 @@ export default function Settings() {
     image_s3_force_path_style: false,
     auto_pause_5h_threshold: 0,
     auto_pause_7d_threshold: 0,
+    auto_pause_5h_guard_band_percent: 5,
+    auto_pause_5h_guard_concurrency: 1,
   })
   const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
@@ -1366,6 +1376,55 @@ export default function Settings() {
                   }}
                   onBlur={() => {
                     void autoSaveSettingsPatch({ auto_pause_7d_threshold: settingsForm.auto_pause_7d_threshold })
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.autoPause5hGuardBand')} description={t('settings.autoPause5hGuardBandHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  inputMode="decimal"
+                  placeholder={t('settings.autoPause5hGuardBandPlaceholder')}
+                  value={settingsForm.auto_pause_5h_guard_band_percent > 0 ? settingsForm.auto_pause_5h_guard_band_percent : ''}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    if (raw === '') {
+                      setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: 0 }))
+                      return
+                    }
+                    const parsed = parseFloat(raw)
+                    if (Number.isNaN(parsed)) return
+                    const value = Math.max(0, Math.min(100, parsed))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: value }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_5h_guard_band_percent: settingsForm.auto_pause_5h_guard_band_percent })
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.autoPause5hGuardConcurrency')} description={t('settings.autoPause5hGuardConcurrencyHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  step={1}
+                  inputMode="numeric"
+                  value={settingsForm.auto_pause_5h_guard_concurrency ?? 1}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    if (raw === '') {
+                      setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: 0 }))
+                      return
+                    }
+                    const parsed = Number.parseInt(raw, 10)
+                    if (Number.isNaN(parsed)) return
+                    const value = Math.max(0, Math.min(1000, parsed))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: value }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_5h_guard_concurrency: settingsForm.auto_pause_5h_guard_concurrency })
                   }}
                 />
               </SettingField>

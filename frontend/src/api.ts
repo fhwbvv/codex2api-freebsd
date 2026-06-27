@@ -22,6 +22,7 @@ import type {
   ImageJobsResponse,
   ImagePromptTemplatePayload,
   ImagePromptTemplatesResponse,
+  InviteResponse,
   MessageResponse,
   ModelSyncResponse,
   ModelsResponse,
@@ -29,9 +30,12 @@ import type {
   OAuthURLResponse,
   OpsErrorSummary,
   OpsOverviewResponse,
+  PromptFilterLog,
   PromptFilterLogsResponse,
+  PromptFilterRulePatternTestResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
+  PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
   RuntimeStatusResponse,
   ResetRadarResponse,
@@ -42,12 +46,15 @@ import type {
   SystemSettings,
   UpdateAccountSchedulerRequest,
   UpdateAPIKeyRequest,
+  UpdateOAuthAccountRequest,
   UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
   UsageStats,
   AccountGroup,
   AccountGroupsResponse,
+  AccountHealthBarsResponse,
+  BatchUpdateAccountsRequest,
   BackgroundUploadResponse,
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
@@ -139,6 +146,24 @@ async function requestPublic<T>(path: string, options: RequestInit = {}): Promis
   return (await res.json()) as T
 }
 
+async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers)
+  headers.set('Authorization', `Bearer ${apiKey}`)
+
+  const res = await fetch('/api/key-usage' + path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return (await res.json()) as T
+}
+
 async function requestBlob(path: string, options: RequestInit = {}): Promise<Blob> {
   const headers = new Headers(options.headers)
 
@@ -194,6 +219,13 @@ function buildOpsErrorSearchParams(params: {
 
 export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
+  getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } = {}) => {
+    const search = new URLSearchParams()
+    search.set('range', range)
+    if (params.page) search.set('page', String(params.page))
+    if (params.pageSize) search.set('page_size', String(params.pageSize))
+    return requestAPIKeyUsage<PublicAPIKeyUsageResponse>(`/summary?${search.toString()}`, apiKey)
+  },
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>
@@ -223,6 +255,14 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
   forceUsageProbe: () =>
     request<{ triggered: boolean; concurrency: number; reason?: string; mode?: string }>(`/accounts/usage/probe`, { method: 'POST' }),
+  refreshAccountUsage: (id: number) =>
+    request<{
+      refreshed: boolean
+      usage_percent_5h?: number
+      usage_percent_7d?: number
+      reset_5h_at?: string
+      reset_7d_at?: string
+    }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
@@ -236,8 +276,16 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/enable`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   toggleAccountLock: (id: number, locked: boolean) =>
     request<MessageResponse>(`/accounts/${id}/lock`, { method: 'POST', body: JSON.stringify({ locked }) }),
+  batchUpdateAccounts: (data: BatchUpdateAccountsRequest) =>
+    request<{ message: string; success: number; failed: number }>('/accounts/batch-update', { method: 'POST', body: JSON.stringify(data) }),
   resetAccountStatus: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/reset-status`, { method: 'POST' }),
+  resetCredits: (id: number) =>
+    request<{ message: string; rate_limit_reset_credits?: number }>(`/accounts/${id}/reset-credits`, { method: 'POST' }),
+  getAccountHealthBars: () =>
+    request<AccountHealthBarsResponse>('/accounts/health-bars'),
+  sendInvite: (id: number, data: { emails?: string[]; emails_text?: string; referral_key?: string; proxy_url?: string; max_emails?: number }) =>
+    request<InviteResponse>(`/accounts/${id}/invite`, { method: 'POST', body: JSON.stringify(data) }),
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number, days?: number) => {
@@ -454,8 +502,18 @@ export const api = {
   },
   clearPromptFilterLogs: () =>
     request<MessageResponse>('/prompt-filter/logs', { method: 'DELETE' }),
+  matchPromptFilterLog: (params: { at: string; endpoint?: string; apiKeyId?: number; source?: string }) => {
+    const search = new URLSearchParams()
+    search.set('at', params.at)
+    if (params.endpoint) search.set('endpoint', params.endpoint)
+    if (params.apiKeyId) search.set('api_key_id', String(params.apiKeyId))
+    if (params.source) search.set('source', params.source)
+    return request<{ found: boolean; log: PromptFilterLog | null }>(`/prompt-filter/logs/match?${search.toString()}`)
+  },
   testPromptFilter: (data: { text: string; endpoint?: string; model?: string }) =>
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
+  testPromptFilterRulePattern: (data: { pattern: string; text: string }) =>
+    request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>
     request<PromptFilterRulesResponse>('/prompt-filter/rules'),
   getModels: () => request<ModelsResponse>('/models'),
@@ -499,6 +557,8 @@ export const api = {
     request<OAuthURLResponse>('/oauth/generate-auth-url', { method: 'POST', body: JSON.stringify(data) }),
   exchangeOAuthCode: (data: { session_id: string; code: string; state: string; name?: string; proxy_url?: string }) =>
     request<OAuthExchangeResponse>('/oauth/exchange-code', { method: 'POST', body: JSON.stringify(data) }),
+  updateOAuthAccount: (id: number, data: UpdateOAuthAccountRequest) =>
+    request<OAuthExchangeResponse>(`/accounts/${id}/oauth/exchange-code`, { method: 'POST', body: JSON.stringify(data) }),
 }
 
 export interface ProxyRow {

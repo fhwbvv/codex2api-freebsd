@@ -81,6 +81,10 @@ func (h *Handler) apiKeyConcurrencyLimiter() *apiKeyConcurrencyLimiter {
 	return h.apiKeyGate
 }
 
+func (h *Handler) AcquireAPIKeyConcurrency(c *gin.Context) (func(), bool) {
+	return h.acquireAPIKeyConcurrency(c)
+}
+
 func (h *Handler) acquireAPIKeyConcurrency(c *gin.Context) (func(), bool) {
 	row := apiKeyRowFromContext(c)
 	if row == nil || row.ID <= 0 || row.Limits.MaxConcurrency <= 0 {

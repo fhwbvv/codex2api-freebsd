@@ -6,6 +6,7 @@ import './i18n'
 import './index.css'
 
 const rootElement = document.getElementById('root')
+const routerBasename = window.location.pathname.startsWith('/admin') ? '/admin' : undefined
 
 if (!rootElement) {
   throw new Error('未找到 root 节点')
@@ -13,7 +14,7 @@ if (!rootElement) {
 
 ReactDOM.createRoot(rootElement).render(
   <StrictMode>
-    <BrowserRouter basename="/admin">
+    <BrowserRouter basename={routerBasename}>
       <App />
     </BrowserRouter>
   </StrictMode>,

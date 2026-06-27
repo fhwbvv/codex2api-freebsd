@@ -10,6 +10,8 @@ interface PageHeaderProps {
   refreshLabel?: string
   actions?: ReactNode
   actionMeta?: ReactNode
+  // titleAdornment 渲染在标题文字右侧（如模式切换下拉）。
+  titleAdornment?: ReactNode
 }
 
 export default function PageHeader({
@@ -19,6 +21,7 @@ export default function PageHeader({
   refreshLabel,
   actions,
   actionMeta,
+  titleAdornment,
 }: PageHeaderProps) {
   const { t } = useTranslation()
   const hasActions = Boolean(onRefresh) || Boolean(actions) || Boolean(actionMeta)
@@ -27,9 +30,12 @@ export default function PageHeader({
   return (
     <div data-slot="page-header" className="flex items-end justify-between gap-5 mb-6 max-sm:flex-col max-sm:items-stretch">
       <div className="max-w-[760px]">
-        <h2 className="text-2xl font-semibold leading-tight text-foreground sm:text-[28px]">
-          {title}
-        </h2>
+        <div className="flex flex-wrap items-center gap-3">
+          <h2 className="text-2xl font-semibold leading-tight text-foreground sm:text-[28px]">
+            {title}
+          </h2>
+          {titleAdornment}
+        </div>
         {description ? (
           <p className="mt-2 max-w-[640px] text-muted-foreground text-sm leading-relaxed">
             {description}

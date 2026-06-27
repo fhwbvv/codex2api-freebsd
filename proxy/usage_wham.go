@@ -1,23 +1,32 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/google/uuid"
 )
 
 // WhamUsageURL 是 ChatGPT 后端用量查询端点。
 // 该端点返回结构化 JSON（不消耗任何额度），可用于零成本获取账号 5h/7d 用量。
 const WhamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
+// WhamResetCreditsConsumeURL 是「消耗 1 次主动重置次数、立即重置额度」的端点。
+const WhamResetCreditsConsumeURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+
 // whamURLForTest 允许测试替换默认 URL。生产代码不要赋值。
 var whamURLForTest = ""
+
+// whamConsumeURLForTest 允许测试替换重置端点 URL。生产代码不要赋值。
+var whamConsumeURLForTest = ""
 
 // WhamUsage 是 /backend-api/wham/usage 的响应结构。
 type WhamUsage struct {
@@ -25,6 +34,12 @@ type WhamUsage struct {
 	AccountID string `json:"account_id"`
 	Email     string `json:"email"`
 	PlanType  string `json:"plan_type"`
+
+	// OpenAI 续费后 JWT 里的 chatgpt_subscription_active_until 不一定会立即随授权刷新，
+	// wham/usage 返回的服务端当前订阅到期时间用于同步管理端展示与调度权重。
+	SubscriptionExpiresAtRaw          whamTimeRaw `json:"subscription_expires_at,omitempty"`
+	SubscriptionActiveUntilRaw        whamTimeRaw `json:"subscription_active_until,omitempty"`
+	ChatGPTSubscriptionActiveUntilRaw whamTimeRaw `json:"chatgpt_subscription_active_until,omitempty"`
 
 	RateLimit struct {
 		Allowed         bool             `json:"allowed"`
@@ -46,6 +61,70 @@ type WhamUsage struct {
 		Reached         bool        `json:"reached"`
 		IndividualLimit interface{} `json:"individual_limit"`
 	} `json:"spend_control,omitempty"`
+
+	// RateLimitResetCredits 是账号在 OpenAI 官方那边剩余的「主动重置次数」。
+	// available_count > 0 时可调用 wham/rate-limit-reset-credits/consume 立即重置额度。
+	RateLimitResetCredits *struct {
+		AvailableCount int `json:"available_count"`
+	} `json:"rate_limit_reset_credits,omitempty"`
+}
+
+type whamTimeRaw string
+
+func (w *whamTimeRaw) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		*w = ""
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err == nil {
+		*w = whamTimeRaw(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(trimmed, &n); err == nil {
+		*w = whamTimeRaw(n.String())
+		return nil
+	}
+	return nil
+}
+
+func (w *WhamUsage) SubscriptionExpiresAt() time.Time {
+	if w == nil {
+		return time.Time{}
+	}
+	for _, raw := range []whamTimeRaw{
+		w.SubscriptionExpiresAtRaw,
+		w.SubscriptionActiveUntilRaw,
+		w.ChatGPTSubscriptionActiveUntilRaw,
+	} {
+		if t := parseWhamTime(string(raw)); !t.IsZero() {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func parseWhamTime(raw string) time.Time {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t
+	}
+	if unix, err := strconv.ParseInt(s, 10, 64); err == nil && unix > 0 {
+		// 兼容秒级与毫秒级 unix 时间戳。
+		if unix > 1_000_000_000_000 {
+			return time.UnixMilli(unix)
+		}
+		return time.Unix(unix, 0)
+	}
+	return time.Time{}
 }
 
 // WhamUsageWindow 是单个限流窗口（primary=5h，secondary=7d）。
@@ -87,7 +166,9 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 		req.Header.Set("chatgpt-account-id", accountID)
 	}
 
-	client := &http.Client{Transport: newCodexStandardTransport(proxyURL)}
+	// 复用网关同款 transport（支持 uTLS Chrome 指纹），而非裸标准 transport，
+	// 让 wham 查询与 /responses 走一致的 TLS 指纹，降低被 Cloudflare 拦截的概率。
+	client := &http.Client{Transport: newCodexTransport(proxyURL)}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -111,6 +192,98 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	return &usage, resp, nil
 }
 
+// WhamResetCredit 是 consume 响应里被兑换的重置凭据元数据。
+type WhamResetCredit struct {
+	ID         string `json:"id,omitempty"`
+	ResetType  string `json:"reset_type,omitempty"`
+	Status     string `json:"status,omitempty"`
+	RedeemedAt string `json:"redeemed_at,omitempty"`
+}
+
+// WhamResetResult 是 /wham/rate-limit-reset-credits/consume 成功响应的投影。
+// windows_reset 表示本次重置了几个限流窗口，可用于即时反馈，省去重置后再查一次 usage。
+type WhamResetResult struct {
+	Code         string           `json:"code"`
+	WindowsReset int              `json:"windows_reset"`
+	Credit       *WhamResetCredit `json:"credit,omitempty"`
+}
+
+// ConsumeResetCredit 消耗账号 1 次「主动重置次数」以立即重置额度。
+// 向 /backend-api/wham/rate-limit-reset-credits/consume 发送 POST，body 携带一个
+// 随机幂等键 redeem_request_id。成功（2xx）返回 nil；非 2xx 返回带状态码的 resp，
+// 由调用方据此触发刷新 / 冷却 / 错误提示。
+func ConsumeResetCredit(ctx context.Context, account *auth.Account, proxyURL string) (*http.Response, error) {
+	_, resp, err := ConsumeResetCreditParsed(ctx, account, proxyURL, uuid.New().String())
+	return resp, err
+}
+
+// ConsumeResetCreditWithID 与 ConsumeResetCredit 相同，但由调用方提供 redeem_request_id。
+// 重试同一次重置时务必复用同一个 ID——上游以它作幂等键，沿用可避免网络抖动重试时
+// 重复消耗一次宝贵的重置次数。
+func ConsumeResetCreditWithID(ctx context.Context, account *auth.Account, proxyURL, redeemRequestID string) (*http.Response, error) {
+	_, resp, err := ConsumeResetCreditParsed(ctx, account, proxyURL, redeemRequestID)
+	return resp, err
+}
+
+// ConsumeResetCreditParsed 在消耗重置次数的同时解析成功响应（windows_reset / credit），
+// 让调用方可即时反馈并优化掉重置后那次额外的 usage 查询往返。
+// 2xx 时返回解析结果且 resp.Body 已关闭；非 2xx 时 result 为 nil 且保留 resp.Body 供调用方读取错误。
+func ConsumeResetCreditParsed(ctx context.Context, account *auth.Account, proxyURL, redeemRequestID string) (*WhamResetResult, *http.Response, error) {
+	url := WhamResetCreditsConsumeURL
+	if whamConsumeURLForTest != "" {
+		url = whamConsumeURLForTest
+	}
+	return consumeResetCreditWithURL(ctx, account, proxyURL, url, redeemRequestID)
+}
+
+func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxyURL, url, redeemRequestID string) (*WhamResetResult, *http.Response, error) {
+	if account == nil {
+		return nil, nil, fmt.Errorf("account is nil")
+	}
+	accessToken := account.GetAccessToken()
+	if accessToken == "" {
+		return nil, nil, fmt.Errorf("account has no access token")
+	}
+
+	if strings.TrimSpace(redeemRequestID) == "" {
+		redeemRequestID = uuid.New().String()
+	}
+	payload, _ := json.Marshal(map[string]string{"redeem_request_id": redeemRequestID})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build reset-credit request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", latestCodexCLIUserAgentPrefix)
+	req.Header.Set("Originator", Originator)
+	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
+		req.Header.Set("chatgpt-account-id", accountID)
+	}
+
+	// 与 wham 查询、/responses 一致的 transport（支持 uTLS Chrome 指纹）。
+	client := &http.Client{Transport: newCodexTransport(proxyURL)}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reset-credit request: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// 保留 resp 让调用方读取 body 并据状态码处理（401 刷新、429 等）。
+		return nil, resp, fmt.Errorf("reset-credit returned status %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	_ = resp.Body.Close()
+	// 解析为尽力而为：重置已成功，解析失败不应让整次操作失败。
+	result := &WhamResetResult{}
+	if len(bytes.TrimSpace(body)) > 0 {
+		_ = json.Unmarshal(body, result)
+	}
+	return result, resp, nil
+}
+
 // ApplyWhamUsage 将 /wham/usage 返回的数据写入账号 state + 持久化。
 // 行为与 SyncCodexUsageState（处理 /responses 响应头时）保持一致：
 //   - plan_type 同步到内存 + DB
@@ -128,8 +301,25 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 	if store != nil && usage.PlanType != "" {
 		store.UpdateAccountPlanType(account, usage.PlanType)
 	}
+	if store != nil {
+		accountID := strings.TrimSpace(usage.AccountID)
+		if accountID == "" {
+			accountID = strings.TrimSpace(usage.UserID)
+		}
+		store.UpdateAccountIdentity(account, usage.Email, accountID)
+		store.UpdateAccountSubscriptionExpiresAt(account, usage.SubscriptionExpiresAt())
+	}
+
+	// 记录「主动重置次数」（OpenAI 官方剩余的手动重置额度次数）。
+	if usage.RateLimitResetCredits != nil {
+		account.SetRateLimitResetCredits(usage.RateLimitResetCredits.AvailableCount)
+	}
 
 	now := time.Now()
+
+	// 记录本次成功的 wham 探针时间。「主动重置次数」只能由 wham 刷新，
+	// 用它独立判断重置次数是否过期（见 auth.Account.NeedsUsageProbe）。
+	account.MarkResetCreditsProbed(now)
 
 	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow, usage.PlanType, now)
 

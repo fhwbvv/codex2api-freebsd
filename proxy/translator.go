@@ -1489,6 +1489,47 @@ func PrepareResponsesWebSocketBody(rawBody []byte) ([]byte, string) {
 	})
 }
 
+const codexReasoningEncryptedContentInclude = "reasoning.encrypted_content"
+
+func ensureDefaultCodexInclude(body map[string]any) {
+	if body == nil {
+		return
+	}
+	if _, ok := body["include"]; !ok {
+		body["include"] = []string{codexReasoningEncryptedContentInclude}
+	}
+}
+
+func ensureCodexReasoningInclude(body map[string]any) {
+	if body == nil {
+		return
+	}
+	if _, ok := body["reasoning"]; !ok {
+		return
+	}
+	if _, ok := body["include"]; !ok {
+		body["include"] = []string{codexReasoningEncryptedContentInclude}
+		return
+	}
+
+	switch includes := body["include"].(type) {
+	case []any:
+		for _, item := range includes {
+			if s, ok := item.(string); ok && s == codexReasoningEncryptedContentInclude {
+				return
+			}
+		}
+		body["include"] = append(includes, codexReasoningEncryptedContentInclude)
+	case []string:
+		for _, item := range includes {
+			if item == codexReasoningEncryptedContentInclude {
+				return
+			}
+		}
+		body["include"] = append(includes, codexReasoningEncryptedContentInclude)
+	}
+}
+
 func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOptions) ([]byte, string) {
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
@@ -1500,9 +1541,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	if opts.forceStoreFalse {
 		body["store"] = false
 	}
-	if _, ok := body["include"]; !ok {
-		body["include"] = []string{"reasoning.encrypted_content"}
-	}
+	ensureDefaultCodexInclude(body)
 
 	normalizeResponsesImageOnlyModel(body)
 	normalizeResponsesPromptCompat(body)
@@ -1537,6 +1576,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 			}
 		}
 	}
+	ensureCodexReasoningInclude(body)
 
 	// 4. service tier 清理（兼容客户端字段；只有 fast/priority 会显式传给 Codex 上游）
 	delete(body, "serviceTier")
@@ -2544,6 +2584,33 @@ func newReasoningChunk(id, model string, created int64, reasoning string) []byte
 	return b
 }
 
+func isCodexToolCallItemType(itemType string) bool {
+	switch itemType {
+	case "function_call", "custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCodexToolInputDeltaEvent(eventType string) bool {
+	switch eventType {
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		return true
+	default:
+		return false
+	}
+}
+
+func isCodexToolInputDoneEvent(eventType string) bool {
+	switch eventType {
+	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
+		return true
+	default:
+		return false
+	}
+}
+
 // newToolCallAnnouncementChunk 构建 tool call 首块（含 id、type、function.name）
 func newToolCallAnnouncementChunk(id, model string, created int64, tcIndex int, callID, funcName string) []byte {
 	chunk := openAIStreamChunk{
@@ -2622,6 +2689,9 @@ func TranslateStreamChunk(eventData []byte, model string, chunkID string, create
 		delta := gjson.GetBytes(eventData, "delta").String()
 		return newReasoningChunk(chunkID, model, created, delta), false
 
+	case "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
+		return nil, false
+
 	case "response.completed":
 		usage := extractUsage(eventData)
 		return newFinalChunk(chunkID, model, created, "stop", usage), true
@@ -2680,47 +2750,64 @@ func NewStreamTranslator(chunkID, model string, created int64) *StreamTranslator
 
 // Translate 将单个 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式
 func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
-	eventType := gjson.GetBytes(eventData, "type").String()
+	return st.TranslateParsed(gjson.ParseBytes(eventData))
+}
+
+// TranslateParsed 将已解析的 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式。
+func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) {
+	eventType := parsed.Get("type").String()
 
 	switch eventType {
 	case "response.output_text.delta":
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newContentChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newReasoningChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.output_item.added":
-		itemType := gjson.GetBytes(eventData, "item.type").String()
-		if itemType != "function_call" {
+		itemType := parsed.Get("item.type").String()
+		if !isCodexToolCallItemType(itemType) {
 			return nil, false
 		}
-		callID := gjson.GetBytes(eventData, "item.call_id").String()
-		name := gjson.GetBytes(eventData, "item.name").String()
-		itemID := gjson.GetBytes(eventData, "item.id").String()
+		callID := parsed.Get("item.call_id").String()
+		if callID == "" {
+			callID = parsed.Get("item.id").String()
+		}
+		name := parsed.Get("item.name").String()
+		itemID := parsed.Get("item.id").String()
+		if itemID == "" {
+			itemID = callID
+		}
 
 		tcIdx := st.nextIdx
 		st.toolCallMap[itemID] = tcIdx
+		if callID != "" && callID != itemID {
+			st.toolCallMap[callID] = tcIdx
+		}
 		st.nextIdx++
 		st.HasToolCalls = true
 
 		return newToolCallAnnouncementChunk(st.ChunkID, st.Model, st.Created, tcIdx, callID, name), false
 
-	case "response.function_call_arguments.delta":
-		itemID := gjson.GetBytes(eventData, "item_id").String()
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		itemID := parsed.Get("item_id").String()
+		if itemID == "" {
+			itemID = parsed.Get("call_id").String()
+		}
 		tcIdx, ok := st.toolCallMap[itemID]
 		if !ok {
 			return nil, false
 		}
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newToolCallDeltaChunk(st.ChunkID, st.Model, st.Created, tcIdx, delta), false
 
-	case "response.function_call_arguments.done":
+	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
 		return nil, false
 
 	case "response.completed":
-		usage := extractUsage(eventData)
+		usage := extractUsageFromResult(parsed.Get("response.usage"))
 		finishReason := "stop"
 		if st.HasToolCalls {
 			finishReason = "tool_calls"
@@ -2728,7 +2815,7 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		return newFinalChunk(st.ChunkID, st.Model, st.Created, finishReason, usage), true
 
 	case "response.failed":
-		errMsg := gjson.GetBytes(eventData, "response.error.message").String()
+		errMsg := parsed.Get("response.error.message").String()
 		if errMsg == "" {
 			errMsg = "Codex upstream error"
 		}
@@ -2743,7 +2830,7 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		return nil, false
 
 	default:
-		if delta := gjson.GetBytes(eventData, "delta"); delta.Exists() && delta.Type == gjson.String {
+		if delta := parsed.Get("delta"); delta.Exists() && delta.Type == gjson.String {
 			return newContentChunk(st.ChunkID, st.Model, st.Created, delta.String()), false
 		}
 		return nil, false
@@ -2892,11 +2979,20 @@ func ExtractToolCallsFromOutput(eventData []byte) []ToolCallResult {
 		return nil
 	}
 	output.ForEach(func(_, item gjson.Result) bool {
-		if item.Get("type").String() == "function_call" {
+		itemType := item.Get("type").String()
+		if isCodexToolCallItemType(itemType) {
+			callID := item.Get("call_id").String()
+			if callID == "" {
+				callID = item.Get("id").String()
+			}
+			arguments := item.Get("arguments").String()
+			if itemType == "custom_tool_call" {
+				arguments = item.Get("input").String()
+			}
 			toolCalls = append(toolCalls, ToolCallResult{
-				ID:        item.Get("call_id").String(),
+				ID:        callID,
 				Name:      item.Get("name").String(),
-				Arguments: item.Get("arguments").String(),
+				Arguments: arguments,
 			})
 		}
 		return true

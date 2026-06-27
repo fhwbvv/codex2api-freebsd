@@ -169,6 +169,7 @@ type Manager struct {
 	// 清理定时器
 	cleanupTicker *time.Ticker
 	stopCleanup   chan struct{}
+	stopOnce      sync.Once
 
 	// 连接回调
 	onConnected    func(accountID int64, session *Session)
@@ -252,8 +253,10 @@ func (m *Manager) evictExpired() {
 
 // Stop 停止管理器
 func (m *Manager) Stop() {
-	close(m.stopCleanup)
-	m.closeAll()
+	m.stopOnce.Do(func() {
+		close(m.stopCleanup)
+		m.closeAll()
+	})
 }
 
 // closeAll 关闭所有连接
@@ -581,6 +584,24 @@ func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey str
 		wc.Close()
 	}
 	m.sessions.Delete(key)
+}
+
+// DiscardConnection 关闭并从连接池移除一条坏连接。
+// 用于上游 WS 异常路径(read error / close 1006/1009/1011 / broken pipe / unexpected EOF)：
+// 关闭底层 socket 解决 CLOSE_WAIT 滞留，并把连接从 connections/sessions 移除，
+// 避免坏连接被 ReleaseConnection 归还后又被 canReuseConnection 误判为可复用。
+// 使用 CompareAndDelete 按本连接精确删除，防止误删同 PoolKey 下已重建的新连接。
+func (m *Manager) DiscardConnection(wc *WsConnection) {
+	if wc == nil {
+		return
+	}
+	wc.Close()
+	if wc.PoolKey != "" {
+		m.connections.CompareAndDelete(wc.PoolKey, wc)
+		if wc.session != nil {
+			m.sessions.CompareAndDelete(wc.PoolKey, wc.session)
+		}
+	}
 }
 
 // poolKey 生成连接池键

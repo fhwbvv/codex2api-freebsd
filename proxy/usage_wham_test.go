@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -20,6 +21,7 @@ func TestQueryWhamUsage_ParsesPlusAccountResponse(t *testing.T) {
 		"account_id": "user-abc",
 		"email": "rundown_consist_3o@icloud.com",
 		"plan_type": "plus",
+		"subscription_expires_at": "2026-07-17T09:30:23Z",
 		"rate_limit": {
 			"allowed": true,
 			"limit_reached": false,
@@ -78,6 +80,10 @@ func TestQueryWhamUsage_ParsesPlusAccountResponse(t *testing.T) {
 	if usage.PlanType != "plus" {
 		t.Errorf("PlanType = %q, want plus", usage.PlanType)
 	}
+	wantSubscriptionExpiresAt := time.Date(2026, 7, 17, 9, 30, 23, 0, time.UTC)
+	if got := usage.SubscriptionExpiresAt(); !got.Equal(wantSubscriptionExpiresAt) {
+		t.Errorf("SubscriptionExpiresAt() = %s, want %s", got.Format(time.RFC3339), wantSubscriptionExpiresAt.Format(time.RFC3339))
+	}
 	if usage.RateLimit.PrimaryWindow == nil || usage.RateLimit.PrimaryWindow.UsedPercent != 83 {
 		t.Errorf("primary used_percent = %+v, want 83", usage.RateLimit.PrimaryWindow)
 	}
@@ -107,6 +113,7 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	reset5h := now.Add(3 * time.Hour).Unix()
 	reset7d := now.Add(5 * 24 * time.Hour).Unix()
 	usage := &WhamUsage{PlanType: "plus"}
+	usage.SubscriptionExpiresAtRaw = whamTimeRaw("2026-07-17T09:30:23Z")
 	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 83, LimitWindowSeconds: 18000, ResetAt: reset5h}
 	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 30, LimitWindowSeconds: 604800, ResetAt: reset7d}
 
@@ -131,6 +138,128 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	}
 	if got := row.GetCredential("plan_type"); got != "plus" {
 		t.Errorf("persisted plan_type = %q, want plus", got)
+	}
+	wantSubscriptionExpiresAt := time.Date(2026, 7, 17, 9, 30, 23, 0, time.UTC)
+	if !account.SubscriptionExpiresAt.Equal(wantSubscriptionExpiresAt) {
+		t.Errorf("account SubscriptionExpiresAt = %s, want %s", account.SubscriptionExpiresAt.Format(time.RFC3339), wantSubscriptionExpiresAt.Format(time.RFC3339))
+	}
+	if got := row.GetCredential("subscription_expires_at"); got != wantSubscriptionExpiresAt.Format(time.RFC3339) {
+		t.Errorf("persisted subscription_expires_at = %q, want %q", got, wantSubscriptionExpiresAt.Format(time.RFC3339))
+	}
+}
+
+func TestApplyWhamUsage_PersistsIdentity(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "at-only", map[string]interface{}{"access_token": "at"}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at"}
+	usage := &WhamUsage{
+		UserID:    "user-from-wham",
+		AccountID: "account-from-wham",
+		Email:     "wham@example.com",
+		PlanType:  "team",
+	}
+
+	ApplyWhamUsage(store, account, usage)
+
+	if account.Email != "wham@example.com" {
+		t.Fatalf("account.Email = %q, want wham@example.com", account.Email)
+	}
+	if account.AccountID != "account-from-wham" {
+		t.Fatalf("account.AccountID = %q, want account-from-wham", account.AccountID)
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("email"); got != "wham@example.com" {
+		t.Fatalf("credentials.email = %q, want wham@example.com", got)
+	}
+	if got := row.GetCredential("account_id"); got != "account-from-wham" {
+		t.Fatalf("credentials.account_id = %q, want account-from-wham", got)
+	}
+}
+
+func TestApplyWhamUsage_PersistsSubscriptionExpiresAtWhenMemoryAlreadyMatches(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "wham-subscription-retry", map[string]interface{}{"plan_type": "plus"}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	expiresAt := time.Date(2026, 7, 17, 9, 30, 23, 0, time.UTC)
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", AccountID: "acc", SubscriptionExpiresAt: expiresAt}
+	usage := &WhamUsage{PlanType: "plus"}
+	usage.SubscriptionExpiresAtRaw = whamTimeRaw(expiresAt.Format(time.RFC3339))
+
+	ApplyWhamUsage(store, account, usage)
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("subscription_expires_at"); got != expiresAt.Format(time.RFC3339) {
+		t.Fatalf("persisted subscription_expires_at = %q, want %q", got, expiresAt.Format(time.RFC3339))
+	}
+}
+
+func TestWhamUsageSubscriptionExpiresAtFallbacks(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want time.Time
+	}{
+		{
+			name: "subscription_active_until",
+			body: `{"subscription_active_until":"2026-07-17T09:30:23.123Z"}`,
+			want: time.Date(2026, 7, 17, 9, 30, 23, 123000000, time.UTC),
+		},
+		{
+			name: "chatgpt_subscription_active_until",
+			body: `{"chatgpt_subscription_active_until":"2026-07-17T09:30:23Z"}`,
+			want: time.Date(2026, 7, 17, 9, 30, 23, 0, time.UTC),
+		},
+		{
+			name: "unix_seconds",
+			body: `{"subscription_expires_at":1784280623}`,
+			want: time.Unix(1784280623, 0),
+		},
+		{
+			name: "unix_milliseconds",
+			body: `{"subscription_expires_at":1784280623000}`,
+			want: time.UnixMilli(1784280623000),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var usage WhamUsage
+			if err := json.Unmarshal([]byte(tc.body), &usage); err != nil {
+				t.Fatalf("json.Unmarshal: %v", err)
+			}
+			if got := usage.SubscriptionExpiresAt(); !got.Equal(tc.want) {
+				t.Fatalf("SubscriptionExpiresAt() = %s, want %s", got.Format(time.RFC3339Nano), tc.want.Format(time.RFC3339Nano))
+			}
+		})
 	}
 }
 
@@ -336,5 +465,248 @@ func TestWhamUsageJSON_RoundTrip(t *testing.T) {
 	}
 	if out.RateLimit.PrimaryWindow == nil || out.RateLimit.PrimaryWindow.UsedPercent != 50 {
 		t.Errorf("roundtrip lost primary window")
+	}
+}
+
+func TestQueryWhamUsage_ParsesRateLimitResetCredits(t *testing.T) {
+	body := `{
+		"plan_type": "plus",
+		"subscription_expires_at": "2026-07-17T09:30:23Z",
+		"rate_limit": {"allowed": true},
+		"rate_limit_reset_credits": {"available_count": 4}
+	}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	oldURL := whamURLForTest
+	whamURLForTest = server.URL
+	defer func() { whamURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	usage, _, err := queryWhamUsageWithURL(context.Background(), account, "", whamURLForTest)
+	if err != nil {
+		t.Fatalf("QueryWhamUsage error: %v", err)
+	}
+	if usage.RateLimitResetCredits == nil || usage.RateLimitResetCredits.AvailableCount != 4 {
+		t.Fatalf("RateLimitResetCredits = %+v, want available_count=4", usage.RateLimitResetCredits)
+	}
+
+	// ApplyWhamUsage 应把次数写入账号。
+	ApplyWhamUsage(nil, account, usage)
+	if count, ok := account.GetRateLimitResetCredits(); !ok || count != 4 {
+		t.Fatalf("account reset credits = (%d,%v), want (4,true)", count, ok)
+	}
+}
+
+func TestConsumeResetCredit_PostsRedeemRequestID(t *testing.T) {
+	var gotMethod, gotAuth, gotAccountID, gotRedeemID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotAuth = r.Header.Get("Authorization")
+		gotAccountID = r.Header.Get("chatgpt-account-id")
+		var payload struct {
+			RedeemRequestID string `json:"redeem_request_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		gotRedeemID = payload.RedeemRequestID
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	resp, err := ConsumeResetCredit(context.Background(), account, "")
+	if err != nil {
+		t.Fatalf("ConsumeResetCredit error: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("resp = %+v, want 200", resp)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if !strings.HasPrefix(gotAuth, "Bearer ") {
+		t.Errorf("Authorization = %q, want Bearer prefix", gotAuth)
+	}
+	if gotAccountID != "acc-1" {
+		t.Errorf("chatgpt-account-id = %q, want acc-1", gotAccountID)
+	}
+	if gotRedeemID == "" {
+		t.Errorf("redeem_request_id missing in request body")
+	}
+}
+
+func TestConsumeResetCredit_NonOKReturnsResp(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	resp, err := ConsumeResetCredit(context.Background(), account, "")
+	if err == nil {
+		t.Fatal("expected error on non-2xx")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("resp = %+v, want 401 surfaced to caller", resp)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestConsumeResetCredit_NoToken(t *testing.T) {
+	account := &auth.Account{DBID: 1}
+	if _, err := ConsumeResetCredit(context.Background(), account, ""); err == nil {
+		t.Fatal("expected error when account has no access token")
+	}
+}
+
+// TestConsumeResetCreditWithID_ReusesProvidedIdempotencyKey 验证调用方提供的
+// redeem_request_id 会原样发给上游——重试同一次重置时复用它，可借助上游幂等去重，
+// 避免重复消耗一次重置次数。
+func TestConsumeResetCreditWithID_ReusesProvidedIdempotencyKey(t *testing.T) {
+	var gotIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			RedeemRequestID string `json:"redeem_request_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		gotIDs = append(gotIDs, payload.RedeemRequestID)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	const fixedID = "fixed-redeem-id-123"
+
+	// 两次调用复用同一个 ID（模拟刷新后重试）。
+	for i := 0; i < 2; i++ {
+		resp, err := ConsumeResetCreditWithID(context.Background(), account, "", fixedID)
+		if err != nil {
+			t.Fatalf("ConsumeResetCreditWithID error: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	if len(gotIDs) != 2 {
+		t.Fatalf("server saw %d requests, want 2", len(gotIDs))
+	}
+	for i, id := range gotIDs {
+		if id != fixedID {
+			t.Errorf("request %d redeem_request_id = %q, want %q (idempotency key must be reused)", i, id, fixedID)
+		}
+	}
+}
+
+// TestConsumeResetCreditWithID_EmptyIDFallsBackToGenerated 验证空 ID 时仍会生成一个，
+// 不会发出空幂等键。
+func TestConsumeResetCreditWithID_EmptyIDFallsBackToGenerated(t *testing.T) {
+	var gotID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			RedeemRequestID string `json:"redeem_request_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		gotID = payload.RedeemRequestID
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	resp, err := ConsumeResetCreditWithID(context.Background(), account, "", "   ")
+	if err != nil {
+		t.Fatalf("ConsumeResetCreditWithID error: %v", err)
+	}
+	_ = resp.Body.Close()
+	if gotID == "" {
+		t.Fatal("redeem_request_id should fall back to a generated value, got empty")
+	}
+}
+
+// TestConsumeResetCreditParsed_ReturnsWindowsResetAndCredit 验证成功响应被解析为
+// WhamResetResult（windows_reset / credit），供调用方即时反馈、省去重置后再查一次 usage。
+func TestConsumeResetCreditParsed_ReturnsWindowsResetAndCredit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code":"ok","windows_reset":2,"credit":{"id":"cr-1","reset_type":"manual","status":"redeemed","redeemed_at":"2026-06-16T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	result, resp, err := ConsumeResetCreditParsed(context.Background(), account, "", "rid-1")
+	if err != nil {
+		t.Fatalf("ConsumeResetCreditParsed error: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("resp = %+v, want 200", resp)
+	}
+	if result == nil {
+		t.Fatal("result is nil, want parsed WhamResetResult")
+	}
+	if result.WindowsReset != 2 {
+		t.Errorf("WindowsReset = %d, want 2", result.WindowsReset)
+	}
+	if result.Code != "ok" {
+		t.Errorf("Code = %q, want ok", result.Code)
+	}
+	if result.Credit == nil || result.Credit.Status != "redeemed" {
+		t.Errorf("Credit = %+v, want status=redeemed", result.Credit)
+	}
+}
+
+// TestConsumeResetCreditParsed_NonOKReturnsRespForCaller 验证非 2xx 时 result 为 nil、
+// resp 保留（body 未关闭）供调用方读取错误详情。
+func TestConsumeResetCreditParsed_NonOKReturnsRespForCaller(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	result, resp, err := ConsumeResetCreditParsed(context.Background(), account, "", "rid-1")
+	if err == nil {
+		t.Fatal("expected error on non-2xx")
+	}
+	if result != nil {
+		t.Fatalf("result = %+v, want nil on non-2xx", result)
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("resp = %+v, want 401 surfaced to caller", resp)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if len(body) == 0 {
+		t.Error("expected error body to remain readable for caller")
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
@@ -152,6 +153,32 @@ func (b *S3Backend) HeadBucket(ctx context.Context) error {
 		return fmt.Errorf("S3 HeadBucket: %w", err)
 	}
 	return nil
+}
+
+// PresignGetURL 为一个 ref 生成带过期时间的预签名 GET 直链。
+//
+// 签名在本地完成、不发起网络请求，因此可在无网环境下单测。适配私有桶：
+// 拿到链接的一方可在 ttl 内直接 GET 下载，无需公开读权限。
+func (b *S3Backend) PresignGetURL(ctx context.Context, ref string, ttl time.Duration) (string, error) {
+	bucket, key, err := parseS3Ref(ref)
+	if err != nil {
+		return "", err
+	}
+	if bucket == "" {
+		bucket = b.bucket
+	}
+	if ttl <= 0 {
+		ttl = 15 * time.Minute
+	}
+	presign := s3.NewPresignClient(b.client)
+	out, err := presign.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", fmt.Errorf("S3 PresignGetObject: %w", err)
+	}
+	return out.URL, nil
 }
 
 func buildS3Ref(bucket, key string) string {

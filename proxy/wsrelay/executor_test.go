@@ -1,14 +1,21 @@
 package wsrelay
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
@@ -223,6 +230,81 @@ func TestWebsocketResponseToHTTPClosesBodyOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Body.Read stayed blocked after context cancellation")
+	}
+}
+
+func newClosedTestWebsocketConn(t *testing.T) *websocket.Conn {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	handshakeDone := make(chan struct{})
+	go func() {
+		defer close(handshakeDone)
+		defer serverConn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(serverConn))
+		if err != nil {
+			return
+		}
+		acceptHash := sha1.Sum([]byte(req.Header.Get("Sec-Websocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+		_, _ = fmt.Fprintf(serverConn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", base64.StdEncoding.EncodeToString(acceptHash[:]))
+	}()
+
+	wsURL, err := url.Parse("ws://example.test/responses")
+	if err != nil {
+		t.Fatalf("parse websocket URL: %v", err)
+	}
+	conn, _, err := websocket.NewClient(clientConn, wsURL, nil, 1024, 1024)
+	if err != nil {
+		t.Fatalf("create test websocket client: %v", err)
+	}
+	<-handshakeDone
+	return conn
+}
+
+func TestExecuteRequestViaWebsocketSendFailureRemovesEffectiveProxyConnection(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	account := &auth.Account{
+		DBID:        42,
+		AccessToken: "token-123",
+		ProxyURL:    "http://account-proxy.test:8080",
+	}
+	sessionID := "session-1"
+	wsURL, err := buildWebsocketURL(proxy.CodexBaseURL + CodexWsEndpoint)
+	if err != nil {
+		t.Fatalf("buildWebsocketURL: %v", err)
+	}
+	effectiveProxy := effectiveProxyURL(account, "")
+	key := manager.poolKey(account.ID(), wsURL, sessionID, effectiveProxy)
+	session := NewSession(account.ID(), manager)
+	session.SetConnected(true)
+	conn := &WsConnection{
+		conn:    newClosedTestWebsocketConn(t),
+		session: session,
+		URL:     wsURL,
+		PoolKey: key,
+	}
+	conn.SetState(StateConnected)
+	conn.Touch()
+	manager.connections.Store(key, conn)
+	manager.sessions.Store(key, session)
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	exec := NewExecutorWithManager(manager)
+	_, err = exec.ExecuteRequestViaWebsocket(ctx, account, []byte(`{"model":"gpt-5.4","input":"hi"}`), sessionID, "", "", nil, http.Header{}, "")
+	if err == nil {
+		t.Fatal("expected final send failure")
+	}
+	if _, ok := manager.connections.Load(key); ok {
+		t.Fatal("expected failed connection keyed by effective account proxy to be removed")
+	}
+	if _, ok := manager.sessions.Load(key); ok {
+		t.Fatal("expected failed session keyed by effective account proxy to be removed")
+	}
+	if conn.IsConnected() {
+		t.Fatal("expected failed connection to be closed")
 	}
 }
 

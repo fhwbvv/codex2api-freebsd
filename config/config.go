@@ -95,8 +95,9 @@ type Config struct {
 	MaxRequestBodySize     int
 	Database               DatabaseConfig
 	Cache                  CacheConfig
-	UseWebsocket           bool   // 是否启用 WebSocket 传输
-	CodexUpstreamTransport string // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
+	UseWebsocket           bool     // 是否启用 WebSocket 传输
+	CodexUpstreamTransport string   // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
+	TrustedProxies         []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
 }
 
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
@@ -132,6 +133,7 @@ func Load(envPath string) (*Config, error) {
 			cfg.MaxRequestBodySize = mb * 1024 * 1024
 		}
 	}
+	cfg.TrustedProxies = parseTrustedProxiesEnv(os.Getenv("CODEX_TRUSTED_PROXIES"))
 
 	// Codex 上游传输配置。CODEX_UPSTREAM_TRANSPORT 优先；USE_WEBSOCKET 保留为旧开关。
 	cfg.CodexUpstreamTransport = normalizeCodexUpstreamTransport(os.Getenv("CODEX_UPSTREAM_TRANSPORT"))
@@ -228,6 +230,28 @@ func parseBoolEnv(value string) bool {
 	default:
 		return false
 	}
+}
+
+func parseTrustedProxiesEnv(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return []string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
+	}
+	switch strings.ToLower(value) {
+	case "0", "false", "off", "none", "no":
+		return nil
+	}
+
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+	})
+	proxies := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if proxy := strings.TrimSpace(part); proxy != "" {
+			proxies = append(proxies, proxy)
+		}
+	}
+	return proxies
 }
 
 func normalizeCodexUpstreamTransport(value string) string {

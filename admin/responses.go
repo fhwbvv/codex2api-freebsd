@@ -50,17 +50,28 @@ type apiKeysResponse struct {
 
 // MaskedAPIKeyRow API Key 响应（含脱敏和完整 key）
 type MaskedAPIKeyRow struct {
-	ID              int64                 `json:"id"`
-	Name            string                `json:"name"`
-	Key             string                `json:"key"`
-	RawKey          string                `json:"raw_key"`
-	QuotaLimit      float64               `json:"quota_limit"`
-	QuotaUsed       float64               `json:"quota_used"`
-	ExpiresAt       *string               `json:"expires_at"`
-	AllowedGroupIDs []int64               `json:"allowed_group_ids"`
-	Limits          database.APIKeyLimits `json:"limits"`
-	Status          string                `json:"status"`
-	CreatedAt       string                `json:"created_at"`
+	ID              int64                    `json:"id"`
+	Name            string                   `json:"name"`
+	Key             string                   `json:"key"`
+	RawKey          string                   `json:"raw_key"`
+	QuotaLimit      float64                  `json:"quota_limit"`
+	QuotaUsed       float64                  `json:"quota_used"`
+	TotalUsed       float64                  `json:"total_used"`
+	ResetCount      int                      `json:"reset_count"`
+	LastResetAt     *string                  `json:"last_reset_at"`
+	ExpiresAt       *string                  `json:"expires_at"`
+	AllowedGroupIDs []int64                  `json:"allowed_group_ids"`
+	Limits          database.APIKeyLimits    `json:"limits"`
+	WindowUsage     *APIKeyWindowUsageDetail `json:"window_usage,omitempty"`
+	Status          string                   `json:"status"`
+	CreatedAt       string                   `json:"created_at"`
+}
+
+// APIKeyWindowUsageDetail 5h/7d/30d 滑动窗口内的累计成本
+type APIKeyWindowUsageDetail struct {
+	Cost5h  float64 `json:"cost_5h"`
+	Cost7d  float64 `json:"cost_7d"`
+	Cost30d float64 `json:"cost_30d"`
 }
 
 // NewMaskedAPIKeyRow 创建 API Key 响应
@@ -69,6 +80,11 @@ func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
 	if row.ExpiresAt.Valid {
 		formatted := row.ExpiresAt.Time.Format(time.RFC3339)
 		expiresAt = &formatted
+	}
+	var lastResetAt *string
+	if row.LastResetAt.Valid {
+		formatted := row.LastResetAt.Time.Format(time.RFC3339)
+		lastResetAt = &formatted
 	}
 	status := "active"
 	if row.IsExpired(time.Now()) {
@@ -83,6 +99,9 @@ func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
 		RawKey:          row.Key,
 		QuotaLimit:      row.QuotaLimit,
 		QuotaUsed:       row.QuotaUsed,
+		TotalUsed:       row.TotalUsed,
+		ResetCount:      row.ResetCount,
+		LastResetAt:     lastResetAt,
 		ExpiresAt:       expiresAt,
 		AllowedGroupIDs: append([]int64(nil), row.AllowedGroupIDs...),
 		Limits:          row.Limits,

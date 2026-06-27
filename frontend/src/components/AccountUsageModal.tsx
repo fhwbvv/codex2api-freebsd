@@ -9,6 +9,7 @@ import {
   Clock3,
   Gauge,
   Package,
+  RotateCcw,
   Search,
   Zap,
 } from 'lucide-react'
@@ -51,9 +52,10 @@ const MODEL_METRIC_OPTIONS: Array<{ key: ModelMetricKey; labelKey: string }> = [
 interface Props {
   account: AccountRow
   onClose: () => void
+  onCreditsReset?: () => void
 }
 
-export default function AccountUsageModal({ account, onClose }: Props) {
+export default function AccountUsageModal({ account, onClose, onCreditsReset }: Props) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const [data, setData] = useState<AccountUsageDetail | null>(null)
@@ -168,6 +170,8 @@ export default function AccountUsageModal({ account, onClose }: Props) {
         creditError={creditError}
         onToggle={handleCreditToggle}
       />
+
+      <ResetCreditsSection account={account} onResetDone={onCreditsReset} />
     </Modal>
   )
 }
@@ -630,6 +634,105 @@ function CreditSettings({
           />
         )}
       </div>
+    </div>
+  )
+}
+
+function ResetCreditsSection({
+  account,
+  onResetDone,
+}: {
+  account: AccountRow
+  onResetDone?: () => void
+}) {
+  const { t } = useTranslation()
+  const initial =
+    typeof account.rate_limit_reset_credits === 'number'
+      ? account.rate_limit_reset_credits
+      : null
+  const [count, setCount] = useState<number | null>(initial)
+  const [confirming, setConfirming] = useState(false)
+  const [resetting, setResetting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [done, setDone] = useState(false)
+
+  // 次数未知（非 Codex 账号或尚未探测）时不显示该区块。
+  if (count === null) return null
+
+  const handleReset = async () => {
+    setResetting(true)
+    setError(null)
+    try {
+      const res = await api.resetCredits(account.id)
+      const next =
+        typeof res.rate_limit_reset_credits === 'number'
+          ? res.rate_limit_reset_credits
+          : Math.max(0, count - 1)
+      setCount(next)
+      setDone(true)
+      setConfirming(false)
+      onResetDone?.()
+    } catch (err) {
+      setError(getErrorMessage(err))
+    } finally {
+      setResetting(false)
+    }
+  }
+
+  return (
+    <div className="mt-5 rounded-2xl border bg-card p-4">
+      <h4 className="mb-3 text-base font-semibold">{t('accounts.resetCreditsTitle')}</h4>
+      {error && <div className="mb-3 text-xs text-red-500">{error}</div>}
+      {done && !error && (
+        <div className="mb-3 text-xs text-emerald-600">{t('accounts.resetCreditsSuccess')}</div>
+      )}
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <p className="text-sm font-medium">{t('accounts.resetCreditsLabel')}</p>
+          <p className="text-xs text-muted-foreground">{t('accounts.resetCreditsHint')}</p>
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="text-2xl font-semibold tabular-nums text-foreground">{count}</span>
+          {count > 0 &&
+            (confirming ? (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={resetting}
+                  onClick={() => void handleReset()}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {resetting ? t('common.loading') : t('accounts.resetCreditsConfirmButton')}
+                </button>
+                <button
+                  type="button"
+                  disabled={resetting}
+                  onClick={() => setConfirming(false)}
+                  className="inline-flex h-8 items-center rounded-lg border bg-background px-3 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground disabled:opacity-60"
+                >
+                  {t('common.cancel')}
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  setDone(false)
+                  setConfirming(true)
+                }}
+                className="inline-flex h-8 items-center gap-1.5 rounded-lg border bg-background px-3 text-xs font-semibold text-foreground transition-colors hover:bg-muted/60"
+              >
+                <RotateCcw className="size-3.5" />
+                {t('accounts.resetCreditsButton')}
+              </button>
+            ))}
+        </div>
+      </div>
+      {confirming && (
+        <p className="mt-3 text-xs text-amber-600">
+          {t('accounts.resetCreditsConfirmMessage')}
+        </p>
+      )}
     </div>
   )
 }

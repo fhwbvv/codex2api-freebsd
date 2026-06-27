@@ -88,6 +88,11 @@ func getGinContext(ctx context.Context) *gin.Context {
 // 3. idempotency-key (请求头)
 // 4. client_principal (gin context 中的 apiKey)
 // 5. auth_id (账号 ID)
+//
+// Deprecated: 线上的连续性/会话身份键由 executor.go 实现（ResolveSessionID /
+// resolveUpstreamSessionID / ExecuteRequest）。本函数在生产路径已无调用方（仅测试引用），
+// 切勿重新接入——其第 4/5 级会把无显式会话的请求按 API Key/账号收敛到同一上游身份，
+// 正是 issue #268 上下文污染的根因。新逻辑请改 executor.go。
 func ResolveContinuity(ctx context.Context, account *auth.Account, req Request, opts Options) Continuity {
 	// 1. 最高优先级：请求体中的 prompt_cache_key
 	if promptCacheKey := strings.TrimSpace(gjson.GetBytes(req.Payload, "prompt_cache_key").String()); promptCacheKey != "" {

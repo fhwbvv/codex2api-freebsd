@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -32,7 +33,17 @@ func sendAnthropicError(c *gin.Context, statusCode int, errType, message string)
 
 // sendAnthropicStreamError 在流式模式中发送错误事件
 func sendAnthropicStreamError(c *gin.Context, errType, message string) {
-	fmt.Fprintf(c.Writer, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":\"%s\"}}\n\n", errType, message)
+	payload, err := json.Marshal(gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    errType,
+			"message": message,
+		},
+	})
+	if err != nil {
+		payload = []byte(`{"type":"error","error":{"type":"api_error","message":"failed to encode stream error"}}`)
+	}
+	fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", payload)
 	if flusher, ok := c.Writer.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -198,10 +209,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		downstreamHeaders := c.Request.Header.Clone()
-		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-		if useWebsocket && explicitSessionID == "" {
-			upstreamSessionID = ""
-		}
+		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionID, explicitSessionID, useWebsocket)
 		if lastUpstreamCancel != nil {
 			lastUpstreamCancel()
 		}
@@ -374,7 +382,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 
 				// 累计 delta 字符数
-				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
+				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 
@@ -454,7 +462,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
-				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
+				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {

@@ -5,7 +5,7 @@ export const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d
 export function getBucketConfig(range: TimeRangeKey): { bucketMinutes: number; bucketCount: number } {
   switch (range) {
     case '1h':
-      return { bucketMinutes: 5, bucketCount: 12 }
+      return { bucketMinutes: 1, bucketCount: 60 }
     case '6h':
       return { bucketMinutes: 15, bucketCount: 24 }
     case '24h':
@@ -15,7 +15,7 @@ export function getBucketConfig(range: TimeRangeKey): { bucketMinutes: number; b
     case '30d':
       return { bucketMinutes: 1440, bucketCount: 30 }
     default:
-      return { bucketMinutes: 5, bucketCount: 12 }
+      return { bucketMinutes: 1, bucketCount: 60 }
   }
 }
 

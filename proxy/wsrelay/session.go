@@ -2,6 +2,7 @@ package wsrelay
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 
@@ -34,7 +35,7 @@ const (
 	// 复用同一 session 的连接时，等待其空闲的轮询退避参数。
 	AcquireInitialBackoff = 10 * time.Millisecond  // 初始退避
 	AcquireMaxBackoff     = 200 * time.Millisecond // 退避封顶
-	AcquireMaxWait        = 30 * time.Second        // 最大累计等待，超时返回错误
+	AcquireMaxWait        = 30 * time.Second       // 最大累计等待，超时返回错误
 )
 
 // ==================== Pending 请求管理 ====================
@@ -244,7 +245,8 @@ func (s *Session) DeliverStreamChunk(msg *Message) bool {
 			pr.closeMu.Unlock()
 			return true
 		default:
-			// 通道已满，丢弃旧数据
+			// 通道已满，丢弃当前流式数据块并返回 false
+			log.Printf("DeliverStreamChunk stream channel full: account=%d session=%s requestID=%s capacity=%d length=%d; dropping current chunk", s.AccountID, s.ID, msg.RequestID, cap(pr.StreamChan), len(pr.StreamChan))
 			pr.closeMu.Unlock()
 			return false
 		}

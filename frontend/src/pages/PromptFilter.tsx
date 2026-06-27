@@ -1,8 +1,8 @@
 import type { Dispatch, ReactNode, SetStateAction, TextareaHTMLAttributes } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { AlertTriangle, CheckCircle2, HelpCircle, Plus, RefreshCw, Save, Search, ShieldAlert, Trash2, Wand2, X } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, ChevronDown, HelpCircle, Pencil, Plus, Power, PowerOff, RefreshCw, Save, Search, ShieldAlert, Trash2, Wand2, X } from 'lucide-react'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
@@ -37,6 +37,8 @@ import {
 import { cn } from '@/lib/utils'
 
 const PROMPT_FILTER_VIEWS = ['overview', 'logs', 'rules'] as const
+const HIT_START_MARKER = '⟦PF_HIT⟧'
+const HIT_END_MARKER = '⟦/PF_HIT⟧'
 type PromptFilterView = typeof PROMPT_FILTER_VIEWS[number]
 
 type PromptFilterForm = Pick<
@@ -50,6 +52,13 @@ type PromptFilterForm = Pick<
   | 'prompt_filter_sensitive_words'
   | 'prompt_filter_custom_patterns'
   | 'prompt_filter_disabled_patterns'
+  | 'prompt_filter_review_enabled'
+  | 'prompt_filter_review_api_key'
+  | 'prompt_filter_review_api_key_configured'
+  | 'prompt_filter_review_base_url'
+  | 'prompt_filter_review_model'
+  | 'prompt_filter_review_timeout_seconds'
+  | 'prompt_filter_review_fail_closed'
 >
 
 type LogFilters = {
@@ -59,6 +68,13 @@ type LogFilters = {
   model: string
   apiKeyId: string
   q: string
+}
+
+type RulePatternTestState = {
+  text: string
+  testing: boolean
+  result: 'matched' | 'not_matched' | 'invalid' | null
+  message: string
 }
 
 type CustomRuleDraft = {
@@ -79,6 +95,13 @@ const defaultForm: PromptFilterForm = {
   prompt_filter_sensitive_words: '',
   prompt_filter_custom_patterns: '[]',
   prompt_filter_disabled_patterns: '[]',
+  prompt_filter_review_enabled: false,
+  prompt_filter_review_api_key: '',
+  prompt_filter_review_api_key_configured: false,
+  prompt_filter_review_base_url: 'https://api.openai.com',
+  prompt_filter_review_model: 'omni-moderation-latest',
+  prompt_filter_review_timeout_seconds: 10,
+  prompt_filter_review_fail_closed: true,
 }
 
 const emptyFilters: LogFilters = {
@@ -98,6 +121,31 @@ const defaultCustomRuleDraft: CustomRuleDraft = {
   strict: false,
 }
 
+const defaultRulePatternTestState: RulePatternTestState = {
+  text: '',
+  testing: false,
+  result: null,
+  message: '',
+}
+
+function parseRuleWeight(raw: string): number | null {
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) return null
+  const weight = Number(trimmed)
+  if (!Number.isSafeInteger(weight) || weight <= 0 || weight > 1000) return null
+  return weight
+}
+
+function customRuleDraftFromRule(rule: PromptFilterRule): CustomRuleDraft {
+  return {
+    name: rule.name || '',
+    pattern: rule.pattern || '',
+    weight: String(rule.weight || 50),
+    category: rule.category || 'custom',
+    strict: Boolean(rule.strict),
+  }
+}
+
 const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilterForm => ({
   prompt_filter_enabled: Boolean(settings?.prompt_filter_enabled),
   prompt_filter_mode: settings?.prompt_filter_mode || 'monitor',
@@ -108,6 +156,13 @@ const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilt
   prompt_filter_sensitive_words: settings?.prompt_filter_sensitive_words || '',
   prompt_filter_custom_patterns: settings?.prompt_filter_custom_patterns || '[]',
   prompt_filter_disabled_patterns: settings?.prompt_filter_disabled_patterns || '[]',
+  prompt_filter_review_enabled: Boolean(settings?.prompt_filter_review_enabled),
+  prompt_filter_review_api_key: '',
+  prompt_filter_review_api_key_configured: Boolean(settings?.prompt_filter_review_api_key_configured),
+  prompt_filter_review_base_url: settings?.prompt_filter_review_base_url || 'https://api.openai.com',
+  prompt_filter_review_model: settings?.prompt_filter_review_model || 'omni-moderation-latest',
+  prompt_filter_review_timeout_seconds: settings?.prompt_filter_review_timeout_seconds || 10,
+  prompt_filter_review_fail_closed: settings?.prompt_filter_review_fail_closed ?? true,
 })
 
 function normalizePromptFilterView(value?: string): PromptFilterView {
@@ -121,6 +176,14 @@ function parseJSONList<T>(raw: string, fallback: T[] = []): T[] {
   } catch {
     return fallback
   }
+}
+
+function promptFilterSavePayload(form: PromptFilterForm): Partial<SystemSettings> {
+  const payload: Partial<SystemSettings> = { ...form }
+  if (!payload.prompt_filter_review_api_key?.trim()) {
+    delete payload.prompt_filter_review_api_key
+  }
+  return payload
 }
 
 export default function PromptFilter() {
@@ -191,7 +254,7 @@ export default function PromptFilter() {
   const saveSettings = async (partial?: Partial<SystemSettings>) => {
     setSaving(true)
     try {
-      const payload = partial ?? form
+      const payload = partial ?? promptFilterSavePayload(form)
       const updated = await api.updateSettings(payload)
       setForm(normalizePromptFilterForm(updated))
       const rules = await api.getPromptFilterRules()
@@ -465,6 +528,51 @@ function OverviewView({
             <Field label={t('promptFilter.sensitiveWords')}>
               <Textarea rows={5} value={form.prompt_filter_sensitive_words} placeholder={t('promptFilter.sensitiveWordsPlaceholder')} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_sensitive_words: event.target.value }))} />
             </Field>
+
+            <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+              <div>
+                <SectionTitle title={t('promptFilter.reviewTitle')} />
+                <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.reviewDesc')}</p>
+              </div>
+              <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-4">
+                <Field label={t('promptFilter.reviewEnabled')}>
+                  <Select
+                    value={form.prompt_filter_review_enabled ? 'true' : 'false'}
+                    onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_enabled: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </Field>
+                <Field label={t('promptFilter.reviewFailClosed')}>
+                  <Select
+                    value={form.prompt_filter_review_fail_closed ? 'true' : 'false'}
+                    onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_fail_closed: value === 'true' }))}
+                    options={[
+                      { label: t('promptFilter.reviewFailClosedBlock'), value: 'true' },
+                      { label: t('promptFilter.reviewFailClosedAllow'), value: 'false' },
+                    ]}
+                  />
+                </Field>
+                <Field label={t('promptFilter.reviewTimeout')}>
+                  <Input type="number" min={1} max={60} value={form.prompt_filter_review_timeout_seconds} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_timeout_seconds: parseInt(event.target.value, 10) || 10 }))} />
+                </Field>
+              </div>
+              <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(180px,0.8fr)]">
+                <Field label={t('promptFilter.reviewBaseUrl')}>
+                  <Input value={form.prompt_filter_review_base_url} placeholder="https://api.openai.com" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
+                </Field>
+                <Field label={t('promptFilter.reviewModel')}>
+                  <Input value={form.prompt_filter_review_model} placeholder="omni-moderation-latest" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
+                </Field>
+              </div>
+              <Field label={t('promptFilter.reviewApiKey')}>
+                <Input
+                  type="password"
+                  value={form.prompt_filter_review_api_key ?? ''}
+                  placeholder={form.prompt_filter_review_api_key_configured ? t('promptFilter.reviewApiKeyConfigured') : t('promptFilter.reviewApiKeyPlaceholder')}
+                  onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_api_key: event.target.value }))}
+                />
+              </Field>
+            </div>
             <Button onClick={onSave} disabled={saving}>
               <Save className="size-4" />
               {saving ? t('common.saving') : t('common.save')}
@@ -642,7 +750,9 @@ function RulesView({
 }) {
   const { t } = useTranslation()
   const [infoOpen, setInfoOpen] = useState(false)
-  const [customDraft, setCustomDraft] = useState<CustomRuleDraft>(defaultCustomRuleDraft)
+  const [customDialogMode, setCustomDialogMode] = useState<'create' | 'edit' | null>(null)
+  const [editingCustomIndex, setEditingCustomIndex] = useState<number | null>(null)
+  const [customDialogDraft, setCustomDialogDraft] = useState<CustomRuleDraft>(defaultCustomRuleDraft)
   const [savingRule, setSavingRule] = useState('')
   const [categoryFilter, setCategoryFilter] = useState<string>('')
   const [selectedRules, setSelectedRules] = useState<Set<string>>(new Set())
@@ -734,24 +844,66 @@ function RulesView({
     await savePartialAndReload({ prompt_filter_custom_patterns: JSON.stringify(next) })
   }
 
-  const addCustomRule = async () => {
-    const name = customDraft.name.trim()
-    const pattern = customDraft.pattern.trim()
-    const weight = parseInt(customDraft.weight, 10)
-    if (!name || !pattern || !weight || weight <= 0) return
-    const next = [
-      ...customPatterns,
-      {
+  const startCreateCustomRule = () => {
+    setCustomDialogMode('create')
+    setEditingCustomIndex(null)
+    setCustomDialogDraft(defaultCustomRuleDraft)
+  }
+
+  const startEditCustomRule = (index: number) => {
+    const rule = customPatterns[index]
+    if (!rule) return
+    setCustomDialogMode('edit')
+    setEditingCustomIndex(index)
+    setCustomDialogDraft(customRuleDraftFromRule(rule))
+  }
+
+  const closeCustomRuleDialog = () => {
+    setCustomDialogMode(null)
+    setEditingCustomIndex(null)
+    setCustomDialogDraft(defaultCustomRuleDraft)
+  }
+
+  const saveCustomRuleDialog = async () => {
+    const name = customDialogDraft.name.trim()
+    const pattern = customDialogDraft.pattern
+    const weight = parseRuleWeight(customDialogDraft.weight)
+    if (!name || !pattern.trim() || weight === null) return
+
+    if (customDialogMode === 'create') {
+      await saveCustomPatterns([
+        ...customPatterns,
+        {
+          name,
+          pattern,
+          weight,
+          category: customDialogDraft.category.trim() || 'custom',
+          strict: customDialogDraft.strict,
+          enabled: true,
+        },
+      ])
+      closeCustomRuleDialog()
+      return
+    }
+
+    if (customDialogMode === 'edit' && editingCustomIndex !== null) {
+      const existing = customPatterns[editingCustomIndex]
+      if (!existing) {
+        closeCustomRuleDialog()
+        return
+      }
+      const next = customPatterns.map((rule, index) => index === editingCustomIndex ? {
+        ...rule,
         name,
         pattern,
         weight,
-        category: customDraft.category.trim() || 'custom',
-        strict: customDraft.strict,
-        enabled: true,
-      },
-    ]
-    await saveCustomPatterns(next)
-    setCustomDraft(defaultCustomRuleDraft)
+        category: customDialogDraft.category.trim() || 'custom',
+        strict: customDialogDraft.strict,
+        enabled: rule.enabled !== false,
+      } : rule)
+      await saveCustomPatterns(next)
+      closeCustomRuleDialog()
+    }
   }
 
   const toggleCustom = async (index: number) => {
@@ -869,28 +1021,10 @@ function RulesView({
               <SectionTitle title={t('promptFilter.customRulesTitle')} />
               <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.customRulesDesc')}</p>
             </div>
-            <Button onClick={() => void addCustomRule()} disabled={savingRule !== '' || !customDraft.name.trim() || !customDraft.pattern.trim()}>
+            <Button onClick={startCreateCustomRule} disabled={savingRule !== ''}>
               <Plus className="size-4" />
               {t('promptFilter.addCustomRule')}
             </Button>
-          </div>
-
-          <div className="mb-4 grid gap-3 lg:grid-cols-[minmax(160px,0.8fr)_minmax(0,1.7fr)_120px_minmax(140px,0.8fr)_120px]">
-            <Field label={t('promptFilter.ruleName')}>
-              <Input value={customDraft.name} onChange={(event) => setCustomDraft((current) => ({ ...current, name: event.target.value }))} placeholder="custom_rule" />
-            </Field>
-            <Field label={t('promptFilter.rulePattern')}>
-              <Input value={customDraft.pattern} onChange={(event) => setCustomDraft((current) => ({ ...current, pattern: event.target.value }))} placeholder="(?i)dangerous phrase" />
-            </Field>
-            <Field label={t('promptFilter.ruleWeight')}>
-              <Input type="number" min={1} max={1000} value={customDraft.weight} onChange={(event) => setCustomDraft((current) => ({ ...current, weight: event.target.value }))} />
-            </Field>
-            <Field label={t('promptFilter.ruleCategory')}>
-              <Input value={customDraft.category} onChange={(event) => setCustomDraft((current) => ({ ...current, category: event.target.value }))} />
-            </Field>
-            <Field label={t('promptFilter.ruleStrict')}>
-              <Select value={customDraft.strict ? 'true' : 'false'} onValueChange={(value) => setCustomDraft((current) => ({ ...current, strict: value === 'true' }))} options={[{ label: t('common.enabled'), value: 'true' }, { label: t('common.disabled'), value: 'false' }]} />
-            </Field>
           </div>
 
           <div className="rounded-lg border border-border">
@@ -910,13 +1044,57 @@ function RulesView({
                     <TableCell colSpan={5} className="h-20 text-center text-muted-foreground">{t('promptFilter.noCustomRules')}</TableCell>
                   </TableRow>
                 ) : customPatterns.map((rule, index) => (
-                  <RuleRow key={`${rule.name}-${index}`} rule={{ ...rule, builtin: false, enabled: rule.enabled !== false }} onToggle={() => void toggleCustom(index)} onDelete={() => void deleteCustom(index)} busy={savingRule !== ''} />
+                  <RuleRow
+                    key={`${rule.name}-${index}`}
+                    rule={{ ...rule, builtin: false, enabled: rule.enabled !== false }}
+                    onToggle={() => void toggleCustom(index)}
+                    onEdit={() => startEditCustomRule(index)}
+                    onDelete={() => void deleteCustom(index)}
+                    iconActions
+                    busy={savingRule !== ''}
+                  />
                 ))}
               </TableBody>
             </Table>
           </div>
         </CardContent>
       </Card>
+
+      <Dialog open={customDialogMode !== null} onOpenChange={(open) => { if (!open) closeCustomRuleDialog() }}>
+        <DialogContent className="max-h-[calc(100vh-2rem)] max-w-2xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{customDialogMode === 'create' ? t('promptFilter.addCustomRule') : t('promptFilter.editCustomRule')}</DialogTitle>
+            <DialogDescription>{customDialogMode === 'create' ? t('promptFilter.addCustomRuleDesc') : t('promptFilter.editCustomRuleDesc')}</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 sm:grid-cols-[minmax(160px,0.8fr)_minmax(0,1.2fr)]">
+            <Field label={t('promptFilter.ruleName')}>
+              <Input value={customDialogDraft.name} onChange={(event) => setCustomDialogDraft((current) => ({ ...current, name: event.target.value }))} placeholder="custom_rule" />
+            </Field>
+            <Field label={t('promptFilter.ruleCategory')}>
+              <Input value={customDialogDraft.category} onChange={(event) => setCustomDialogDraft((current) => ({ ...current, category: event.target.value }))} />
+            </Field>
+          </div>
+          <Field label={t('promptFilter.rulePattern')}>
+            <Textarea rows={5} value={customDialogDraft.pattern} onChange={(event) => setCustomDialogDraft((current) => ({ ...current, pattern: event.target.value }))} placeholder="(?i)dangerous phrase" />
+          </Field>
+          <RulePatternTester pattern={customDialogDraft.pattern} />
+          <div className="grid gap-3 sm:grid-cols-[minmax(120px,0.8fr)_minmax(140px,0.8fr)]">
+            <Field label={t('promptFilter.ruleWeight')}>
+              <Input type="number" min={1} max={1000} value={customDialogDraft.weight} onChange={(event) => setCustomDialogDraft((current) => ({ ...current, weight: event.target.value }))} />
+            </Field>
+            <Field label={t('promptFilter.ruleStrict')}>
+              <Select value={customDialogDraft.strict ? 'true' : 'false'} onValueChange={(value) => setCustomDialogDraft((current) => ({ ...current, strict: value === 'true' }))} triggerClassName="h-9 rounded-md px-3 text-sm" options={[{ label: t('common.enabled'), value: 'true' }, { label: t('common.disabled'), value: 'false' }]} />
+            </Field>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={closeCustomRuleDialog} disabled={savingRule !== ''}>{t('common.cancel')}</Button>
+            <Button onClick={() => void saveCustomRuleDialog()} disabled={savingRule !== '' || !customDialogDraft.name.trim() || !customDialogDraft.pattern.trim() || parseRuleWeight(customDialogDraft.weight) === null}>
+              <Save className="size-4" />
+              {savingRule !== '' ? t('common.saving') : t('common.save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={infoOpen} onOpenChange={setInfoOpen}>
         <DialogContent className="max-w-2xl">
@@ -945,7 +1123,98 @@ function RulesView({
   )
 }
 
-function RuleRow({ rule, selected, onSelect, onToggle, onDelete, busy }: { rule: PromptFilterRule; selected?: boolean; onSelect?: () => void; onToggle: () => void; onDelete?: () => void; busy?: boolean }) {
+function RulePatternTester({ pattern, className }: { pattern: string; className?: string }) {
+  const { t } = useTranslation()
+  const [state, setState] = useState<RulePatternTestState>(defaultRulePatternTestState)
+  const requestIdRef = useRef(0)
+
+  useEffect(() => {
+    requestIdRef.current += 1
+    setState((current) => ({ ...current, result: null, message: '' }))
+  }, [pattern])
+
+  const runPatternTest = async () => {
+    const text = state.text
+    if (!pattern.trim()) {
+      setState((current) => ({ ...current, result: 'invalid', message: t('promptFilter.rulePatternRequired') }))
+      return
+    }
+    if (!text.trim()) {
+      setState((current) => ({ ...current, result: 'invalid', message: t('promptFilter.ruleTestTextRequired') }))
+      return
+    }
+    const requestId = requestIdRef.current + 1
+    requestIdRef.current = requestId
+    setState((current) => ({ ...current, testing: true, result: null, message: '' }))
+    try {
+      const result = await api.testPromptFilterRulePattern({ pattern, text })
+      if (requestIdRef.current !== requestId) return
+      if (result.error) {
+        setState((current) => ({ ...current, testing: false, result: 'invalid', message: result.error || t('promptFilter.rulePatternInvalid') }))
+      } else if (result.matched) {
+        setState((current) => ({ ...current, testing: false, result: 'matched', message: t('promptFilter.ruleTestMatched') }))
+      } else {
+        setState((current) => ({ ...current, testing: false, result: 'not_matched', message: t('promptFilter.ruleTestNotMatched') }))
+      }
+    } catch (err) {
+      if (requestIdRef.current !== requestId) return
+      setState((current) => ({ ...current, testing: false, result: 'invalid', message: getErrorMessage(err) }))
+    }
+  }
+
+  const resultClass = state.result === 'matched'
+    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+    : state.result === 'not_matched'
+      ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+      : 'border-destructive/30 bg-destructive/10 text-destructive'
+
+  return (
+    <div className={cn('rounded-lg border border-border bg-muted/20 p-3', className)}>
+      <div className="mb-3 flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch">
+        <div>
+          <div className="text-sm font-semibold text-foreground">{t('promptFilter.rulePatternTesterTitle')}</div>
+          <p className="mt-1 text-xs text-muted-foreground">{t('promptFilter.rulePatternTesterDesc')}</p>
+        </div>
+        <Button size="sm" variant="outline" onClick={() => void runPatternTest()} disabled={state.testing || !pattern.trim() || !state.text.trim()}>
+          <Search className="size-3.5" />
+          {state.testing ? t('promptFilter.rulePatternTesting') : t('promptFilter.rulePatternTest')}
+        </Button>
+      </div>
+      <Textarea
+        rows={3}
+        value={state.text}
+        placeholder={t('promptFilter.ruleTestTextPlaceholder')}
+        onChange={(event) => {
+          requestIdRef.current += 1
+          setState((current) => ({ ...current, text: event.target.value, result: null, message: '' }))
+        }}
+      />
+      {state.result && state.message ? (
+        <div className={cn('mt-3 rounded-md border px-3 py-2 text-sm font-medium', resultClass)}>{state.message}</div>
+      ) : null}
+    </div>
+  )
+}
+
+function RuleRow({
+  rule,
+  selected,
+  onSelect,
+  onToggle,
+  onEdit,
+  onDelete,
+  iconActions = false,
+  busy,
+}: {
+  rule: PromptFilterRule
+  selected?: boolean
+  onSelect?: () => void
+  onToggle: () => void
+  onEdit?: () => void
+  onDelete?: () => void
+  iconActions?: boolean
+  busy?: boolean
+}) {
   const { t } = useTranslation()
   const enabled = rule.enabled !== false
   return (
@@ -975,11 +1244,22 @@ function RuleRow({ rule, selected, onSelect, onToggle, onDelete, busy }: { rule:
       </TableCell>
       <TableCell>
         <div className="flex flex-wrap gap-2">
-          <Button size="sm" variant="outline" onClick={onToggle} disabled={busy}>
-            {enabled ? t('promptFilter.disableRule') : t('promptFilter.enableRule')}
-          </Button>
+          {iconActions ? (
+            <Button size="icon-sm" variant="ghost" onClick={onToggle} disabled={busy} aria-label={enabled ? t('promptFilter.disableRule') : t('promptFilter.enableRule')} title={enabled ? t('promptFilter.disableRule') : t('promptFilter.enableRule')}>
+              {enabled ? <PowerOff className="size-3.5" /> : <Power className="size-3.5" />}
+            </Button>
+          ) : (
+            <Button size="sm" variant="outline" onClick={onToggle} disabled={busy}>
+              {enabled ? t('promptFilter.disableRule') : t('promptFilter.enableRule')}
+            </Button>
+          )}
+          {onEdit ? (
+            <Button size="icon-sm" variant="ghost" onClick={onEdit} disabled={busy} aria-label={t('promptFilter.editCustomRule')} title={t('promptFilter.editCustomRule')}>
+              <Pencil className="size-3.5" />
+            </Button>
+          ) : null}
           {onDelete ? (
-            <Button size="sm" variant="ghost" onClick={onDelete} disabled={busy}>
+            <Button size="icon-sm" variant="ghost" onClick={onDelete} disabled={busy} aria-label={t('common.delete')} title={t('common.delete')}>
               <Trash2 className="size-3.5" />
             </Button>
           ) : null}
@@ -993,15 +1273,15 @@ function PromptFilterLogsTable({ logs, compact = false }: { logs: PromptFilterLo
   const { t } = useTranslation()
   return (
     <div className="rounded-lg border border-border">
-      <Table>
+      <Table className="table-fixed">
         <TableHeader>
           <TableRow>
-            <TableHead>{t('promptFilter.colTime')}</TableHead>
-            <TableHead>{t('promptFilter.colAction')}</TableHead>
-            <TableHead>{t('promptFilter.colEndpoint')}</TableHead>
-            <TableHead>{t('promptFilter.colScore')}</TableHead>
-            <TableHead>{t('promptFilter.colMatch')}</TableHead>
-            <TableHead>{t('promptFilter.colApiKey')}</TableHead>
+            <TableHead className={compact ? 'w-[92px]' : 'w-[150px]'}>{t('promptFilter.colTime')}</TableHead>
+            <TableHead className={compact ? 'w-[82px]' : 'w-[96px]'}>{t('promptFilter.colAction')}</TableHead>
+            <TableHead className={compact ? 'w-[150px]' : 'w-[180px]'}>{t('promptFilter.colEndpoint')}</TableHead>
+            <TableHead className={compact ? 'w-[72px]' : 'w-[88px]'}>{t('promptFilter.colScore')}</TableHead>
+            <TableHead className={compact ? 'w-[150px]' : 'w-[220px]'}>{t('promptFilter.colMatch')}</TableHead>
+            <TableHead className={compact ? 'w-[118px]' : 'w-[160px]'}>{t('promptFilter.colApiKey')}</TableHead>
             <TableHead>{t('promptFilter.colPreview')}</TableHead>
           </TableRow>
         </TableHeader>
@@ -1084,8 +1364,10 @@ function VerdictPanel({ verdict }: { verdict: PromptFilterVerdict }) {
         <MiniStat label="Mode" value={verdict.mode || '-'} />
         <MiniStat label="Score" value={`${verdict.score} / ${verdict.threshold}`} />
         <MiniStat label="Matches" value={String(verdict.matched?.length ?? 0)} />
+        <MiniStat label="Review" value={verdict.reviewed ? (verdict.review_flagged ? 'Flagged' : 'Cleared') : '-'} />
       </div>
       {verdict.reason ? <p className="mt-3 text-sm text-muted-foreground">{verdict.reason}</p> : null}
+      {verdict.review_error ? <p className="mt-2 text-sm text-destructive">{verdict.review_error}</p> : null}
       {verdict.matched?.length ? (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {verdict.matched.map((match, index) => (
@@ -1096,10 +1378,104 @@ function VerdictPanel({ verdict }: { verdict: PromptFilterVerdict }) {
         </div>
       ) : null}
       {verdict.text_preview ? (
-        <pre className="mt-3 max-h-28 overflow-auto rounded-md bg-background p-2 text-xs leading-5 text-muted-foreground">{verdict.text_preview}</pre>
+        <pre className="mt-3 max-h-28 overflow-auto rounded-md bg-background p-2 text-xs leading-5 text-muted-foreground"><HighlightedPromptPreview text={verdict.text_preview} /></pre>
       ) : null}
     </div>
   )
+}
+
+function HighlightedPromptPreview({ text, className }: { text: string; className?: string }) {
+  const parts = parseHitMarkedText(text)
+  return <HighlightedParts parts={parts} className={className} />
+}
+
+function HighlightedPromptText({ text, terms, className }: { text: string; terms: string[]; className?: string }) {
+  return <HighlightedParts parts={splitTextByHitTerms(text, terms)} className={className} />
+}
+
+function HighlightedParts({ parts, className }: { parts: Array<{ text: string; hit: boolean }>; className?: string }) {
+  return (
+    <span className={className}>
+      {parts.map((part, index) => part.hit ? (
+        <mark key={index} className="rounded bg-amber-200 px-1 py-0.5 font-medium text-amber-950 dark:bg-amber-400/25 dark:text-amber-100">
+          {part.text}
+        </mark>
+      ) : <span key={index}>{part.text}</span>)}
+    </span>
+  )
+}
+
+function parseHitMarkedText(text: string): Array<{ text: string; hit: boolean }> {
+  const parts: Array<{ text: string; hit: boolean }> = []
+  let cursor = 0
+  while (cursor < text.length) {
+    const start = text.indexOf(HIT_START_MARKER, cursor)
+    if (start < 0) {
+      parts.push({ text: text.slice(cursor), hit: false })
+      break
+    }
+    const end = text.indexOf(HIT_END_MARKER, start + HIT_START_MARKER.length)
+    if (end < 0) {
+      parts.push({ text: text.slice(cursor), hit: false })
+      break
+    }
+    if (start > cursor) {
+      parts.push({ text: text.slice(cursor, start), hit: false })
+    }
+    parts.push({ text: text.slice(start + HIT_START_MARKER.length, end), hit: true })
+    cursor = end + HIT_END_MARKER.length
+  }
+  return parts.length ? parts : [{ text, hit: false }]
+}
+
+function extractHitTerms(text: string): string[] {
+  const terms: string[] = []
+  for (const part of parseHitMarkedText(text)) {
+    const term = stripHitMarkers(part.text).trim()
+    if (part.hit && term && !terms.some((existing) => existing.toLowerCase() === term.toLowerCase())) {
+      terms.push(term)
+    }
+  }
+  return terms
+}
+
+function splitTextByHitTerms(text: string, terms: string[]): Array<{ text: string; hit: boolean }> {
+  const normalizedTerms = terms
+    .map((term) => term.trim())
+    .filter((term) => term.length > 0)
+    .sort((a, b) => b.length - a.length)
+  if (text === '' || normalizedTerms.length === 0) {
+    return [{ text, hit: false }]
+  }
+
+  const lowerText = text.toLowerCase()
+  const parts: Array<{ text: string; hit: boolean }> = []
+  let cursor = 0
+  while (cursor < text.length) {
+    let bestIndex = -1
+    let bestTerm = ''
+    for (const term of normalizedTerms) {
+      const index = lowerText.indexOf(term.toLowerCase(), cursor)
+      if (index >= 0 && (bestIndex < 0 || index < bestIndex || (index === bestIndex && term.length > bestTerm.length))) {
+        bestIndex = index
+        bestTerm = term
+      }
+    }
+    if (bestIndex < 0) {
+      parts.push({ text: text.slice(cursor), hit: false })
+      break
+    }
+    if (bestIndex > cursor) {
+      parts.push({ text: text.slice(cursor, bestIndex), hit: false })
+    }
+    parts.push({ text: text.slice(bestIndex, bestIndex + bestTerm.length), hit: true })
+    cursor = bestIndex + bestTerm.length
+  }
+  return parts.length ? parts : [{ text, hit: false }]
+}
+
+function stripHitMarkers(text: string): string {
+  return text.split(HIT_START_MARKER).join('').split(HIT_END_MARKER).join('')
 }
 
 function MiniStat({ label, value }: { label: string; value: string }) {
@@ -1112,10 +1488,16 @@ function MiniStat({ label, value }: { label: string; value: string }) {
 }
 
 function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: boolean }) {
+  const { t } = useTranslation()
   const matches = parseLogMatches(log.matched_patterns)
+  const [expanded, setExpanded] = useState(false)
+  const fullText = (log.full_text || '').trim()
+  const hasFull = fullText.length > 0
+  const hitTerms = extractHitTerms(log.text_preview || '')
   return (
+    <>
     <TableRow>
-      <TableCell className="min-w-[150px]">
+      <TableCell className={compact ? 'w-[92px] min-w-0' : 'w-[150px] min-w-0'}>
         <div className="font-medium text-foreground">{formatRelativeTime(log.created_at, { variant: 'compact' })}</div>
         {!compact ? <div className="text-xs text-muted-foreground">{formatBeijingTime(log.created_at)}</div> : null}
       </TableCell>
@@ -1123,17 +1505,18 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         <div className="flex flex-col items-start gap-1">
           <ActionBadge action={log.action} />
           {log.source === 'upstream_cyber_policy' ? <Badge variant="outline" className="text-[11px]">upstream</Badge> : null}
+          {log.review_model ? <Badge variant="outline" className="text-[11px]">{log.review_flagged ? 'review flagged' : 'review cleared'}</Badge> : null}
         </div>
       </TableCell>
       <TableCell>
-        <div className="font-mono text-xs text-foreground">{log.endpoint || '-'}</div>
-        <div className="font-mono text-xs text-muted-foreground">{log.model || '-'}</div>
+        <div className="truncate font-mono text-xs text-foreground">{log.endpoint || '-'}</div>
+        <div className="truncate font-mono text-xs text-muted-foreground">{log.model || '-'}</div>
       </TableCell>
       <TableCell>
         <span className="font-semibold">{log.score}</span>
         <span className="text-muted-foreground"> / {log.threshold}</span>
       </TableCell>
-      <TableCell className="max-w-[220px]">
+      <TableCell className={compact ? 'w-[150px] min-w-0' : 'w-[220px] min-w-0'}>
         {matches.length ? (
           <div className="flex flex-wrap gap-1">
             {matches.slice(0, 3).map((match, index) => <Badge key={`${match.name}-${index}`} variant="outline">{match.name}</Badge>)}
@@ -1142,13 +1525,42 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         ) : <span className="text-muted-foreground">-</span>}
       </TableCell>
       <TableCell>
-        <div className="max-w-[160px] truncate">{log.api_key_name || log.api_key_masked || '-'}</div>
+        <div className={compact ? 'max-w-[110px] truncate' : 'max-w-[160px] truncate'}>{log.api_key_name || log.api_key_masked || '-'}</div>
         {!compact && log.client_ip ? <div className="text-xs text-muted-foreground">{log.client_ip}</div> : null}
       </TableCell>
-      <TableCell className="max-w-[360px]">
-        <div className="truncate text-muted-foreground" title={log.text_preview || log.error_code || ''}>{log.text_preview || log.error_code || '-'}</div>
+      <TableCell className="min-w-0">
+        <div className="truncate text-muted-foreground" title={stripHitMarkers(log.text_preview || log.error_code || log.review_error || '')}>{log.text_preview ? <HighlightedPromptPreview text={log.text_preview} /> : (log.error_code || log.review_error || '-')}</div>
+        {hasFull ? (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+          >
+            <ChevronDown className={`size-3 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+            {expanded ? t('promptFilter.collapseFullText') : t('promptFilter.viewFullText')}
+          </button>
+        ) : null}
+        {!compact && log.review_model ? <div className="mt-1 truncate text-xs text-muted-foreground">{log.review_model}</div> : null}
       </TableCell>
     </TableRow>
+    {expanded && hasFull ? (
+      <TableRow>
+        <TableCell colSpan={7} className="bg-muted/30">
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-xs font-semibold text-muted-foreground">{t('promptFilter.fullTextTitle')}</span>
+            <button
+              type="button"
+              onClick={() => void navigator.clipboard?.writeText(fullText)}
+              className="text-xs font-medium text-primary hover:underline"
+            >
+              {t('common.copy')}
+            </button>
+          </div>
+          <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-3 text-xs leading-relaxed text-foreground"><HighlightedPromptText text={fullText} terms={hitTerms} /></pre>
+        </TableCell>
+      </TableRow>
+    ) : null}
+    </>
   )
 }
 

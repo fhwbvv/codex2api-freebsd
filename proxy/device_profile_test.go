@@ -19,6 +19,22 @@ func TestParseCodexCLIVersion(t *testing.T) {
 		wantOK    bool
 	}{
 		{
+			name:      "valid codex-tui version",
+			ua:        "codex-tui/0.142.3 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.142.3)",
+			wantMajor: 0,
+			wantMinor: 142,
+			wantPatch: 3,
+			wantOK:    true,
+		},
+		{
+			name:      "valid codex-tui prerelease version",
+			ua:        "codex-tui/0.142.0-alpha.10 (Mac OS 13.7.8; arm64) xterm-256color (codex-tui; 0.142.0-alpha.10)",
+			wantMajor: 0,
+			wantMinor: 142,
+			wantPatch: 0,
+			wantOK:    true,
+		},
+		{
 			name:      "valid codex_cli_rs version",
 			ua:        "codex_cli_rs/0.117.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464",
 			wantMajor: 0,
@@ -35,6 +51,51 @@ func TestParseCodexCLIVersion(t *testing.T) {
 			wantOK:    true,
 		},
 		{
+			name:      "valid vscode version",
+			ua:        "codex_vscode/2.3.4",
+			wantMajor: 2,
+			wantMinor: 3,
+			wantPatch: 4,
+			wantOK:    true,
+		},
+		{
+			name:      "valid trailer version",
+			ua:        "Mozilla/5.0 (Macintosh) codex_cli_rs/0.120.1",
+			wantMajor: 0,
+			wantMinor: 120,
+			wantPatch: 1,
+			wantOK:    true,
+		},
+		{
+			name:      "valid spaced codex version",
+			ua:        "codex 0.136.0",
+			wantMajor: 0,
+			wantMinor: 136,
+			wantPatch: 0,
+			wantOK:    true,
+		},
+		{
+			name:      "valid version with semicolon boundary",
+			ua:        "agent;codex_cli_rs/0.121.0)",
+			wantMajor: 0,
+			wantMinor: 121,
+			wantPatch: 0,
+			wantOK:    true,
+		},
+		{
+			name:      "valid legacy pre-release version",
+			ua:        "codex_cli_rs/0.136.0-beta",
+			wantMajor: 0,
+			wantMinor: 136,
+			wantPatch: 0,
+			wantOK:    true,
+		},
+		{
+			name:   "invalid four segment version",
+			ua:     "codex_cli_rs/0.136.0.1",
+			wantOK: false,
+		},
+		{
 			name:   "invalid version - no version",
 			ua:     "codex_cli_rs (Mac OS 15.5.0; arm64)",
 			wantOK: false,
@@ -42,6 +103,11 @@ func TestParseCodexCLIVersion(t *testing.T) {
 		{
 			name:   "invalid version - different format",
 			ua:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+			wantOK: false,
+		},
+		{
+			name:   "invalid embedded partial token",
+			ua:     "random-codex_cli_rs/0.136.0",
 			wantOK: false,
 		},
 		{
@@ -348,34 +414,34 @@ func TestExtractDeviceProfile(t *testing.T) {
 
 func TestDeviceProfileScopeKey(t *testing.T) {
 	tests := []struct {
-		name   string
+		name    string
 		account *auth.Account
-		apiKey string
-		want   string
+		apiKey  string
+		want    string
 	}{
 		{
-			name:   "nil account, empty api key",
+			name:    "nil account, empty api key",
 			account: nil,
-			apiKey: "",
-			want:   "global",
+			apiKey:  "",
+			want:    "global",
 		},
 		{
-			name:   "nil account, with api key",
+			name:    "nil account, with api key",
 			account: nil,
-			apiKey: "sk-test123",
-			want:   "api_key:sk-test123",
+			apiKey:  "sk-test123",
+			want:    "api_key:sk-test123",
 		},
 		{
-			name:   "with account, empty api key",
+			name:    "with account, empty api key",
 			account: &auth.Account{},
-			apiKey: "",
-			want:   "global",
+			apiKey:  "",
+			want:    "global",
 		},
 		{
-			name:   "api key takes priority over account",
+			name:    "api key takes priority over account",
 			account: &auth.Account{}, // account.ID() == 0
-			apiKey: "sk-priority",
-			want:   "api_key:sk-priority",
+			apiKey:  "sk-priority",
+			want:    "api_key:sk-priority",
 		},
 	}
 
@@ -653,10 +719,10 @@ func TestMapStainlessOS(t *testing.T) {
 
 	// 验证已知映射
 	validOS := map[string]bool{
-		"MacOS":        true,
-		"Windows":      true,
-		"Linux":        true,
-		"FreeBSD":      true,
+		"MacOS":   true,
+		"Windows": true,
+		"Linux":   true,
+		"FreeBSD": true,
 	}
 
 	// 如果不是已知值，应该以 "Other::" 开头
@@ -674,9 +740,9 @@ func TestMapStainlessArch(t *testing.T) {
 
 	// 验证已知映射
 	validArch := map[string]bool{
-		"x64":  true,
+		"x64":   true,
 		"arm64": true,
-		"x86":  true,
+		"x86":   true,
 	}
 
 	// 如果不是已知值，应该以 "other::" 开头

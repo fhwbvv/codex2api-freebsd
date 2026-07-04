@@ -160,7 +160,7 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", latestCodexCLIUserAgentPrefix)
+	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
 	req.Header.Set("Originator", Originator)
 	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
@@ -257,7 +257,7 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", latestCodexCLIUserAgentPrefix)
+	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
 	req.Header.Set("Originator", Originator)
 	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
@@ -302,11 +302,10 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 		store.UpdateAccountPlanType(account, usage.PlanType)
 	}
 	if store != nil {
-		accountID := strings.TrimSpace(usage.AccountID)
-		if accountID == "" {
-			accountID = strings.TrimSpace(usage.UserID)
-		}
-		store.UpdateAccountIdentity(account, usage.Email, accountID)
+		// 只回填真正的工作区 ID。此前 account_id 缺失时用 user_id 兜底写入
+		// account_id 字段，会污染 OAuth 身份去重键（JWT 解出的工作区 ID 与
+		// 库里存的 user-... 永远对不上），导致同一账号重复导入(串号池)。
+		store.UpdateAccountIdentity(account, usage.Email, strings.TrimSpace(usage.AccountID))
 		store.UpdateAccountSubscriptionExpiresAt(account, usage.SubscriptionExpiresAt())
 	}
 
@@ -350,7 +349,7 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 	}
 
 	// premium 5h 限流标记
-	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 {
+	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
 		if store != nil {
 			store.MarkPremium5hRateLimited(account, result.Reset5hAt)
 		}

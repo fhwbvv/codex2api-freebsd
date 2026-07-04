@@ -106,6 +106,8 @@ func main() {
 			CodexWSSilentMaxRetries:          2,
 			AutoPause5hGuardBandPercent:      5,
 			AutoPause5hGuardConcurrency:      1,
+			SmartPacingMinConcurrency:        1,
+			SmartPacingWindows:               "5h,7d",
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -148,6 +150,8 @@ func main() {
 			CodexWSSilentMaxRetries:          2,
 			AutoPause5hGuardBandPercent:      5,
 			AutoPause5hGuardConcurrency:      1,
+			SmartPacingMinConcurrency:        1,
+			SmartPacingWindows:               "5h,7d",
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",

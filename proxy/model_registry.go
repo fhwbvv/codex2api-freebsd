@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/security"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -24,6 +26,7 @@ const (
 	ModelSourceBuiltin           = "builtin"
 	ModelSourceOfficialCodexDocs = "official_codex_docs"
 	ModelSourceReasoningEffort   = "reasoning_effort"
+	ModelSourceUpstreamManifest  = "upstream_manifest"
 )
 
 // ModelInfo describes one model exposed by this proxy.
@@ -60,12 +63,16 @@ type ModelSyncResult struct {
 }
 
 var builtinModelInfos = []ModelInfo{
+	// gpt-5.6 系列（Sol/Terra/Luna）：官网已出现的新模型，先内置兜底，
+	// 官方文档页同步（SyncOfficialCodexModels）上线后会以同步结果为准。
+	modelInfoForID("gpt-5.6-sol", ModelSourceBuiltin),
+	modelInfoForID("gpt-5.6-terra", ModelSourceBuiltin),
+	modelInfoForID("gpt-5.6-luna", ModelSourceBuiltin),
 	modelInfoForID("gpt-5.5", ModelSourceBuiltin),
 	modelInfoForID("gpt-5.4", ModelSourceBuiltin),
 	modelInfoForID("gpt-5.4-mini", ModelSourceBuiltin),
-	modelInfoForID("gpt-5.3-codex", ModelSourceBuiltin),
+	// 5.3 只保留 spark 变体；gpt-5.3-codex 及 5.2/更低模型已下线（含上游同步过滤）。
 	modelInfoForID("gpt-5.3-codex-spark", ModelSourceBuiltin),
-	modelInfoForID("gpt-5.2", ModelSourceBuiltin),
 	// codex-auto-review — Codex internal auto-review model.
 	// Upstream confirms: returns effective model "gpt-5.4" (tested 2026-05-20).
 	// Available on Plus/Pro/Team/Business per official catalog; excludes free.
@@ -104,7 +111,7 @@ func modelInfoForID(id string, source string) ModelInfo {
 	switch strings.ToLower(id) {
 	case "gpt-5.3-codex-spark":
 		info.ProOnly = true
-	case "gpt-5.5":
+	case "gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna":
 		info.APIKeyAuthAvailable = false
 	case "gpt-image-2":
 		info.Category = ModelCategoryImage
@@ -218,6 +225,11 @@ func mergeModelInfos(rows []database.ModelRegistryRow) []ModelInfo {
 		if info.ID == "" {
 			continue
 		}
+		// 退役模型（5.3 非 spark、5.2 及以下、gpt-4*）即使注册表里有残留行也不再暴露，
+		// 保证升级后 DB 旧行不会让它们复现。
+		if isRetiredCodexModel(info.ID) {
+			continue
+		}
 		byID[info.ID] = info
 	}
 
@@ -237,6 +249,46 @@ func mergeModelInfos(rows []database.ModelRegistryRow) []ModelInfo {
 	})
 	result = append(result, extras...)
 	return result
+}
+
+// isRetiredCodexModel 判断模型是否已下线（不再对外暴露 / 不参与校验）：
+// gpt-5.3 非 spark、gpt-5.2 及更低、gpt-4* 均退役；image、codex-auto-review、
+// 非 gpt- 前缀及 5.4+ 保留。是 isAllowedUpstreamCodexModel 的"暴露侧"补集，
+// 但对 image/非 gpt 模型返回 false（保留）。
+func isRetiredCodexModel(id string) bool {
+	id = strings.TrimSpace(strings.ToLower(id))
+	if !strings.HasPrefix(id, "gpt-") || strings.Contains(id, "image") {
+		return false
+	}
+	version := strings.TrimPrefix(id, "gpt-")
+	if dash := strings.IndexByte(version, '-'); dash >= 0 {
+		version = version[:dash]
+	}
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	if major > 5 {
+		return false
+	}
+	if major < 5 {
+		return true
+	}
+	if minor >= 4 {
+		return false
+	}
+	if minor == 3 {
+		return !strings.Contains(id, "spark")
+	}
+	return true
 }
 
 func appendReasoningEffortModelInfos(items []ModelInfo, settingsJSON string) []ModelInfo {
@@ -366,9 +418,14 @@ func modelSortRank(id string) int {
 	return len(builtinModelInfos) + 1000
 }
 
+// isAllowedUpstreamCodexModel 判断上游发现的模型是否允许进入本地注册表
+// （官方文档同步 + manifest 学习共用）。策略：
+//   - gpt-5.4 及更高版本：允许
+//   - gpt-5.3：只允许 spark 变体（gpt-5.3-codex-spark），其余 5.3 下线
+//   - gpt-5.2 及更低、image、非 gpt- 前缀：拒绝
 func isAllowedUpstreamCodexModel(id string) bool {
 	id = strings.TrimSpace(strings.ToLower(id))
-	if id == "" || id == "gpt-5.2-codex" || strings.Contains(id, "image") {
+	if id == "" || strings.Contains(id, "image") {
 		return false
 	}
 	if !strings.HasPrefix(id, "gpt-") {
@@ -393,7 +450,19 @@ func isAllowedUpstreamCodexModel(id string) bool {
 	if major > 5 {
 		return true
 	}
-	return major == 5 && minor >= 2
+	if major < 5 {
+		return false
+	}
+	// major == 5
+	if minor >= 4 {
+		return true
+	}
+	if minor == 3 {
+		// 5.3 只保留 spark
+		return strings.Contains(id, "spark")
+	}
+	return false
+
 }
 
 // SyncOfficialCodexModels fetches the fixed official docs page and merges discovered models.
@@ -484,4 +553,89 @@ func modelRegistryMetadataEqual(a database.ModelRegistryRow, b database.ModelReg
 		valueOrDefault(a.Source, "manual") == valueOrDefault(b.Source, "manual") &&
 		a.ProOnly == b.ProOnly &&
 		a.APIKeyAuthAvailable == b.APIKeyAuthAvailable
+}
+
+// ExtractManifestModelSlugs 从上游模型清单里提取 models[].slug。
+// 只依赖 slug 这一个身份字段，清单 schema 的其余演进不影响提取；
+// 非法/超长的名字直接丢弃。解析不出任何 slug 时返回空切片（调用方按 no-op 处理）。
+func ExtractManifestModelSlugs(manifest []byte) []string {
+	if len(manifest) == 0 {
+		return nil
+	}
+	items := gjson.GetBytes(manifest, "models")
+	if !items.IsArray() {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	slugs := make([]string, 0, 8)
+	items.ForEach(func(_, item gjson.Result) bool {
+		slug := strings.TrimSpace(item.Get("slug").String())
+		if slug == "" {
+			return true
+		}
+		if err := security.ValidateModelName(slug); err != nil {
+			return true
+		}
+		key := strings.ToLower(slug)
+		if _, dup := seen[key]; dup {
+			return true
+		}
+		seen[key] = struct{}{}
+		slugs = append(slugs, slug)
+		return true
+	})
+	return slugs
+}
+
+// LearnModelsFromManifest 把上游清单里注册表尚不认识的模型学习进注册表。
+//
+// 严格"只增不改不删"：
+//   - 只插入内置列表和注册表全部行（含已禁用）都没有的新 slug——已存在的行
+//     一个字段不碰，管理员禁用过的模型不会被翻案；
+//   - 清单里缺席的模型不删除：清单反映的是本次所用账号的真实权限，不同套餐
+//     账号看到的清单不同，缺席不代表全局下线，注册表收敛为账号池权限的并集。
+//
+// 返回本次新插入的模型 ID（无新增时为空）。
+func LearnModelsFromManifest(ctx context.Context, db *database.DB, manifest []byte, seenAt time.Time) ([]string, error) {
+	if db == nil {
+		return nil, nil
+	}
+	slugs := ExtractManifestModelSlugs(manifest)
+	if len(slugs) == 0 {
+		return nil, nil
+	}
+
+	known := make(map[string]struct{}, len(builtinModelInfos))
+	for _, info := range builtinModelInfos {
+		known[strings.ToLower(info.ID)] = struct{}{}
+	}
+	rows, err := db.ListModelRegistry(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		known[strings.ToLower(strings.TrimSpace(row.ID))] = struct{}{}
+	}
+
+	newRows := make([]database.ModelRegistryRow, 0, len(slugs))
+	added := make([]string, 0, len(slugs))
+	for _, slug := range slugs {
+		if _, exists := known[strings.ToLower(slug)]; exists {
+			continue
+		}
+		// 上游同步不引入 5.3 以下模型（5.3 仅 spark）；与官方文档同步同一策略。
+		if !isAllowedUpstreamCodexModel(slug) {
+			continue
+		}
+		info := modelInfoForID(slug, ModelSourceUpstreamManifest)
+		newRows = append(newRows, modelInfoToRow(info, seenAt))
+		added = append(added, slug)
+	}
+	if len(newRows) == 0 {
+		return nil, nil
+	}
+	if err := db.UpsertModelRegistryRows(ctx, newRows); err != nil {
+		return nil, err
+	}
+	return added, nil
 }

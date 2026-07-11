@@ -185,6 +185,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
+	respCacheOwner := responseCacheOwner(apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -315,17 +316,21 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if silentRetryEnabled && retryable && attempt < maxRetries {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			if kind != "" && !(timedOut && shouldRetry) {
+			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
+			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
+			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			if !stickyRetry {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
 			if timedOut && shouldRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("Responses WebSocket upstream first token timeout, retrying with another account (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
 				continue
 			}
-			if !timedOut {
+			if !timedOut && !stickyRetry {
 				retryExclusions.MarkHard(account.ID())
 			}
 
@@ -338,6 +343,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			log.Printf("Responses WebSocket upstream request failed (attempt %d): %v", attempt+1, reqErr)
 			lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, reqErr.Error(), api.ErrorTypeUpstream)
 			if shouldRetry {
+				if stickyRetry {
+					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, ws)", account.ID(), attempt+1, maxRetries+1)
+				}
+				if !h.waitBeforeRetry(c.Request.Context()) {
+					return errResponsesWSClientGone
+				}
 				continue
 			}
 			apiErr = api.NewAPIError(api.ErrCodeUpstreamError, reqErr.Error(), api.ErrorTypeUpstream)
@@ -413,6 +424,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				lastRetryableUpstreamErr = responsesWSUpstreamAPIError(resp.StatusCode, errBody)
+				if !h.waitBeforeRetry(c.Request.Context()) {
+					return errResponsesWSClientGone
+				}
 				continue
 			}
 
@@ -422,7 +436,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -438,6 +452,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 						retryExclusions.MarkHard(account.ID())
 					}
 					log.Printf("Responses WebSocket upstream stream ended before first token, retrying (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), retryErr.outcome.failureMessage)
+					// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
+					if !isFirstTokenTimeoutOutcome(retryErr.outcome) && !h.waitBeforeRetry(c.Request.Context()) {
+						return errResponsesWSClientGone
+					}
 					continue
 				}
 				apiErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -469,6 +487,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	logEffectiveModel string,
 	reasoningEffort string,
 	serviceTier string,
+	respCacheOwner string,
 	expandedInputRaw string,
 	start time.Time,
 	ttftGuard *firstTokenTimeoutGuard,
@@ -497,6 +516,10 @@ func (h *Handler) streamResponsesWSUpstream(
 	var imageLogInfo imageUsageLogInfo
 	var terminalFailurePayload []byte
 	wroteAnyBody := false
+	// 首 token 前收到不可重试的 response.failed 时置位:不把原始失败帧透传给客户端,
+	// 循环外改写 error 帧并按错误类别用非正常 close code 关闭,
+	// 让下游中转/计费方明确感知失败,而不是把它当成一次正常结束的会话。
+	abortedForErrorClose := false
 	pendingFirstTokenMessages := make([][]byte, 0, 4)
 	pendingFirstTokenBytes := 0
 
@@ -534,7 +557,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
 			}
-			cacheCompletedResponse([]byte(expandedInputRaw), data)
+			cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 			gotTerminal = true
 		}
 		if eventType == "response.failed" {
@@ -560,6 +583,18 @@ func (h *Handler) streamResponsesWSUpstream(
 				if (silentRetryEnabled || hideUpstreamErrors) && eventType == "response.failed" && !ttftRecorded && !wroteAnyBody && responseFailedRetryable(terminalFailurePayload) {
 					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
 					pendingFirstTokenBytes = 0
+					return false
+				}
+				// 首 token 前的不可重试 response.failed(如 context_length_exceeded)
+				// 不透传原始失败帧:丢弃前导缓冲并提前结束读取,循环外按真实错误
+				// 语义返回 error 帧 + 非正常 close code(与 SSE 路径返回 4xx 对齐)。
+				// 可重试的失败不在此拦截:silent retry 开启时由上面的分支换号重试,
+				// 关闭时按既有约定原样透传失败帧。
+				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) &&
+					!responseFailedRetryable(terminalFailurePayload) {
+					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
+					pendingFirstTokenBytes = 0
+					abortedForErrorClose = true
 					return false
 				}
 				if len(pendingFirstTokenMessages) > 0 && !flushPendingFirstTokenMessages() {
@@ -666,12 +701,21 @@ func (h *Handler) streamResponsesWSUpstream(
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
 	} else if outcome.logStatusCode == http.StatusOK {
 		h.store.ClearModelCooldown(account, effectiveModel)
+		h.store.ConfirmResponsesAvailable(account)
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 	}
 	h.store.Release(account)
 
 	if writeErr != nil {
 		return errResponsesWSClientGone
+	}
+	if abortedForErrorClose && !wroteAnyBody {
+		// 首 token 前上游失败且未向客户端写过任何帧:发结构化 error 帧后按错误类别
+		// 关闭连接,避免下游把"正常收尾的会话"当成功并按预估 input token 计费。
+		apiErr := api.NewAPIError(api.ErrCodeUpstreamError, outcome.failureMessage, api.ErrorTypeUpstream)
+		clientErr := responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
+		_ = writeResponsesWSError(conn, clientErr)
+		return newResponsesWSCloseError(responsesWSCloseCodeForStatus(outcome.logStatusCode), clientErr.Message, apiErr)
 	}
 	if outcome.logStatusCode != http.StatusOK && hideUpstreamErrors && len(terminalFailurePayload) > 0 && !wroteAnyBody {
 		apiErr := api.NewAPIError(api.ErrCodeUpstreamError, outcome.failureMessage, api.ErrorTypeUpstream)
@@ -815,6 +859,19 @@ func newResponsesWSCloseError(code int, reason string, err error) error {
 		code:   code,
 		reason: truncateWebSocketCloseReason(reason),
 		err:    err,
+	}
+}
+
+// responsesWSCloseCodeForStatus 把上游失败的 HTTP 语义状态码映射为 WebSocket close code:
+// 429 → 1013(稍后重试);其余 4xx 确定性客户端错误 → 1008(策略拒绝);5xx → 1011。
+func responsesWSCloseCodeForStatus(statusCode int) int {
+	switch {
+	case statusCode == http.StatusTooManyRequests:
+		return websocket.CloseTryAgainLater
+	case statusCode >= 400 && statusCode < 500:
+		return websocket.ClosePolicyViolation
+	default:
+		return websocket.CloseInternalServerErr
 	}
 }
 

@@ -164,3 +164,85 @@ func TestSyncCodexUsageStateCreditAccountSkipsPremium5hWindowLimit(t *testing.T)
 		t.Fatalf("5h snapshot = (%v, %v), want 100 with valid snapshot", pct5h, ok)
 	}
 }
+
+func TestSyncCodexUsageStateIgnoredLimitRecordsSnapshotWithoutBlocking(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         4,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	acc := &auth.Account{
+		DBID:        2,
+		AccessToken: "token",
+		PlanType:    "team",
+		Status:      auth.StatusReady,
+	}
+	store.AddAccount(acc)
+	resp := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "100")
+	resp.Header.Set("x-codex-primary-window-minutes", "300")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "900")
+
+	result := SyncCodexUsageState(store, acc, resp)
+
+	if !result.UsageWindowLimitsIgnored {
+		t.Fatal("UsageWindowLimitsIgnored = false, want true")
+	}
+	if !result.HasUsage5h || result.UsagePct5h != 100 {
+		t.Fatalf("5h snapshot = (%v, %v), want 100 and valid", result.UsagePct5h, result.HasUsage5h)
+	}
+	if result.Premium5hRateLimited || acc.IsPremium5hRateLimited() {
+		t.Fatal("100% usage metadata must not create a premium cooldown when ignored")
+	}
+	if !acc.IsAvailable() {
+		t.Fatal("account should remain schedulable after a successful Responses status")
+	}
+}
+
+func TestApply429CooldownUsageLimitStillBlocksWhenUsageStatusIgnored(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         4,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	acc := &auth.Account{DBID: 3, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(acc)
+	resp := &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header)}
+	body := []byte(`{"error":{"type":"usage_limit_reached","plan_type":"plus","resets_in_seconds":1800}}`)
+
+	decision := Apply429Cooldown(store, acc, body, resp, "gpt-5.4")
+
+	if decision.Scope != rateLimitScopeAccount {
+		t.Fatalf("decision.Scope = %q, want account", decision.Scope)
+	}
+	if acc.IsAvailable() {
+		t.Fatal("429 usage_limit_reached must keep the account unavailable")
+	}
+	if !acc.HasActiveCooldown() {
+		t.Fatal("429 usage_limit_reached must create an explicit cooldown")
+	}
+}
+
+func TestWebSocketResponseFailedUsageLimitStillBlocksWhenUsageStatusIgnored(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         4,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	acc := &auth.Account{DBID: 4, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(acc)
+	handler := &Handler{store: store}
+	payload := []byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","plan_type":"plus","resets_in_seconds":1800}}}`)
+
+	decision := handler.applyResponseFailedCooldown(acc, payload, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if decision.Scope != rateLimitScopeAccount {
+		t.Fatalf("decision.Scope = %q, want account", decision.Scope)
+	}
+	if acc.IsAvailable() || !acc.HasActiveCooldown() {
+		t.Fatal("WebSocket response.failed usage_limit_reached must create an account cooldown")
+	}
+}

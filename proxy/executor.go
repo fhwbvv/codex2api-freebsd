@@ -42,6 +42,11 @@ func (e *poolEntry) touch() {
 
 var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL|transportMode
 
+// Some Codex-only Responses relays require the official client installation
+// metadata in addition to the User-Agent. Learn that capability after the
+// relay returns codex_access_restricted so generic Responses APIs stay untouched.
+var openAIResponsesCodexMetadataRequired sync.Map // map[accountID|baseURL]struct{}
+
 // clientPoolTTL 未使用超过此时间的 Client 将被淘汰
 const clientPoolTTL = 5 * time.Minute
 
@@ -128,6 +133,9 @@ func newCodexStandardTransport(proxyURL string) http.RoundTripper {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = 4
 	transport.IdleConnTimeout = 90 * time.Second
+	// 兜住"连接建立后上游迟迟不回响应头"的假死场景。响应头（含 SSE 的
+	// 200 头）在正常情况下远早于首 token 到达，5 分钟已非常宽裕。
+	transport.ResponseHeaderTimeout = 5 * time.Minute
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{}
 	}
@@ -210,7 +218,12 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 	entry := &poolEntry{
 		client: &http.Client{
 			Transport: transport,
-			Timeout:   10 * time.Minute,
+			// 不设整体超时：http.Client.Timeout 覆盖包括读响应体在内的完整
+			// 生命周期，流式回答超过上限会在数据正常传输中被切断（issue #287，
+			// 复杂任务单回合可超过 10 分钟）。生命周期由请求 context 控制
+			// （下游断开即取消），假死场景由拨号超时 + ResponseHeaderTimeout
+			// + 流层断流检测兜底，与 uTLS 路径(NewUTLSHttpClient)语义一致。
+			Timeout: 0,
 		},
 	}
 	entry.touch()
@@ -234,6 +247,11 @@ var codexAllowedForwardHeaders = []string{
 	"X-Codex-Turn-Metadata",
 	"X-Client-Request-Id",
 	"X-Codex-Beta-Features",
+	// DeviceCheck 设备认证头（上游 openai/codex#20619）。仅在下游真实 Codex
+	// 客户端携带时原样透传——本代理无法（也不该）伪造：token 是 Apple 硬件
+	// 背书、服务端向 Apple 验证，假值必然验证失败、比"不携带"更暴露特征。
+	// 缺失是合法状态（纯 CLI / 非 macOS 客户端本就不发）。
+	"X-Oai-Attestation",
 }
 
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
@@ -412,20 +430,119 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	}
 
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
-	if err != nil {
-		return nil, ErrInternalError("创建请求失败", err)
-	}
-	applyOpenAIResponsesRequestHeaders(req, account, apiKey, headers)
-
-	resp, err := getPooledClient(account, proxyURL).Do(req)
-	if err != nil {
-		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+	capabilityKey := openAIResponsesCodexMetadataCapabilityKey(account, baseURL)
+	clientMetadataMode := account.OpenAIResponsesCodexClientMetadataMode()
+	proxyInjectedMetadata := false
+	if clientMetadataMode == auth.CodexClientMetadataModeAlways {
+		requestBody, proxyInjectedMetadata = ensureCodexClientInstallationMetadata(requestBody, account, headers)
+	} else if clientMetadataMode == auth.CodexClientMetadataModeAuto {
+		_, required := openAIResponsesCodexMetadataRequired.Load(capabilityKey)
+		if required {
+			requestBody, proxyInjectedMetadata = ensureCodexClientInstallationMetadata(requestBody, account, headers)
 		}
-		return nil, ErrUpstream(0, "请求 OpenAI Responses API 失败", err)
 	}
-	return resp, nil
+
+	client := getPooledClient(account, proxyURL)
+	send := func(body []byte) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, ErrInternalError("创建请求失败", err)
+		}
+		applyOpenAIResponsesRequestHeaders(req, account, apiKey, headers)
+		resp, err := client.Do(req)
+		if err != nil {
+			if shouldRecyclePooledClient(err) {
+				recyclePooledClient(account, proxyURL)
+			}
+			return nil, ErrUpstream(0, "请求 OpenAI Responses API 失败", err)
+		}
+		return resp, nil
+	}
+
+	resp, err := send(requestBody)
+	if err != nil {
+		return nil, err
+	}
+	if clientMetadataMode == auth.CodexClientMetadataModeOff || clientMetadataMode == auth.CodexClientMetadataModeAlways {
+		return resp, nil
+	}
+	if proxyInjectedMetadata {
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			openAIResponsesCodexMetadataRequired.Store(capabilityKey, struct{}{})
+		}
+		return resp, nil
+	}
+	if codexClientInstallationID(requestBody) != "" {
+		// A pass-through client ID does not prove that this relay requires generated metadata.
+		return resp, nil
+	}
+	if !isCodexAccessRestrictedResponse(resp) {
+		return resp, nil
+	}
+
+	retryBody, injected := ensureCodexClientInstallationMetadata(requestBody, account, headers)
+	if !injected {
+		return resp, nil
+	}
+	_ = resp.Body.Close()
+	retryResp, err := send(retryBody)
+	if err != nil {
+		return nil, err
+	}
+	if retryResp.StatusCode >= http.StatusOK && retryResp.StatusCode < http.StatusMultipleChoices {
+		openAIResponsesCodexMetadataRequired.Store(capabilityKey, struct{}{})
+	}
+	return retryResp, nil
+}
+
+func openAIResponsesCodexMetadataCapabilityKey(account *auth.Account, baseURL string) string {
+	accountID := int64(0)
+	if account != nil {
+		accountID = account.ID()
+	}
+	return fmt.Sprintf("%d|%s", accountID, strings.ToLower(strings.TrimSpace(baseURL)))
+}
+
+func codexClientInstallationID(requestBody []byte) string {
+	return strings.TrimSpace(gjson.GetBytes(requestBody, "client_metadata.x-codex-installation-id").String())
+}
+
+func ensureCodexClientInstallationMetadata(requestBody []byte, account *auth.Account, headers http.Header) ([]byte, bool) {
+	if !gjson.ValidBytes(requestBody) || codexClientInstallationID(requestBody) != "" {
+		return requestBody, false
+	}
+
+	seed := ""
+	if headers != nil {
+		seed = strings.TrimSpace(headers.Get("Authorization"))
+	}
+	if seed == "" && account != nil {
+		baseURL, apiKey := account.OpenAIResponsesCredentials()
+		seed = fmt.Sprintf("%d|%s|%s", account.ID(), baseURL, apiKey)
+	}
+	if seed == "" {
+		seed = "default"
+	}
+	installationID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:client-installation:"+seed)).String()
+	updatedBody, err := sjson.SetBytes(requestBody, "client_metadata.x-codex-installation-id", installationID)
+	if err != nil {
+		return requestBody, false
+	}
+	return updatedBody, true
+}
+
+func isCodexAccessRestrictedResponse(resp *http.Response) bool {
+	if resp == nil || resp.StatusCode != http.StatusForbidden || resp.Body == nil {
+		return false
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	resp.ContentLength = int64(len(body))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()), "codex_access_restricted")
 }
 
 // ExecuteOpenAIResponsesCompactRequest 向中转（OpenAI Responses API）账号发送
@@ -579,6 +696,9 @@ func generatedCodexClientHeaders(account *auth.Account, settings RuntimeSettings
 	if version == "" {
 		version = codexVersionFromUserAgent(userAgent, latestCodexCLIVersion)
 	}
+	// 画像池钉的是内置常量版本；抬升到当前生效的最新版（含远端同步值），
+	// 再叠加显式的最低版本门槛。
+	version = effectiveCodexClientVersion(version, effectiveLatestCodexCLIVersion())
 	version = effectiveCodexClientVersion(version, versionFloor)
 	userAgent = replaceCodexUserAgentVersion(userAgent, version)
 	return userAgent, version
@@ -632,7 +752,8 @@ func resolveCodexOutboundClientHeaders(account *auth.Account, apiKey string, dev
 	if userAgent, version, ok := codexUserAgentFromConfig(settings.CodexUserAgentConfig, versionFloor); ok {
 		return userAgent, version, true
 	}
-	return defaultCodexCLIUserAgent, latestCodexCLIVersion, false
+	effectiveVersion := effectiveLatestCodexCLIVersion()
+	return replaceCodexUserAgentVersion(defaultCodexCLIUserAgent, effectiveVersion), effectiveVersion, false
 }
 
 func ResolveCodexOutboundClientHeaders(account *auth.Account, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) (userAgent, version string) {
@@ -652,6 +773,19 @@ func applyCodexAllowedForwardHeaders(req *http.Request, downstreamHeaders http.H
 		if value := strings.TrimSpace(downstreamHeaders.Get(name)); value != "" {
 			req.Header.Set(name, value)
 		}
+	}
+}
+
+func applyAccountCustomHeaders(req *http.Request, account *auth.Account) {
+	if req == nil || account == nil {
+		return
+	}
+	for name, value := range account.GetCustomHeaders() {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		req.Header.Set(name, value)
 	}
 }
 
@@ -690,6 +824,7 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		req.Header.Set("Session_id", cacheKey)
 		req.Header.Del("Conversation_id")
 	}
+	applyAccountCustomHeaders(req, account)
 }
 
 func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account, apiKey string, headers http.Header) {
@@ -711,6 +846,7 @@ func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account
 			}
 		}
 	}
+	applyAccountCustomHeaders(req, account)
 }
 
 // ResolveSessionID 从下游请求提取或生成 session ID
@@ -719,10 +855,20 @@ func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account
 //  2. Header: Conversation_id
 //  3. Header: Idempotency-Key
 //  4. Body:   prompt_cache_key
-//  5. 基于 Bearer API Key 的确定性 UUID
+//  5. Body:   内容派生种子（model+instructions+system+首条 user 消息，见
+//     deriveContentSessionSeed；带 previous_response_id 的续链请求跳过）
+//  6. 基于 Bearer API Key 的确定性 UUID
+//
+// 第 5 级让"同一段对话的多轮请求"收敛到同一账号粘性键：单 API Key 供多终端
+// 用户共用时，粘性粒度从"整个 Key 挤一个账号"细化为"每段对话独立粘定"。
+// 该值只参与本地路由（affinityKey），默认隔离模式下不发往上游。
 func ResolveSessionID(headers http.Header, body []byte) string {
 	if explicit := ResolveExplicitSessionID(headers, body); explicit != "" {
 		return explicit
+	}
+
+	if seed := deriveContentSessionSeed(body); seed != "" {
+		return seed
 	}
 
 	// 基于下游用户的 API Key 生成确定性 cache key（参考 CLIProxyAPI codex_executor.go:621）

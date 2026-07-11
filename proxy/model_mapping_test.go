@@ -140,6 +140,49 @@ func TestApplyReasoningEffortModelAliasToBody(t *testing.T) {
 	}
 }
 
+// ultra 是预埋的思考强度档位（未来新模型可能支持），必须在 alias 配置与
+// 请求级 effort 归一化中原样透传，而不是被钳位回 high。
+func TestApplyReasoningEffortModelAliasSupportsUltra(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.SetReasoningEffortModels(`[{"model":"gpt-5.5","effort":"ultra"}]`)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body, original, effective, mapped := handler.applyConfiguredModelMappingToBody(
+		[]byte(`{"model":"gpt-5.5(ultra)","input":"hello"}`),
+		[]string{"gpt-5.5", "gpt-5.5(ultra)"},
+	)
+	if !mapped {
+		t.Fatal("expected ultra alias to be resolved")
+	}
+	if original != "gpt-5.5(ultra)" || effective != "gpt-5.5" {
+		t.Fatalf("original/effective = %q/%q, want gpt-5.5(ultra)/gpt-5.5", original, effective)
+	}
+	if got := gjson.GetBytes(body, "reasoning.effort").String(); got != "ultra" {
+		t.Fatalf("reasoning.effort = %q, want ultra; body=%s", got, body)
+	}
+}
+
+func TestNormalizeReasoningEffortLevels(t *testing.T) {
+	cases := map[string]string{
+		"none":    "none",
+		"minimal": "minimal",
+		"low":     "low",
+		"medium":  "medium",
+		"high":    "high",
+		"xhigh":   "xhigh",
+		"ultra":   "ultra",
+		"ULTRA":   "ultra",
+		"max":     "xhigh",
+		"unknown": "high",
+		"":        "",
+	}
+	for input, want := range cases {
+		if got := normalizeReasoningEffort(input); got != want {
+			t.Errorf("normalizeReasoningEffort(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
 func TestApplyReasoningEffortModelAliasBeforeCodexMapping(t *testing.T) {
 	store := auth.NewStore(nil, nil, nil)
 	store.SetReasoningEffortModels(`[{"model":"gpt-5.5","effort":"xhigh"}]`)
@@ -181,6 +224,105 @@ func TestApplyConfiguredModelMappingToBodyIgnoresClaudeMappingSetting(t *testing
 	}
 	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.2" {
 		t.Fatalf("body model = %q, want gpt-5.2; body=%s", got, body)
+	}
+}
+
+func TestApplyConfiguredCompactModelMappingPreservesRequestedAlias(t *testing.T) {
+	tests := []struct {
+		name    string
+		mapping string
+		want    string
+	}{
+		{
+			name:    "full compact alias maps first",
+			mapping: `{"gpt-5.6-sol-openai-compact":"gpt-5.5"}`,
+			want:    "gpt-5.5",
+		},
+		{
+			name:    "base model mapping follows suffix fallback",
+			mapping: `{"gpt-5.6-sol":"gpt-5.5"}`,
+			want:    "gpt-5.5",
+		},
+		{
+			name:    "suffix fallback remains effective without a rule",
+			mapping: `{}`,
+			want:    "gpt-5.6-sol",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := auth.NewStore(nil, nil, nil)
+			store.SetCodexModelMapping(tt.mapping)
+			handler := NewHandler(store, nil, nil, nil)
+
+			body, original, effective, mapped := handler.applyConfiguredCompactModelMappingToBody(
+				[]byte(`{"model":"gpt-5.6-sol-openai-compact","input":"hello"}`),
+				[]string{"gpt-5.6-sol", "gpt-5.5"},
+			)
+
+			if !mapped {
+				t.Fatal("compact alias should be normalized or mapped")
+			}
+			if original != "gpt-5.6-sol-openai-compact" {
+				t.Fatalf("original model = %q, want full client alias", original)
+			}
+			if effective != tt.want {
+				t.Fatalf("effective model = %q, want %q", effective, tt.want)
+			}
+			if got := gjson.GetBytes(body, "model").String(); got != tt.want {
+				t.Fatalf("body model = %q, want %q; body=%s", got, tt.want, body)
+			}
+		})
+	}
+}
+
+func TestApplyConfiguredCompactModelMappingMatchesSyntheticCompactAlias(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.SetCodexModelMapping(`{"gpt-5.6-sol-openai-compact":"gpt-5.5"}`)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body, original, effective, mapped := handler.applyConfiguredCompactModelMappingToBody(
+		[]byte(`{"model":"gpt-5.6-sol","input":"hello"}`),
+		[]string{"gpt-5.6-sol", "gpt-5.5"},
+	)
+
+	if !mapped {
+		t.Fatal("endpoint-qualified compact alias should map a base-model request")
+	}
+	if original != "gpt-5.6-sol" || effective != "gpt-5.5" {
+		t.Fatalf("original/effective = %q/%q, want gpt-5.6-sol/gpt-5.5", original, effective)
+	}
+	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("body model = %q, want gpt-5.5; body=%s", got, body)
+	}
+}
+
+func TestApplyConfiguredCompactModelMappingResolvesReasoningEffortTarget(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	store.SetReasoningEffortModels(`[{"model":"gpt-5.5","effort":"xhigh"}]`)
+	store.SetCodexModelMapping(`{"gpt-5.6-sol-openai-compact":"gpt-5.5(xhigh)"}`)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body, original, effective, mapped := handler.applyConfiguredCompactModelMappingToBody(
+		[]byte(`{"model":"gpt-5.6-sol","input":"hello"}`),
+		[]string{"gpt-5.6-sol", "gpt-5.5", "gpt-5.5(xhigh)"},
+	)
+
+	if !mapped {
+		t.Fatal("compact alias should map to the reasoning-effort target")
+	}
+	if original != "gpt-5.6-sol" || effective != "gpt-5.5" {
+		t.Fatalf("original/effective = %q/%q, want gpt-5.6-sol/gpt-5.5", original, effective)
+	}
+	if got := gjson.GetBytes(body, "model").String(); got != "gpt-5.5" {
+		t.Fatalf("body model = %q, want gpt-5.5; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "reasoning_effort").String(); got != "xhigh" {
+		t.Fatalf("reasoning_effort = %q, want xhigh; body=%s", got, body)
+	}
+	if got := gjson.GetBytes(body, "reasoning.effort").String(); got != "xhigh" {
+		t.Fatalf("reasoning.effort = %q, want xhigh; body=%s", got, body)
 	}
 }
 

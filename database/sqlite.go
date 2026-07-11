@@ -23,6 +23,9 @@ func sqliteConnectDSN(dsn string) string {
 	}
 
 	q := url.Values{}
+	// deferred 事务（BeginTx 默认）从读锁升级写锁遇忙会立刻 SQLITE_BUSY，
+	// busy_timeout 拦不住；immediate 让写事务在 BEGIN 就拿写锁、正常走等待。
+	q.Add("_txlock", "immediate")
 	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMillis))
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "synchronous(NORMAL)")
@@ -185,6 +188,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					max_concurrency INTEGER DEFAULT 2,
 				global_rpm INTEGER DEFAULT 0,
 				test_model TEXT DEFAULT 'gpt-5.4',
+				test_content TEXT DEFAULT 'hi',
 				test_concurrency INTEGER DEFAULT 50,
 				proxy_url TEXT DEFAULT '',
 				pg_max_conns INTEGER DEFAULT 50,
@@ -227,7 +231,17 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					codex_ws_keepalive_interval_sec INTEGER DEFAULT 60,
 					codex_ws_hide_upstream_errors INTEGER DEFAULT 1,
 					codex_ws_silent_retry_enabled INTEGER DEFAULT 1,
-					codex_ws_silent_max_retries INTEGER DEFAULT 2
+					codex_ws_silent_max_retries INTEGER DEFAULT 2,
+					codex_continue_thinking_enabled INTEGER DEFAULT 0,
+					codex_continue_max_rounds INTEGER DEFAULT 8,
+					retry_interval_ms INTEGER DEFAULT 0,
+					transport_retry_policy TEXT DEFAULT 'rotate',
+					codex_synced_cli_version TEXT DEFAULT '',
+					codex_cli_version_sync_enabled INTEGER DEFAULT 1,
+					codex_cli_version_sync_interval_hours INTEGER DEFAULT 12,
+					model_pricing_overrides TEXT DEFAULT '{}',
+					model_pricing_sync_url TEXT DEFAULT '',
+					ignore_usage_limit_status INTEGER DEFAULT 0
 				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -398,6 +412,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "site_name", "TEXT DEFAULT 'CodexProxy'"},
 		{"system_settings", "site_logo", "TEXT DEFAULT ''"},
 		{"system_settings", "background_config", "TEXT DEFAULT '{}'"},
+		{"system_settings", "test_content", "TEXT DEFAULT 'hi'"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
 		{"system_settings", "auto_clean_unauthorized", "INTEGER DEFAULT 0"},
@@ -420,6 +435,16 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "codex_ws_hide_upstream_errors", "INTEGER DEFAULT 1"},
 		{"system_settings", "codex_ws_silent_retry_enabled", "INTEGER DEFAULT 1"},
 		{"system_settings", "codex_ws_silent_max_retries", "INTEGER DEFAULT 2"},
+		{"system_settings", "codex_continue_thinking_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_continue_max_rounds", "INTEGER DEFAULT 8"},
+		{"system_settings", "retry_interval_ms", "INTEGER DEFAULT 0"},
+		{"system_settings", "transport_retry_policy", "TEXT DEFAULT 'rotate'"},
+		{"system_settings", "codex_synced_cli_version", "TEXT DEFAULT ''"},
+		{"system_settings", "codex_cli_version_sync_enabled", "INTEGER DEFAULT 1"},
+		{"system_settings", "codex_cli_version_sync_interval_hours", "INTEGER DEFAULT 12"},
+		{"system_settings", "model_pricing_overrides", "TEXT DEFAULT '{}'"},
+		{"system_settings", "model_pricing_sync_url", "TEXT DEFAULT ''"},
+		{"system_settings", "ignore_usage_limit_status", "INTEGER DEFAULT 0"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},

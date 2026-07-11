@@ -1068,6 +1068,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		MaxConcurrency:                   2,
 		GlobalRPM:                        0,
 		TestModel:                        "gpt-5.4",
+		TestContent:                      "say pong",
 		TestConcurrency:                  50,
 		BackgroundRefreshIntervalMinutes: 2,
 		UsageProbeMaxAgeMinutes:          10,
@@ -1113,6 +1114,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		CodexWSHideUpstreamErrors:        true,
 		CodexWSSilentRetryEnabled:        true,
 		CodexWSSilentMaxRetries:          4,
+		IgnoreUsageLimitStatus:           true,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1126,6 +1128,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
+	}
+	if !settings.IgnoreUsageLimitStatus {
+		t.Fatal("IgnoreUsageLimitStatus = false, want true")
+	}
+	if settings.TestContent != "say pong" {
+		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
 	}
 	if settings.FirstTokenMode != "loose" {
 		t.Fatalf("FirstTokenMode = %q, want loose", settings.FirstTokenMode)
@@ -2279,6 +2287,79 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestUsageLogsIncludeAccountNameForOpenAIResponsesAccount(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	accountID, err := db.InsertOpenAIResponsesAccount(ctx, "API 别名", map[string]interface{}{
+		"base_url": "https://api.example.com",
+		"email":    "https://api.example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount 返回错误: %v", err)
+	}
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:  accountID,
+		Endpoint:   "/v1/responses",
+		Model:      "gpt-4.1",
+		StatusCode: 200,
+		DurationMs: 120,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	recentLogs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(recentLogs) != 1 {
+		t.Fatalf("recentLogs 长度 = %d, want 1", len(recentLogs))
+	}
+	if recentLogs[0].AccountName != "API 别名" {
+		t.Fatalf("AccountName = %q, want API 别名", recentLogs[0].AccountName)
+	}
+	if recentLogs[0].AccountEmail != "https://api.example.com" {
+		t.Fatalf("AccountEmail = %q, want base URL", recentLogs[0].AccountEmail)
+	}
+
+	page, err := db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
+		Start:    now.Add(-1 * time.Hour),
+		End:      now.Add(1 * time.Hour),
+		Page:     1,
+		PageSize: 10,
+		Email:    "API 别名",
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 {
+		t.Fatalf("page = total %d len %d, want 1/1", page.Total, len(page.Logs))
+	}
+	if page.Logs[0].AccountName != "API 别名" {
+		t.Fatalf("paged AccountName = %q, want API 别名", page.Logs[0].AccountName)
+	}
+
+	logs, err := db.ListUsageLogsByFilter(ctx, UsageLogFilter{
+		Start: now.Add(-1 * time.Hour),
+		End:   now.Add(1 * time.Hour),
+		Query: "API 别名",
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByFilter 返回错误: %v", err)
+	}
+	if len(logs) != 1 || logs[0].AccountName != "API 别名" {
+		t.Fatalf("filter logs = %+v, want one account name match", logs)
+	}
+}
+
 func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -2625,5 +2706,64 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	got := logs[0]
 	if got.ReviewModel != "omni-moderation-latest" || got.ReviewFlagged || got.ReviewError != "temporary failure" {
 		t.Fatalf("review metadata = %+v", got)
+	}
+}
+
+func TestSQLiteSystemSettingsContinueThinkingRoundtrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// 播种默认行（全新库无 system_settings 行），并确认续想默认关闭、轮数 8。
+	seed := &SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		CodexContinueMaxRounds: 8,
+	}
+	if err := db.UpdateSystemSettings(ctx, seed); err != nil {
+		t.Fatalf("UpdateSystemSettings(seed): %v", err)
+	}
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got.CodexContinueThinkingEnabled {
+		t.Errorf("默认应关闭续想, got enabled")
+	}
+	if got.CodexContinueMaxRounds != 8 {
+		t.Errorf("默认轮数 = %d, want 8", got.CodexContinueMaxRounds)
+	}
+
+	// 写入后读回。
+	got.CodexContinueThinkingEnabled = true
+	got.CodexContinueMaxRounds = 15
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+	after, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(2): %v", err)
+	}
+	if !after.CodexContinueThinkingEnabled || after.CodexContinueMaxRounds != 15 {
+		t.Fatalf("往返后 = {enabled=%v rounds=%d}, want {true 15}", after.CodexContinueThinkingEnabled, after.CodexContinueMaxRounds)
+	}
+
+	// 越界轮数落库时归一到上界 32。
+	after.CodexContinueMaxRounds = 100
+	if err := db.UpdateSystemSettings(ctx, after); err != nil {
+		t.Fatalf("UpdateSystemSettings(clamp): %v", err)
+	}
+	clamped, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(3): %v", err)
+	}
+	if clamped.CodexContinueMaxRounds != 32 {
+		t.Errorf("越界轮数应归一到 32, got %d", clamped.CodexContinueMaxRounds)
 	}
 }

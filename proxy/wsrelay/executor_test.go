@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -65,6 +66,50 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 	}
 	if got := headers.Get("Session_id"); got != "session-123" {
 		t.Fatalf("Session_id = %q", got)
+	}
+}
+
+// TestPrepareWebsocketHeadersForwardsAttestationOnlyWhenPresent 验证 WS 路径同样
+// 只在下游携带 DeviceCheck token（openai/codex#20619）时透传，缺失不伪造。
+func TestPrepareWebsocketHeadersForwardsAttestationOnlyWhenPresent(t *testing.T) {
+	exec := NewExecutor()
+	acc := &auth.Account{DBID: 42, AccountID: "42"}
+
+	withToken := exec.prepareWebsocketHeaders("token-123", acc, "42", "session-123", "api-key-1", nil, http.Header{
+		"X-Oai-Attestation": []string{"v1.real-devicecheck-token"},
+	})
+	if got := withToken.Get("X-Oai-Attestation"); got != "v1.real-devicecheck-token" {
+		t.Fatalf("X-Oai-Attestation = %q, want passthrough of downstream token", got)
+	}
+
+	without := exec.prepareWebsocketHeaders("token-123", acc, "42", "session-123", "api-key-1", nil, http.Header{})
+	if got := without.Get("X-Oai-Attestation"); got != "" {
+		t.Fatalf("X-Oai-Attestation = %q, want empty (never fabricate)", got)
+	}
+}
+
+func TestPrepareWebsocketHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
+	exec := NewExecutor()
+	account := &auth.Account{
+		DBID:      42,
+		AccountID: "42",
+		CustomHeaders: map[string]string{
+			"Authorization":      "Bearer websocket-override",
+			"Chatgpt-Account-Id": "acct-override",
+			"X-Custom-Header":    "custom-value",
+		},
+	}
+
+	headers := exec.prepareWebsocketHeaders("token-123", account, "42", "session-123", "api-key-1", nil, http.Header{})
+
+	if got := headers.Get("Authorization"); got != "Bearer websocket-override" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := headers.Get("Chatgpt-Account-Id"); got != "acct-override" {
+		t.Fatalf("Chatgpt-Account-Id = %q", got)
+	}
+	if got := headers.Get("X-Custom-Header"); got != "custom-value" {
+		t.Fatalf("X-Custom-Header = %q", got)
 	}
 }
 
@@ -398,5 +443,90 @@ func TestSendRequestWritesResponseCreatePayloadDirectly(t *testing.T) {
 	}
 	if gjson.GetBytes(got, "request_id").Exists() {
 		t.Fatalf("payload should not contain internal request_id wrapper: %s", got)
+	}
+}
+
+// TestResolveHandshakeSessionID 验证握手头 Session_id/Conversation_id 的取值策略。
+// 该头逐连接冻结、复用连接时永不更新，因此 stateless 复用连接绝不能携带任何
+// 单个请求的身份，否则第一个请求的会话身份会泄漏给后续复用该连接的所有用户
+// （跨用户上下文污染，"用户2串到用户1的上下文"）。
+func TestResolveHandshakeSessionID(t *testing.T) {
+	t.Run("explicit session keeps original behavior", func(t *testing.T) {
+		got := resolveHandshakeSessionID("session-123", "route-key", []byte(`{"prompt_cache_key":"whatever"}`))
+		if got != "session-123" {
+			t.Fatalf("headerSessionID = %q, want session-123", got)
+		}
+	})
+
+	t.Run("stateless isolated mode must not send any session identity", func(t *testing.T) {
+		// 默认隔离模式：帧体是每请求随机 prompt_cache_key，poolRouteKey 非空。
+		// 若把随机 key 冻结进握手头，复用连接的后续用户都会顶着第一个请求的身份。
+		got := resolveHandshakeSessionID("stateless-abc", "route-key", []byte(`{"prompt_cache_key":"per-request-random-uuid"}`))
+		if got != "" {
+			t.Fatalf("headerSessionID = %q, want empty (no connection-level session identity)", got)
+		}
+	})
+
+	t.Run("stateless per-api-key mode keeps deterministic cache key", func(t *testing.T) {
+		got := resolveHandshakeSessionID("stateless-abc", "", []byte(`{"prompt_cache_key":"deterministic-key"}`))
+		if got != "deterministic-key" {
+			t.Fatalf("headerSessionID = %q, want deterministic-key", got)
+		}
+	})
+
+	t.Run("stateless without cache key falls back to stateless id", func(t *testing.T) {
+		got := resolveHandshakeSessionID("stateless-abc", "", []byte(`{}`))
+		if got != "stateless-abc" {
+			t.Fatalf("headerSessionID = %q, want stateless-abc", got)
+		}
+	})
+}
+
+// TestPrepareWebsocketHeadersOmitsSessionHeadersWhenEmpty 验证 headerSessionID 为空时
+// 不发送 Session_id/Conversation_id 握手头（隔离模式的 stateless 复用连接）。
+func TestPrepareWebsocketHeadersOmitsSessionHeadersWhenEmpty(t *testing.T) {
+	exec := NewExecutor()
+
+	headers := exec.prepareWebsocketHeaders("token-123", &auth.Account{DBID: 42, AccountID: "42"}, "42", "", "api-key-1", nil, http.Header{})
+
+	if got := headers.Get("Session_id"); got != "" {
+		t.Fatalf("Session_id = %q, want unset", got)
+	}
+	if got := headers.Get("Conversation_id"); got != "" {
+		t.Fatalf("Conversation_id = %q, want unset", got)
+	}
+}
+
+func TestStatelessOneShotEnabled(t *testing.T) {
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "")
+	if statelessOneShotEnabled() {
+		t.Fatal("default must be false (slot reuse on)")
+	}
+	t.Setenv("CODEX_WS_STATELESS_ONESHOT", "1")
+	if !statelessOneShotEnabled() {
+		t.Fatal("CODEX_WS_STATELESS_ONESHOT=1 must disable slot reuse")
+	}
+}
+
+func TestShouldRetryWebsocketSendError(t *testing.T) {
+	messageTooBig := fmt.Errorf("send interrupted: %w", &websocket.CloseError{
+		Code: websocket.CloseMessageTooBig,
+		Text: "message too big",
+	})
+	if shouldRetryWebsocketSendError(messageTooBig) {
+		t.Fatal("close 1009 must return to the handler for HTTP fallback without rebuilding WebSocket connections")
+	}
+
+	if !shouldRetryWebsocketSendError(errors.New("temporary write failure")) {
+		t.Fatal("ordinary transport write failures should retain the bounded reconnect retry")
+	}
+	if !shouldRetryWebsocketSendError(fmt.Errorf("send interrupted: %w", &websocket.CloseError{
+		Code: websocket.CloseInternalServerErr,
+		Text: "temporary upstream failure",
+	})) {
+		t.Fatal("retryable peer closes other than 1009 should retain the bounded reconnect retry")
+	}
+	if shouldRetryWebsocketSendError(nil) {
+		t.Fatal("nil is not a retryable send error")
 	}
 }

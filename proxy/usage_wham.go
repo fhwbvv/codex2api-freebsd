@@ -22,11 +22,26 @@ const WhamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 // WhamResetCreditsConsumeURL 是「消耗 1 次主动重置次数、立即重置额度」的端点。
 const WhamResetCreditsConsumeURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
 
+// WhamResetCreditsURL 列出账号所有「主动重置次数」凭据（含各自的发放/过期时间）。
+// 与 wham/usage 一样不消耗任何额度（issue #322：展示每张重置券的有效期明细）。
+const WhamResetCreditsURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+
 // whamURLForTest 允许测试替换默认 URL。生产代码不要赋值。
 var whamURLForTest = ""
 
+// SetWhamUsageURLForTest 供其他包的测试替换 wham 用量端点 URL，返回恢复函数。
+// 生产代码不要调用。
+func SetWhamUsageURLForTest(url string) (restore func()) {
+	old := whamURLForTest
+	whamURLForTest = url
+	return func() { whamURLForTest = old }
+}
+
 // whamConsumeURLForTest 允许测试替换重置端点 URL。生产代码不要赋值。
 var whamConsumeURLForTest = ""
+
+// whamResetCreditsURLForTest 允许测试替换重置券列表端点 URL。生产代码不要赋值。
+var whamResetCreditsURLForTest = ""
 
 // WhamUsage 是 /backend-api/wham/usage 的响应结构。
 type WhamUsage struct {
@@ -162,7 +177,9 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
 	req.Header.Set("Originator", Originator)
-	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
+	// 用 EffectiveAccountID:自定义头覆盖了工作区 ID 时,额度必须查覆盖后的空间,
+	// 否则进度条/自动暂停/智能配速统计的是与实际流量不同的空间。
+	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
 	}
 
@@ -198,6 +215,100 @@ type WhamResetCredit struct {
 	ResetType  string `json:"reset_type,omitempty"`
 	Status     string `json:"status,omitempty"`
 	RedeemedAt string `json:"redeemed_at,omitempty"`
+}
+
+// WhamResetCreditItem 是 /wham/rate-limit-reset-credits 列表里的单张重置券。
+// reset_type=codex_rate_limits 且 status=available 的即「当前可用」的券。
+type WhamResetCreditItem struct {
+	ID        string `json:"id"`
+	ResetType string `json:"reset_type"`
+	Status    string `json:"status"`
+	GrantedAt string `json:"granted_at"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// WhamResetCreditsList 是 /wham/rate-limit-reset-credits 的响应结构。
+type WhamResetCreditsList struct {
+	AvailableCount int                   `json:"available_count"`
+	Credits        []WhamResetCreditItem `json:"credits"`
+}
+
+// AvailableCodexCredits 返回列表中可用的 codex 限流重置券（reset_type=codex_rate_limits
+// 且 status=available 且带过期时间），其余状态（已消耗/已过期/非 codex 类型）一律过滤。
+func (l *WhamResetCreditsList) AvailableCodexCredits() []WhamResetCreditItem {
+	if l == nil {
+		return nil
+	}
+	out := make([]WhamResetCreditItem, 0, len(l.Credits))
+	for _, c := range l.Credits {
+		if c.ResetType != "codex_rate_limits" {
+			continue
+		}
+		if c.Status != "available" {
+			continue
+		}
+		if strings.TrimSpace(c.ExpiresAt) == "" {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// QueryWhamResetCredits 调用 /backend-api/wham/rate-limit-reset-credits 获取账号
+// 重置券明细（每张的发放/过期时间）。零额度成本，与 QueryWhamUsage 同款请求形态。
+// 非 200 时返回 resp（body 未读）供调用方处理。
+func QueryWhamResetCredits(ctx context.Context, account *auth.Account, proxyURL string) (*WhamResetCreditsList, *http.Response, error) {
+	url := WhamResetCreditsURL
+	if whamResetCreditsURLForTest != "" {
+		url = whamResetCreditsURLForTest
+	}
+	return queryWhamResetCreditsWithURL(ctx, account, proxyURL, url)
+}
+
+func queryWhamResetCreditsWithURL(ctx context.Context, account *auth.Account, proxyURL, url string) (*WhamResetCreditsList, *http.Response, error) {
+	if account == nil {
+		return nil, nil, fmt.Errorf("account is nil")
+	}
+	accessToken := account.GetAccessToken()
+	if accessToken == "" {
+		return nil, nil, fmt.Errorf("account has no access token")
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build reset-credits list request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	req.Header.Set("Originator", Originator)
+	// 与 wham 查询一致,重置券按自定义头覆盖后的空间查询。
+	if accountID := account.EffectiveAccountID(); accountID != "" {
+		req.Header.Set("chatgpt-account-id", accountID)
+	}
+
+	client := &http.Client{Transport: newCodexTransport(proxyURL)}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reset-credits list request: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, resp, fmt.Errorf("reset-credits list returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, resp, fmt.Errorf("read reset-credits list response: %w", err)
+	}
+
+	var list WhamResetCreditsList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, resp, fmt.Errorf("parse reset-credits list response: %w", err)
+	}
+	return &list, resp, nil
 }
 
 // WhamResetResult 是 /wham/rate-limit-reset-credits/consume 成功响应的投影。
@@ -259,7 +370,8 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
 	req.Header.Set("Originator", Originator)
-	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
+	// 与 wham 查询一致,重置额度也作用于自定义头覆盖后的空间。
+	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
 	}
 
@@ -297,6 +409,7 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 	if account == nil || usage == nil {
 		return result
 	}
+	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 
 	if store != nil && usage.PlanType != "" {
 		store.UpdateAccountPlanType(account, usage.PlanType)
@@ -305,7 +418,13 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 		// 只回填真正的工作区 ID。此前 account_id 缺失时用 user_id 兜底写入
 		// account_id 字段，会污染 OAuth 身份去重键（JWT 解出的工作区 ID 与
 		// 库里存的 user-... 永远对不上），导致同一账号重复导入(串号池)。
-		store.UpdateAccountIdentity(account, usage.Email, strings.TrimSpace(usage.AccountID))
+		// 自定义头覆盖了工作区 ID 时,wham 返回的是覆盖后空间的 ID,
+		// 不能回写进 OAuth 身份字段(会覆盖真实身份并与覆盖值反复打架)。
+		identityAccountID := strings.TrimSpace(usage.AccountID)
+		if account.AccountIDOverridden() {
+			identityAccountID = ""
+		}
+		store.UpdateAccountIdentity(account, usage.Email, identityAccountID)
 		store.UpdateAccountSubscriptionExpiresAt(account, usage.SubscriptionExpiresAt())
 	}
 
@@ -329,14 +448,20 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 		result.Reset5hAt = resetAt
 		result.HasUsage5h = true
 		result.Used5hHeaders = true
+		if store != nil {
+			// 5h 窗口重置时刻武装「到点即探」，窗口翻新即刷新进度条。
+			store.WakeBoundaryProbe(resetAt)
+		}
 	}
 
 	if w7d != nil {
 		resetAt := whamWindowResetAt(w7d, now)
 		account.SetReset7dAt(resetAt)
+		account.SetWindow7dSeconds(w7d.LimitWindowSeconds)
 		result.UsagePct7d = w7d.UsedPercent
 		result.HasUsage7d = true
 		if store != nil {
+			store.WakeBoundaryProbe(resetAt)
 			store.PersistUsageSnapshot(account, w7d.UsedPercent)
 			if result.UsagePct7d >= 100 {
 				result.Usage7dRateLimited = store.MarkUsage7dRateLimited(account)
@@ -359,7 +484,7 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 	return result
 }
 
-// 已知窗口长度（秒）。和 CPA-Manager src/utils/quota/codexQuota.ts 保持一致。
+// 已知窗口长度（秒），与上游 wham 返回的 limit_window_seconds 取值对应。
 const (
 	whamWindow5hSeconds int64 = 18_000
 	whamWindow7dSeconds int64 = 604_800
@@ -367,7 +492,7 @@ const (
 
 // pickClassifiedWhamWindows 把 primary/secondary 两个窗口归类到 5h/7d 槽位。
 //
-// 策略对齐 CPA-Manager 的 pickClassifiedWindows：
+// 分类策略：
 //  1. 第一遍：按 limit_window_seconds 精确匹配（18000→5h，604800→7d）
 //  2. 第二遍：把 free plan 或 reset 明显超过 5h 的未知窗口归到 7d
 //  3. 最后按字段位置兜底（primary→5h、secondary→7d），只填补空槽位
@@ -382,12 +507,13 @@ func pickClassifiedWhamWindows(primary, secondary *WhamUsageWindow, planType str
 		if w == nil {
 			continue
 		}
-		switch w.LimitWindowSeconds {
-		case whamWindow5hSeconds:
+		switch {
+		case w.LimitWindowSeconds == whamWindow5hSeconds:
 			if w5h == nil {
 				w5h = w
 			}
-		case whamWindow7dSeconds:
+		// 长窗口槽(7d)：plus/pro 为周窗(604800)，team plan 为月窗(约 2592000，28–31 天容差)。
+		case w.LimitWindowSeconds == whamWindow7dSeconds || auth.IsMonthlyWindowSeconds(w.LimitWindowSeconds):
 			if w7d == nil {
 				w7d = w
 			}

@@ -1,4 +1,4 @@
-export type ToastType = 'success' | 'error'
+export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
 
 export interface ToastState {
@@ -7,6 +7,7 @@ export interface ToastState {
 }
 
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
+export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
 
 export interface StatsResponse {
   total: number
@@ -39,6 +40,9 @@ export interface AccountRow {
   openai_responses_api?: boolean
   base_url?: string
   models?: string[]
+  model_mapping?: string
+  codex_client_metadata_mode?: CodexClientMetadataMode
+  custom_headers?: Record<string, string> | null
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -86,6 +90,8 @@ export interface AccountRow {
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
   auto_pause_7d_disabled?: boolean
+  ignore_usage_limit_status_override?: boolean | null
+  ignore_usage_limit_status_effective?: boolean
   dispatch_count_limit?: number | null
   dispatch_count_used?: number
   dispatch_count_reset_at?: ISODateString
@@ -94,6 +100,10 @@ export interface AccountRow {
   usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
+  // 长窗口(7d 槽)真实类型: "monthly"(free/team 月窗)/"weekly"/未知。
+  // free/team plan 的长窗口实为约 30 天,标签应显示 30d 而非 7d (issue #324)。
+  usage_window_7d_kind?: 'monthly' | 'weekly' | ''
+  usage_window_7d_seconds?: number
   billed_5h?: number
   billed_7d?: number
   cooldown_until?: ISODateString
@@ -116,6 +126,18 @@ export interface AccountRow {
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
+
+// 单张「主动重置次数」券的有效期明细（issue #322）。
+export interface ResetCreditItem {
+  id: string
+  granted_at?: ISODateString
+  expires_at: ISODateString
+}
+
+export interface ResetCreditsDetailResponse {
+  available_count: number
+  credits: ResetCreditItem[]
+}
 
 // AccountHealthBucket 是「健康状态」条单个时间窗口内的请求成败计数。
 export interface AccountHealthBucket {
@@ -177,6 +199,7 @@ export interface AddAccountRequest {
   session_token?: string
   proxy_url: string
   allow_duplicate?: boolean
+  custom_headers?: Record<string, string> | null
 }
 
 export interface AddATAccountRequest {
@@ -184,6 +207,7 @@ export interface AddATAccountRequest {
   access_token: string
   proxy_url: string
   allow_duplicate?: boolean
+  custom_headers?: Record<string, string> | null
 }
 
 export interface AddOpenAIResponsesAccountRequest {
@@ -191,7 +215,10 @@ export interface AddOpenAIResponsesAccountRequest {
   base_url: string
   api_key: string
   models: string[]
+  model_mapping?: string
+  codex_client_metadata_mode?: CodexClientMetadataMode
   proxy_url: string
+  custom_headers?: Record<string, string> | null
 }
 
 export interface UpdateOpenAIResponsesAccountRequest {
@@ -199,7 +226,10 @@ export interface UpdateOpenAIResponsesAccountRequest {
   base_url: string
   api_key?: string
   models: string[]
+  model_mapping?: string
+  codex_client_metadata_mode?: CodexClientMetadataMode
   proxy_url: string
+  custom_headers?: Record<string, string> | null
 }
 
 export interface FetchOpenAIResponsesModelsRequest {
@@ -226,7 +256,9 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
   auto_pause_7d_disabled?: boolean
+  ignore_usage_limit_status_override?: boolean | null
   dispatch_count_limit?: number | null
+  custom_headers?: Record<string, string> | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
@@ -327,6 +359,30 @@ export interface AccountUsageDetail {
 
 export interface MessageResponse {
   message: string
+}
+
+export interface SystemUpdateInfo {
+  current_version: string
+  latest_version: string
+  has_update: boolean
+  supported: boolean
+  unsupported_reason?: string
+  runtime_os: string
+  runtime_arch: string
+  mode: string
+  release_url?: string
+  asset_name?: string
+  published_at?: string
+  warning?: string
+}
+
+export interface SystemUpdateResult extends MessageResponse {
+  current_version: string
+  latest_version: string
+  need_restart: boolean
+  restarting: boolean
+  mode: string
+  backup_path?: string
 }
 
 export interface CreateAccountResponse extends MessageResponse {
@@ -531,6 +587,7 @@ export interface SystemSettings {
   max_concurrency: number
   global_rpm: number
   test_model: string
+  test_content: string
   test_concurrency: number
   background_refresh_interval_minutes: number
 	  usage_probe_max_age_minutes: number
@@ -557,10 +614,14 @@ export interface SystemSettings {
   codex_ws_hide_upstream_errors: boolean
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
+  codex_continue_thinking_enabled: boolean
+  codex_continue_max_rounds: number
   scheduler_mode: string
   affinity_mode?: string
   max_retries: number
   max_rate_limit_retries: number
+  retry_interval_ms: number
+  transport_retry_policy: string
   allow_remote_migration: boolean
   database_driver: string
   database_label: string
@@ -591,6 +652,9 @@ export interface SystemSettings {
   prompt_filter_review_fail_closed: boolean
   client_compat_mode: 'preserve' | 'auto' | 'force' | string
   codex_min_cli_version: string
+  codex_cli_version_sync_enabled: boolean
+  codex_cli_version_sync_interval_hours: number
+  codex_synced_cli_version?: string
   codex_user_agent_config: string
   usage_log_mode: 'full' | 'errors' | 'off' | string
   usage_log_batch_size: number
@@ -618,6 +682,7 @@ export interface SystemSettings {
   smart_pacing_enabled: boolean
   smart_pacing_min_concurrency: number
   smart_pacing_windows: string
+  ignore_usage_limit_status: boolean
 }
 
 export interface SetupHintsResponse {
@@ -889,6 +954,7 @@ export interface UsageLog {
   image_bytes: number
   image_format: string
   image_size: string
+  account_name: string
   account_email: string
   created_at: ISODateString
   account_billed: number
@@ -950,6 +1016,19 @@ export interface ChartAggregation {
   models: ChartModelPoint[]
 }
 
+export interface ModelPricingOverride {
+  source?: string
+  input?: number
+  cached_input?: number
+  output?: number
+  input_priority?: number
+  cached_input_priority?: number
+  output_priority?: number
+  input_long?: number
+  cached_input_long?: number
+  output_long?: number
+}
+
 export interface APIKeyLimits {
   model_allow?: string[]
   model_deny?: string[]
@@ -963,6 +1042,7 @@ export interface APIKeyLimits {
   token_limit_5h?: number
   token_limit_7d?: number
   token_limit_30d?: number
+  disable_image_generation?: boolean
 }
 
 export interface APIKeyWindowUsage {
@@ -989,6 +1069,7 @@ export interface APIKeyRow {
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
   window_usage?: APIKeyWindowUsage
+  last_used_at?: ISODateString | null
   created_at: ISODateString
 }
 

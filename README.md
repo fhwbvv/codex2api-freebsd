@@ -75,6 +75,13 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 
 <table>
 <tr>
+<td width="180" align="center" valign="middle"><a href="https://www.fastaitoken.com/register"><img src="assets/fastaitoken-logo.jpg" width="90" alt="FastAIToken"></a></td>
+<td valign="middle"><b><a href="https://www.fastaitoken.com/register">FastAIToken</a></b> is a developer-first AI API gateway providing unified access to leading models including OpenAI, Claude, and Gemini. Fully OpenAI-API compatible and works seamlessly with Claude Code, Codex, Gemini CLI, Cherry Studio, Cline, and Continue. With a 1:1 top-up ratio (¥1 = $1 API credit) and routes ranging from 0.02× OpenAI (limited time) to 1.2× Claude Max, plus a public status page and 24/7 human support. Enterprise-ready with invoice support and 99% SLA dedicated account pools.</td>
+</tr>
+</table>
+
+<table>
+<tr>
 <td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
 <td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> is a high-availability AI model API relay platform for individual developers and enterprise teams. Supports Codex/Claude Code at ~1/10 official pricing. Register using the link and promo code <code>CODEX2API</code> to get $3 test credit. </td>
 </tr>
@@ -104,6 +111,7 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 - [Core Capabilities](#core-capabilities)
 - [Project Structure](#project-structure)
 - [Notes](#notes)
+- [Community](#community)
 - [Disclaimer and License](#disclaimer-and-license)
 - [Star History](#star-history)
 - [Links](#links)
@@ -272,7 +280,7 @@ The standard `.env.example` declares `DATABASE_DRIVER=postgres` and `CACHE_DRIVE
 
 Runtime business settings are stored in the database `SystemSettings` table and can be updated from the admin settings page.
 
-Examples include `MaxConcurrency`, `GlobalRPM`, `TestModel`, `TestConcurrency`, `ProxyURL`, `PgMaxConns`, `RedisPoolSize`, `AdminSecret`, `SchedulerMode`, and auto-cleanup switches.
+Examples include `MaxConcurrency`, `GlobalRPM`, `TestModel`, `TestContent`, `TestConcurrency`, `ProxyURL`, `PgMaxConns`, `RedisPoolSize`, `AdminSecret`, `SchedulerMode`, and auto-cleanup switches.
 
 Default settings are written automatically on first startup.
 
@@ -515,6 +523,15 @@ codex2api/
 - Before manually building the Go binary, run `npm run build` in `frontend/`.
 - `.env` controls physical runtime settings such as port, database, and Redis. Business settings are stored in the database and managed from the admin dashboard.
 - API keys are stored in the database and configured through the admin dashboard.
+
+---
+
+## Community
+
+- QQ group: [Join the "codex2api" group chat](https://qun.qq.com/universal-share/share?ac=1&authKey=6vwawW4MeqdACT7PajnHlf2lLkjfuNXEMSos67l9FBiAJ8t%2BKeaXJXB0dgsnhFa1&busi_data=eyJncm91cENvZGUiOiI4MTY3Mzk4NDIiLCJ0b2tlbiI6ImU1YW1KR3dNaXZoUXZDUWpYTWVncmdmMXhQV1RwQ21tbEhkdjB5VW45aWVPSjhFM2grMkRHNGdhWnhEU29oS08iLCJ1aW4iOiIxMTYzNDc2OTQ5In0%3D&data=adSomD6r40Al25rBr8PocFCKumQR5oxi1kq5jXjXxeJ49Z5cj4QLzbNf6vfIQKWMORrJntrZtcoyQuHg2ksUeA&svctype=4&tempid=h5_group_info) (group ID: 816739842)
+- Telegram group: [Join the Telegram group](https://t.me/+9hJAA3ZWQxxmMzE5)
+
+Join the group to discuss deployment, usage, and development questions.
 
 ---
 

@@ -1,13 +1,16 @@
-import { type CSSProperties, type PropsWithChildren, type ReactNode, useEffect, useRef, useState } from 'react'
+import { type CSSProperties, type PropsWithChildren, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, ChevronLeft, Palette, Sun, Moon, LogOut, Download, Loader2, RefreshCw, Menu, X, CircleDollarSign } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { resetAdminAuthState } from '../api'
+import { api, resetAdminAuthState } from '../api'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, useBranding } from '../branding'
 import { useVersionCheck } from '../hooks/useVersionCheck'
 import { useTheme } from '../hooks/useTheme'
+import { useToast } from '../hooks/useToast'
+import { getErrorMessage } from '../utils/error'
 import SecurityBanner from './SecurityBanner'
+import { cn } from '@/lib/utils'
 
 type NavDef = {
   to: string
@@ -26,20 +29,34 @@ const navDefs: NavDef[] = [
   { to: '/prompt-filter/overview', labelKey: 'nav.promptFilter', icon: <ShieldAlert className="size-[18px]" />, activePrefix: '/prompt-filter' },
   { to: '/ops/overview', labelKey: 'nav.ops', icon: <Server className="size-[18px]" />, activePrefix: '/ops' },
   { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
+  { to: '/model-pricing', labelKey: 'nav.modelPricing', icon: <CircleDollarSign className="size-[18px]" /> },
   { to: '/theme', labelKey: 'nav.theme', icon: <Palette className="size-[18px]" /> },
   { to: '/settings', labelKey: 'nav.settings', icon: <Settings className="size-[18px]" /> },
   { to: '/docs', labelKey: 'nav2.docs', icon: <BookOpen className="size-[18px]" /> },
 ]
 
+// Explicit mobile primary order: dashboard → accounts → usage → ops.
+const MOBILE_PRIMARY_PATHS = ['/', '/accounts', '/usage', '/ops/overview'] as const
+const mobilePrimaryPathSet = new Set<string>(MOBILE_PRIMARY_PATHS)
+const mobilePrimaryNav = MOBILE_PRIMARY_PATHS
+  .map((path) => navDefs.find((item) => item.to === path))
+  .filter((item): item is NavDef => Boolean(item))
+const mobileMoreNav = navDefs.filter((item) => !mobilePrimaryPathSet.has(item.to))
+
 export default function Layout({ children }: PropsWithChildren) {
   const location = useLocation()
   const { t, i18n } = useTranslation()
-  const { hasUpdate, latestVersion } = useVersionCheck(location.pathname)
+  const { hasUpdate, latestVersion, updateInfo, refreshVersion } = useVersionCheck(location.pathname)
   const { siteName, siteLogo, backgroundImage, backgroundOpacity, backgroundBlur, backgroundGlassOpacity, backgroundGlassBlur } = useBranding()
   const { theme, toggle } = useTheme()
+  const { showToast } = useToast()
   const [spinning, setSpinning] = useState(false)
   const logoSrc = siteLogo || DEFAULT_SITE_LOGO
   const [showVersionPopover, setShowVersionPopover] = useState(false)
+  const [updatingVersion, setUpdatingVersion] = useState(false)
+  const [restartingAfterUpdate, setRestartingAfterUpdate] = useState(false)
+  const restartPollRef = useRef<number | null>(null)
+  const restartPollActiveRef = useRef(false)
   // 侧栏折叠状态。lg+ 屏才生效;collapsed=true 时只显示 icon,列宽从 264 → 64。
   // localStorage 持久化跨刷新保留选择。
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
@@ -50,6 +67,7 @@ export default function Layout({ children }: PropsWithChildren) {
       return false
     }
   })
+  const [mobileMoreOpen, setMobileMoreOpen] = useState(false)
   const toggleSidebarCollapsed = () => {
     setSidebarCollapsed((prev) => {
       const next = !prev
@@ -64,9 +82,80 @@ export default function Layout({ children }: PropsWithChildren) {
   const versionPopoverRef = useRef<HTMLDivElement | null>(null)
   const versionButtonRef = useRef<HTMLButtonElement | null>(null)
   const [versionPopoverPos, setVersionPopoverPos] = useState<{ top: number; left: number } | null>(null)
-  const releaseURL = latestVersion
+  const releaseURL = updateInfo?.release_url || (latestVersion
     ? `https://github.com/james-6-23/codex2api/releases/tag/${encodeURIComponent(latestVersion)}`
-    : undefined
+    : undefined)
+  const canApplyUpdate = hasUpdate && Boolean(updateInfo) && updateInfo?.supported !== false
+  const updateUnavailableReason = updateInfo?.unsupported_reason
+
+  const stopRestartPolling = useCallback(() => {
+    restartPollActiveRef.current = false
+    if (restartPollRef.current !== null) {
+      window.clearTimeout(restartPollRef.current)
+      restartPollRef.current = null
+    }
+  }, [])
+
+  const pollForUpdatedVersion = useCallback((targetVersion: string) => {
+    stopRestartPolling()
+    const normalizedTarget = targetVersion.replace(/^v/i, '')
+    let attempts = 0
+    restartPollActiveRef.current = true
+
+    const scheduleNext = (delayMs: number) => {
+      restartPollRef.current = window.setTimeout(async () => {
+        if (!restartPollActiveRef.current) return
+        attempts += 1
+        try {
+          const info = await api.getSystemUpdate()
+          if (info.current_version.replace(/^v/i, '') === normalizedTarget) {
+            stopRestartPolling()
+            window.location.reload()
+            return
+          }
+        } catch {
+          // service may be restarting
+        }
+        if (!restartPollActiveRef.current) return
+        if (attempts >= 60) {
+          stopRestartPolling()
+          setRestartingAfterUpdate(false)
+          // 90s 内未观察到版本切换:服务可能仍在重启(容器/守护进程拉起较慢),
+          // 提示用户稍后手动刷新,而不是静默恢复按钮让人以为“没反应”。
+          showToast(t('common.restartTimeout'), 'error')
+          return
+        }
+        scheduleNext(1500)
+      }, delayMs)
+    }
+
+    scheduleNext(2500)
+  }, [stopRestartPolling, showToast, t])
+
+  const handleApplyUpdate = async () => {
+    if (!canApplyUpdate || updatingVersion || restartingAfterUpdate) return
+    setUpdatingVersion(true)
+    try {
+      const result = await api.performSystemUpdate()
+      showToast(result.message || t('common.updateApplied'), 'success')
+      setRestartingAfterUpdate(Boolean(result.restarting))
+      if (result.restarting) {
+        pollForUpdatedVersion(result.latest_version)
+      } else {
+        void refreshVersion(true)
+      }
+    } catch (error) {
+      showToast(getErrorMessage(error, t('common.updateFailed')), 'error')
+    } finally {
+      setUpdatingVersion(false)
+    }
+  }
+
+  useEffect(() => {
+    if (showVersionPopover && hasUpdate && !updateInfo) {
+      void refreshVersion(true)
+    }
+  }, [showVersionPopover, hasUpdate, updateInfo, refreshVersion])
 
   useEffect(() => {
     if (!showVersionPopover) return
@@ -99,6 +188,32 @@ export default function Layout({ children }: PropsWithChildren) {
       window.removeEventListener('scroll', updatePosition, true)
     }
   }, [showVersionPopover])
+
+  useEffect(() => stopRestartPolling, [stopRestartPolling])
+
+  // Close mobile more sheet on route change.
+  useEffect(() => {
+    setMobileMoreOpen(false)
+  }, [location.pathname])
+
+  // Lock body scroll while the mobile more sheet is open.
+  useEffect(() => {
+    if (!mobileMoreOpen) return
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = prev
+    }
+  }, [mobileMoreOpen])
+
+  useEffect(() => {
+    if (!mobileMoreOpen) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileMoreOpen(false)
+    }
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [mobileMoreOpen])
 
   useEffect(() => {
     const root = document.documentElement
@@ -161,7 +276,7 @@ export default function Layout({ children }: PropsWithChildren) {
     setTimeout(() => setSpinning(false), 500)
   }
 
-  const isNavActive = (item: NavDef) => {
+  const isNavActive = useCallback((item: NavDef) => {
     if (item.activePrefix) {
       return location.pathname === item.activePrefix || location.pathname.startsWith(`${item.activePrefix}/`)
     }
@@ -169,7 +284,12 @@ export default function Layout({ children }: PropsWithChildren) {
       return location.pathname === item.to
     }
     return location.pathname === item.to || location.pathname.startsWith(`${item.to}/`)
-  }
+  }, [location.pathname])
+
+  const mobileMoreActive = useMemo(
+    () => mobileMoreNav.some((item) => isNavActive(item)),
+    [isNavActive],
+  )
 
   // Apple HIG-style easing for sidebar choreography:
   //  - container width/padding/gap use 380ms (long, slow ease-out)
@@ -279,6 +399,38 @@ export default function Layout({ children }: PropsWithChildren) {
                               {t('common.latestVersion', { version: latestVersion })}
                             </div>
                           )}
+                          {hasUpdate && updateUnavailableReason && (
+                            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] font-medium leading-relaxed text-amber-700">
+                              {updateUnavailableReason}
+                            </div>
+                          )}
+                          {hasUpdate && updateInfo?.warning && (
+                            <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] font-medium leading-relaxed text-amber-700">
+                              {updateInfo.warning}
+                            </div>
+                          )}
+                          {hasUpdate && (
+                            <button
+                              type="button"
+                              className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-semibold text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+                              disabled={!canApplyUpdate || updatingVersion || restartingAfterUpdate}
+                              title={!canApplyUpdate ? updateUnavailableReason : undefined}
+                              onClick={handleApplyUpdate}
+                            >
+                              {restartingAfterUpdate ? (
+                                <RefreshCw className="size-3.5 animate-spin" />
+                              ) : updatingVersion ? (
+                                <Loader2 className="size-3.5 animate-spin" />
+                              ) : (
+                                <Download className="size-3.5" />
+                              )}
+                              {restartingAfterUpdate
+                                ? t('common.restarting')
+                                : updatingVersion
+                                  ? t('common.updating')
+                                  : t('common.updateNow')}
+                            </button>
+                          )}
                           {releaseURL && (
                             <a
                               href={releaseURL}
@@ -343,14 +495,24 @@ export default function Layout({ children }: PropsWithChildren) {
                     to={item.to}
                     end={item.end}
                     title={sidebarCollapsed ? label : undefined}
-                    className={`flex items-center min-h-10 border rounded-lg text-[14px] font-semibold transition-[background-color,color,border-color,padding,gap] ${containerEase} ${
-                      sidebarCollapsed ? 'justify-center px-2 py-2' : 'gap-2.5 px-3 py-2'
-                    } ${
+                    className={cn(
+                      'relative flex min-h-10 items-center rounded-xl border text-[14px] font-semibold transition-[background-color,color,border-color,padding,gap]',
+                      containerEase,
+                      sidebarCollapsed ? 'justify-center px-2 py-2' : 'gap-2.5 px-3 py-2',
                       active
-                        ? 'bg-primary/10 border-primary/20 text-primary'
-                        : 'border-transparent text-muted-foreground hover:bg-muted/60 hover:text-foreground'
-                    }`}
+                        ? 'border-primary/20 bg-primary/10 text-primary'
+                        : 'border-transparent text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+                    )}
                   >
+                    {active ? (
+                      <span
+                        aria-hidden
+                        className={cn(
+                          'absolute top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full bg-primary',
+                          sidebarCollapsed ? 'left-1' : 'left-1.5',
+                        )}
+                      />
+                    ) : null}
                     {item.icon}
                     <span
                       className={`overflow-hidden whitespace-nowrap transition-[max-width,opacity] ${textEase} ${textRevealDelay} ${
@@ -422,24 +584,40 @@ export default function Layout({ children }: PropsWithChildren) {
         </aside>
 
         {/* Main content */}
-        <main className="min-w-0 p-5 max-lg:p-3 max-lg:pb-[92px]">
+        {/* overflow-x-clip (not hidden): clips horizontal overflow without creating a
+            scroll container that would break position:sticky for in-page sidebars (docs TOC). */}
+        <main className="min-w-0 overflow-x-clip p-5 max-lg:p-3 max-lg:pb-safe-nav max-lg:safe-px">
           {/* Mobile topbar */}
-          <header data-slot="admin-mobile-topbar" className="hidden max-lg:flex min-w-0 w-full max-w-full items-center justify-between gap-2 overflow-hidden mb-4 p-3 border border-border rounded-lg bg-card/95 shadow-sm">
-            <div className="flex min-w-0 flex-1 items-center gap-3">
-              <img src={logoSrc} alt={siteName} className="w-8 h-8 rounded-[10px] object-cover" />
-              <strong className="min-w-0 flex-1 truncate text-lg" title={siteName}>{siteName}</strong>
+          <header
+            data-slot="admin-mobile-topbar"
+            className="mb-4 hidden max-lg:flex min-w-0 w-full max-w-full items-center justify-between gap-2 overflow-hidden rounded-xl border border-border bg-card/95 p-2.5 shadow-sm safe-pt"
+          >
+            <div className="flex min-w-0 flex-1 items-center gap-2.5">
+              <button
+                type="button"
+                onClick={() => setMobileMoreOpen(true)}
+                className="flex size-10 shrink-0 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
+                title={t('common.moreMenu')}
+                aria-label={t('common.moreMenu')}
+              >
+                <Menu className="size-5" />
+              </button>
+              <img src={logoSrc} alt={siteName} className="size-8 rounded-[10px] object-cover" />
+              <strong className="min-w-0 flex-1 truncate text-base font-semibold sm:text-lg" title={siteName}>
+                {siteName}
+              </strong>
             </div>
-            <div className="flex shrink-0 items-center gap-1.5">
+            <div className="flex shrink-0 items-center gap-0.5">
               <button
                 onClick={toggleLang}
-                className="flex items-center justify-center size-8 rounded-lg text-muted-foreground hover:text-foreground transition-colors text-[11px] font-bold"
+                className="flex size-10 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
                 title={i18n.language === 'zh' ? 'English' : '中文'}
               >
                 <Languages className="size-4" />
               </button>
               <button
                 onClick={handleThemeToggle}
-                className="flex items-center justify-center size-8 rounded-lg text-muted-foreground hover:text-foreground transition-colors"
+                className="flex size-10 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
                 title={theme === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
                 aria-label={theme === 'dark' ? t('common.switchToLight') : t('common.switchToDark')}
               >
@@ -449,15 +627,12 @@ export default function Layout({ children }: PropsWithChildren) {
               </button>
               <button
                 onClick={resetAdminAuthState}
-                className="flex items-center justify-center size-8 rounded-lg text-muted-foreground hover:text-foreground transition-colors"
+                className="flex size-10 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
                 title={t('common.logout')}
                 aria-label={t('common.logout')}
               >
                 <LogOut className="size-4" />
               </button>
-              <span className="inline-flex items-center justify-center min-h-[28px] px-2.5 rounded-full text-[12px] font-bold bg-[hsl(var(--success-bg))] text-[hsl(var(--success))] shrink-0 whitespace-nowrap max-[420px]:hidden">
-                {t('common.online')}
-              </span>
             </div>
           </header>
 
@@ -465,27 +640,106 @@ export default function Layout({ children }: PropsWithChildren) {
           <div className="min-h-full">{children}</div>
         </main>
 
-        {/* Mobile bottom nav */}
-        <nav data-slot="admin-mobile-nav" className="fixed left-3 right-3 bottom-3 z-40 hidden max-lg:flex gap-1 overflow-x-auto rounded-xl border border-border bg-card/95 p-1.5 shadow-lg backdrop-blur-[20px] [contain:layout_paint] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" aria-label="Mobile navigation">
-          {navDefs.map((item) => {
-            const active = isNavActive(item)
-            return (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                end={item.end}
-                className={`flex min-w-[74px] flex-col items-center justify-center gap-1 min-h-[54px] px-2 py-1.5 border rounded-lg text-center text-[10px] font-bold transition-colors duration-150 ${
-                  active
-                    ? 'bg-primary/10 border-primary/20 text-primary'
-                    : 'border-transparent text-muted-foreground'
-                }`}
+        {/* Mobile bottom nav — primary destinations only */}
+        <nav
+          data-slot="admin-mobile-nav"
+          className="fixed inset-x-0 bottom-0 z-40 hidden max-lg:block px-3 pb-[max(0.75rem,env(safe-area-inset-bottom,0px))]"
+          aria-label="Mobile navigation"
+        >
+          <div className="rounded-2xl border border-border bg-card/95 p-1.5 shadow-lg backdrop-blur-[20px] [contain:layout_paint]">
+            <div className="grid grid-cols-5 gap-0.5">
+              {mobilePrimaryNav.map((item) => {
+                const active = isNavActive(item)
+                return (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end={item.end}
+                    className={cn(
+                      'flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-xl border px-1 py-1.5 text-center text-[11px] font-semibold transition-colors duration-150',
+                      active
+                        ? 'border-primary/20 bg-primary/10 text-primary'
+                        : 'border-transparent text-muted-foreground hover:bg-muted/50 hover:text-foreground',
+                    )}
+                  >
+                    {item.icon}
+                    <span className="w-full truncate leading-tight">{t(item.labelKey)}</span>
+                  </NavLink>
+                )
+              })}
+              <button
+                type="button"
+                onClick={() => setMobileMoreOpen(true)}
+                className={cn(
+                  'flex min-h-12 flex-col items-center justify-center gap-0.5 rounded-xl border px-1 py-1.5 text-center text-[11px] font-semibold transition-colors duration-150',
+                  mobileMoreOpen || mobileMoreActive
+                    ? 'border-primary/20 bg-primary/10 text-primary'
+                    : 'border-transparent text-muted-foreground hover:bg-muted/50 hover:text-foreground',
+                )}
+                aria-expanded={mobileMoreOpen}
+                aria-haspopup="dialog"
               >
-                {item.icon}
-                <span className="w-full truncate leading-tight">{t(item.labelKey)}</span>
-              </NavLink>
-            )
-          })}
+                <Menu className="size-[18px]" />
+                <span className="w-full truncate leading-tight">{t('common.more')}</span>
+              </button>
+            </div>
+          </div>
         </nav>
+
+        {/* Mobile more sheet */}
+        {mobileMoreOpen && createPortal(
+          <div className="fixed inset-0 z-[60] max-lg:block lg:hidden" role="dialog" aria-modal="true" aria-label={t('common.moreMenu')}>
+            <button
+              type="button"
+              className="absolute inset-0 bg-black/45 backdrop-blur-[2px]"
+              aria-label={t('common.close')}
+              onClick={() => setMobileMoreOpen(false)}
+            />
+            <div className="absolute inset-x-0 bottom-0 max-h-[min(82dvh,640px)] overflow-hidden rounded-t-2xl border border-border bg-card shadow-2xl safe-pb animate-in slide-in-from-bottom-4 fade-in-0 duration-200">
+              <div className="flex items-center justify-between border-b border-border px-4 py-3">
+                <div>
+                  <div className="text-sm font-semibold text-foreground">{t('common.moreMenu')}</div>
+                  <div className="mt-0.5 text-xs text-muted-foreground">{t('common.moreMenuDesc')}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setMobileMoreOpen(false)}
+                  className="flex size-10 items-center justify-center rounded-xl text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground"
+                  aria-label={t('common.close')}
+                >
+                  <X className="size-5" />
+                </button>
+              </div>
+              <div className="max-h-[calc(min(82dvh,640px)-4.5rem)] overflow-y-auto p-3">
+                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  {mobileMoreNav.map((item) => {
+                    const active = isNavActive(item)
+                    return (
+                      <NavLink
+                        key={item.to}
+                        to={item.to}
+                        end={item.end}
+                        onClick={() => setMobileMoreOpen(false)}
+                        className={cn(
+                          'flex min-h-[72px] flex-col items-start justify-center gap-2 rounded-xl border px-3.5 py-3 text-left transition-colors',
+                          active
+                            ? 'border-primary/25 bg-primary/10 text-primary'
+                            : 'border-border/80 bg-background/60 text-foreground hover:bg-muted/50',
+                        )}
+                      >
+                        <span className={cn('flex size-9 items-center justify-center rounded-lg', active ? 'bg-primary/15' : 'bg-muted/70 text-muted-foreground')}>
+                          {item.icon}
+                        </span>
+                        <span className="text-[13px] font-semibold leading-tight">{t(item.labelKey)}</span>
+                      </NavLink>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
       </div>
     </div>
   )

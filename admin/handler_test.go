@@ -1512,6 +1512,66 @@ func TestUpdateAccountSchedulerRuntimePatchPreservesOmittedOverrides(t *testing.
 	}
 }
 
+func TestUpdateAccountSchedulerPersistsIgnoreUsageLimitOverrideAndInheritance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	runtimeAccount := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady}
+	store.AddAccount(runtimeAccount)
+	handler := &Handler{db: db, store: store}
+
+	patchOverride := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+		ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAccountScheduler(ginCtx)
+		return recorder
+	}
+
+	if recorder := patchOverride(`{"ignore_usage_limit_status_override":false}`); recorder.Code != http.StatusOK {
+		t.Fatalf("disable override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if runtimeAccount.IgnoresUsageLimitStatus() {
+		t.Fatal("explicit account false should override global true")
+	}
+	if override := runtimeAccount.GetIgnoreUsageLimitStatusOverride(); override == nil || *override {
+		t.Fatalf("runtime override = %v, want false", override)
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if override := row.GetCredentialOptionalBool("ignore_usage_limit_status_override"); override == nil || *override {
+		t.Fatalf("persisted override = %v, want false", override)
+	}
+
+	if recorder := patchOverride(`{"ignore_usage_limit_status_override":null}`); recorder.Code != http.StatusOK {
+		t.Fatalf("inherit override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !runtimeAccount.IgnoresUsageLimitStatus() {
+		t.Fatal("null account override should inherit global true")
+	}
+	if override := runtimeAccount.GetIgnoreUsageLimitStatusOverride(); override != nil {
+		t.Fatalf("runtime override = %v, want nil", override)
+	}
+	row, err = db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID after inherit: %v", err)
+	}
+	if override := row.GetCredentialOptionalBool("ignore_usage_limit_status_override"); override != nil {
+		t.Fatalf("persisted override = %v, want nil", override)
+	}
+}
+
 func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

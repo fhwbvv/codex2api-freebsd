@@ -25,6 +25,7 @@ import type {
   InviteResponse,
   MessageResponse,
   ModelSyncResponse,
+  ModelPricingOverride,
   ModelsResponse,
   OAuthExchangeResponse,
   OAuthURLResponse,
@@ -37,9 +38,12 @@ import type {
   PromptFilterTestResponse,
   PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
+  ResetCreditsDetailResponse,
   RuntimeStatusResponse,
   SiteBranding,
   StatsResponse,
+  SystemUpdateInfo,
+  SystemUpdateResult,
   SetupHintsResponse,
   CPAExportEntry,
   SystemSettings,
@@ -85,6 +89,9 @@ export function resetAdminAuthState() {
   window.dispatchEvent(new Event(ADMIN_AUTH_REQUIRED_EVENT))
 }
 
+// RequestInit 扩展:timeoutMs 可选,开启后到时自动 abort 请求。
+type RequestOptions = RequestInit & { timeoutMs?: number }
+
 function extractAdminErrorMessage(body: string, status: number): string {
   if (!body.trim()) {
     return `HTTP ${status}`
@@ -102,7 +109,7 @@ function extractAdminErrorMessage(body: string, status: number): string {
   return body
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const headers = new Headers(options.headers)
   const isFormData = typeof FormData !== 'undefined' && options.body instanceof FormData
   if (options.body !== undefined && options.body !== null && !isFormData && !headers.has('Content-Type')) {
@@ -114,11 +121,31 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     headers.set('X-Admin-Key', adminKey)
   }
 
-  const res = await fetch(BASE + path, {
-    ...options,
-    cache: options.cache ?? 'no-store',
-    headers,
-  })
+  // 可选的客户端超时:调用方通过 timeoutMs 显式开启,不传则保持原有“无超时”行为,
+  // 避免影响下载/导出等长耗时接口。仅在调用方未自带 signal 时接管中止逻辑。
+  const { timeoutMs, ...init } = options
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  if (timeoutMs && timeoutMs > 0 && !init.signal && typeof AbortController !== 'undefined') {
+    const controller = new AbortController()
+    init.signal = controller.signal
+    timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+  }
+
+  let res: Response
+  try {
+    res = await fetch(BASE + path, {
+      ...init,
+      cache: init.cache ?? 'no-store',
+      headers,
+    })
+  } catch (err) {
+    if (timeoutId !== undefined && err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('请求超时，请稍后重试')
+    }
+    throw err
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId)
+  }
 
   if (!res.ok) {
     const body = await res.text()
@@ -281,6 +308,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/reset-status`, { method: 'POST' }),
   resetCredits: (id: number) =>
     request<{ message: string; rate_limit_reset_credits?: number }>(`/accounts/${id}/reset-credits`, { method: 'POST' }),
+  getResetCredits: (id: number) =>
+    request<ResetCreditsDetailResponse>(`/accounts/${id}/reset-credits`),
   getAccountHealthBars: () =>
     request<AccountHealthBarsResponse>('/accounts/health-bars'),
   sendInvite: (id: number, data: { emails?: string[]; emails_text?: string; referral_key?: string; proxy_url?: string; max_emails?: number }) =>
@@ -298,6 +327,11 @@ export const api = {
   getHealth: () => request<HealthResponse>('/health'),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),
+  getSystemUpdate: () => request<SystemUpdateInfo>('/system/update', { timeoutMs: 20_000 }),
+  performSystemUpdate: () =>
+    // 后端下载上游二进制最长约 10 分钟,客户端给到 11 分钟兜底:既不会误伤慢下载,
+    // 又能保证请求最终有界返回,不会无限期卡在“更新中”。
+    request<SystemUpdateResult>('/system/update', { method: 'POST', timeoutMs: 11 * 60_000 }),
   getOpsErrorSummary: (params: {
     start: string
     end: string
@@ -516,6 +550,30 @@ export const api = {
     request<PromptFilterRulesResponse>('/prompt-filter/rules'),
   getModels: () => request<ModelsResponse>('/models'),
   syncModels: () => request<ModelSyncResponse>('/models/sync', { method: 'POST' }),
+  syncCodexCLIVersion: () =>
+    request<{
+      fetched_version: string
+      effective_version: string
+      builtin_version: string
+      updated: boolean
+    }>('/codex-cli-version/sync', { method: 'POST' }),
+  listModelPricing: () =>
+    request<{
+      models: Array<{ model: string; source: string; pricing: ModelPricingOverride }>
+      sync_url: string
+      default_sync_url: string
+      models_dev_url: string
+    }>('/model-pricing'),
+  updateModelPricing: (payload: { model: string; reset?: boolean; pricing?: ModelPricingOverride }) =>
+    request<{ model: string; reset: boolean }>('/model-pricing', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+  syncModelPricing: (url: string) =>
+    request<{ source_url: string; fetched: number; applied: number; skipped: number }>('/model-pricing/sync', {
+      method: 'POST',
+      body: JSON.stringify({ url: url ?? '' }),
+    }),
   batchTestAccounts: (ids?: number[]) =>
     request<{ total: number; success: number; failed: number; banned: number; rate_limited: number }>('/accounts/batch-test', {
       method: 'POST',
@@ -531,6 +589,13 @@ export const api = {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))
     return request<CPAExportEntry[]>(`/accounts/export?${sp.toString()}`)
+  },
+  /** 导出回收站账号；ids 为空则导出回收站全部。 */
+  exportRecycleBinAccounts: (ids?: number[]) => {
+    const sp = new URLSearchParams()
+    if (ids && ids.length > 0) sp.set('ids', ids.join(','))
+    const q = sp.toString()
+    return request<CPAExportEntry[]>(`/accounts/recycle-bin/export${q ? `?${q}` : ''}`)
   },
   downloadAccountAuthJSON: (id: number) =>
     requestBlob(`/accounts/${id}/auth-json`),

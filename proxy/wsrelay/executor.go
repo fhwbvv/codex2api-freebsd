@@ -3,6 +3,8 @@ package wsrelay
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,6 +38,44 @@ func shouldSendWebsocketUserAgent() bool {
 	default:
 		return true
 	}
+}
+
+// statelessOneShotEnabled 是否禁用无显式会话请求的 WS 连接复用（每请求独享连接、
+// 用完即毁）。这是杜绝一切连接级状态跨请求/跨用户泄漏的硬隔离逃生阀，代价是
+// 逐请求握手（高 RPM 下可能触发上游握手限流 503）。
+func statelessOneShotEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_WS_STATELESS_ONESHOT"))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveHandshakeSessionID 决定 WS 握手头 Session_id/Conversation_id 的取值。
+// 该头是逐连接冻结的：建连时发送一次，连接复用时永不更新。因此对会在多个请求
+// （乃至共享同一 API Key 的多个终端用户）间复用的 stateless 连接，绝不能携带任何
+// "单个请求的身份"（如每请求随机 prompt_cache_key）——若上游按连接级
+// Conversation_id 绑定会话状态，第一个请求的对话身份会泄漏给后续复用该连接的
+// 所有用户，造成跨用户上下文污染（issue #268/#308 同类，"用户2串到用户1的上下文"）。
+//
+//   - 显式会话（非 stateless）：连接按会话专用，头 = 会话 ID（原行为）。
+//   - stateless + 默认隔离（poolRouteKey 非空）：返回空串 → 不发送该组头，
+//     上游没有任何可绑定的连接级会话身份；逐请求身份完全由帧体内每请求唯一的
+//     prompt_cache_key 承担。
+//   - stateless + per-api-key 模式（poolRouteKey 为空）：沿用帧体的确定性
+//     cache key（该模式显式选择按 Key 共享上游缓存，头与帧体一致才有缓存收益）。
+func resolveHandshakeSessionID(sessionID, poolRouteKey string, wsBody []byte) string {
+	if !proxy.IsStatelessWebsocketSessionID(sessionID) {
+		return sessionID
+	}
+	if strings.TrimSpace(poolRouteKey) != "" {
+		return ""
+	}
+	if cacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String()); cacheKey != "" {
+		return cacheKey
+	}
+	return sessionID
 }
 
 // ==================== WebSocket 执行器 ====================
@@ -88,15 +128,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 准备请求体
 	wsBody := e.prepareWebsocketBody(requestBody, sessionID)
 
-	// 握手头中的 Session_id/Conversation_id 会影响上游 prompt cache 路由，必须与
-	// 请求体的确定性 prompt_cache_key 一致；stateless 连接 ID 是每请求随机的，
-	// 发给上游会导致 prompt cache 永远 miss，它只用于本地连接池隔离。
-	headerSessionID := sessionID
-	if proxy.IsStatelessWebsocketSessionID(sessionID) {
-		if cacheKey := strings.TrimSpace(gjson.GetBytes(wsBody, "prompt_cache_key").String()); cacheKey != "" {
-			headerSessionID = cacheKey
-		}
-	}
+	headerSessionID := resolveHandshakeSessionID(sessionID, poolRouteKey, wsBody)
 
 	// 构建 WebSocket URL
 	httpURL := proxy.CodexBaseURL + CodexWsEndpoint
@@ -122,37 +154,51 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 的槽位池内复用连接，避免持续高 RPM 下逐请求握手触发上游限流。
 	//
 	// 连接池 baseKey 必须按 API Key 稳定，绝不能等于每请求唯一的上游身份键，否则
-	// 默认隔离模式下 headerSessionID 每请求都变 → 槽位池失效 → 逐请求握手触发 503。
+	// 默认隔离模式下每请求都变 → 槽位池失效 → 逐请求握手触发 503。
 	// poolRouteKey（来自上游确定性键）非空时优先用它作 baseKey：连接复用按 API Key
 	// 稳定命中同一组 8 槽。
 	//
 	// 隔离说明：默认隔离模式下，每请求的上游身份隔离由写入每个 response.create 帧体的
 	// 每请求唯一 prompt_cache_key 保证（见 proxy/executor.go 注入处）。握手头里的
-	// Session_id/Conversation_id 只在建连时发送一次、对一条复用连接的生命周期保持不变
-	// （复用连接上不是逐请求轮换），因此不能依赖它做逐请求隔离。
+	// Session_id/Conversation_id 是逐连接冻结的，绝不能携带任何单个请求的身份
+	// （见 resolveHandshakeSessionID）。
+	//
+	// CODEX_WS_STATELESS_ONESHOT=1 时禁用槽位复用：每个无会话请求独享一条连接、
+	// 用完即毁（彻底杜绝任何连接级状态跨请求泄漏，代价是逐请求握手）。
+	// 续链亲和：上游无服务端存储时，previous_response_id 的上下文只存活在产出
+	// 该响应的那条 WS 连接里。带续链 ID 的请求优先取回原连接（独占成功才用），
+	// 否则落到随机槽位会触发上游 "previous response not found"。
 	poolSessionID := sessionID
-	effectiveProxy := effectiveProxyURL(account, proxyOverride)
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
-	if proxy.IsStatelessWebsocketSessionID(sessionID) && headerSessionID != sessionID {
-		baseKey := headerSessionID
-		if strings.TrimSpace(poolRouteKey) != "" {
-			baseKey = poolRouteKey
+	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
+		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
+			wc, pr, poolSessionID = pwc, ppr, slotKey
 		}
-		wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, StatelessConnectionSlots, headers, proxyOverride)
-	} else {
-		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
+	}
+	baseKey := strings.TrimSpace(poolRouteKey)
+	if baseKey == "" && headerSessionID != sessionID {
+		baseKey = headerSessionID
+	}
+	if wc == nil {
+		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {
+			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, StatelessConnectionSlots, headers, proxyOverride)
+		} else {
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
+		}
 	}
 	if err2 != nil {
 		return nil, err2
 	}
 
-	// 发送请求，失败时最多重试 2 次（重建连接）
+	// 发送请求，失败时最多重试 2 次（重建连接）。
+	// 用 DiscardConnection 按连接指针精确清理：续链亲和取回的连接其 PoolKey
+	// 可能与当前请求的 proxy 组合不同，按参数重算 key 会漏删。
 	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
-	for retries := 0; sendErr != nil && retries < 2; retries++ {
+	for retries := 0; shouldRetryWebsocketSendError(sendErr) && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.RemoveConnection(account.ID(), wsURL, poolSessionID, effectiveProxy)
+		e.manager.DiscardConnection(wc)
 
 		// 短暂退避，避免瞬间重连风暴
 		select {
@@ -169,7 +215,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 	if sendErr != nil {
 		wc.session.RemovePendingRequest(pr.RequestID)
-		e.manager.RemoveConnection(account.ID(), wsURL, poolSessionID, effectiveProxy)
+		e.manager.DiscardConnection(wc)
 		return nil, fmt.Errorf("发送 WebSocket 请求失败: %w", sendErr)
 	}
 
@@ -181,8 +227,17 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		pendingReq:  pr,
 		sessionID:   poolSessionID,
 		manager:     e.manager,
+		apiKey:      apiKey,
 		readErrChan: make(chan error, 1),
 	}, nil
+}
+
+func shouldRetryWebsocketSendError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var closeErr *websocket.CloseError
+	return !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseMessageTooBig
 }
 
 // prepareWebsocketBody 准备 WebSocket 请求体
@@ -256,7 +311,9 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 	} else {
 		headers.Set("Originator", proxy.Originator)
 	}
-	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Responsesapi-Include-Timing-Metrics"} {
+	// X-Oai-Attestation：DeviceCheck 设备认证头（上游 openai/codex#20619），
+	// 仅在下游携带时透传，本代理不伪造（假 token 服务端验证必败，反而暴露）。
+	for _, name := range []string{"X-Codex-Turn-State", "X-Codex-Turn-Metadata", "X-Client-Request-Id", "X-Responsesapi-Include-Timing-Metrics", "X-Oai-Attestation"} {
 		if value := strings.TrimSpace(ginHeaders.Get(name)); value != "" {
 			headers.Set(name, value)
 		}
@@ -270,6 +327,13 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 		headers.Set("Session_id", sessionID)
 		headers.Set("Conversation_id", sessionID)
 	}
+	for name, value := range account.GetCustomHeaders() {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		headers.Set(name, value)
+	}
 
 	return headers
 }
@@ -278,6 +342,9 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 func (e *Executor) sendRequest(wc *WsConnection, body []byte, requestID string) error {
 	if !wc.IsConnected() {
 		return fmt.Errorf("websocket connection is not connected")
+	}
+	if err := wc.ensureReadLeaseForSend(requestID); err != nil {
+		return err
 	}
 	return wc.WriteMessage(websocket.TextMessage, body)
 }
@@ -292,6 +359,8 @@ type WsResponse struct {
 	manager     *Manager
 	readErrChan chan error
 	closed      bool
+	// apiKey 发起本请求的下游 API Key，用于 response_id → 连接绑定的归属校验。
+	apiKey string
 	// connBroken 标记读流因上游 WS 异常(非正常关闭)或下游写入失败而终止；
 	// Close() 据此销毁坏连接而非归还连接池复用。受 mu 保护。
 	connBroken bool
@@ -306,19 +375,21 @@ type WsResponse struct {
 
 // ReadStream 读取 SSE 流
 func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
-	if r.conn == nil || !r.conn.IsConnected() {
+	if r.conn == nil {
 		return fmt.Errorf("websocket connection is not available")
+	}
+	if r.pendingReq != nil {
+		if err := r.conn.ensureReadLeaseForResponse(r.pendingReq.RequestID); err != nil {
+			return fmt.Errorf("websocket connection is not available: %w", err)
+		}
 	}
 
 	for {
 		msgType, payload, err := r.conn.ReadMessage()
 		if err != nil {
-			// 检查是否是正常关闭
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				return nil
-			}
-			// 非正常关闭(close 1006/1009/1011、broken pipe、unexpected EOF、读超时等)：
-			// 连接已不可靠，标记为坏连接，Close() 时销毁并移出连接池，避免复用与 CLOSE_WAIT 滞留。
+			// ReadStream only returns successfully after consuming an explicit
+			// response terminal frame. Any socket close here, including 1000/1001,
+			// is premature and must preserve the real close error for the consumer.
 			r.markConnBroken()
 			return fmt.Errorf("websocket read error: %w", err)
 		}
@@ -355,6 +426,12 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 	// 上游错误帧：透传给下游(转成 SSE 错误事件)，而不是转成 Go error 后静默关闭 pipe。
 	// 否则下游只会读到一个底层 read error → 表现为空响应，无从得知具体错误。
 	if errEvent, isErr := r.buildErrorEvent(payload); isErr {
+		// 连接级寿命限制错误：针对连接而非单个请求，这条连接上的后续
+		// response.create 一律失败，而 Ping 探活仍会成功；归还池会持续毒害
+		// 后续请求（含续链亲和定向回来的），必须标记销毁 (issue #346)。
+		if isConnLimitErrorFrame(payload) {
+			r.markConnBroken()
+		}
 		// 把错误内容作为 SSE 数据写给下游，让客户端看到完整错误 JSON。
 		callback(errEvent)
 		// 错误即终止：结束流(等价于 response.failed)。
@@ -376,6 +453,17 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 	// 检查是否是终止事件
 	eventType := gjson.GetBytes(payload, "type").String()
 	if eventType == "response.completed" || eventType == "response.failed" {
+		// 续链亲和：记录本响应由哪条连接产出，后续带 previous_response_id 的
+		// 请求可回到原连接（上游无服务端存储时上下文只存活在连接内）。
+		if eventType == "response.completed" && r.manager != nil && r.conn != nil {
+			if respID := gjson.GetBytes(payload, "response.id").String(); respID != "" {
+				accountID := int64(0)
+				if r.conn.session != nil {
+					accountID = r.conn.session.AccountID
+				}
+				r.manager.BindResponseConn(respID, r.conn, r.sessionID, accountID, r.apiKey)
+			}
+		}
 		return io.EOF
 	}
 
@@ -410,7 +498,9 @@ func (r *WsResponse) buildErrorEvent(payload []byte) ([]byte, bool) {
 
 	// 构造 response.failed 事件：下游 ReadSSEStream 已识别该类型为终止失败，
 	// 与 HTTP 路径的错误语义对齐；同时保留原始上游错误对象供客户端排查。
-	errObj := gjson.GetBytes(payload, "error").Raw
+	// 上游错误对象可能是带换行的 pretty-printed JSON，必须压缩成单行，
+	// 否则经 SSE data: 行编码后下游只能读到第一行（错误信息被截断）。
+	errObj := compactJSONOneLine(gjson.GetBytes(payload, "error").Raw)
 	if errObj == "" {
 		errObj = fmt.Sprintf(`{"message":%q,"code":%d}`, errMsg, status)
 	}
@@ -419,6 +509,17 @@ func (r *WsResponse) buildErrorEvent(payload []byte) ([]byte, bool) {
 		event = fmt.Sprintf(`{"type":"response.failed","response":{"status":"failed","status_code":%d,"error":%s}}`, status, errObj)
 	}
 	return []byte(event), true
+}
+
+// isConnLimitErrorFrame 判断上游错误帧是否为连接级寿命限制错误
+// (websocket_connection_limit_reached)：该错误按连接而非按请求生效，
+// 复用此连接必然继续失败。
+func isConnLimitErrorFrame(payload []byte) bool {
+	code := gjson.GetBytes(payload, "error.code").String()
+	if code == "" {
+		code = gjson.GetBytes(payload, "code").String()
+	}
+	return code == "websocket_connection_limit_reached"
 }
 
 // normalizeCompletionEvent 标准化完成事件类型
@@ -430,6 +531,19 @@ func normalizeCompletionEvent(payload []byte) []byte {
 		}
 	}
 	return payload
+}
+
+// compactJSONOneLine 把可能带换行的 JSON 压缩为单行；非法 JSON 或空串返回 ""。
+func compactJSONOneLine(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, []byte(raw)); err != nil {
+		return ""
+	}
+	return buf.String()
 }
 
 // markConnBroken 标记底层连接因上游 WS 异常或下游写入失败而不可复用（幂等，受 mu 保护）。
@@ -458,7 +572,7 @@ func (r *WsResponse) Close() error {
 	r.closed = true
 
 	// 移除等待请求
-	if r.conn != nil && r.conn.session != nil {
+	if r.conn != nil && r.conn.session != nil && r.pendingReq != nil {
 		r.conn.session.RemovePendingRequest(r.pendingReq.RequestID)
 	}
 
@@ -535,13 +649,15 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 
 	// 检查 HTTP 握手响应状态。WebSocket 握手成功的标准状态是 101，
 	// 但这里要包装成现有 handler 可消费的 SSE HTTP 200 响应。
-	statusCode, handshakeHeader, handshakeFailed := normalizeWebsocketHandshakeResponse(wsResp.HTTPResponse())
+	handshakeResp := wsResp.HTTPResponse()
+	statusCode, handshakeHeader, handshakeFailed := normalizeWebsocketHandshakeResponse(handshakeResp)
 	if handshakeFailed {
+		detail := formatFailedHandshakeHTTPBody(statusCode, handshakeResp)
 		wsResp.Close()
 		return &http.Response{
 			StatusCode: statusCode,
 			Header:     handshakeHeader.Clone(),
-			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("websocket handshake failed: %d", statusCode))),
+			Body:       io.NopCloser(strings.NewReader(detail)),
 		}, nil
 	}
 
@@ -593,6 +709,15 @@ func websocketResponseToHTTP(ctx context.Context, wsResp *WsResponse, statusCode
 		defer wsResp.Close()
 
 		err := wsResp.ReadStream(func(data []byte) bool {
+			// SSE 的 data: 负载以换行为界，含换行的帧（如 pretty-printed JSON）
+			// 必须先压缩成单行，否则下游解析器只能读到第一行。
+			if bytes.IndexByte(data, '\n') >= 0 {
+				if compacted := compactJSONOneLine(string(data)); compacted != "" {
+					data = []byte(compacted)
+				} else {
+					data = bytes.ReplaceAll(data, []byte("\n"), []byte(" "))
+				}
+			}
 			// 将数据编码为 SSE 格式
 			if _, err := pw.Write([]byte("data: ")); err != nil {
 				return false

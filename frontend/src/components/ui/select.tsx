@@ -29,8 +29,36 @@ interface DropdownPosition {
 }
 
 const DROPDOWN_GAP = 8
-const DROPDOWN_MAX_HEIGHT = 288
+const DROPDOWN_MAX_HEIGHT = 320
 const VIEWPORT_PADDING = 8
+
+// Radix Dialog 的 react-remove-scroll 会在 document capture 阶段对
+// 弹层外（含 createPortal 到 body 的下拉）的 wheel/touchmove 调 preventDefault，
+// 导致 overflow 容器无法原生滚动。这里手动改 scrollTop，兼容 Dialog 内外。
+function applyManualScroll(el: HTMLElement, deltaX: number, deltaY: number): boolean {
+  const canScrollY = el.scrollHeight > el.clientHeight + 1
+  const canScrollX = el.scrollWidth > el.clientWidth + 1
+  if (!canScrollY && !canScrollX) return false
+
+  let scrolled = false
+  if (canScrollY && deltaY !== 0) {
+    const maxTop = el.scrollHeight - el.clientHeight
+    const next = Math.min(maxTop, Math.max(0, el.scrollTop + deltaY))
+    if (next !== el.scrollTop) {
+      el.scrollTop = next
+      scrolled = true
+    }
+  }
+  if (canScrollX && deltaX !== 0) {
+    const maxLeft = el.scrollWidth - el.clientWidth
+    const next = Math.min(maxLeft, Math.max(0, el.scrollLeft + deltaX))
+    if (next !== el.scrollLeft) {
+      el.scrollLeft = next
+      scrolled = true
+    }
+  }
+  return scrolled
+}
 
 export function Select({
   value,
@@ -46,6 +74,8 @@ export function Select({
   const [position, setPosition] = useState<DropdownPosition | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null)
   const selectedOption = options.find((option) => option.value === value)
 
   const computePosition = useCallback(() => {
@@ -53,14 +83,19 @@ export function Select({
     if (!trigger) return
     const rect = trigger.getBoundingClientRect()
     const viewportHeight = window.innerHeight
+    const viewportWidth = window.innerWidth
     const spaceBelow = viewportHeight - rect.bottom - DROPDOWN_GAP - VIEWPORT_PADDING
     const spaceAbove = rect.top - DROPDOWN_GAP - VIEWPORT_PADDING
     const openUp = spaceBelow < Math.min(DROPDOWN_MAX_HEIGHT, 160) && spaceAbove > spaceBelow
-    const maxHeight = Math.max(120, Math.min(DROPDOWN_MAX_HEIGHT, openUp ? spaceAbove : spaceBelow))
+    const maxHeight = Math.max(140, Math.min(DROPDOWN_MAX_HEIGHT, openUp ? spaceAbove : spaceBelow))
+    // Keep dropdown fully inside the viewport on small screens.
+    const width = Math.min(rect.width, viewportWidth - VIEWPORT_PADDING * 2)
+    const maxLeft = viewportWidth - width - VIEWPORT_PADDING
+    const left = Math.min(Math.max(VIEWPORT_PADDING, rect.left), Math.max(VIEWPORT_PADDING, maxLeft))
     setPosition({
       top: openUp ? rect.top - DROPDOWN_GAP : rect.bottom + DROPDOWN_GAP,
-      left: rect.left,
-      width: rect.width,
+      left,
+      width,
       maxHeight,
       openUp,
     })
@@ -70,6 +105,15 @@ export function Select({
     if (!open) return
     computePosition()
   }, [open, computePosition, options.length])
+
+  // 打开后把当前选中项滚进可视区。
+  useLayoutEffect(() => {
+    if (!open || !position) return
+    const list = listRef.current
+    if (!list) return
+    const selected = list.querySelector<HTMLElement>('[aria-selected="true"]')
+    selected?.scrollIntoView({ block: 'nearest' })
+  }, [open, position, value])
 
   useEffect(() => {
     if (!open) return
@@ -94,16 +138,61 @@ export function Select({
 
     const handleReposition = () => computePosition()
 
+    // 在 document capture 阶段手动滚动：晚于 React 挂载、与 remove-scroll 同阶段，
+    // 即使其 preventDefault 了默认滚动，我们仍可通过改 scrollTop 完成滚动。
+    const handleWheel = (event: WheelEvent) => {
+      const list = listRef.current
+      if (!list) return
+      const target = event.target as Node | null
+      if (!target || !list.contains(target)) return
+      if (applyManualScroll(list, event.deltaX, event.deltaY)) {
+        event.preventDefault()
+      }
+    }
+
+    const handleTouchStart = (event: TouchEvent) => {
+      const list = listRef.current
+      if (!list) return
+      const target = event.target as Node | null
+      if (!target || !list.contains(target)) return
+      const touch = event.touches[0]
+      if (!touch) return
+      touchStartRef.current = { x: touch.clientX, y: touch.clientY }
+    }
+
+    const handleTouchMove = (event: TouchEvent) => {
+      const list = listRef.current
+      const start = touchStartRef.current
+      if (!list || !start) return
+      const target = event.target as Node | null
+      if (!target || !list.contains(target)) return
+      const touch = event.touches[0]
+      if (!touch) return
+      const deltaX = start.x - touch.clientX
+      const deltaY = start.y - touch.clientY
+      touchStartRef.current = { x: touch.clientX, y: touch.clientY }
+      if (applyManualScroll(list, deltaX, deltaY)) {
+        event.preventDefault()
+      }
+    }
+
     document.addEventListener('pointerdown', handlePointerDown)
     document.addEventListener('keydown', handleEscape)
     window.addEventListener('resize', handleReposition)
     window.addEventListener('scroll', handleReposition, true)
+    document.addEventListener('wheel', handleWheel, { passive: false, capture: true })
+    document.addEventListener('touchstart', handleTouchStart, { passive: true, capture: true })
+    document.addEventListener('touchmove', handleTouchMove, { passive: false, capture: true })
 
     return () => {
       document.removeEventListener('pointerdown', handlePointerDown)
       document.removeEventListener('keydown', handleEscape)
       window.removeEventListener('resize', handleReposition)
       window.removeEventListener('scroll', handleReposition, true)
+      document.removeEventListener('wheel', handleWheel, true)
+      document.removeEventListener('touchstart', handleTouchStart, true)
+      document.removeEventListener('touchmove', handleTouchMove, true)
+      touchStartRef.current = null
     }
   }, [open, computePosition])
 
@@ -125,8 +214,9 @@ export function Select({
         aria-haspopup="listbox"
         aria-expanded={open}
         className={cn(
-          'flex w-full items-center justify-between gap-3 border border-input bg-background text-left shadow-xs transition-[border-color,box-shadow,transform] outline-none',
-          compact ? 'h-8 rounded-lg px-2.5 text-[13px]' : 'h-11 rounded-xl px-3.5 text-[15px]',
+          'flex w-full items-center justify-between gap-2 border border-input bg-background text-left shadow-xs transition-[border-color,box-shadow,transform] outline-none',
+          // Match Input (h-9) so form grids stay vertically aligned.
+          compact ? 'h-8 rounded-md px-2.5 text-[13px]' : 'h-9 rounded-md px-3 text-sm',
           'hover:border-primary/30 hover:bg-accent/50',
           'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/20',
           'disabled:cursor-not-allowed disabled:opacity-60',
@@ -156,16 +246,28 @@ export function Select({
                 bottom: position.openUp ? window.innerHeight - position.top : undefined,
                 left: position.left,
                 width: position.width,
+                maxHeight: position.maxHeight,
               }}
               className={cn(
-                'pointer-events-auto z-[1000] overflow-hidden border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm rounded-lg'
+                'pointer-events-auto z-[1000] flex flex-col overflow-hidden rounded-md border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm'
               )}
             >
               <div
-                className={cn('overflow-auto', compact ? 'p-1' : 'p-2')}
+                ref={listRef}
+                className={cn(
+                  'min-h-0 flex-1 overscroll-contain overflow-x-hidden overflow-y-auto',
+                  // 始终显示细滚动条，避免 macOS 叠加滚动条「看不见、以为不能滚」。
+                  '[scrollbar-gutter:stable] [scrollbar-width:thin]',
+                  '[&::-webkit-scrollbar]:w-1.5',
+                  '[&::-webkit-scrollbar-track]:bg-transparent',
+                  '[&::-webkit-scrollbar-thumb]:rounded-full',
+                  '[&::-webkit-scrollbar-thumb]:bg-border',
+                  '[&::-webkit-scrollbar-thumb:hover]:bg-muted-foreground/40',
+                  compact ? 'p-1' : 'p-1.5',
+                )}
                 style={{ maxHeight: position.maxHeight }}
               >
-                <div role="listbox" aria-activedescendant={value || undefined} className={compact ? 'space-y-0.5' : 'space-y-1'}>
+                <div role="listbox" aria-activedescendant={value || undefined} className="space-y-0.5">
                   {options.map((option) => {
                     const isSelected = option.value === value
                     return (
@@ -176,8 +278,8 @@ export function Select({
                         role="option"
                         aria-selected={isSelected}
                         className={cn(
-                          'flex w-full items-center justify-between gap-3 text-left transition-colors',
-                          compact ? 'rounded-md px-2 py-1.5 text-[13px]' : 'rounded-md px-3 py-2.5 text-[15px]',
+                          'flex w-full items-center justify-between gap-2 text-left transition-colors',
+                          compact ? 'rounded-md px-2 py-1.5 text-[13px]' : 'rounded-md px-2.5 py-2 text-sm',
                           isSelected
                             ? 'bg-primary/10 text-primary'
                             : 'text-foreground hover:bg-accent/70 hover:text-accent-foreground'

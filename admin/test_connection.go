@@ -89,7 +89,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	}
 
 	// 构建最小测试请求体（参考 sub2api createOpenAITestPayload）
-	payload := buildTestPayload(testModel)
+	payload := buildConnectionTestPayload(h.store, testModel)
 
 	// 发送请求
 	start := time.Now()
@@ -216,7 +216,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			}
 			// 测试成功即重置失败/冷却状态，用量限制由调度器自行判断；
 			// 临时账号（回收站）不回写任何调度状态。
-			if !isTransient && (isOpenAIResponsesAccount || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100))) {
+			if !isTransient && (isOpenAIResponsesAccount || usageState.UsageWindowLimitsIgnored || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100))) {
 				h.store.RecordManualTestSuccess(account, time.Since(start))
 			}
 			if isTransient {
@@ -271,8 +271,24 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	}
 }
 
-// buildTestPayload 构建最小测试请求体
+func buildConnectionTestPayload(store *auth.Store, model string) []byte {
+	content := auth.DefaultTestContent
+	if store != nil {
+		content = store.GetTestContent()
+	}
+	// 多行内容按行随机抽取 + 变量展开（issue #320），减少批量账号
+	// 共用同一句测活内容的指纹特征。单行配置行为不变。
+	return buildTestPayloadWithContent(model, auth.RenderTestContent(content))
+}
+
+// buildTestPayload 构建默认最小测试请求体
 func buildTestPayload(model string) []byte {
+	return buildTestPayloadWithContent(model, auth.DefaultTestContent)
+}
+
+// buildTestPayloadWithContent 构建带自定义用户输入内容的最小测试请求体
+func buildTestPayloadWithContent(model string, content string) []byte {
+	content = auth.NormalizeTestContent(content)
 	payload := []byte(`{}`)
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	payload, _ = sjson.SetBytes(payload, "input", []map[string]any{
@@ -281,7 +297,7 @@ func buildTestPayload(model string) []byte {
 			"content": []map[string]any{
 				{
 					"type": "input_text",
-					"text": "hi",
+					"text": content,
 				},
 			},
 		},
@@ -293,6 +309,9 @@ func buildTestPayload(model string) []byte {
 }
 
 func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool) {
+	if state.UsageWindowLimitsIgnored {
+		return "", false
+	}
 	if state.Premium5hRateLimited {
 		remaining := time.Until(state.Reset5hAt).Round(time.Second)
 		if remaining < 0 {
@@ -308,6 +327,9 @@ func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool
 
 func applyUsageLimitedAccountState(store *auth.Store, account *auth.Account, state proxy.CodexUsageSyncResult) bool {
 	if store == nil || account == nil {
+		return false
+	}
+	if state.UsageWindowLimitsIgnored {
 		return false
 	}
 	if state.Premium5hRateLimited || state.Usage7dRateLimited {
@@ -504,6 +526,13 @@ func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *au
 		return "", fmt.Errorf("该 Responses API 账号没有可用于测试的文本模型")
 	}
 	if requested != "" {
+		if mappedModel, ok := proxy.ResolveAccountModelMapping(account, requested); ok && mappedModel != "" {
+			for _, model := range textModels {
+				if strings.EqualFold(model, mappedModel) {
+					return mappedModel, nil
+				}
+			}
+		}
 		for _, model := range textModels {
 			if strings.EqualFold(model, requested) {
 				return model, nil
@@ -879,7 +908,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
 		return "failed", modelErr.Error()
 	}
-	payload := buildTestPayload(testModel)
+	payload := buildConnectionTestPayload(h.store, testModel)
 	start := time.Now()
 
 	var resp *http.Response
@@ -977,7 +1006,7 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 		}
 		return "failed", modelErr.Error()
 	}
-	payload := buildTestPayload(testModel)
+	payload := buildConnectionTestPayload(h.store, testModel)
 
 	var resp *http.Response
 	var err error

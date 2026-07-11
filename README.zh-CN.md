@@ -75,6 +75,13 @@
 
 <table>
 <tr>
+<td width="180" align="center" valign="middle"><a href="https://www.fastaitoken.com/register"><img src="assets/fastaitoken-logo.jpg" width="90" alt="FastAIToken"></a></td>
+<td valign="middle"><b><a href="https://www.fastaitoken.com/register">FastAIToken</a></b> 是面向开发者的 AI API 聚合平台，支持 OpenAI、Claude、Gemini 等主流大模型，兼容 OpenAI API 协议，可无缝接入 Claude Code、Codex、Gemini CLI、Cherry Studio、Cline、Continue 等开发工具。采用充值 1:1（1 元 = 1 美元 API 额度），分组覆盖 0.02× OpenAI 福利（限时）到 1.2× Claude Max，并提供公开状态页与 7×24 小时真人技术支持。支持企业开票，提供 99% SLA 企业级稳定号池。</td>
+</tr>
+</table>
+
+<table>
+<tr>
 <td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
 <td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> 是一家面向个人开发者和企业团队的高可用 AI 模型 API 中转平台。支持 Codex/Claude Code，价格大约是官方的 1 折不到！通过链接注册，使用优惠码 <code>CODEX2API</code> 即可获得 3$ 测试额度。</td>
 </tr>
@@ -105,6 +112,7 @@
 - [核心能力](#核心能力)
 - [目录结构](#目录结构)
 - [常见注意事项](#常见注意事项)
+- [交流群](#交流群)
 - [免责声明](#免责声明与开源协议)
 - [Star History](#star-history)
 - [友情链接](#友情链接)
@@ -323,7 +331,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 以下参数**保存在数据库 `SystemSettings` 中**，通过管理台设置页面修改：
 
-`MaxConcurrency`、`GlobalRPM`、`TestModel`、`TestConcurrency`、`ProxyURL`、`PgMaxConns`、`RedisPoolSize`、`AdminSecret`、`SchedulerMode`、自动清理开关等。
+`MaxConcurrency`、`GlobalRPM`、`TestModel`、`TestContent`、`TestConcurrency`、`ProxyURL`、`PgMaxConns`、`RedisPoolSize`、`AdminSecret`、`SchedulerMode`、自动清理开关等。
 
 首次启动时程序会自动写入默认设置。
 
@@ -580,6 +588,15 @@ codex2api/
 - 本地手动构建 Go 二进制前需先执行 `frontend/` 的 `npm run build`
 - `.env` 只负责端口、数据库、Redis 等物理层配置；业务参数在管理台数据库里维护
 - API Key 以数据库为准，在管理台中配置
+
+---
+
+## 交流群
+
+- QQ 交流群：[点击链接加入群聊【codex2api】](https://qun.qq.com/universal-share/share?ac=1&authKey=6vwawW4MeqdACT7PajnHlf2lLkjfuNXEMSos67l9FBiAJ8t%2BKeaXJXB0dgsnhFa1&busi_data=eyJncm91cENvZGUiOiI4MTY3Mzk4NDIiLCJ0b2tlbiI6ImU1YW1KR3dNaXZoUXZDUWpYTWVncmdmMXhQV1RwQ21tbEhkdjB5VW45aWVPSjhFM2grMkRHNGdhWnhEU29oS08iLCJ1aW4iOiIxMTYzNDc2OTQ5In0%3D&data=adSomD6r40Al25rBr8PocFCKumQR5oxi1kq5jXjXxeJ49Z5cj4QLzbNf6vfIQKWMORrJntrZtcoyQuHg2ksUeA&svctype=4&tempid=h5_group_info)（群号：816739842）
+- Telegram 群组：[加入 Telegram 群组](https://t.me/+9hJAA3ZWQxxmMzE5)
+
+欢迎加群交流部署、使用与二次开发相关问题。
 
 ---
 

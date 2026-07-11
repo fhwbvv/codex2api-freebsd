@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 )
 
@@ -318,6 +320,83 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 	}
 }
 
+func TestApplyCodexRequestHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+
+	acc := &auth.Account{
+		DBID:      42,
+		AccountID: "acct-default",
+		CustomHeaders: map[string]string{
+			"Authorization":      "Bearer upstream-override",
+			"Chatgpt-Account-Id": "acct-override",
+			"X-Custom-Header":    "custom-value",
+		},
+	}
+
+	applyCodexRequestHeaders(req, acc, "token-123", "cache-key-1", "api-key-1", nil, http.Header{})
+
+	if got := req.Header.Get("Authorization"); got != "Bearer upstream-override" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := req.Header.Get("Chatgpt-Account-Id"); got != "acct-override" {
+		t.Fatalf("Chatgpt-Account-Id = %q", got)
+	}
+	if got := req.Header.Get("X-Custom-Header"); got != "custom-value" {
+		t.Fatalf("X-Custom-Header = %q", got)
+	}
+}
+
+// TestApplyCodexRequestHeadersForwardsAttestationOnlyWhenPresent 验证 DeviceCheck
+// 设备认证头（openai/codex#20619）的透传策略：下游携带真实 token 时原样转发，
+// 缺失时绝不伪造/补空——假 token 服务端向 Apple 验证必败，比不携带更暴露特征。
+func TestApplyCodexRequestHeadersForwardsAttestationOnlyWhenPresent(t *testing.T) {
+	acc := &auth.Account{DBID: 42, AccountID: "acct-42"}
+
+	// 下游携带真实 token → 原样透传
+	withToken, _ := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	applyCodexRequestHeaders(withToken, acc, "token-123", "cache-key-1", "api-key-1", nil, http.Header{
+		"X-Oai-Attestation": []string{"v1.real-devicecheck-token"},
+	})
+	if got := withToken.Header.Get("X-Oai-Attestation"); got != "v1.real-devicecheck-token" {
+		t.Fatalf("X-Oai-Attestation = %q, want passthrough of downstream token", got)
+	}
+
+	// 下游未携带 → 不注入（保持与合法 CLI 一致的"干净缺失"）
+	without, _ := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	applyCodexRequestHeaders(without, acc, "token-123", "cache-key-1", "api-key-1", nil, http.Header{})
+	if got := without.Header.Get("X-Oai-Attestation"); got != "" {
+		t.Fatalf("X-Oai-Attestation = %q, want empty (never fabricate)", got)
+	}
+}
+
+func TestApplyOpenAIResponsesRequestHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+
+	acc := &auth.Account{
+		DBID: 42,
+		CustomHeaders: map[string]string{
+			"Authorization":       "Bearer upstream-override",
+			"OpenAI-Organization": "org-override",
+		},
+	}
+	downstreamHeaders := http.Header{"OpenAI-Organization": []string{"org-downstream"}}
+
+	applyOpenAIResponsesRequestHeaders(req, acc, "api-key-1", downstreamHeaders)
+
+	if got := req.Header.Get("Authorization"); got != "Bearer upstream-override" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := req.Header.Get("OpenAI-Organization"); got != "org-override" {
+		t.Fatalf("OpenAI-Organization = %q", got)
+	}
+}
+
 func TestApplyCodexRequestHeadersUsesMinimalFallbackByDefault(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
 	if err != nil {
@@ -619,24 +698,24 @@ func TestApplyOpenAIResponsesRequestHeadersSetsCodexUserAgent(t *testing.T) {
 
 func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 	type result struct {
-		path      string
-		ua        string
-		version   string
-		auth      string
-		accept    string
-		bodyBytes int
+		path    string
+		ua      string
+		version string
+		auth    string
+		accept  string
+		body    []byte
 	}
 	results := make(chan result, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		_ = r.Body.Close()
 		results <- result{
-			path:      r.URL.Path,
-			ua:        r.Header.Get("User-Agent"),
-			version:   r.Header.Get("Version"),
-			auth:      r.Header.Get("Authorization"),
-			accept:    r.Header.Get("Accept"),
-			bodyBytes: len(body),
+			path:    r.URL.Path,
+			ua:      r.Header.Get("User-Agent"),
+			version: r.Header.Get("Version"),
+			auth:    r.Header.Get("Authorization"),
+			accept:  r.Header.Get("Accept"),
+			body:    body,
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
@@ -680,12 +759,238 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 			if got.accept != "application/json, text/event-stream" {
 				t.Fatalf("%s Accept = %q", wantPath, got.accept)
 			}
-			if got.bodyBytes == 0 {
+			if len(got.body) == 0 {
 				t.Fatalf("%s request body was empty", wantPath)
+			}
+			if installationID := gjson.GetBytes(got.body, "client_metadata.x-codex-installation-id").String(); installationID != "" {
+				t.Fatalf("%s unexpectedly injected Codex client metadata into a compatible relay request", wantPath)
 			}
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for %s", wantPath)
 		}
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestLearnsCodexClientMetadataRequirement(t *testing.T) {
+	var mu sync.Mutex
+	requestCount := 0
+	installationIDs := make([]string, 0, 3)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		installationID := strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
+
+		mu.Lock()
+		requestCount++
+		installationIDs = append(installationIDs, installationID)
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if installationID == "" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"message":"official client required","code":"codex_access_restricted"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	account := &auth.Account{
+		DBID:         42001,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "relay-token",
+	}
+	headers := http.Header{
+		"Authorization": []string{"Bearer downstream-api-key"},
+		"User-Agent":    []string{"curl/8.0"},
+	}
+	body := []byte(`{"model":"gpt-5.5","input":"hello"}`)
+
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", headers)
+	if err != nil {
+		t.Fatalf("first ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first response status = %d, want 200", resp.StatusCode)
+	}
+
+	resp, err = ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", headers)
+	if err != nil {
+		t.Fatalf("second ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second response status = %d, want 200", resp.StatusCode)
+	}
+
+	mu.Lock()
+	gotCount := requestCount
+	gotIDs := append([]string(nil), installationIDs...)
+	mu.Unlock()
+	if gotCount != 3 {
+		t.Fatalf("upstream requests = %d, want initial rejection + retry + cached request", gotCount)
+	}
+	if len(gotIDs) != 3 || gotIDs[0] != "" || gotIDs[1] == "" || gotIDs[2] != gotIDs[1] {
+		t.Fatalf("installation IDs = %#v, want empty then one stable generated ID", gotIDs)
+	}
+	if _, err := uuid.Parse(gotIDs[1]); err != nil {
+		t.Fatalf("generated installation ID %q is not a UUID: %v", gotIDs[1], err)
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestHonorsCodexClientMetadataMode(t *testing.T) {
+	tests := []struct {
+		name          string
+		mode          string
+		wantStatus    int
+		wantMetadata  bool
+		seedAutoCache bool
+	}{
+		{name: "always injects on first request", mode: auth.CodexClientMetadataModeAlways, wantStatus: http.StatusOK, wantMetadata: true},
+		{name: "off never injects", mode: auth.CodexClientMetadataModeOff, wantStatus: http.StatusForbidden, wantMetadata: false, seedAutoCache: true},
+	}
+
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mu sync.Mutex
+			requestCount := 0
+			installationID := ""
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				_ = r.Body.Close()
+				gotInstallationID := strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
+				mu.Lock()
+				requestCount++
+				installationID = gotInstallationID
+				mu.Unlock()
+
+				w.Header().Set("Content-Type", "application/json")
+				if gotInstallationID == "" {
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"error":{"code":"codex_access_restricted"}}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+			}))
+			t.Cleanup(server.Close)
+
+			account := &auth.Account{
+				DBID:                    int64(42100 + index),
+				UpstreamType:            auth.UpstreamOpenAIResponses,
+				BaseURL:                 server.URL,
+				APIKey:                  "relay-token",
+				CodexClientMetadataMode: tt.mode,
+			}
+			capabilityKey := openAIResponsesCodexMetadataCapabilityKey(account, server.URL)
+			if tt.seedAutoCache {
+				openAIResponsesCodexMetadataRequired.Store(capabilityKey, struct{}{})
+				t.Cleanup(func() { openAIResponsesCodexMetadataRequired.Delete(capabilityKey) })
+			}
+
+			resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.5"}`), "", nil)
+			if err != nil {
+				t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("response status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+
+			mu.Lock()
+			gotCount := requestCount
+			gotInstallationID := installationID
+			mu.Unlock()
+			if gotCount != 1 {
+				t.Fatalf("upstream requests = %d, want 1", gotCount)
+			}
+			if (gotInstallationID != "") != tt.wantMetadata {
+				t.Fatalf("installation ID = %q, want metadata=%v", gotInstallationID, tt.wantMetadata)
+			}
+		})
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestPreservesClientInstallationIDWithoutLearningRequirement(t *testing.T) {
+	var mu sync.Mutex
+	installationIDs := make([]string, 0, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		installationID := gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String()
+		mu.Lock()
+		installationIDs = append(installationIDs, installationID)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	account := &auth.Account{
+		DBID:         42002,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "relay-token",
+	}
+	capabilityKey := openAIResponsesCodexMetadataCapabilityKey(account, server.URL)
+	openAIResponsesCodexMetadataRequired.Delete(capabilityKey)
+	t.Cleanup(func() { openAIResponsesCodexMetadataRequired.Delete(capabilityKey) })
+
+	body := []byte(`{"model":"gpt-5.5","client_metadata":{"x-codex-installation-id":"client-installation-id"}}`)
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", nil)
+	if err != nil {
+		t.Fatalf("client metadata request error = %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.5"}`), "", nil)
+	if err != nil {
+		t.Fatalf("plain request error = %v", err)
+	}
+	resp.Body.Close()
+
+	mu.Lock()
+	gotIDs := append([]string(nil), installationIDs...)
+	mu.Unlock()
+	if len(gotIDs) != 2 || gotIDs[0] != "client-installation-id" || gotIDs[1] != "" {
+		t.Fatalf("installation IDs = %#v, want preserved client ID then no injected ID", gotIDs)
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestDoesNotRetryUnrelatedForbidden(t *testing.T) {
+	var mu sync.Mutex
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"not allowed","code":"permission_denied"}}`))
+	}))
+	t.Cleanup(server.Close)
+
+	account := &auth.Account{
+		DBID:         42003,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "relay-token",
+	}
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.5"}`), "", nil)
+	if err != nil {
+		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	responseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden || gjson.GetBytes(responseBody, "error.code").String() != "permission_denied" {
+		t.Fatalf("response = status %d body %s, want original permission_denied response", resp.StatusCode, responseBody)
+	}
+	mu.Lock()
+	gotCount := requestCount
+	mu.Unlock()
+	if gotCount != 1 {
+		t.Fatalf("upstream requests = %d, want 1", gotCount)
 	}
 }
 

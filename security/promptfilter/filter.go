@@ -33,16 +33,18 @@ const (
 )
 
 type Config struct {
-	Enabled          bool            `json:"enabled"`
-	Mode             string          `json:"mode"`
-	Threshold        int             `json:"threshold"`
-	StrictThreshold  int             `json:"strict_threshold"`
-	LogMatches       bool            `json:"log_matches"`
-	MaxTextLength    int             `json:"max_text_length"`
-	SensitiveWords   string          `json:"sensitive_words"`
-	CustomPatterns   []PatternConfig `json:"custom_patterns"`
-	DisabledPatterns []string        `json:"disabled_patterns"`
-	Review           ReviewConfig    `json:"review"`
+	Enabled               bool            `json:"enabled"`
+	Mode                  string          `json:"mode"`
+	Threshold             int             `json:"threshold"`
+	StrictThreshold       int             `json:"strict_threshold"`
+	StrictTerminalEnabled bool            `json:"strict_terminal_enabled"`
+	LogMatches            bool            `json:"log_matches"`
+	MaxTextLength         int             `json:"max_text_length"`
+	SensitiveWords        string          `json:"sensitive_words"`
+	CustomPatterns        []PatternConfig `json:"custom_patterns"`
+	DisabledPatterns      []string        `json:"disabled_patterns"`
+	Review                ReviewConfig    `json:"review"`
+	Advanced              AdvancedConfig  `json:"advanced"`
 }
 
 type ReviewConfig struct {
@@ -55,12 +57,16 @@ type ReviewConfig struct {
 }
 
 type PatternConfig struct {
-	Name     string `json:"name"`
-	Pattern  string `json:"pattern"`
-	Weight   int    `json:"weight"`
-	Category string `json:"category,omitempty"`
-	Strict   bool   `json:"strict,omitempty"`
-	Enabled  *bool  `json:"enabled,omitempty"`
+	Name            string   `json:"name"`
+	Pattern         string   `json:"pattern"`
+	Weight          int      `json:"weight"`
+	Category        string   `json:"category,omitempty"`
+	Strict          bool     `json:"strict,omitempty"`
+	Enabled         *bool    `json:"enabled,omitempty"`
+	AllPatterns     []string `json:"all_patterns,omitempty"`
+	AnyPatterns     []string `json:"any_patterns,omitempty"`
+	ExcludePatterns []string `json:"exclude_patterns,omitempty"`
+	MinMatches      int      `json:"min_matches,omitempty"`
 }
 
 type Match struct {
@@ -71,22 +77,24 @@ type Match struct {
 }
 
 type Verdict struct {
-	Enabled        bool    `json:"enabled"`
-	Mode           string  `json:"mode"`
-	Action         string  `json:"action"`
-	Score          int     `json:"score"`
-	RawScore       int     `json:"raw_score"`
-	Threshold      int     `json:"threshold"`
-	StrictHit      bool    `json:"strict_hit"`
-	Matched        []Match `json:"matched"`
-	Reason         string  `json:"reason,omitempty"`
-	TextPreview    string  `json:"text_preview,omitempty"`
-	FullText       string  `json:"full_text,omitempty"`
-	ExtractedChars int     `json:"extracted_chars"`
-	Reviewed       bool    `json:"reviewed,omitempty"`
-	ReviewFlagged  bool    `json:"review_flagged,omitempty"`
-	ReviewError    string  `json:"review_error,omitempty"`
-	ReviewModel    string  `json:"review_model,omitempty"`
+	Enabled             bool    `json:"enabled"`
+	Mode                string  `json:"mode"`
+	Action              string  `json:"action"`
+	Score               int     `json:"score"`
+	RawScore            int     `json:"raw_score"`
+	Threshold           int     `json:"threshold"`
+	StrictHit           bool    `json:"strict_hit"`
+	TerminalStrictHit   bool    `json:"terminal_strict_hit"`
+	TerminalCategoryHit bool    `json:"terminal_category_hit"`
+	Matched             []Match `json:"matched"`
+	Reason              string  `json:"reason,omitempty"`
+	TextPreview         string  `json:"text_preview,omitempty"`
+	FullText            string  `json:"full_text,omitempty"`
+	ExtractedChars      int     `json:"extracted_chars"`
+	Reviewed            bool    `json:"reviewed,omitempty"`
+	ReviewFlagged       bool    `json:"review_flagged,omitempty"`
+	ReviewError         string  `json:"review_error,omitempty"`
+	ReviewModel         string  `json:"review_model,omitempty"`
 }
 
 type Engine struct {
@@ -100,6 +108,9 @@ type compiledPattern struct {
 	cfg      PatternConfig
 	re       *regexp.Regexp
 	requires []string
+	all      []*regexp.Regexp
+	any      []*regexp.Regexp
+	exclude  []*regexp.Regexp
 }
 
 type literalIndex struct {
@@ -119,6 +130,7 @@ func DefaultConfig() Config {
 		LogMatches:      true,
 		MaxTextLength:   DefaultMaxTextLength,
 		Review:          DefaultReviewConfig(),
+		Advanced:        DefaultAdvancedConfig(),
 	}
 }
 
@@ -214,6 +226,7 @@ func NormalizeConfig(cfg Config) Config {
 	}
 	cfg.DisabledPatterns = normalizePatternNames(cfg.DisabledPatterns)
 	cfg.Review = NormalizeReviewConfig(cfg.Review)
+	cfg.Advanced = NormalizeAdvancedConfig(cfg.Advanced)
 	return cfg
 }
 
@@ -235,29 +248,33 @@ func engineForConfig(cfg Config) (*Engine, error) {
 func engineCacheKey(cfg Config) string {
 	cfg = NormalizeConfig(cfg)
 	key := struct {
-		Enabled          bool            `json:"enabled"`
-		Mode             string          `json:"mode"`
-		Threshold        int             `json:"threshold"`
-		StrictThreshold  int             `json:"strict_threshold"`
-		LogMatches       bool            `json:"log_matches"`
-		MaxTextLength    int             `json:"max_text_length"`
-		SensitiveWords   string          `json:"sensitive_words"`
-		CustomPatterns   []PatternConfig `json:"custom_patterns"`
-		DisabledPatterns []string        `json:"disabled_patterns"`
+		Enabled               bool            `json:"enabled"`
+		Mode                  string          `json:"mode"`
+		Threshold             int             `json:"threshold"`
+		StrictThreshold       int             `json:"strict_threshold"`
+		StrictTerminalEnabled bool            `json:"strict_terminal_enabled"`
+		LogMatches            bool            `json:"log_matches"`
+		MaxTextLength         int             `json:"max_text_length"`
+		SensitiveWords        string          `json:"sensitive_words"`
+		CustomPatterns        []PatternConfig `json:"custom_patterns"`
+		DisabledPatterns      []string        `json:"disabled_patterns"`
+		Advanced              AdvancedConfig  `json:"advanced"`
 	}{
-		Enabled:          cfg.Enabled,
-		Mode:             cfg.Mode,
-		Threshold:        cfg.Threshold,
-		StrictThreshold:  cfg.StrictThreshold,
-		LogMatches:       cfg.LogMatches,
-		MaxTextLength:    cfg.MaxTextLength,
-		SensitiveWords:   cfg.SensitiveWords,
-		CustomPatterns:   cfg.CustomPatterns,
-		DisabledPatterns: cfg.DisabledPatterns,
+		Enabled:               cfg.Enabled,
+		Mode:                  cfg.Mode,
+		Threshold:             cfg.Threshold,
+		StrictThreshold:       cfg.StrictThreshold,
+		StrictTerminalEnabled: cfg.StrictTerminalEnabled,
+		LogMatches:            cfg.LogMatches,
+		MaxTextLength:         cfg.MaxTextLength,
+		SensitiveWords:        cfg.SensitiveWords,
+		CustomPatterns:        cfg.CustomPatterns,
+		DisabledPatterns:      cfg.DisabledPatterns,
+		Advanced:              cfg.Advanced,
 	}
 	data, err := json.Marshal(key)
 	if err != nil {
-		return fmt.Sprintf("%t|%s|%d|%d|%t|%d|%s|%s|%s", cfg.Enabled, cfg.Mode, cfg.Threshold, cfg.StrictThreshold, cfg.LogMatches, cfg.MaxTextLength, cfg.SensitiveWords, MarshalCustomPatterns(cfg.CustomPatterns), MarshalDisabledPatterns(cfg.DisabledPatterns))
+		return fmt.Sprintf("%t|%s|%d|%d|%t|%t|%d|%s|%s|%s|%s", cfg.Enabled, cfg.Mode, cfg.Threshold, cfg.StrictThreshold, cfg.StrictTerminalEnabled, cfg.LogMatches, cfg.MaxTextLength, cfg.SensitiveWords, MarshalCustomPatterns(cfg.CustomPatterns), MarshalDisabledPatterns(cfg.DisabledPatterns), MarshalAdvancedConfig(cfg.Advanced))
 	}
 	return string(data)
 }
@@ -273,7 +290,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 		pattern.Name = strings.TrimSpace(pattern.Name)
 		pattern.Pattern = strings.TrimSpace(pattern.Pattern)
 		pattern.Category = strings.TrimSpace(pattern.Category)
-		if pattern.Name == "" || pattern.Pattern == "" || pattern.Weight <= 0 {
+		if pattern.Name == "" || (pattern.Pattern == "" && len(pattern.AllPatterns) == 0 && len(pattern.AnyPatterns) == 0) || pattern.Weight <= 0 {
 			continue
 		}
 		if disabled[strings.ToLower(pattern.Name)] {
@@ -282,14 +299,45 @@ func NewEngine(cfg Config) (*Engine, error) {
 		if pattern.Enabled != nil && !*pattern.Enabled {
 			continue
 		}
-		re, err := regexp.Compile(pattern.Pattern)
+		var re *regexp.Regexp
+		var err error
+		if pattern.Pattern != "" {
+			re, err = regexp.Compile(pattern.Pattern)
+			if err != nil {
+				return nil, fmt.Errorf("compile pattern %q: %w", pattern.Name, err)
+			}
+		}
+		compileList := func(items []string) ([]*regexp.Regexp, error) {
+			out := make([]*regexp.Regexp, 0, len(items))
+			for _, item := range items {
+				if strings.TrimSpace(item) == "" {
+					return nil, fmt.Errorf("empty regex")
+				}
+				x, e := regexp.Compile(item)
+				if e != nil {
+					return nil, e
+				}
+				out = append(out, x)
+			}
+			return out, nil
+		}
+		all, err := compileList(pattern.AllPatterns)
 		if err != nil {
-			return nil, fmt.Errorf("compile pattern %q: %w", pattern.Name, err)
+			return nil, fmt.Errorf("compile all pattern %q: %w", pattern.Name, err)
+		}
+		any, err := compileList(pattern.AnyPatterns)
+		if err != nil {
+			return nil, fmt.Errorf("compile any pattern %q: %w", pattern.Name, err)
+		}
+		exclude, err := compileList(pattern.ExcludePatterns)
+		if err != nil {
+			return nil, fmt.Errorf("compile exclude pattern %q: %w", pattern.Name, err)
 		}
 		patterns = append(patterns, compiledPattern{
 			cfg:      pattern,
 			re:       re,
 			requires: patternRequires(pattern.Pattern),
+			all:      all, any: any, exclude: exclude,
 		})
 	}
 	sensitiveWords := parseSensitiveWords(cfg.SensitiveWords)
@@ -494,8 +542,9 @@ func (e *Engine) InspectText(text string) Verdict {
 		return verdict
 	}
 
-	scanText := normalizeForScan(limitScanText(text, cfg.MaxTextLength))
-	if utf8.RuneCountInString(scanText) < 3 {
+	limitedText := limitScanText(text, cfg.MaxTextLength)
+	scanTexts := scanViews(limitedText, cfg.Advanced.Normalization)
+	if len(scanTexts) == 0 {
 		return verdict
 	}
 
@@ -515,32 +564,38 @@ func (e *Engine) InspectText(text string) Verdict {
 	matchesByName := map[string]Match{}
 	rawScore := 0
 	strictScore := 0
-	literalHits := e.literalIndex.match(scanText)
-	for _, word := range e.sensitiveWords {
-		if word == "" {
-			continue
-		}
-		if literalMatched(scanText, literalHits, word) {
-			match := Match{Name: "sensitive_word", Weight: 100, Category: "sensitive_word", Strict: true}
-			_, context := matchContextFromLiteral(scanText, word)
-			recordContext(context)
-			matchesByName[match.Name+":"+word] = match
-		}
+	strictMatched := false
+	terminalCategoryMatched := false
+	terminalCategories := make(map[string]bool, len(cfg.Advanced.Enforcement.TerminalCategories))
+	for _, category := range cfg.Advanced.Enforcement.TerminalCategories {
+		terminalCategories[strings.ToLower(category)] = true
 	}
-	for _, pattern := range e.patterns {
-		if !patternShouldRun(scanText, pattern, literalHits) {
+	for _, scanText := range scanTexts {
+		if utf8.RuneCountInString(scanText) < 3 {
 			continue
 		}
-		if loc := pattern.re.FindStringIndex(scanText); loc != nil {
-			match := Match{
-				Name:     pattern.cfg.Name,
-				Weight:   pattern.cfg.Weight,
-				Category: pattern.cfg.Category,
-				Strict:   pattern.cfg.Strict,
+		literalHits := e.literalIndex.match(scanText)
+		for _, word := range e.sensitiveWords {
+			if word == "" {
+				continue
 			}
-			_, context := regexMatchContext(scanText, loc)
-			recordContext(context)
-			matchesByName[match.Name] = match
+			if literalMatched(scanText, literalHits, word) {
+				match := Match{Name: "sensitive_word", Weight: 100, Category: "sensitive_word", Strict: true}
+				_, context := matchContextFromLiteral(scanText, word)
+				recordContext(context)
+				matchesByName[match.Name+":"+word] = match
+			}
+		}
+		for _, pattern := range e.patterns {
+			if !patternShouldRun(scanText, pattern, literalHits) {
+				continue
+			}
+			if loc := compiledPatternMatchIndex(scanText, pattern); loc != nil {
+				match := Match{Name: pattern.cfg.Name, Weight: pattern.cfg.Weight, Category: pattern.cfg.Category, Strict: pattern.cfg.Strict}
+				_, context := regexMatchContext(scanText, loc)
+				recordContext(context)
+				matchesByName[match.Name] = match
+			}
 		}
 	}
 
@@ -550,6 +605,10 @@ func (e *Engine) InspectText(text string) Verdict {
 		rawScore += match.Weight
 		if match.Strict {
 			strictScore += match.Weight
+			strictMatched = true
+		}
+		if terminalCategories[strings.ToLower(strings.TrimSpace(match.Category))] {
+			terminalCategoryMatched = true
 		}
 	}
 	sort.Slice(matches, func(i, j int) bool {
@@ -561,16 +620,20 @@ func (e *Engine) InspectText(text string) Verdict {
 
 	score := rawScore
 	contextDiscount := 0
-	if rawScore > 0 {
-		contextDiscount = defensiveContextDiscount(scanText)
+	terminalCategoryHit := terminalCategoryMatched
+	terminalStrictHit := (cfg.StrictTerminalEnabled && strictMatched) || terminalCategoryHit
+	if rawScore > 0 && !terminalStrictHit {
+		contextDiscount = defensiveContextDiscount(limitedText)
 		score -= contextDiscount
 		if score < 0 {
 			score = 0
 		}
 	}
-	strictHit := strictScore >= cfg.StrictThreshold
+	strictHit := terminalStrictHit || strictScore >= cfg.StrictThreshold
 	action := ActionAllow
-	if score >= cfg.Threshold || strictHit {
+	if terminalStrictHit {
+		action = ActionBlock
+	} else if score >= cfg.Threshold || strictHit {
 		switch cfg.Mode {
 		case ModeBlock:
 			action = ActionBlock
@@ -585,6 +648,8 @@ func (e *Engine) InspectText(text string) Verdict {
 	verdict.Score = score
 	verdict.RawScore = rawScore
 	verdict.StrictHit = strictHit
+	verdict.TerminalStrictHit = terminalStrictHit
+	verdict.TerminalCategoryHit = terminalCategoryHit
 	verdict.Matched = matches
 	if len(matches) > 0 {
 		verdict.Reason = reasonForVerdict(action, score, cfg.Threshold, matches)
@@ -593,6 +658,48 @@ func (e *Engine) InspectText(text string) Verdict {
 		verdict.TextPreview = strings.Join(matchContexts, "\n---\n")
 	}
 	return verdict
+}
+
+func compiledPatternMatchIndex(text string, pattern compiledPattern) []int {
+	for _, re := range pattern.exclude {
+		if re.MatchString(text) {
+			return nil
+		}
+	}
+	first := []int(nil)
+	if pattern.re != nil {
+		first = pattern.re.FindStringIndex(text)
+		if first == nil {
+			return nil
+		}
+	}
+	for _, re := range pattern.all {
+		loc := re.FindStringIndex(text)
+		if loc == nil {
+			return nil
+		}
+		if first == nil || loc[0] < first[0] {
+			first = loc
+		}
+	}
+	matchedAny := 0
+	for _, re := range pattern.any {
+		loc := re.FindStringIndex(text)
+		if loc != nil {
+			matchedAny++
+			if first == nil || loc[0] < first[0] {
+				first = loc
+			}
+		}
+	}
+	minimum := pattern.cfg.MinMatches
+	if minimum <= 0 && len(pattern.any) > 0 {
+		minimum = 1
+	}
+	if matchedAny < minimum {
+		return nil
+	}
+	return first
 }
 
 func ExtractText(body []byte, endpoint string, maxLen int) string {
@@ -610,10 +717,16 @@ func ExtractText(body []byte, endpoint string, maxLen int) string {
 
 	switch endpoint {
 	case "chat", "chat_completions", "/v1/chat/completions":
-		addResultText(gjson.GetBytes(body, "messages"))
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
 	case "messages", "anthropic", "/v1/messages":
-		addResultText(gjson.GetBytes(body, "system"))
-		addResultText(gjson.GetBytes(body, "messages"))
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
+	case "response", "responses", "responses_compact", "/v1/responses", "/v1/responses/compact":
+		// Top-level instructions and non-user roles are application-owned
+		// context. Scanning them attributes platform safety and tool instructions
+		// to the end user, so only actual user prompt fields participate.
+		collectUserMessageText(gjson.GetBytes(body, "input"), &parts)
+		addResultText(gjson.GetBytes(body, "prompt"))
+		collectUserMessageText(gjson.GetBytes(body, "messages"), &parts)
 	case "image", "images", "images_generations", "images_edits", "/v1/images/generations", "/v1/images/edits":
 		addResultText(gjson.GetBytes(body, "prompt"))
 		addResultText(gjson.GetBytes(body, "style"))
@@ -624,6 +737,31 @@ func ExtractText(body []byte, endpoint string, maxLen int) string {
 		addResultText(gjson.GetBytes(body, "messages"))
 	}
 	return limitScanText(strings.Join(parts, "\n"), maxLen)
+}
+
+func collectUserMessageText(result gjson.Result, parts *[]string) {
+	if !result.Exists() || result.Type == gjson.Null {
+		return
+	}
+	if !result.IsArray() {
+		if result.IsObject() {
+			role := strings.ToLower(strings.TrimSpace(result.Get("role").String()))
+			if role != "" && role != "user" {
+				return
+			}
+		}
+		collectGJSONText(result, parts)
+		return
+	}
+	for _, item := range result.Array() {
+		if item.IsObject() {
+			role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+			if role != "" && role != "user" {
+				continue
+			}
+		}
+		collectGJSONText(item, parts)
+	}
 }
 
 func Preview(text string, maxRunes int) string {

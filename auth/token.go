@@ -138,10 +138,10 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 	// 解析 id_token 获取账号信息
 	info := parseIDToken(tokenResp.IDToken)
 
-	// 回退：如果 id_token 中缺少 plan_type，尝试从 access_token 提取
-	if info.PlanType == "" && tokenResp.AccessToken != "" {
+	// 回退：如果 id_token 中缺少字段，尝试从 access_token 提取
+	if tokenResp.AccessToken != "" && (info.PlanType == "" || info.SubscriptionExpiresAt.IsZero()) {
 		if atInfo := ParseAccessToken(tokenResp.AccessToken); atInfo != nil {
-			if atInfo.PlanType != "" {
+			if info.PlanType == "" && atInfo.PlanType != "" {
 				log.Printf("[token] id_token 缺少 plan_type，从 access_token 回退获取: %s", atInfo.PlanType)
 				info.PlanType = atInfo.PlanType
 			}
@@ -151,6 +151,9 @@ func RefreshAccessToken(ctx context.Context, refreshToken string, proxyURL strin
 			}
 			if info.ChatGPTAccountID == "" && atInfo.ChatGPTAccountID != "" {
 				info.ChatGPTAccountID = atInfo.ChatGPTAccountID
+			}
+			if info.SubscriptionExpiresAt.IsZero() && !atInfo.SubscriptionExpiresAt.IsZero() {
+				info.SubscriptionExpiresAt = atInfo.SubscriptionExpiresAt
 			}
 		}
 	}
@@ -271,6 +274,7 @@ func RefreshWithSessionToken(ctx context.Context, sessionToken string, proxyURL 
 		info.Email = atInfo.Email
 		info.ChatGPTAccountID = atInfo.ChatGPTAccountID
 		info.PlanType = atInfo.PlanType
+		info.SubscriptionExpiresAt = atInfo.SubscriptionExpiresAt
 	}
 	if info.Email == "" {
 		info.Email = strings.TrimSpace(sessionResp.User.Email)

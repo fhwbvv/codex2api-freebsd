@@ -2,7 +2,7 @@ import type { Dispatch, ReactNode, SetStateAction, TextareaHTMLAttributes } from
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { AlertTriangle, CheckCircle2, ChevronDown, HelpCircle, Pencil, Plus, Power, PowerOff, RefreshCw, Save, Search, ShieldAlert, Trash2, Wand2, X } from 'lucide-react'
+import { Activity, AlertTriangle, BookOpen, CheckCircle2, ChevronDown, ClipboardCheck, Copy, FileText, Gauge, GitBranch, HelpCircle, KeyRound, Layers, ListChecks, Network, Pencil, Plus, Power, PowerOff, RefreshCw, Save, Search, Shield, ShieldAlert, Sparkles, Trash2, Wand2, X } from 'lucide-react'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
@@ -12,7 +12,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
-import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, SystemSettings } from '../types'
+import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, PromptIntelligenceCandidate, PromptIntelligenceRun, SystemSettings } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -25,7 +25,9 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { DraftNumberInput } from '@/components/ui/draft-number-input'
 import { Select } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import {
   Table,
   TableBody,
@@ -34,9 +36,10 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 
-const PROMPT_FILTER_VIEWS = ['overview', 'logs', 'rules'] as const
+const PROMPT_FILTER_VIEWS = ['overview', 'logs', 'rules', 'intelligence', 'docs'] as const
 const HIT_START_MARKER = '⟦PF_HIT⟧'
 const HIT_END_MARKER = '⟦/PF_HIT⟧'
 type PromptFilterView = typeof PROMPT_FILTER_VIEWS[number]
@@ -47,6 +50,8 @@ type PromptFilterForm = Pick<
   | 'prompt_filter_mode'
   | 'prompt_filter_threshold'
   | 'prompt_filter_strict_threshold'
+  | 'prompt_filter_strict_terminal_enabled'
+  | 'prompt_filter_advanced_config'
   | 'prompt_filter_log_matches'
   | 'prompt_filter_max_text_length'
   | 'prompt_filter_sensitive_words'
@@ -86,11 +91,48 @@ type CustomRuleDraft = {
   strict: boolean
 }
 
+type AdvancedProtectionConfig = {
+  enforcement: { terminal_categories: string[] }
+  normalization: { enabled: boolean; decode_url: boolean; decode_html: boolean; decode_base64: boolean; max_decode_runs: number }
+  risk: { enabled: boolean; window_seconds: number; block_threshold: number; review_threshold: number; user_weight_percent: number; ip_weight_percent: number; session_weight_percent: number }
+  sidecar: { enabled: boolean; base_url: string; timeout_seconds: number; fail_closed: boolean; min_score: number }
+  output: { enabled: boolean; buffer_bytes: number; overlap_bytes: number; strict_only: boolean }
+  intelligence: { enabled: boolean; interval_hours: number; queries: string[]; max_search_results: number; model_enabled: boolean; model: string; max_model_calls: number; auto_add: boolean }
+  newapi: { enabled: boolean; max_clock_skew_seconds: number; offense_window_seconds: number; ban_after: number }
+}
+
+const defaultAdvancedProtection: AdvancedProtectionConfig = {
+  enforcement: { terminal_categories: [] },
+  normalization: { enabled: false, decode_url: false, decode_html: false, decode_base64: false, max_decode_runs: 1 },
+  risk: { enabled: false, window_seconds: 600, block_threshold: 100, review_threshold: 60, user_weight_percent: 50, ip_weight_percent: 30, session_weight_percent: 20 },
+  sidecar: { enabled: false, base_url: '', timeout_seconds: 3, fail_closed: true, min_score: 30 },
+  output: { enabled: false, buffer_bytes: 4096, overlap_bytes: 512, strict_only: true },
+  intelligence: { enabled: false, interval_hours: 24, queries: ['LLM jailbreak prompt injection', 'ChatGPT jailbreak prompt', 'Codex prompt injection jailbreak', '大模型 破限 提示词', 'GPT 破甲 提示词', 'AI 越狱 提示词', '中文 prompt injection 绕过'], max_search_results: 20, model_enabled: false, model: 'gpt-5.4', max_model_calls: 1, auto_add: false },
+  newapi: { enabled: false, max_clock_skew_seconds: 120, offense_window_seconds: 86400, ban_after: 2 },
+}
+
+function parseAdvancedProtection(raw: string): AdvancedProtectionConfig {
+  try {
+    const value = JSON.parse(raw || '{}')
+    return {
+      enforcement: { ...defaultAdvancedProtection.enforcement, ...(value.enforcement || {}) },
+      normalization: { ...defaultAdvancedProtection.normalization, ...(value.normalization || {}) },
+      risk: { ...defaultAdvancedProtection.risk, ...(value.risk || {}) },
+      sidecar: { ...defaultAdvancedProtection.sidecar, ...(value.sidecar || {}) },
+      output: { ...defaultAdvancedProtection.output, ...(value.output || {}) },
+      intelligence: { ...defaultAdvancedProtection.intelligence, ...(value.intelligence || {}) },
+      newapi: { ...defaultAdvancedProtection.newapi, ...(value.newapi || {}) },
+    }
+  } catch { return defaultAdvancedProtection }
+}
+
 const defaultForm: PromptFilterForm = {
   prompt_filter_enabled: false,
   prompt_filter_mode: 'monitor',
   prompt_filter_threshold: 50,
   prompt_filter_strict_threshold: 90,
+  prompt_filter_strict_terminal_enabled: false,
+  prompt_filter_advanced_config: '{}',
   prompt_filter_log_matches: true,
   prompt_filter_max_text_length: 81920,
   prompt_filter_sensitive_words: '',
@@ -153,6 +195,8 @@ const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilt
   prompt_filter_mode: settings?.prompt_filter_mode || 'monitor',
   prompt_filter_threshold: settings?.prompt_filter_threshold || 50,
   prompt_filter_strict_threshold: settings?.prompt_filter_strict_threshold || 90,
+  prompt_filter_strict_terminal_enabled: Boolean(settings?.prompt_filter_strict_terminal_enabled),
+  prompt_filter_advanced_config: settings?.prompt_filter_advanced_config || '{}',
   prompt_filter_log_matches: settings?.prompt_filter_log_matches ?? true,
   prompt_filter_max_text_length: settings?.prompt_filter_max_text_length || 81920,
   prompt_filter_sensitive_words: settings?.prompt_filter_sensitive_words || '',
@@ -393,6 +437,10 @@ export default function PromptFilter() {
           />
         ) : null}
 
+        {activeView === 'intelligence' ? <IntelligenceView /> : null}
+
+        {activeView === 'docs' ? <DocsView /> : null}
+
       </>
     </StateShell>
   )
@@ -404,14 +452,21 @@ function PromptFilterTabs({ activeView }: { activeView: PromptFilterView }) {
     { view: 'overview' as const, label: t('promptFilter.views.overview'), to: '/prompt-filter/overview' },
     { view: 'logs' as const, label: t('promptFilter.views.logs'), to: '/prompt-filter/logs' },
     { view: 'rules' as const, label: t('promptFilter.views.rules'), to: '/prompt-filter/rules' },
+    { view: 'intelligence' as const, label: t('promptFilter.views.intelligence'), to: '/prompt-filter/intelligence' },
+    { view: 'docs' as const, label: t('promptFilter.views.docs'), to: '/prompt-filter/docs' },
   ]
+  const tabCount = tabs.length
   const activeIndex = Math.max(0, tabs.findIndex((tab) => tab.view === activeView))
   return (
     <div className="mb-5 flex justify-center">
-      <div className="relative grid w-full max-w-[560px] grid-cols-3 rounded-2xl border border-border bg-background/80 p-1 shadow-sm backdrop-blur-lg" role="tablist">
+      <div
+        className="relative grid w-full max-w-[900px] rounded-2xl border border-border bg-background/80 p-1 shadow-sm backdrop-blur-lg"
+        style={{ gridTemplateColumns: `repeat(${tabCount}, minmax(0, 1fr))` }}
+        role="tablist"
+      >
         <div
           className="pointer-events-none absolute left-1 top-1 h-[calc(100%-0.5rem)] rounded-xl border border-primary/15 bg-primary/8 transition-transform duration-300 ease-out"
-          style={{ width: 'calc((100% - 0.5rem) / 3)', transform: `translateX(${activeIndex * 100}%)` }}
+          style={{ width: `calc((100% - 0.5rem) / ${tabCount})`, transform: `translateX(${activeIndex * 100}%)` }}
         />
         {tabs.map((tab) => (
           <NavLink
@@ -419,7 +474,7 @@ function PromptFilterTabs({ activeView }: { activeView: PromptFilterView }) {
             to={tab.to}
             role="tab"
             aria-selected={activeView === tab.view}
-            className={`relative z-10 flex h-9 items-center justify-center rounded-xl px-3 text-sm font-semibold transition-colors ${
+            className={`relative z-10 flex h-9 items-center justify-center rounded-xl px-2 text-sm font-semibold transition-colors sm:px-3 ${
               activeView === tab.view ? 'text-primary' : 'text-muted-foreground hover:text-foreground'
             }`}
           >
@@ -427,6 +482,1080 @@ function PromptFilterTabs({ activeView }: { activeView: PromptFilterView }) {
           </NavLink>
         ))}
       </div>
+    </div>
+  )
+}
+
+function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const { t } = useTranslation()
+  const [generatedNewAPISecret, setGeneratedNewAPISecret] = useState('')
+  const [secretCopied, setSecretCopied] = useState(false)
+  const [secretStatus, setSecretStatus] = useState<{ configured: boolean; source: string; masked: string }>({ configured: false, source: 'none', masked: '' })
+  const [secretSaving, setSecretSaving] = useState(false)
+  const [secretError, setSecretError] = useState('')
+  const [secretRevealOpen, setSecretRevealOpen] = useState(false)
+  const [secretCloseConfirmOpen, setSecretCloseConfirmOpen] = useState(false)
+  const config = useMemo(() => parseAdvancedProtection(value), [value])
+  const update = <K extends keyof AdvancedProtectionConfig>(section: K, patch: Partial<AdvancedProtectionConfig[K]>) => {
+    onChange(JSON.stringify({ ...config, [section]: { ...config[section], ...patch } }))
+  }
+  const setBool = <K extends keyof AdvancedProtectionConfig>(section: K, key: string, next: boolean) => {
+    update(section, { [key]: next } as never)
+  }
+  useEffect(() => { void api.getPromptFilterNewAPISecret().then(setSecretStatus).catch(() => undefined) }, [])
+  const generateNewAPISecret = async () => {
+    if (secretStatus.source === 'environment') return
+    setSecretSaving(true); setSecretError('')
+    try {
+      const result = await api.generatePromptFilterNewAPISecret()
+      setGeneratedNewAPISecret(result.secret); setSecretStatus(result); setSecretCopied(false); setSecretRevealOpen(true)
+    } catch (error) { setSecretError(getErrorMessage(error)) } finally { setSecretSaving(false) }
+  }
+  const copyNewAPISecret = async () => {
+    if (!generatedNewAPISecret) return
+    await navigator.clipboard.writeText(generatedNewAPISecret)
+    setSecretCopied(true)
+  }
+  const requestCloseSecretReveal = () => {
+    if (!generatedNewAPISecret) { setSecretRevealOpen(false); return }
+    setSecretCloseConfirmOpen(true)
+  }
+  const confirmCloseSecretReveal = () => {
+    setSecretCloseConfirmOpen(false)
+    setSecretRevealOpen(false)
+    setGeneratedNewAPISecret('')
+    setSecretCopied(false)
+  }
+  const terminalCategoriesText = config.enforcement.terminal_categories.join(', ')
+  const queryCount = config.intelligence.queries.length
+
+  return (
+    <div className="space-y-3">
+      <SectionTitle title={t('promptFilter.advancedVisualTitle')} />
+
+      {/* Core defense: compact 2×2 dashboard — equal-height cards, unified control grid */}
+      <div className="grid gap-3 lg:grid-cols-2">
+        <AdvancedPanel title={t('promptFilter.normalizationTitle')}>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-3">
+            <SwitchField
+              label={t('promptFilter.enabled')}
+              hint={t('promptFilter.help.normalizationEnabled')}
+              checked={config.normalization.enabled}
+              onCheckedChange={(next) => setBool('normalization', 'enabled', next)}
+            />
+            <CompactField label={t('promptFilter.decodeRuns')} hint={t('promptFilter.help.decodeRuns')}>
+              <DraftNumberInput min={1} max={2} value={config.normalization.max_decode_runs} onValueChange={(v) => update('normalization', { max_decode_runs: v })} />
+            </CompactField>
+            <SwitchField
+              label="URL Decode"
+              hint={t('promptFilter.help.decodeUrl')}
+              checked={config.normalization.decode_url}
+              onCheckedChange={(next) => setBool('normalization', 'decode_url', next)}
+            />
+            <SwitchField
+              label="HTML Decode"
+              hint={t('promptFilter.help.decodeHtml')}
+              checked={config.normalization.decode_html}
+              onCheckedChange={(next) => setBool('normalization', 'decode_html', next)}
+            />
+            <SwitchField
+              label="Base64 Decode"
+              hint={t('promptFilter.help.decodeBase64')}
+              checked={config.normalization.decode_base64}
+              onCheckedChange={(next) => setBool('normalization', 'decode_base64', next)}
+            />
+          </div>
+        </AdvancedPanel>
+
+        <AdvancedPanel title={t('promptFilter.terminalCategories')}>
+          <CompactField label={t('promptFilter.terminalCategories')} hint={t('promptFilter.help.terminalCategories')}>
+            <Input
+              value={terminalCategoriesText}
+              placeholder="reverse_engineering, malware"
+              onChange={(e) => update('enforcement', {
+                terminal_categories: e.target.value.split(',').map((item) => item.trim()).filter(Boolean),
+              })}
+            />
+          </CompactField>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalCategoriesHint')}</p>
+        </AdvancedPanel>
+
+        <AdvancedPanel title={t('promptFilter.riskTitle')}>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
+            <SwitchField
+              label={t('promptFilter.enabled')}
+              hint={t('promptFilter.help.riskEnabled')}
+              checked={config.risk.enabled}
+              onCheckedChange={(next) => setBool('risk', 'enabled', next)}
+            />
+            <CompactField label={t('promptFilter.riskWindow')} hint={t('promptFilter.help.riskWindow')}>
+              <DraftNumberInput min={60} max={86400} value={config.risk.window_seconds} onValueChange={(v) => update('risk', { window_seconds: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.blockThreshold')} hint={t('promptFilter.help.blockThreshold')}>
+              <DraftNumberInput min={1} max={1000} value={config.risk.block_threshold} onValueChange={(v) => update('risk', { block_threshold: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.reviewThreshold')} hint={t('promptFilter.help.reviewThreshold')}>
+              <DraftNumberInput min={1} max={1000} value={config.risk.review_threshold} onValueChange={(v) => update('risk', { review_threshold: v })} />
+            </CompactField>
+          </div>
+        </AdvancedPanel>
+
+        <AdvancedPanel title={t('promptFilter.outputScanTitle')}>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
+            <SwitchField
+              label={t('promptFilter.enabled')}
+              hint={t('promptFilter.help.outputEnabled')}
+              checked={config.output.enabled}
+              onCheckedChange={(next) => setBool('output', 'enabled', next)}
+            />
+            <SwitchField
+              label={t('promptFilter.strictOnly')}
+              hint={t('promptFilter.help.strictOnly')}
+              checked={config.output.strict_only}
+              onCheckedChange={(next) => setBool('output', 'strict_only', next)}
+            />
+            <CompactField label={t('promptFilter.bufferBytes')} hint={t('promptFilter.help.bufferBytes')}>
+              <DraftNumberInput min={512} max={65536} value={config.output.buffer_bytes} onValueChange={(v) => update('output', { buffer_bytes: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.overlapBytes')} hint={t('promptFilter.help.overlapBytes')}>
+              <DraftNumberInput min={64} max={16384} value={config.output.overlap_bytes} onValueChange={(v) => update('output', { overlap_bytes: v })} />
+            </CompactField>
+          </div>
+        </AdvancedPanel>
+      </div>
+
+      {/* Integration row: NewAPI + Intelligence — matched structure & equal height */}
+      <div className="grid gap-3 xl:grid-cols-2">
+        <AdvancedPanel
+          title={t('promptFilter.newapi.title')}
+          hint={t('promptFilter.newapi.description')}
+          footer={(
+            <details className="group rounded-lg border border-foreground/10 bg-muted/10 open:bg-muted/15 dark:border-foreground/15">
+              <summary className="flex h-9 cursor-pointer list-none items-center justify-between gap-2 px-3 text-sm font-medium marker:content-none [&::-webkit-details-marker]:hidden">
+                <span>{t('promptFilter.newapi.protocolTitle')}</span>
+                <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+              </summary>
+              <div className="space-y-4 border-t border-foreground/8 px-3 py-3">
+                <div className="grid gap-4 lg:grid-cols-2">
+                  <div className="space-y-2">
+                    <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.newapi.codexEnv')}</div>
+                    <SoftCodeBlock>{t('promptFilter.newapi.codexSecretExample')}</SoftCodeBlock>
+                    <p className="text-xs leading-relaxed text-muted-foreground">{t('promptFilter.newapi.secretStorageHint')}</p>
+                    <div className="rounded-lg border border-foreground/10 bg-background/80 p-3">
+                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 text-sm font-medium"><KeyRound className="size-4 text-muted-foreground" />{t('promptFilter.newapi.generator')}</div>
+                        <Button type="button" size="sm" variant="outline" disabled={secretSaving || secretStatus.source === 'environment'} onClick={() => void generateNewAPISecret()}>
+                          <RefreshCw className={`size-3.5 ${secretSaving ? 'animate-spin' : ''}`} />
+                          {secretStatus.configured ? t('promptFilter.newapi.replaceSecret') : t('promptFilter.newapi.generateSecret')}
+                        </Button>
+                      </div>
+                      {secretError ? <p className="text-xs text-destructive">{secretError}</p> : null}
+                      <p className="text-xs text-muted-foreground">
+                        {secretStatus.configured
+                          ? t('promptFilter.newapi.secretConfigured', {
+                              masked: secretStatus.masked,
+                              source: secretStatus.source === 'environment' ? t('promptFilter.newapi.environment') : t('promptFilter.newapi.database'),
+                            })
+                          : t('promptFilter.newapi.secretUnconfigured')}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.newapi.newapiEnv')}</div>
+                    <SoftCodeBlock>{t('promptFilter.newapi.newapiEnvExample')}</SoftCodeBlock>
+                  </div>
+                  <div className="space-y-2 lg:col-span-2">
+                    <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.newapi.headersTitle')}</div>
+                    <SoftCodeBlock>{t('promptFilter.newapi.headersExample')}</SoftCodeBlock>
+                    <p className="text-xs leading-relaxed text-muted-foreground">{t('promptFilter.newapi.signatureHint')}</p>
+                  </div>
+                </div>
+              </div>
+            </details>
+          )}
+        >
+          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
+            <SwitchField
+              label={t('promptFilter.newapi.enabled')}
+              hint={t('promptFilter.newapi.enabledHint')}
+              checked={config.newapi.enabled}
+              onCheckedChange={(next) => setBool('newapi', 'enabled', next)}
+            />
+            <CompactField label={t('promptFilter.newapi.clockSkew')} hint={t('promptFilter.newapi.clockSkewHint')}>
+              <DraftNumberInput min={30} max={600} value={config.newapi.max_clock_skew_seconds} onValueChange={(v) => update('newapi', { max_clock_skew_seconds: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.newapi.offenseWindow')} hint={t('promptFilter.newapi.offenseWindowHint')}>
+              <DraftNumberInput min={60} max={2592000} value={config.newapi.offense_window_seconds} onValueChange={(v) => update('newapi', { offense_window_seconds: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.newapi.banAfter')} hint={t('promptFilter.newapi.banAfterHint')}>
+              <DraftNumberInput min={2} max={10} value={config.newapi.ban_after} onValueChange={(v) => update('newapi', { ban_after: v })} />
+            </CompactField>
+          </div>
+        </AdvancedPanel>
+
+        <AdvancedPanel
+          title={t('promptFilter.intelligence.configTitle')}
+          footer={(
+            <details className="group rounded-md border border-foreground/15 bg-muted/15 open:bg-muted/25 dark:border-foreground/20">
+              <summary className="flex h-9 cursor-pointer list-none items-center justify-between gap-2 px-3 text-sm font-medium marker:content-none [&::-webkit-details-marker]:hidden">
+                <span className="flex items-center gap-2">
+                  {t('promptFilter.intelligence.queries')}
+                  <Badge variant="outline" className="h-5 font-normal">{queryCount}</Badge>
+                </span>
+                <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+              </summary>
+              <div className="space-y-3 border-t px-3 py-3">
+                <CompactField label={t('promptFilter.intelligence.queries')} hint={t('promptFilter.help.queries')}>
+                  <Textarea
+                    rows={3}
+                    value={config.intelligence.queries.join('\n')}
+                    placeholder="LLM jailbreak prompt injection"
+                    onChange={(e) => update('intelligence', {
+                      queries: e.target.value.split('\n').map((item) => item.trim()).filter(Boolean),
+                    })}
+                  />
+                </CompactField>
+                <div className="rounded-md bg-muted/50 p-2.5">
+                  <div className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                    {t('promptFilter.intelligence.builtinQueries')}
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {['LLM jailbreak prompt injection', 'ChatGPT jailbreak prompt', 'Codex prompt injection jailbreak', '大模型 破限 提示词', 'GPT 破甲 提示词', 'AI 越狱 提示词', '中文 prompt injection 绕过'].map((query) => (
+                      <Badge key={query} variant="outline" className="text-[11px] font-normal">{query}</Badge>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </details>
+          )}
+        >
+          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
+            <SwitchField
+              label={t('promptFilter.intelligence.scheduleEnabled')}
+              hint={t('promptFilter.help.scheduleEnabled')}
+              checked={config.intelligence.enabled}
+              onCheckedChange={(next) => setBool('intelligence', 'enabled', next)}
+            />
+            <CompactField label={t('promptFilter.intelligence.intervalHours')} hint={t('promptFilter.help.intervalHours')}>
+              <DraftNumberInput min={1} max={720} value={config.intelligence.interval_hours} onValueChange={(v) => update('intelligence', { interval_hours: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.intelligence.maxResults')} hint={t('promptFilter.help.maxResults')}>
+              <DraftNumberInput min={1} max={100} value={config.intelligence.max_search_results} onValueChange={(v) => update('intelligence', { max_search_results: v })} />
+            </CompactField>
+            <SwitchField
+              label={t('promptFilter.intelligence.modelEnabled')}
+              hint={t('promptFilter.help.modelEnabled')}
+              checked={config.intelligence.model_enabled}
+              onCheckedChange={(next) => setBool('intelligence', 'model_enabled', next)}
+            />
+            <CompactField label={t('promptFilter.intelligence.model')} hint={t('promptFilter.help.model')}>
+              <Input value={config.intelligence.model} onChange={(e) => update('intelligence', { model: e.target.value })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.intelligence.maxModelCalls')} hint={t('promptFilter.help.maxModelCalls')}>
+              <DraftNumberInput min={0} max={3} value={config.intelligence.max_model_calls} onValueChange={(v) => update('intelligence', { max_model_calls: v })} />
+            </CompactField>
+            <SwitchField
+              label={t('promptFilter.intelligence.autoAdd')}
+              hint={t('promptFilter.help.autoAdd')}
+              checked={config.intelligence.auto_add}
+              onCheckedChange={(next) => setBool('intelligence', 'auto_add', next)}
+            />
+          </div>
+        </AdvancedPanel>
+      </div>
+
+      <Dialog open={secretRevealOpen} onOpenChange={(open) => { if (!open) requestCloseSecretReveal() }}>
+        <DialogContent className="sm:max-w-2xl" onEscapeKeyDown={(event) => { event.preventDefault(); requestCloseSecretReveal() }} onPointerDownOutside={(event) => { event.preventDefault(); requestCloseSecretReveal() }}>
+          <DialogHeader>
+            <DialogTitle>{t('promptFilter.newapi.revealTitle')}</DialogTitle>
+            <DialogDescription>{t('promptFilter.newapi.revealDescription')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="flex gap-2">
+              <Input readOnly value={generatedNewAPISecret} className="font-mono text-xs" />
+              <Button type="button" variant="outline" onClick={() => void copyNewAPISecret()}>
+                <Copy className="size-4" />
+                {secretCopied ? t('promptFilter.newapi.copied') : t('promptFilter.newapi.copySecret')}
+              </Button>
+            </div>
+            <SoftCodeBlock>{`CODEX2API_POLICY_SECRET=${generatedNewAPISecret}`}</SoftCodeBlock>
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+              {t('promptFilter.newapi.revealWarning')}
+            </div>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={requestCloseSecretReveal}>{t('promptFilter.newapi.close')}</Button>
+            <Button type="button" onClick={() => void copyNewAPISecret()}>
+              <Copy className="size-4" />
+              {secretCopied ? t('promptFilter.newapi.copied') : t('promptFilter.newapi.copyAndConfigure')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={secretCloseConfirmOpen} onOpenChange={setSecretCloseConfirmOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t('promptFilter.newapi.closeConfirmTitle')}</DialogTitle>
+            <DialogDescription>{t('promptFilter.newapi.closeConfirmDescription')}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setSecretCloseConfirmOpen(false)}>{t('promptFilter.newapi.backToCopy')}</Button>
+            <Button type="button" variant="destructive" onClick={confirmCloseSecretReveal}>{t('promptFilter.newapi.confirmClose')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
+
+function FieldHint({ label, hint }: { label: string; hint?: string }) {
+  if (!hint) return null
+  return (
+    <TooltipProvider delayDuration={150}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button type="button" aria-label={`${label} help`} className="shrink-0 text-muted-foreground hover:text-primary" onClick={(event) => event.preventDefault()}>
+            <HelpCircle className="size-3" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-[320px] whitespace-normal leading-relaxed">{hint}</TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
+function AdvancedPanel({
+  title,
+  hint,
+  children,
+  footer,
+}: {
+  title: string
+  hint?: string
+  children: ReactNode
+  footer?: ReactNode
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-3 rounded-lg border border-foreground/15 bg-background p-3.5 shadow-sm dark:border-foreground/20">
+      <div className="flex h-5 items-center gap-1.5">
+        <h3 className="text-sm font-semibold leading-none text-foreground">{title}</h3>
+        <FieldHint label={title} hint={hint} />
+      </div>
+      <div className="min-w-0 flex-1">{children}</div>
+      {footer ? <div className="mt-auto min-w-0">{footer}</div> : null}
+    </div>
+  )
+}
+
+function SoftCodeBlock({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <pre
+      className={cn(
+        'overflow-x-auto rounded-lg border border-foreground/10 bg-muted/40 p-3 font-mono text-xs leading-6 text-foreground/85 shadow-none',
+        'dark:border-foreground/12 dark:bg-muted/30 dark:text-foreground/80',
+        className,
+      )}
+    >
+      <code className="whitespace-pre-wrap break-all">{children}</code>
+    </pre>
+  )
+}
+
+function CompactField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+    <label className="flex min-w-0 flex-col gap-1.5">
+      <span className="flex h-4 items-center gap-1 truncate text-xs font-medium leading-none text-muted-foreground">
+        <span className="truncate">{label}</span>
+        <FieldHint label={label} hint={hint} />
+      </span>
+      <div className="min-w-0 [&_input]:h-9 [&_input]:border-foreground/15 [&_input]:shadow-none dark:[&_input]:border-foreground/20">
+        {children}
+      </div>
+    </label>
+  )
+}
+
+function SwitchField({
+  label,
+  hint,
+  checked,
+  onCheckedChange,
+}: {
+  label: string
+  hint?: string
+  checked: boolean
+  onCheckedChange: (checked: boolean) => void
+}) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <span className="flex h-4 items-center gap-1 truncate text-xs font-medium leading-none text-muted-foreground">
+        <span className="truncate">{label}</span>
+        <FieldHint label={label} hint={hint} />
+      </span>
+      <div className="flex h-9 items-center rounded-md border border-foreground/15 bg-transparent px-3 dark:border-foreground/20 dark:bg-input/30">
+        <Switch checked={checked} onCheckedChange={onCheckedChange} />
+      </div>
+    </div>
+  )
+}
+
+function IntelligenceView() {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [running, setRunning] = useState(false)
+  const [adding, setAdding] = useState('')
+  const [result, setResult] = useState<PromptIntelligenceRun | null>(null)
+  const [history, setHistory] = useState<PromptIntelligenceRun[]>([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+
+  const loadHistory = useCallback(async () => {
+    setHistoryLoading(true)
+    try { setHistory((await api.getPromptIntelligenceHistory(1, 20)).runs) } catch (error) { showToast(getErrorMessage(error), 'error') } finally { setHistoryLoading(false) }
+  }, [showToast])
+
+  useEffect(() => { void loadHistory() }, [loadHistory])
+
+  const run = async () => {
+    setRunning(true)
+    try {
+      const value = await api.runPromptIntelligence()
+      setResult(value)
+      await loadHistory()
+      showToast(t('promptFilter.intelligence.runSuccess', { count: value.candidates.length }))
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  const add = async (candidate: PromptIntelligenceCandidate) => {
+    setAdding(candidate.name)
+    try {
+      const value = await api.addPromptIntelligenceRule(candidate)
+      showToast(value.updated ? t('promptFilter.intelligence.updateSuccess') : value.added ? t('promptFilter.intelligence.addSuccess') : t('promptFilter.intelligence.alreadyExists'))
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setAdding('')
+    }
+  }
+
+  return (
+    <div className="space-y-5">
+      <Card>
+        <CardContent className="p-5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h2 className="text-base font-semibold">{t('promptFilter.intelligence.title')}</h2>
+              <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{t('promptFilter.intelligence.description')}</p>
+            </div>
+            <Button onClick={() => void run()} disabled={running}>
+              <Search className="size-4" />
+              {running ? t('promptFilter.intelligence.running') : t('promptFilter.intelligence.run')}
+            </Button>
+          </div>
+          <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-muted-foreground">
+            {t('promptFilter.intelligence.auditHint')}
+          </div>
+        </CardContent>
+      </Card>
+
+      {result ? (
+        <Card>
+          <CardContent className="p-5">
+            <div className="mb-4 flex flex-wrap gap-3 text-sm text-muted-foreground">
+              <span>{t('promptFilter.intelligence.sources')}: {result.sources.length}</span>
+              <span>{t('promptFilter.intelligence.modelCalls')}: {result.model_calls}</span>
+              <span>{t('promptFilter.intelligence.candidates')}: {result.candidates.length}</span>
+              <span>{t('promptFilter.intelligence.autoAdded')}: {result.added}</span>
+            </div>
+            {result.errors.length ? <div className="mb-4 rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{result.errors.join('；')}</div> : null}
+            <Table>
+              <TableHeader><TableRow><TableHead>{t('promptFilter.intelligence.rule')}</TableHead><TableHead>{t('promptFilter.intelligence.category')}</TableHead><TableHead>{t('promptFilter.intelligence.weight')}</TableHead><TableHead>{t('promptFilter.intelligence.reason')}</TableHead><TableHead className="text-right">{t('common.actions')}</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {result.candidates.map((candidate) => (
+                  <TableRow key={`${candidate.name}-${candidate.pattern}`}>
+                    <TableCell><div className="flex items-center gap-2 font-medium">{candidate.name}<Badge variant="outline" className={candidate.status === 'update' ? 'border-amber-500/40 text-amber-600' : 'border-emerald-500/40 text-emerald-600'}>{candidate.status === 'update' ? t('promptFilter.intelligence.update') : t('promptFilter.intelligence.new')}</Badge></div><code className="mt-1 block max-w-md break-all text-xs text-muted-foreground">{candidate.pattern}</code></TableCell>
+                    <TableCell>{candidate.category}</TableCell><TableCell>{candidate.weight}{candidate.strict ? ' / strict' : ''}</TableCell>
+                    <TableCell className="max-w-sm text-sm text-muted-foreground">{candidate.rationale || '-'}</TableCell>
+                    <TableCell className="text-right"><Button size="sm" variant="outline" disabled={adding === candidate.name} onClick={() => void add(candidate)}>{candidate.status === 'update' ? t('promptFilter.intelligence.updateRule') : t('promptFilter.intelligence.addRule')}</Button></TableCell>
+                  </TableRow>
+                ))}
+                {!result.candidates.length ? <TableRow><TableCell colSpan={5} className="py-8 text-center text-muted-foreground">{t('promptFilter.intelligence.noCandidates')}</TableCell></TableRow> : null}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      <Card>
+        <CardContent className="p-5">
+          <div className="mb-4 flex items-center justify-between"><div><h2 className="text-base font-semibold">{t('promptFilter.intelligence.historyTitle')}</h2><p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.intelligence.historyDesc')}</p></div><Button variant="outline" size="sm" onClick={() => void loadHistory()} disabled={historyLoading}><RefreshCw className="size-4" />{t('common.refresh')}</Button></div>
+          <div className="space-y-3">
+            {history.map((run, index) => <div key={`${run.started_at}-${index}`} className="rounded-lg border p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div className="font-medium">{formatBeijingTime(run.started_at)}</div><div className="flex gap-2"><Badge variant="outline">{t('promptFilter.intelligence.sources')} {run.sources.length}</Badge><Badge variant="outline">{t('promptFilter.intelligence.candidates')} {run.candidates.length}</Badge><Badge variant="outline">{t('promptFilter.intelligence.modelCalls')} {run.model_calls}</Badge></div></div><div className="mt-3 grid gap-2 md:grid-cols-2">{run.sources.map((source) => <a key={source.url} href={source.url} target="_blank" rel="noreferrer" className="rounded-md bg-muted/40 p-2 text-sm hover:text-primary"><div className="font-medium">{source.title}</div><div className="truncate text-xs text-muted-foreground">{source.url}</div></a>)}</div>{run.errors.length ? <div className="mt-3 text-sm text-destructive">{run.errors.join('；')}</div> : null}</div>)}
+            {!historyLoading && !history.length ? <div className="py-8 text-center text-muted-foreground">{t('promptFilter.intelligence.noHistory')}</div> : null}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+type DocsSectionKind = 'default' | 'pipeline' | 'pages' | 'modes' | 'features' | 'checklist'
+
+type DocsSection = {
+  id: string
+  group: 'intro' | 'setup' | 'core' | 'ops'
+  kind: DocsSectionKind
+  title: string
+  icon: ReactNode
+  paragraphs?: string[]
+  bullets?: string[]
+  steps?: string[]
+  callout?: string
+  table?: { headers: string[]; rows: string[][] }
+  cards?: { title: string; body: string; tone?: 'neutral' | 'warn' | 'danger' | 'success' }[]
+}
+
+const DOCS_GROUP_ORDER = ['intro', 'setup', 'core', 'ops'] as const
+
+function DocsView() {
+  const { t } = useTranslation()
+  const [activeId, setActiveId] = useState('what')
+  const activeLockRef = useRef(false)
+  const activeLockTimerRef = useRef<number | null>(null)
+
+  const sections = useMemo<DocsSection[]>(() => [
+    {
+      id: 'what',
+      group: 'intro',
+      kind: 'features',
+      icon: <Shield className="size-4" />,
+      title: t('promptFilter.docs.what.title'),
+      paragraphs: [t('promptFilter.docs.what.p1'), t('promptFilter.docs.what.p2')],
+      bullets: [
+        t('promptFilter.docs.what.b1'),
+        t('promptFilter.docs.what.b2'),
+        t('promptFilter.docs.what.b3'),
+        t('promptFilter.docs.what.b4'),
+      ],
+    },
+    {
+      id: 'pipeline',
+      group: 'intro',
+      kind: 'pipeline',
+      icon: <GitBranch className="size-4" />,
+      title: t('promptFilter.docs.pipeline.title'),
+      paragraphs: [t('promptFilter.docs.pipeline.p1')],
+      steps: [
+        t('promptFilter.docs.pipeline.s1'),
+        t('promptFilter.docs.pipeline.s2'),
+        t('promptFilter.docs.pipeline.s3'),
+        t('promptFilter.docs.pipeline.s4'),
+        t('promptFilter.docs.pipeline.s5'),
+        t('promptFilter.docs.pipeline.s6'),
+        t('promptFilter.docs.pipeline.s7'),
+      ],
+    },
+    {
+      id: 'pages',
+      group: 'intro',
+      kind: 'pages',
+      icon: <Layers className="size-4" />,
+      title: t('promptFilter.docs.pages.title'),
+      paragraphs: [t('promptFilter.docs.pages.p1')],
+      table: {
+        headers: [t('promptFilter.docs.pages.colPage'), t('promptFilter.docs.pages.colUse')],
+        rows: [
+          [t('promptFilter.views.overview'), t('promptFilter.docs.pages.overview')],
+          [t('promptFilter.views.logs'), t('promptFilter.docs.pages.logs')],
+          [t('promptFilter.views.rules'), t('promptFilter.docs.pages.rules')],
+          [t('promptFilter.views.intelligence'), t('promptFilter.docs.pages.intelligence')],
+          [t('promptFilter.views.docs'), t('promptFilter.docs.pages.docs')],
+        ],
+      },
+    },
+    {
+      id: 'quickstart',
+      group: 'setup',
+      kind: 'checklist',
+      icon: <Sparkles className="size-4" />,
+      title: t('promptFilter.docs.quickstart.title'),
+      paragraphs: [t('promptFilter.docs.quickstart.p1')],
+      steps: [
+        t('promptFilter.docs.quickstart.s1'),
+        t('promptFilter.docs.quickstart.s2'),
+        t('promptFilter.docs.quickstart.s3'),
+        t('promptFilter.docs.quickstart.s4'),
+        t('promptFilter.docs.quickstart.s5'),
+        t('promptFilter.docs.quickstart.s6'),
+      ],
+      callout: t('promptFilter.docs.quickstart.callout'),
+    },
+    {
+      id: 'modes',
+      group: 'setup',
+      kind: 'modes',
+      icon: <Gauge className="size-4" />,
+      title: t('promptFilter.docs.modes.title'),
+      paragraphs: [t('promptFilter.docs.modes.p1')],
+      cards: [
+        { title: t('promptFilter.modeMonitor'), body: t('promptFilter.docs.modes.monitor'), tone: 'neutral' },
+        { title: t('promptFilter.modeWarn'), body: t('promptFilter.docs.modes.warn'), tone: 'warn' },
+        { title: t('promptFilter.modeBlock'), body: t('promptFilter.docs.modes.block'), tone: 'danger' },
+      ],
+      callout: t('promptFilter.docs.modes.callout'),
+    },
+    {
+      id: 'scoring',
+      group: 'core',
+      kind: 'default',
+      icon: <Activity className="size-4" />,
+      title: t('promptFilter.docs.scoring.title'),
+      paragraphs: [t('promptFilter.docs.scoring.p1'), t('promptFilter.docs.scoring.p2')],
+      bullets: [
+        t('promptFilter.docs.scoring.b1'),
+        t('promptFilter.docs.scoring.b2'),
+        t('promptFilter.docs.scoring.b3'),
+        t('promptFilter.docs.scoring.b4'),
+      ],
+    },
+    {
+      id: 'advanced',
+      group: 'core',
+      kind: 'features',
+      icon: <ShieldAlert className="size-4" />,
+      title: t('promptFilter.docs.advanced.title'),
+      paragraphs: [t('promptFilter.docs.advanced.p1')],
+      bullets: [
+        t('promptFilter.docs.advanced.b1'),
+        t('promptFilter.docs.advanced.b2'),
+        t('promptFilter.docs.advanced.b3'),
+        t('promptFilter.docs.advanced.b4'),
+        t('promptFilter.docs.advanced.b5'),
+        t('promptFilter.docs.advanced.b6'),
+      ],
+      callout: t('promptFilter.docs.advanced.callout'),
+    },
+    {
+      id: 'review',
+      group: 'core',
+      kind: 'default',
+      icon: <ClipboardCheck className="size-4" />,
+      title: t('promptFilter.docs.review.title'),
+      paragraphs: [t('promptFilter.docs.review.p1'), t('promptFilter.docs.review.p2')],
+      bullets: [
+        t('promptFilter.docs.review.b1'),
+        t('promptFilter.docs.review.b2'),
+        t('promptFilter.docs.review.b3'),
+      ],
+    },
+    {
+      id: 'rules',
+      group: 'ops',
+      kind: 'default',
+      icon: <FileText className="size-4" />,
+      title: t('promptFilter.docs.rules.title'),
+      paragraphs: [t('promptFilter.docs.rules.p1'), t('promptFilter.docs.rules.p2')],
+      bullets: [
+        t('promptFilter.docs.rules.b1'),
+        t('promptFilter.docs.rules.b2'),
+        t('promptFilter.docs.rules.b3'),
+        t('promptFilter.docs.rules.b4'),
+      ],
+    },
+    {
+      id: 'logs',
+      group: 'ops',
+      kind: 'default',
+      icon: <ListChecks className="size-4" />,
+      title: t('promptFilter.docs.logs.title'),
+      paragraphs: [t('promptFilter.docs.logs.p1')],
+      bullets: [
+        t('promptFilter.docs.logs.b1'),
+        t('promptFilter.docs.logs.b2'),
+        t('promptFilter.docs.logs.b3'),
+        t('promptFilter.docs.logs.b4'),
+      ],
+    },
+    {
+      id: 'intelligence',
+      group: 'ops',
+      kind: 'default',
+      icon: <Search className="size-4" />,
+      title: t('promptFilter.docs.intelligence.title'),
+      paragraphs: [t('promptFilter.docs.intelligence.p1')],
+      bullets: [
+        t('promptFilter.docs.intelligence.b1'),
+        t('promptFilter.docs.intelligence.b2'),
+        t('promptFilter.docs.intelligence.b3'),
+      ],
+      callout: t('promptFilter.docs.intelligence.callout'),
+    },
+    {
+      id: 'newapi',
+      group: 'ops',
+      kind: 'default',
+      icon: <Network className="size-4" />,
+      title: t('promptFilter.docs.newapi.title'),
+      paragraphs: [t('promptFilter.docs.newapi.p1'), t('promptFilter.docs.newapi.p2')],
+      bullets: [
+        t('promptFilter.docs.newapi.b1'),
+        t('promptFilter.docs.newapi.b2'),
+        t('promptFilter.docs.newapi.b3'),
+      ],
+    },
+    {
+      id: 'checklist',
+      group: 'ops',
+      kind: 'checklist',
+      icon: <CheckCircle2 className="size-4" />,
+      title: t('promptFilter.docs.checklist.title'),
+      paragraphs: [t('promptFilter.docs.checklist.p1')],
+      steps: [
+        t('promptFilter.docs.checklist.s1'),
+        t('promptFilter.docs.checklist.s2'),
+        t('promptFilter.docs.checklist.s3'),
+        t('promptFilter.docs.checklist.s4'),
+        t('promptFilter.docs.checklist.s5'),
+        t('promptFilter.docs.checklist.s6'),
+      ],
+    },
+  ], [t])
+
+  const groups = useMemo(() => {
+    return DOCS_GROUP_ORDER.map((group) => ({
+      id: group,
+      label: t(`promptFilter.docs.groups.${group}`),
+      items: sections.filter((section) => section.group === group),
+    })).filter((group) => group.items.length > 0)
+  }, [sections, t])
+
+  const sectionIds = useMemo(() => sections.map((section) => section.id), [sections])
+
+  useEffect(() => {
+    const SPY_OFFSET = 120
+
+    const resolveActiveSection = () => {
+      if (activeLockRef.current) return
+
+      let current = sectionIds[0] ?? 'what'
+      for (const id of sectionIds) {
+        const el = document.getElementById(`pf-docs-${id}`)
+        if (!el) continue
+        // Last section whose top has reached/passed the spy line is active.
+        if (el.getBoundingClientRect().top - SPY_OFFSET <= 0) {
+          current = id
+        } else {
+          break
+        }
+      }
+      setActiveId((prev) => (prev === current ? prev : current))
+    }
+
+    let frame = 0
+    const onScroll = () => {
+      if (frame) return
+      frame = window.requestAnimationFrame(() => {
+        frame = 0
+        resolveActiveSection()
+      })
+    }
+
+    resolveActiveSection()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    window.addEventListener('resize', onScroll)
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame)
+      window.removeEventListener('scroll', onScroll)
+      window.removeEventListener('resize', onScroll)
+      if (activeLockTimerRef.current != null) {
+        window.clearTimeout(activeLockTimerRef.current)
+        activeLockTimerRef.current = null
+      }
+    }
+  }, [sectionIds])
+
+  const scrollTo = (id: string) => {
+    const el = document.getElementById(`pf-docs-${id}`)
+    if (!el) return
+
+    // Lock highlight during smooth scroll so the next section is not auto-selected mid-animation.
+    activeLockRef.current = true
+    setActiveId(id)
+    if (activeLockTimerRef.current != null) {
+      window.clearTimeout(activeLockTimerRef.current)
+    }
+
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+
+    activeLockTimerRef.current = window.setTimeout(() => {
+      activeLockRef.current = false
+      activeLockTimerRef.current = null
+      // Re-sync once after scroll settles (in case user scrolled past during lock).
+      const SPY_OFFSET = 120
+      let current = id
+      for (const sectionId of sectionIds) {
+        const node = document.getElementById(`pf-docs-${sectionId}`)
+        if (!node) continue
+        if (node.getBoundingClientRect().top - SPY_OFFSET <= 0) {
+          current = sectionId
+        } else {
+          break
+        }
+      }
+      setActiveId(current)
+    }, 900)
+  }
+
+  return (
+    <div className="grid gap-5 xl:grid-cols-[260px_minmax(0,1fr)]">
+      {/* Sidebar TOC */}
+      <aside className="h-fit xl:sticky xl:top-3">
+        <div className="overflow-hidden rounded-xl border border-foreground/12 bg-card shadow-sm">
+          <div className="border-b border-foreground/10 bg-muted/30 px-4 py-3">
+            <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+              {t('promptFilter.docs.toc')}
+            </div>
+            <div className="mt-1 text-sm font-semibold text-foreground">{t('promptFilter.docs.tocHint')}</div>
+          </div>
+          <nav className="max-h-[min(70vh,720px)] space-y-4 overflow-y-auto p-3 [scrollbar-width:thin]">
+            {groups.map((group) => (
+              <div key={group.id}>
+                <div className="mb-1.5 px-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80">
+                  {group.label}
+                </div>
+                <div className="space-y-0.5">
+                  {group.items.map((section) => {
+                    const active = activeId === section.id
+                    return (
+                      <button
+                        key={section.id}
+                        type="button"
+                        onClick={() => scrollTo(section.id)}
+                        className={cn(
+                          'flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-sm transition-colors',
+                          active
+                            ? 'bg-primary/10 font-medium text-primary shadow-sm ring-1 ring-primary/15'
+                            : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground',
+                        )}
+                      >
+                        <span className={cn(
+                          'flex size-7 shrink-0 items-center justify-center rounded-md border',
+                          active ? 'border-primary/20 bg-primary/10 text-primary' : 'border-foreground/10 bg-background text-muted-foreground',
+                        )}>
+                          {section.icon}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate leading-snug">{section.title}</span>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            ))}
+          </nav>
+        </div>
+      </aside>
+
+      {/* Document body */}
+      <article className="overflow-hidden rounded-xl border border-foreground/12 bg-card shadow-sm">
+        <header className="relative overflow-hidden border-b border-foreground/10 bg-gradient-to-br from-primary/[0.07] via-card to-card px-6 py-7 sm:px-8 sm:py-8">
+          <div className="pointer-events-none absolute -right-16 -top-20 size-56 rounded-full bg-primary/10 blur-3xl" />
+          <div className="pointer-events-none absolute -bottom-20 right-20 size-40 rounded-full bg-sky-400/10 blur-3xl" />
+          <div className="relative flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="max-w-3xl">
+              <div className="mb-3 inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/8 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-primary">
+                <BookOpen className="size-3.5" />
+                {t('promptFilter.docs.badge')}
+              </div>
+              <h1 className="text-2xl font-semibold tracking-tight text-foreground sm:text-[1.75rem]">
+                {t('promptFilter.docs.title')}
+              </h1>
+              <p className="mt-2.5 text-sm leading-7 text-muted-foreground sm:text-[15px]">
+                {t('promptFilter.docs.description')}
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <Badge variant="outline" className="h-7 border-foreground/15 bg-background/80 font-normal">
+                {t('promptFilter.docs.metaSections', { count: sections.length })}
+              </Badge>
+              <Badge variant="outline" className="h-7 border-foreground/15 bg-background/80 font-normal">
+                {t('promptFilter.docs.metaAudience')}
+              </Badge>
+            </div>
+          </div>
+        </header>
+
+        <div className="divide-y divide-foreground/10">
+          {sections.map((section, index) => (
+            <section
+              key={section.id}
+              id={`pf-docs-${section.id}`}
+              className="scroll-mt-24 px-6 py-7 sm:px-8 sm:py-8"
+            >
+              <div className="mb-4 flex items-start gap-3">
+                <div className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-lg border border-foreground/12 bg-muted/40 text-foreground">
+                  {section.icon}
+                </div>
+                <div className="min-w-0">
+                  <div className="mb-1 flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-[11px] font-medium tracking-wide text-muted-foreground">
+                      {String(index + 1).padStart(2, '0')}
+                    </span>
+                    <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/80">
+                      {t(`promptFilter.docs.groups.${section.group}`)}
+                    </span>
+                  </div>
+                  <h2 className="text-lg font-semibold tracking-tight text-foreground sm:text-xl">
+                    {section.title}
+                  </h2>
+                </div>
+              </div>
+
+              <div className="space-y-4 pl-0 sm:pl-12">
+                {section.paragraphs?.map((paragraph) => (
+                  <p key={paragraph} className="text-sm leading-7 text-muted-foreground sm:text-[15px]">
+                    {paragraph}
+                  </p>
+                ))}
+
+                {section.kind === 'pipeline' && section.steps?.length ? (
+                  <div className="relative space-y-0">
+                    <div className="absolute bottom-3 left-[15px] top-3 w-px bg-border" />
+                    {section.steps.map((step, stepIndex) => (
+                      <div key={step} className="relative flex gap-3 py-2.5">
+                        <div className="relative z-10 flex size-8 shrink-0 items-center justify-center rounded-full border border-foreground/15 bg-background text-xs font-semibold text-foreground shadow-sm">
+                          {stepIndex + 1}
+                        </div>
+                        <div className="min-w-0 flex-1 rounded-lg border border-foreground/10 bg-muted/20 px-3.5 py-2.5 text-sm leading-6 text-foreground/90">
+                          {step}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {section.kind === 'checklist' && section.steps?.length ? (
+                  <ol className="space-y-2.5">
+                    {section.steps.map((step, stepIndex) => (
+                      <li
+                        key={step}
+                        className="flex gap-3 rounded-lg border border-foreground/10 bg-background px-3.5 py-3 text-sm leading-6 shadow-sm"
+                      >
+                        <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-xs font-semibold text-primary">
+                          {stepIndex + 1}
+                        </span>
+                        <span className="pt-0.5 text-foreground/90">{step}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
+
+                {section.kind !== 'pipeline' && section.kind !== 'checklist' && section.steps?.length ? (
+                  <ol className="space-y-2">
+                    {section.steps.map((step, stepIndex) => (
+                      <li key={step} className="flex gap-3 text-sm leading-6">
+                        <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full border border-foreground/15 bg-muted/40 text-[11px] font-semibold">
+                          {stepIndex + 1}
+                        </span>
+                        <span className="text-foreground/90">{step}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
+
+                {section.kind === 'features' && section.bullets?.length ? (
+                  <div className="grid gap-2.5 sm:grid-cols-2">
+                    {section.bullets.map((bullet, bulletIndex) => (
+                      <div
+                        key={bullet}
+                        className="rounded-lg border border-foreground/10 bg-muted/15 px-3.5 py-3 text-sm leading-6 text-foreground/90"
+                      >
+                        <div className="mb-1.5 font-mono text-[11px] font-medium text-muted-foreground">
+                          {String(bulletIndex + 1).padStart(2, '0')}
+                        </div>
+                        {bullet}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {section.kind !== 'features' && section.bullets?.length ? (
+                  <ul className="space-y-2.5">
+                    {section.bullets.map((bullet) => (
+                      <li key={bullet} className="flex gap-2.5 text-sm leading-6 text-foreground/90">
+                        <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-primary/80" />
+                        <span>{bullet}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+
+                {section.kind === 'modes' && section.cards?.length ? (
+                  <div className="grid gap-3 md:grid-cols-3">
+                    {section.cards.map((card) => (
+                      <div
+                        key={card.title}
+                        className={cn(
+                          'rounded-xl border p-4 shadow-sm',
+                          card.tone === 'warn' && 'border-amber-500/25 bg-amber-500/[0.06]',
+                          card.tone === 'danger' && 'border-rose-500/25 bg-rose-500/[0.06]',
+                          card.tone === 'success' && 'border-emerald-500/25 bg-emerald-500/[0.06]',
+                          (!card.tone || card.tone === 'neutral') && 'border-foreground/10 bg-muted/20',
+                        )}
+                      >
+                        <div className="mb-2 text-sm font-semibold text-foreground">{card.title}</div>
+                        <p className="text-sm leading-6 text-muted-foreground">{card.body}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {section.table ? (
+                  <div className="overflow-hidden rounded-xl border border-foreground/12 shadow-sm">
+                    <Table>
+                      <TableHeader>
+                        <TableRow className="bg-muted/40 hover:bg-muted/40">
+                          {section.table.headers.map((header) => (
+                            <TableHead key={header} className="h-10 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                              {header}
+                            </TableHead>
+                          ))}
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {section.table.rows.map((row) => (
+                          <TableRow key={row.join('|')} className="hover:bg-muted/20">
+                            {row.map((cell, cellIndex) => (
+                              <TableCell
+                                key={`${cell}-${cellIndex}`}
+                                className={cn(
+                                  'align-top text-sm leading-6',
+                                  cellIndex === 0 ? 'w-[140px] font-semibold text-foreground whitespace-nowrap' : 'text-muted-foreground',
+                                )}
+                              >
+                                {cell}
+                              </TableCell>
+                            ))}
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                ) : null}
+
+                {section.callout ? (
+                  <div className="flex gap-3 rounded-xl border border-amber-500/25 bg-amber-500/[0.07] px-4 py-3.5">
+                    <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                    <p className="text-sm leading-6 text-foreground/85">{section.callout}</p>
+                  </div>
+                ) : null}
+              </div>
+            </section>
+          ))}
+        </div>
+      </article>
     </div>
   )
 }
@@ -519,76 +1648,25 @@ function OverviewView({
                 />
               </Field>
               <Field label={t('promptFilter.threshold')}>
-                <Input type="number" min={1} max={100} value={form.prompt_filter_threshold} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_threshold: parseInt(event.target.value, 10) || 1 }))} />
+                <DraftNumberInput min={1} max={100} value={form.prompt_filter_threshold} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_threshold: value }))} />
               </Field>
               <Field label={t('promptFilter.strictThreshold')}>
-                <Input type="number" min={1} max={100} value={form.prompt_filter_strict_threshold} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_strict_threshold: parseInt(event.target.value, 10) || 1 }))} />
+                <DraftNumberInput min={1} max={100} value={form.prompt_filter_strict_threshold} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_strict_threshold: value }))} />
+              </Field>
+              <Field label={t('promptFilter.strictTerminal')}>
+                <Select value={form.prompt_filter_strict_terminal_enabled ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_strict_terminal_enabled: value === 'true' }))} options={booleanOptions} />
+                <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.strictTerminalHint')}</span>
               </Field>
               <Field label={t('promptFilter.logMatches')}>
                 <Select value={form.prompt_filter_log_matches ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_log_matches: value === 'true' }))} options={booleanOptions} />
               </Field>
               <Field label={t('promptFilter.maxTextLength')}>
-                <Input type="number" min={1024} max={262144} value={form.prompt_filter_max_text_length} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_max_text_length: parseInt(event.target.value, 10) || 81920 }))} />
+                <DraftNumberInput min={1024} max={262144} value={form.prompt_filter_max_text_length} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_max_text_length: value }))} />
               </Field>
             </div>
             <Field label={t('promptFilter.sensitiveWords')}>
               <Textarea rows={5} value={form.prompt_filter_sensitive_words} placeholder={t('promptFilter.sensitiveWordsPlaceholder')} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_sensitive_words: event.target.value }))} />
             </Field>
-
-            <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
-              <div>
-                <SectionTitle title={t('promptFilter.reviewTitle')} />
-                <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.reviewDesc')}</p>
-              </div>
-              <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-4">
-                <Field label={t('promptFilter.reviewEnabled')}>
-                  <Select
-                    value={form.prompt_filter_review_enabled ? 'true' : 'false'}
-                    onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_enabled: value === 'true' }))}
-                    options={booleanOptions}
-                  />
-                </Field>
-                <Field label={t('promptFilter.reviewFailClosed')}>
-                  <Select
-                    value={form.prompt_filter_review_fail_closed ? 'true' : 'false'}
-                    onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_fail_closed: value === 'true' }))}
-                    options={[
-                      { label: t('promptFilter.reviewFailClosedBlock'), value: 'true' },
-                      { label: t('promptFilter.reviewFailClosedAllow'), value: 'false' },
-                    ]}
-                  />
-                </Field>
-                <Field label={t('promptFilter.reviewTimeout')}>
-                  <Input type="number" min={1} max={60} value={form.prompt_filter_review_timeout_seconds} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_timeout_seconds: parseInt(event.target.value, 10) || 10 }))} />
-                </Field>
-              </div>
-              <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(180px,0.8fr)]">
-                <Field label={t('promptFilter.reviewBaseUrl')}>
-                  <Input value={form.prompt_filter_review_base_url} placeholder="https://api.openai.com" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
-                </Field>
-                <Field label={t('promptFilter.reviewModel')}>
-                  <Input value={form.prompt_filter_review_model} placeholder="omni-moderation-latest" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
-                </Field>
-              </div>
-              <Field label={t('promptFilter.reviewApiKey')}>
-                <Textarea
-                  rows={4}
-                  className="font-mono"
-                  value={form.prompt_filter_review_api_key ?? ''}
-                  placeholder={
-                    form.prompt_filter_review_api_key_configured
-                      ? t('promptFilter.reviewApiKeyConfigured', { n: form.prompt_filter_review_api_key_count })
-                      : t('promptFilter.reviewApiKeyPlaceholder')
-                  }
-                  onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_api_key: event.target.value }))}
-                />
-                <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewApiKeyHint')}</span>
-              </Field>
-            </div>
-            <Button onClick={onSave} disabled={saving}>
-              <Save className="size-4" />
-              {saving ? t('common.saving') : t('common.save')}
-            </Button>
           </CardContent>
         </Card>
 
@@ -617,6 +1695,71 @@ function OverviewView({
           </CardContent>
         </Card>
       </div>
+
+      <Card className="mt-4">
+        <CardContent className="space-y-5 pt-5">
+          <AdvancedProtectionEditor
+            value={form.prompt_filter_advanced_config}
+            onChange={(value) => setForm((current) => ({ ...current, prompt_filter_advanced_config: value }))}
+          />
+
+          <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
+            <div>
+              <SectionTitle title={t('promptFilter.reviewTitle')} />
+              <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.reviewDesc')}</p>
+            </div>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-4">
+              <Field label={t('promptFilter.reviewEnabled')}>
+                <Select
+                  value={form.prompt_filter_review_enabled ? 'true' : 'false'}
+                  onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_enabled: value === 'true' }))}
+                  options={booleanOptions}
+                />
+              </Field>
+              <Field label={t('promptFilter.reviewFailClosed')}>
+                <Select
+                  value={form.prompt_filter_review_fail_closed ? 'true' : 'false'}
+                  onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_fail_closed: value === 'true' }))}
+                  options={[
+                    { label: t('promptFilter.reviewFailClosedBlock'), value: 'true' },
+                    { label: t('promptFilter.reviewFailClosedAllow'), value: 'false' },
+                  ]}
+                />
+              </Field>
+              <Field label={t('promptFilter.reviewTimeout')}>
+                <DraftNumberInput min={1} max={60} value={form.prompt_filter_review_timeout_seconds} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_timeout_seconds: value }))} />
+              </Field>
+            </div>
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(180px,0.8fr)]">
+              <Field label={t('promptFilter.reviewBaseUrl')}>
+                <Input value={form.prompt_filter_review_base_url} placeholder="https://api.openai.com" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
+              </Field>
+              <Field label={t('promptFilter.reviewModel')}>
+                <Input value={form.prompt_filter_review_model} placeholder="omni-moderation-latest" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
+              </Field>
+            </div>
+            <Field label={t('promptFilter.reviewApiKey')}>
+              <Textarea
+                rows={3}
+                className="font-mono"
+                value={form.prompt_filter_review_api_key ?? ''}
+                placeholder={
+                  form.prompt_filter_review_api_key_configured
+                    ? t('promptFilter.reviewApiKeyConfigured', { n: form.prompt_filter_review_api_key_count })
+                    : t('promptFilter.reviewApiKeyPlaceholder')
+                }
+                onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_api_key: event.target.value }))}
+              />
+              <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewApiKeyHint')}</span>
+            </Field>
+          </div>
+
+          <Button onClick={onSave} disabled={saving}>
+            <Save className="size-4" />
+            {saving ? t('common.saving') : t('common.save')}
+          </Button>
+        </CardContent>
+      </Card>
 
       <Card className="mt-4">
         <CardContent>
@@ -762,6 +1905,8 @@ function RulesView({
 }) {
   const { t } = useTranslation()
   const [infoOpen, setInfoOpen] = useState(false)
+  const [previewRule, setPreviewRule] = useState<PromptFilterRule | null>(null)
+  const [previewPatternCopied, setPreviewPatternCopied] = useState(false)
   const [customDialogMode, setCustomDialogMode] = useState<'create' | 'edit' | null>(null)
   const [editingCustomIndex, setEditingCustomIndex] = useState<number | null>(null)
   const [customDialogDraft, setCustomDialogDraft] = useState<CustomRuleDraft>(defaultCustomRuleDraft)
@@ -770,6 +1915,22 @@ function RulesView({
   const [selectedRules, setSelectedRules] = useState<Set<string>>(new Set())
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
+
+  const openRulePreview = (rule: PromptFilterRule) => {
+    setPreviewRule(rule)
+    setPreviewPatternCopied(false)
+  }
+
+  const copyPreviewPattern = async () => {
+    if (!previewRule?.pattern) return
+    try {
+      await navigator.clipboard.writeText(previewRule.pattern)
+      setPreviewPatternCopied(true)
+      window.setTimeout(() => setPreviewPatternCopied(false), 1500)
+    } catch {
+      // ignore clipboard failures
+    }
+  }
 
   const disabled = useMemo(() => parseJSONList<string>(form.prompt_filter_disabled_patterns), [form.prompt_filter_disabled_patterns])
   const customPatterns = rules?.custom_patterns ?? parseJSONList<PromptFilterRule>(form.prompt_filter_custom_patterns)
@@ -1002,6 +2163,7 @@ function RulesView({
                     rule={rule}
                     selected={selectedRules.has(rule.name)}
                     onSelect={() => toggleSelectRule(rule.name)}
+                    onPreview={() => openRulePreview(rule)}
                     onToggle={() => void toggleBuiltin(rule)}
                     busy={saving || savingRule !== ''}
                   />
@@ -1059,6 +2221,7 @@ function RulesView({
                   <RuleRow
                     key={`${rule.name}-${index}`}
                     rule={{ ...rule, builtin: false, enabled: rule.enabled !== false }}
+                    onPreview={() => openRulePreview({ ...rule, builtin: false, enabled: rule.enabled !== false })}
                     onToggle={() => void toggleCustom(index)}
                     onEdit={() => startEditCustomRule(index)}
                     onDelete={() => void deleteCustom(index)}
@@ -1128,6 +2291,64 @@ function RulesView({
           </div>
           <DialogFooter>
             <Button onClick={() => setInfoOpen(false)}>{t('common.confirm')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={previewRule !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setPreviewRule(null)
+            setPreviewPatternCopied(false)
+          }
+        }}
+      >
+        <DialogContent className="max-h-[calc(100vh-2rem)] max-w-3xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle className="font-mono text-base">{previewRule?.name}</DialogTitle>
+            <DialogDescription>{t('promptFilter.rulePreviewDesc')}</DialogDescription>
+          </DialogHeader>
+
+          {previewRule ? (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center gap-2">
+                {previewRule.builtin ? (
+                  <Badge variant="secondary">{t('promptFilter.builtinRule')}</Badge>
+                ) : (
+                  <Badge variant="outline">{t('promptFilter.customRule')}</Badge>
+                )}
+                {previewRule.strict ? <Badge variant="destructive">{t('promptFilter.ruleStrict')}</Badge> : null}
+                <Badge variant={previewRule.enabled !== false ? 'default' : 'outline'}>
+                  {previewRule.enabled !== false ? t('common.enabled') : t('common.disabled')}
+                </Badge>
+                <Badge variant="outline" className="font-mono">
+                  {t('promptFilter.ruleWeight')}: {previewRule.weight}
+                </Badge>
+                <Badge variant="outline" className="font-mono">
+                  {t('promptFilter.ruleCategory')}: {previewRule.category || '-'}
+                </Badge>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-sm font-semibold text-foreground">{t('promptFilter.rulePattern')}</span>
+                  <Button type="button" size="sm" variant="outline" onClick={() => void copyPreviewPattern()}>
+                    <Copy className="size-3.5" />
+                    {previewPatternCopied ? t('promptFilter.patternCopied') : t('promptFilter.copyPattern')}
+                  </Button>
+                </div>
+                <pre className="max-h-[min(40vh,360px)] overflow-auto whitespace-pre-wrap break-all rounded-lg border border-foreground/12 bg-muted/40 p-3 font-mono text-xs leading-6 text-foreground">
+                  {previewRule.pattern || '-'}
+                </pre>
+              </div>
+
+              <RulePatternTester pattern={previewRule.pattern || ''} />
+            </div>
+          ) : null}
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPreviewRule(null)}>{t('common.close')}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1212,6 +2433,7 @@ function RuleRow({
   rule,
   selected,
   onSelect,
+  onPreview,
   onToggle,
   onEdit,
   onDelete,
@@ -1221,6 +2443,7 @@ function RuleRow({
   rule: PromptFilterRule
   selected?: boolean
   onSelect?: () => void
+  onPreview?: () => void
   onToggle: () => void
   onEdit?: () => void
   onDelete?: () => void
@@ -1230,9 +2453,12 @@ function RuleRow({
   const { t } = useTranslation()
   const enabled = rule.enabled !== false
   return (
-    <TableRow>
+    <TableRow
+      className={onPreview ? 'cursor-pointer hover:bg-muted/30' : undefined}
+      onClick={onPreview}
+    >
       {onSelect !== undefined ? (
-        <TableCell>
+        <TableCell onClick={(event) => event.stopPropagation()}>
           <input
             type="checkbox"
             checked={selected}
@@ -1242,7 +2468,19 @@ function RuleRow({
         </TableCell>
       ) : null}
       <TableCell>
-        <div className="font-mono text-xs font-semibold text-foreground">{rule.name}</div>
+        <button
+          type="button"
+          className="text-left"
+          onClick={(event) => {
+            if (!onPreview) return
+            event.stopPropagation()
+            onPreview()
+          }}
+        >
+          <div className="font-mono text-xs font-semibold text-foreground transition-colors hover:text-primary">
+            {rule.name}
+          </div>
+        </button>
         <div className="mt-1 flex gap-1">
           {rule.builtin ? <Badge variant="secondary">{t('promptFilter.builtinRule')}</Badge> : <Badge variant="outline">{t('promptFilter.customRule')}</Badge>}
           {rule.strict ? <Badge variant="destructive">{t('promptFilter.ruleStrict')}</Badge> : null}
@@ -1252,9 +2490,17 @@ function RuleRow({
       <TableCell>{rule.category || '-'}</TableCell>
       <TableCell className="font-mono text-sm">{rule.weight}</TableCell>
       <TableCell className="max-w-[520px]">
-        <code className="line-clamp-2 whitespace-normal break-all rounded bg-muted/60 px-2 py-1 text-xs text-muted-foreground">{rule.pattern}</code>
+        <code
+          className={cn(
+            'line-clamp-2 whitespace-normal break-all rounded bg-muted/60 px-2 py-1 text-xs text-muted-foreground',
+            onPreview && 'transition-colors hover:bg-primary/10 hover:text-foreground',
+          )}
+          title={onPreview ? t('promptFilter.rulePreviewHint') : undefined}
+        >
+          {rule.pattern}
+        </code>
       </TableCell>
-      <TableCell>
+      <TableCell onClick={(event) => event.stopPropagation()}>
         <div className="flex flex-wrap gap-2">
           {iconActions ? (
             <Button size="icon-sm" variant="ghost" onClick={onToggle} disabled={busy} aria-label={enabled ? t('promptFilter.disableRule') : t('promptFilter.enableRule')} title={enabled ? t('promptFilter.disableRule') : t('promptFilter.enableRule')}>
@@ -1322,10 +2568,13 @@ function SectionTitle({ title }: { title: string }) {
   return <h3 className="text-base font-semibold leading-tight text-foreground">{title}</h3>
 }
 
-function Field({ label, children }: { label: string; children: ReactNode }) {
+function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
     <label className="block min-w-0 space-y-2">
-      <span className="block text-sm font-semibold leading-none text-foreground">{label}</span>
+      <span className="flex items-center gap-1.5 text-sm font-semibold leading-none text-foreground">
+        {label}
+        {hint ? <TooltipProvider delayDuration={150}><Tooltip><TooltipTrigger asChild><button type="button" aria-label={`${label} help`} className="text-muted-foreground hover:text-primary" onClick={(event) => event.preventDefault()}><HelpCircle className="size-3.5" /></button></TooltipTrigger><TooltipContent className="max-w-[320px] whitespace-normal leading-relaxed">{hint}</TooltipContent></Tooltip></TooltipProvider> : null}
+      </span>
       {children}
     </label>
   )

@@ -146,11 +146,13 @@ func SyncCodexCLIVersion(ctx context.Context, db *database.DB, proxyURL string) 
 		return result, nil
 	}
 
-	settings.CodexSyncedCLIVersion = fetched
-	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+	if err := db.UpdateCodexSyncedCLIVersion(ctx, fetched); err != nil {
 		return result, err
 	}
-	ApplyRuntimeSettingsFromSystem(settings)
+	UpdateRuntimeSettings(func(settings RuntimeSettings) RuntimeSettings {
+		settings.CodexSyncedCLIVersion = fetched
+		return settings
+	})
 
 	result.Updated = true
 	result.EffectiveVersion = effectiveLatestCodexCLIVersion()

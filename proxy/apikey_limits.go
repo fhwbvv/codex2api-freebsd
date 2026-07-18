@@ -55,6 +55,22 @@ func APIKeyRowFromContext(c *gin.Context) *database.APIKeyRow {
 	return apiKeyRowFromContext(c)
 }
 
+// payloadRuleIdentity 从鉴权 context 构造 payload 规则身份（供 api_key_*/group_* 匹配门与
+// service_tier 记账重算共用）。无鉴权身份时返回 nil（带身份门的规则将 fail-closed 不命中）。
+func (h *Handler) payloadRuleIdentity(c *gin.Context) *PayloadRuleIdentity {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return nil
+	}
+	id := &PayloadRuleIdentity{APIKeyID: row.ID, APIKeyName: strings.TrimSpace(row.Name)}
+	if h != nil && h.store != nil {
+		// 用 store 侧的允许组（组删除后会刷新，是权威源），再解析组名。
+		id.GroupIDs = h.store.GetAPIKeyAllowedGroups(row.ID)
+		id.GroupNames = h.store.ResolveGroupNames(id.GroupIDs)
+	}
+	return id
+}
+
 // EnforceAPIKeyLimits checks API key scoped model and rate/cost limits.
 func (h *Handler) EnforceAPIKeyLimits(c *gin.Context, model string) (int, string) {
 	return h.enforceAPIKeyLimits(c, model)

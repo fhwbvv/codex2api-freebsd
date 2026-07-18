@@ -382,6 +382,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		BillingTierPolicy:                proxy.BillingTierPolicyActual,
 		AffinityMode:                     "bounded",
 		PublicKeyUsagePageEnabled:        true,
+		PublicImageStudioPageEnabled:     true,
 		CodexWSHideUpstreamErrors:        true,
 		CodexWSSilentRetryEnabled:        true,
 		CodexWSSilentMaxRetries:          2,
@@ -389,5 +390,6 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		AutoPause5hGuardConcurrency:      1,
 		SmartPacingMinConcurrency:        1,
 		SmartPacingWindows:               "5h,7d",
+		AutoResetCreditsBeforeExpiryMin:  60,
 	}
 }

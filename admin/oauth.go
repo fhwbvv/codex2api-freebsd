@@ -43,6 +43,8 @@ type oauthSession struct {
 	CodeVerifier string
 	RedirectURI  string
 	ProxyURL     string
+	ContactEmail string // 自助门户提交者的联系邮箱（仅自助流程写入，作为备注标识）
+	SelfService  bool   // 是否来自公开自助门户（决定待审核入池路径）
 	CreatedAt    time.Time
 
 	// 回调自动捕获字段
@@ -178,6 +180,14 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 		CreatedAt:    time.Now(),
 	})
 
+	c.JSON(http.StatusOK, gin.H{
+		"auth_url":   buildOAuthAuthorizeURL(redirectURI, state, codeVerifier),
+		"session_id": sessionID,
+	})
+}
+
+// buildOAuthAuthorizeURL 组装 Codex CLI PKCE 授权链接（admin 与公开自助门户共用）。
+func buildOAuthAuthorizeURL(redirectURI, state, codeVerifier string) string {
 	params := neturl.Values{}
 	params.Set("response_type", "code")
 	params.Set("client_id", oauthClientID)
@@ -188,11 +198,7 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 	params.Set("code_challenge_method", "S256")
 	params.Set("id_token_add_organizations", "true")
 	params.Set("codex_cli_simplified_flow", "true")
-
-	c.JSON(http.StatusOK, gin.H{
-		"auth_url":   oauthAuthorizeURL + "?" + params.Encode(),
-		"session_id": sessionID,
-	})
+	return oauthAuthorizeURL + "?" + params.Encode()
 }
 
 // ExchangeOAuthCode 用授权码兑换 token，并写入新账号

@@ -113,7 +113,7 @@ func TestImageGalleryPersisterRecordsAssetAndJob(t *testing.T) {
 	p.finalize(ctx)
 
 	// 应登记一条 asset，且 storage_path 为 s3:// ref。
-	assets, err := db.ListImageAssets(ctx, 1, 10)
+	assets, err := db.ListImageAssets(ctx, 1, 10, 0)
 	if err != nil {
 		t.Fatalf("ListImageAssets: %v", err)
 	}
@@ -169,6 +169,31 @@ func TestBuildImagesResponsesRequestMatchesReferenceChain(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "input.0.content.0.text").String(); got != "draw a cat" {
 		t.Fatalf("prompt = %q, want draw a cat", got)
+	}
+}
+
+func TestBuildImagesResponsesRequestCarriesMaxEditImages(t *testing.T) {
+	if MaxImageEditInputCount != 16 {
+		t.Fatalf("MaxImageEditInputCount = %d, want 16（对齐官方 gpt-image 编辑上限）", MaxImageEditInputCount)
+	}
+
+	images := make([]string, MaxImageEditInputCount)
+	for i := range images {
+		images[i] = fmt.Sprintf("data:image/png;base64,IMG%d", i)
+	}
+	body := buildImagesResponsesRequest("edit these", images, nil)
+
+	parts := gjson.GetBytes(body, "input.0.content").Array()
+	if len(parts) != MaxImageEditInputCount+1 {
+		t.Fatalf("content parts = %d, want %d（1 条文本 + %d 张图）", len(parts), MaxImageEditInputCount+1, MaxImageEditInputCount)
+	}
+	for i, part := range parts[1:] {
+		if got := part.Get("type").String(); got != "input_image" {
+			t.Fatalf("content[%d].type = %q, want input_image", i+1, got)
+		}
+		if got := part.Get("image_url").String(); got != images[i] {
+			t.Fatalf("content[%d].image_url = %q, want %q", i+1, got, images[i])
+		}
 	}
 }
 

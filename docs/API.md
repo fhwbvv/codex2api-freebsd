@@ -56,6 +56,14 @@ Anthropic `/v1/messages` 仅将官方 `speed:"fast"` 映射为上游 Codex `serv
 Authorization: Bearer sk-xxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
+多个最终用户共享同一个 API Key 时，可选传入稳定的本地亲和标识：
+
+```http
+X-Codex2API-Affinity-Key: tenant-user-or-conversation-id
+```
+
+该请求头优先于其他会话亲和信号。Codex2API 会先对原始值做 SHA-256 派生，只保留本地路由标识；原始值不会保存，也不会转发给上游。
+
 **配置方式:**
 
 1. 通过管理后台 `/admin/settings` 页面配置
@@ -521,12 +529,25 @@ data: [DONE]
   "ids": [1, 2, 3],
   "enabled": false,
   "locked": true,
+  "score_bias_override": 25,
+  "base_concurrency_override": 4,
+  "scheduler_priority": 10,
   "tags": ["ops", "paid"],
   "group_ids": [1],
   "auto_pause_5h_threshold": 0.8,
   "auto_pause_7d_disabled": true
 }
 ```
+
+常用批量调度字段：
+
+| 字段 | 类型 | 范围/语义 |
+|------|------|-----------|
+| `score_bias_override` | integer/null | `-200..200`；`null` 恢复套餐默认分数偏置 |
+| `base_concurrency_override` | integer/null | `1..50`；`null` 恢复分组或全局继承值 |
+| `scheduler_priority` | integer/null | `-100..100`；`null` 恢复默认优先级 `0` |
+| `tags` | string[] | 替换账号标签；空数组清空 |
+| `group_ids` | integer[] | 替换账号分组；空数组清空 |
 
 **响应:**
 
@@ -1120,7 +1141,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 
 ### 账号分组管理
 
-账号分组用于把账号池划分为多个可调度集合。API Key 的 `allowed_group_ids` 可以限制下游密钥只能使用指定分组；账号自己的 `allowed_api_key_ids` 也可以反向限制哪些 API Key 能调度该账号。
+账号分组用于把账号池划分为多个可调度集合。API Key 的 `allowed_group_ids` 可以限制下游密钥只能使用指定分组；账号自己的 `allowed_api_key_ids` 也可以反向限制哪些 API Key 能调度该账号。分组还可以通过 `base_concurrency_override` 为成员账号提供基础并发继承值：账号级覆盖优先，账号属于多个分组时取最小的有效分组值，均未设置时回退到全局 `max_concurrency`。
 
 #### GET /api/admin/account-groups
 
@@ -1137,6 +1158,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
       "description": "付费团队账号",
       "color": "#2563eb",
       "sort_order": 0,
+      "base_concurrency_override": 4,
       "member_count": 8,
       "created_at": "2026-05-13T00:00:00Z",
       "updated_at": "2026-05-13T00:00:00Z"
@@ -1156,7 +1178,8 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
   "name": "Team",
   "description": "付费团队账号",
   "color": "#2563eb",
-  "sort_order": 0
+  "sort_order": 0,
+  "base_concurrency_override": 4
 }
 ```
 
@@ -1180,9 +1203,12 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
   "name": "Team Plus",
   "description": "高优先级账号",
   "color": "#16a34a",
-  "sort_order": 10
+  "sort_order": 10,
+  "base_concurrency_override": 2
 }
 ```
+
+`base_concurrency_override` 的有效范围为 `1..50`。创建时省略或传 `null` 表示不设置分组覆盖；PATCH 时传 `null` 会清除已有值并恢复继承。该值只决定基础并发，健康档位、用量保护和智能配速仍可能继续下调实际并发。
 
 **响应:**
 
@@ -1235,6 +1261,8 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "fast_scheduler_enabled": false,
   "max_retries": 3,
   "max_rate_limit_retries": 2,
+  "retry_interval_ms": 0,
+  "transport_retry_policy": "rotate",
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
   "database_driver": "postgres",
@@ -1264,7 +1292,9 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "auto_clean_rate_limited": false,
   "fast_scheduler_enabled": true,
   "scheduler_mode": "remaining_quota",
-  "max_rate_limit_retries": 2
+  "max_rate_limit_retries": 2,
+  "retry_interval_ms": 500,
+  "transport_retry_policy": "sticky"
 }
 ```
 

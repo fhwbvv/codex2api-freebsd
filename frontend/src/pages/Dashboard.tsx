@@ -9,14 +9,43 @@ import StatCard from '../components/StatCard'
 import UsageStatsSummary from '../components/UsageStatsSummary'
 import TimeRangeSelector from '../components/TimeRangeSelector'
 import SystemHealthBar from '../components/SystemHealthBar'
-import type { StatsResponse, SystemSettings, UsageStats, ChartAggregation } from '../types'
+import type {
+  AccountRow,
+  OpsOverviewResponse,
+  StatsResponse,
+  SystemSettings,
+  UsageStats,
+  ChartAggregation,
+} from '../types'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { Card, CardContent } from '@/components/ui/card'
-import { Users, CheckCircle, Gauge, XCircle, Activity } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { BarChart3, Users, CheckCircle, Gauge, XCircle, Activity } from 'lucide-react'
+import PoolRunwayCard from '../components/PoolRunwayCard'
 
 const DashboardUsageCharts = lazy(() => import('../components/DashboardUsageCharts'))
 
 const DASHBOARD_REFRESH_INTERVAL_MS = 15_000
+const DASHBOARD_POOL_RUNWAY_VISIBILITY_KEY = 'codex2api:dashboard:pool-runway-visible'
+
+function getInitialPoolRunwayVisibility(): boolean {
+  try {
+    return window.localStorage.getItem(DASHBOARD_POOL_RUNWAY_VISIBILITY_KEY) !== 'false'
+  } catch {
+    return true
+  }
+}
+
+function persistPoolRunwayVisibility(visible: boolean) {
+  try {
+    window.localStorage.setItem(
+      DASHBOARD_POOL_RUNWAY_VISIBILITY_KEY,
+      visible ? 'true' : 'false',
+    )
+  } catch {
+    // Restricted browser modes may block localStorage; keep in-memory toggle working.
+  }
+}
 
 function ChartsSkeleton() {
   return (
@@ -47,32 +76,71 @@ function ChartsSkeleton() {
 export default function Dashboard() {
   const { t } = useTranslation()
   const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
+  const [showPoolRunway, setShowPoolRunway] = useState(getInitialPoolRunwayVisibility)
   const [chartData, setChartData] = useState<ChartAggregation | null>(null)
   const [chartRefreshedAt, setChartRefreshedAt] = useState<number | null>(null)
   const [chartLoading, setChartLoading] = useState(true)
   const chartAbort = useRef<AbortController | null>(null)
   const timeRangeRef = useRef<TimeRangeKey>(timeRange)
   const usageStatsRangeInitialized = useRef(false)
+  const showPoolRunwayRef = useRef(showPoolRunway)
 
-  // 仅加载轻量级统计数据（秒级响应）
+  // 统计始终加载；号池分析仅在开启时拉账号列表 + ops RPM（隐藏时省流量）
   const loadDashboardStats = useCallback(async () => {
     const { start, end } = getTimeRangeISO(timeRangeRef.current)
-    const [stats, usageStats, settings] = await Promise.all([
+    const includePoolRunway = showPoolRunwayRef.current
+    const [stats, usageStats, settings, accountsRes, opsOverview] = await Promise.all([
       api.getStats(),
       api.getUsageStats({ start, end }),
       api.getSettings().catch((): SystemSettings | null => null),
+      includePoolRunway
+        ? api.getAccounts().catch(() => ({ accounts: [] as AccountRow[] }))
+        : Promise.resolve({ accounts: [] as AccountRow[] }),
+      includePoolRunway
+        ? api.getOpsOverview().catch((): OpsOverviewResponse | null => null)
+        : Promise.resolve(null),
     ])
-    return { stats, usageStats, settings }
+    return {
+      stats,
+      usageStats,
+      settings,
+      accounts: accountsRes.accounts ?? [],
+      opsOverview,
+    }
   }, [])
 
-  const { data, loading, error, reload, reloadSilently } = useDataLoader<{
+  const { data, loading, error, reload, reloadSilently, setData } = useDataLoader<{
     stats: StatsResponse | null
     usageStats: UsageStats | null
     settings: SystemSettings | null
+    accounts: AccountRow[]
+    opsOverview: OpsOverviewResponse | null
   }>({
-    initialData: { stats: null, usageStats: null, settings: null },
+    initialData: {
+      stats: null,
+      usageStats: null,
+      settings: null,
+      accounts: [],
+      opsOverview: null,
+    },
     load: loadDashboardStats,
   })
+
+  // 偏好持久化 + 开关切换时补拉/清空（跳过首屏，避免与 useDataLoader 首拉重复）
+  const poolRunwayToggleReady = useRef(false)
+  useEffect(() => {
+    showPoolRunwayRef.current = showPoolRunway
+    persistPoolRunwayVisibility(showPoolRunway)
+    if (!poolRunwayToggleReady.current) {
+      poolRunwayToggleReady.current = true
+      return
+    }
+    if (!showPoolRunway) {
+      setData((prev) => ({ ...prev, accounts: [], opsOverview: null }))
+      return
+    }
+    void reloadSilently()
+  }, [showPoolRunway, reloadSilently, setData])
 
   useEffect(() => {
     timeRangeRef.current = timeRange
@@ -124,13 +192,16 @@ export default function Dashboard() {
     return () => window.clearInterval(timer)
   }, [reloadSilently, timeRange, loadChartData])
 
-  const { stats, usageStats, settings } = data
+  const { stats, usageStats, settings, accounts, opsOverview } = data
   const showFullUsageNumbers = settings?.show_full_usage_numbers ?? false
   const total = stats?.total ?? 0
   const available = stats?.available ?? 0
   const rateLimited = stats?.rate_limited ?? 0
   const errorCount = stats?.error ?? 0
   const todayRequests = stats?.today_requests ?? 0
+  const currentRpm = opsOverview?.traffic?.rpm ?? 0
+  const rpmLimit = opsOverview?.traffic?.rpm_limit ?? 0
+  const avgDurationMs = opsOverview?.traffic?.avg_duration_ms ?? 0
 
   const icons: Record<string, ReactNode> = {
     total: <Users className="size-[22px]" />,
@@ -156,10 +227,32 @@ export default function Dashboard() {
           description={t('dashboard.description')}
           onRefresh={() => { void reload(); void loadChartData() }}
           actions={
-            <TimeRangeSelector
-              timeRange={timeRange}
-              onTimeRangeChange={setTimeRange}
-            />
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                aria-pressed={showPoolRunway}
+                onClick={() => setShowPoolRunway((visible) => !visible)}
+                title={
+                  showPoolRunway
+                    ? t('dashboard.hidePoolRunway')
+                    : t('dashboard.showPoolRunway')
+                }
+              >
+                <BarChart3 className="size-3.5" />
+                <span className="hidden sm:inline">
+                  {showPoolRunway
+                    ? t('dashboard.hidePoolRunway')
+                    : t('dashboard.showPoolRunway')}
+                </span>
+              </Button>
+              <TimeRangeSelector
+                timeRange={timeRange}
+                onTimeRangeChange={setTimeRange}
+              />
+            </div>
           }
         />
 
@@ -235,8 +328,16 @@ export default function Dashboard() {
           <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} />
         </div>
 
-        {/* System health */}
-        <div className="mb-6">
+        {/* Pool runway（可开关）+ system health */}
+        <div className="mb-6 space-y-3">
+          {showPoolRunway && accounts.length > 0 ? (
+            <PoolRunwayCard
+              accounts={accounts}
+              currentRpm={currentRpm}
+              rpmLimit={rpmLimit}
+              avgDurationMs={avgDurationMs}
+            />
+          ) : null}
           <SystemHealthBar chartData={chartData} timeRange={timeRange} loading={chartLoading} />
         </div>
 

@@ -102,6 +102,7 @@ func main() {
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
 			PublicKeyUsagePageEnabled:        true,
+			PublicImageStudioPageEnabled:     true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
@@ -110,6 +111,7 @@ func main() {
 			AutoPause5hGuardConcurrency:      1,
 			SmartPacingMinConcurrency:        1,
 			SmartPacingWindows:               "5h,7d",
+			AutoResetCreditsBeforeExpiryMin:  60,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -148,6 +150,7 @@ func main() {
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
 			PublicKeyUsagePageEnabled:        true,
+			PublicImageStudioPageEnabled:     true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
@@ -156,6 +159,7 @@ func main() {
 			AutoPause5hGuardConcurrency:      1,
 			SmartPacingMinConcurrency:        1,
 			SmartPacingWindows:               "5h,7d",
+			AutoResetCreditsBeforeExpiryMin:  60,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -266,11 +270,14 @@ func main() {
 	store.TriggerRecoveryProbeAsync()
 	store.TriggerAutoCleanupAsync()
 	defer store.Stop()
+	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	defer cancelBackground()
+	adminHandler.StartAutoResetCredits(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
 	// CODEX_DISABLE_CLI_VERSION_SYNC 为硬关闭。
-	proxy.StartCodexCLIVersionSync(context.Background(), db, store.GetProxyURL)
+	proxy.StartCodexCLIVersionSync(backgroundCtx, db, store.GetProxyURL)
 
 	log.Printf("账号就绪: %d/%d 可用", store.AvailableCount(), store.AccountCount())
 
@@ -287,6 +294,7 @@ func main() {
 	r.Use(api.VersionMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
 	r.Use(security.RequestSizeLimiter(int64(security.MaxRequestBodySize)))
+	r.Use(security.RequestBodyDecompressor(int64(security.MaxRequestBodySize)))
 	r.Use(api.BodyCacheMiddleware())
 	r.Use(api.CORSMiddleware())
 	r.Use(api.SecurityHeadersMiddleware())
@@ -318,6 +326,7 @@ func main() {
 
 	handler.RegisterRoutes(r)
 	adminHandler.RegisterExternalImageRoutes(r, handler)
+	adminHandler.StartPromptIntelligence(backgroundCtx)
 	adminHandler.RegisterRoutes(r)
 
 	// 管理后台前端静态文件
@@ -362,6 +371,38 @@ func main() {
 			}
 			serveFrontend(c)
 		}
+		serveImageStudioFrontend := func(c *gin.Context) {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			defer cancel()
+
+			enabled, err := adminHandler.PublicImageStudioPageEnabled(ctx)
+			if err != nil {
+				log.Printf("读取生图门户开关失败: %v", err)
+				c.Status(http.StatusInternalServerError)
+				return
+			}
+			if !enabled {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			serveFrontend(c)
+		}
+		serveAccountPortalFrontend := func(c *gin.Context) {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			defer cancel()
+
+			enabled, err := adminHandler.PublicAccountPortalPageEnabled(ctx)
+			if err != nil {
+				log.Printf("读取账号自助门户开关失败: %v", err)
+				c.Status(http.StatusInternalServerError)
+				return
+			}
+			if !enabled {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			serveFrontend(c)
+		}
 
 		// 同时处理 /admin 和 /admin/*，避免依赖自动补斜杠重定向。
 		r.GET("/admin", serveFrontend)
@@ -372,6 +413,14 @@ func main() {
 		r.GET("/key-usage/*filepath", serveKeyUsageFrontend)
 		r.HEAD("/key-usage", serveKeyUsageFrontend)
 		r.HEAD("/key-usage/*filepath", serveKeyUsageFrontend)
+		r.GET("/image-studio", serveImageStudioFrontend)
+		r.GET("/image-studio/*filepath", serveImageStudioFrontend)
+		r.HEAD("/image-studio", serveImageStudioFrontend)
+		r.HEAD("/image-studio/*filepath", serveImageStudioFrontend)
+		r.GET("/account-portal", serveAccountPortalFrontend)
+		r.GET("/account-portal/*filepath", serveAccountPortalFrontend)
+		r.HEAD("/account-portal", serveAccountPortalFrontend)
+		r.HEAD("/account-portal/*filepath", serveAccountPortalFrontend)
 	}
 
 	// 根路径重定向到管理后台（使用 302 避免浏览器永久缓存）
@@ -402,6 +451,8 @@ func main() {
 	log.Printf("  HTTP:   http://%s:%d", displayHost, cfg.Port)
 	log.Printf("  管理台: http://%s:%d/admin/", displayHost, cfg.Port)
 	log.Printf("  Key用量: http://%s:%d/key-usage", displayHost, cfg.Port)
+	log.Printf("  生图门户: http://%s:%d/image-studio", displayHost, cfg.Port)
+	log.Printf("  账号自助: http://%s:%d/account-portal", displayHost, cfg.Port)
 	log.Printf("  API:    POST /v1/chat/completions")
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")
@@ -431,11 +482,14 @@ func main() {
 	<-quit
 
 	log.Println("正在关闭...")
+	// 先停止会产生新副作用的后台任务，再等待现有 HTTP 请求排空。
+	cancelBackground()
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelShutdown()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
 	}
+	adminHandler.WaitAutoResetCredits()
 	wsKeepalive.Stop()
 	store.Stop()
 	wsrelay.ShutdownExecutor()

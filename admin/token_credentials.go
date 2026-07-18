@@ -79,6 +79,10 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 			seed.subscriptionExpiresAt = info.SubscriptionExpiresAt
 		}
 	}
+	// 付费套餐下已过去的到期时间是续费前的陈旧 JWT claim，导入时不落库。(issue #360)
+	if auth.StaleSubscriptionExpiry(seed.planType, seed.subscriptionExpiresAt, time.Now()) {
+		seed.subscriptionExpiresAt = time.Time{}
+	}
 
 	if seed.expiresAt.IsZero() && seed.expiresIn > 0 {
 		seed.expiresAt = time.Now().Add(time.Duration(seed.expiresIn) * time.Second)

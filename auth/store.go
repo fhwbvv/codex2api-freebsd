@@ -87,6 +87,8 @@ func NormalizeTestContent(content string) string {
 // Account 运行时账号状态
 type Account struct {
 	mu                      sync.RWMutex
+	usageSyncMu             sync.Mutex
+	usageObservedAt         time.Time
 	DBID                    int64 // 数据库 ID
 	RefreshToken            string
 	SessionToken            string
@@ -105,7 +107,7 @@ type Account struct {
 	CodexClientMetadataMode string
 	Status                  AccountStatus
 	CooldownUtil            time.Time
-	CooldownReason          string // rate_limited / unauthorized / 空
+	CooldownReason          string // rate_limited / rate_limited_5h / unauthorized / 空
 	ErrorMsg                string
 
 	// 用量进度（从 Codex 响应头被动解析）
@@ -131,6 +133,9 @@ type Account struct {
 	// 「主动重置次数」只能通过 wham 探针刷新（普通 /responses 流量不携带该字段），
 	// 因此用它独立判断重置次数是否过期，避免活跃账号因用量快照一直被流量刷新而长期不探针。
 	resetCreditsProbedAt time.Time
+	// subscriptionExpiryProbedAt 记录最近一次网页端 /subscriptions 订阅到期探针的
+	// 尝试时间（无论成败），用于节流，避免高频访问网页端点。(issue #360)
+	subscriptionExpiryProbedAt time.Time
 
 	usageProbeInFlight          bool
 	recoveryProbeInFlight       bool
@@ -153,6 +158,9 @@ type Account struct {
 	dispatchCountMu           sync.Mutex
 	dispatchWindowUsed        int64
 	dispatchWindowResetAt     time.Time
+	// SchedulerPriority 账号调度优先级（issue #358）：数值大者严格先调度，
+	// 同优先级内才按健康档位与调度分竞争。0 为默认；负值可把账号压为兜底渠道。
+	SchedulerPriority int64
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -160,6 +168,7 @@ type Account struct {
 	DispatchScore            float64
 	ScoreBiasEffective       int64
 	BaseConcurrencyEffective int64
+	groupBaseConcurrency     int64 // resolved from memberships; 0 means no group override
 	DynamicConcurrencyLimit  int64
 	LatencyEWMA              float64
 	SuccessStreak            int
@@ -899,6 +908,9 @@ func (a *Account) effectiveBaseConcurrencyLocked(storeBaseLimit int64) int64 {
 	if a.BaseConcurrencyOverride != nil && *a.BaseConcurrencyOverride > 0 {
 		return *a.BaseConcurrencyOverride
 	}
+	if a.groupBaseConcurrency > 0 {
+		return a.groupBaseConcurrency
+	}
 	if storeBaseLimit <= 0 {
 		return 1
 	}
@@ -1005,6 +1017,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		tier = HealthTierBanned
 	}
 	if a.premium5hRateLimitedLocked(now) && tier != HealthTierBanned {
+		tier = HealthTierRisky
+	}
+	if a.Status == StatusCooldown && a.CooldownReason == premium5hCooldownReason && tier != HealthTierBanned {
 		tier = HealthTierRisky
 	}
 	if a.SkipWarmTier && tier == HealthTierWarm {
@@ -1361,6 +1376,24 @@ func resolveEffectiveThreshold(accountThreshold float64, groupIDs []int64, s *St
 	return s.GetGlobalAutoPause7dThreshold()
 }
 
+func (a *Account) recomputeEffectiveGroupBaseConcurrency(s *Store) {
+	a.groupBaseConcurrency = resolveGroupBaseConcurrency(a.GroupIDs, s)
+}
+
+func resolveGroupBaseConcurrency(groupIDs []int64, s *Store) int64 {
+	if s == nil {
+		return 0
+	}
+	var best int64
+	for _, groupID := range groupIDs {
+		value, ok := s.getGroupBaseConcurrencyOverride(groupID)
+		if ok && value > 0 && (best == 0 || value < best) {
+			best = value
+		}
+	}
+	return best
+}
+
 func (a *Account) creditSkipsUsageWindowLocked() bool {
 	return a.CreditEnabled && a.CreditSkipUsageWindow
 }
@@ -1448,7 +1481,11 @@ func (a *Account) SetCooldownUntil(until time.Time, reason string) {
 	switch reason {
 	case "unauthorized":
 		a.HealthTier = HealthTierBanned
-	case "rate_limited":
+	case "rate_limited_5h":
+		if a.HealthTier != HealthTierBanned {
+			a.HealthTier = HealthTierRisky
+		}
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
 		if a.healthTierLocked() == HealthTierHealthy {
 			a.HealthTier = HealthTierWarm
 		} else {
@@ -1606,10 +1643,39 @@ func (a *Account) SetUsageSnapshot5h(pct float64, resetAt time.Time) {
 func (a *Account) SetUsageSnapshot5hAt(pct float64, resetAt time.Time, updatedAt time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if updatedAt.After(a.usageObservedAt) {
+		a.usageObservedAt = updatedAt
+	}
 	a.UsagePercent5h = pct
 	a.UsagePercent5hValid = true
 	a.Reset5hAt = resetAt
 	a.UsageUpdatedAt5h = updatedAt
+}
+
+// ApplyUsageObservation serializes one authoritative upstream usage observation,
+// including its database writes. The timestamp check prevents an older observer
+// that waited on the lock from overwriting a newer 5h presence/absence decision.
+func (a *Account) ApplyUsageObservation(observedAt time.Time, apply func()) bool {
+	if a == nil || apply == nil {
+		return false
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+
+	a.usageSyncMu.Lock()
+	defer a.usageSyncMu.Unlock()
+
+	a.mu.Lock()
+	if observedAt.Before(a.usageObservedAt) {
+		a.mu.Unlock()
+		return false
+	}
+	a.usageObservedAt = observedAt
+	a.mu.Unlock()
+
+	apply()
+	return true
 }
 
 // GetUsagePercent5h 获取 5h 用量百分比
@@ -1644,6 +1710,38 @@ func (a *Account) MarkResetCreditsProbed(t time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.resetCreditsProbedAt = t
+}
+
+// NeedsSubscriptionExpiryProbe 判断是否需要从网页端 /subscriptions 同步权威订阅
+// 到期时间：仅付费套餐、且到期时间未知或临近/已过（续费窗口附近才可能变化）时需要；
+// 距上次尝试不足 minInterval 时节流。(issue #360)
+func (a *Account) NeedsSubscriptionExpiryProbe(now time.Time, minInterval time.Duration) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	plan := strings.ToLower(strings.TrimSpace(a.PlanType))
+	if plan == "" || plan == "free" || plan == "api" {
+		return false
+	}
+	if !a.subscriptionExpiryProbedAt.IsZero() && now.Sub(a.subscriptionExpiryProbedAt) < minInterval {
+		return false
+	}
+	if a.SubscriptionExpiresAt.IsZero() {
+		return true
+	}
+	return a.SubscriptionExpiresAt.Sub(now) <= expiryUrgencyWarnDays*24*time.Hour
+}
+
+// MarkSubscriptionExpiryProbed 记录订阅到期探针的尝试时间（无论成败），用于节流。
+func (a *Account) MarkSubscriptionExpiryProbed(t time.Time) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.subscriptionExpiryProbedAt = t
 }
 
 // ClearUsageCache 清除内存中的用量缓存，下次请求时从上游重新获取
@@ -2032,7 +2130,7 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 		// premium 5h 限流期间不发 /responses 探活，但 wham 零成本，仍允许其刷新重置次数。
 		return resetCreditsStale
 	}
-	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
+	if a.Status == StatusCooldown && isUsageLimitCooldownReason(a.CooldownReason) && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		// 429 冷却期间不发 /responses 探活（避免加重限流），但允许 wham-only 探针刷新重置次数——
 		// 这正是用户最需要看到"还剩几次主动重置"的时刻。
 		return resetCreditsStale
@@ -2054,10 +2152,10 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	if a.UsagePercent7dValid && !a.Reset7dAt.IsZero() && !a.Reset7dAt.After(now) && a.UsageUpdatedAt.Before(a.Reset7dAt) {
 		return true
 	}
-	if a.effectiveAutoPause5h > 0 && !a.AutoPause5hDisabled {
-		if !a.UsagePercent5hValid || a.UsageUpdatedAt5h.IsZero() {
-			return true
-		}
+	// 5h 是上游可选窗口：仅当本地仍持有有效 5h 快照时才按 maxAge 刷新。
+	// 上游已取消 5h（issue #382）时，缺失快照不应因 auto-pause 5h 配置而永久探测。
+	if a.effectiveAutoPause5h > 0 && !a.AutoPause5hDisabled &&
+		a.UsagePercent5hValid && !a.UsageUpdatedAt5h.IsZero() {
 		if a.Reset5hAt.IsZero() || a.Reset5hAt.After(now) {
 			return now.Sub(a.UsageUpdatedAt5h) > maxAge
 		}
@@ -2122,7 +2220,7 @@ func (a *Account) InLimitedState() bool {
 	if a.premium5hRateLimitedLocked(now) {
 		return true
 	}
-	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
+	if a.Status == StatusCooldown && isUsageLimitCooldownReason(a.CooldownReason) && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
 		return true
 	}
 	return false
@@ -2287,6 +2385,7 @@ type Store struct {
 	allowRemoteMigration  atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping          atomic.Value // 模型映射 JSON 字符串
 	codexModelMapping     atomic.Value // Codex 模型映射 JSON 字符串
+	payloadRules          atomic.Value // Payload 请求体重写规则 JSON 字符串
 	reasoningEffortModels atomic.Value // 带思考强度的模型别名 JSON 数组
 	schedulerMode         atomic.Value // string: "round_robin" or "remaining_quota"
 	affinityMode          atomic.Value // string: "bounded" / "off" / "strict"
@@ -2294,14 +2393,16 @@ type Store struct {
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
 
-	globalAutoPause5hThreshold  float64  // protected by mu
-	globalAutoPause7dThreshold  float64  // protected by mu
-	autoPause5hGuardBandPercent float64  // protected by mu, percentage points
-	autoPause5hGuardConcurrency int      // protected by mu, 0 = disabled
-	smartPacingEnabled          bool     // protected by mu; issue #312 智能配速总开关
-	smartPacingMinConcurrency   int      // protected by mu, 配速并发下限
-	smartPacingWindows          string   // protected by mu, "5h,7d" / "5h" / "7d"
-	groupAutoPauseThresholds    sync.Map // int64 -> [2]float64 {5h, 7d}
+	globalAutoPause5hThreshold    float64  // protected by mu
+	globalAutoPause7dThreshold    float64  // protected by mu
+	autoPause5hGuardBandPercent   float64  // protected by mu, percentage points
+	autoPause5hGuardConcurrency   int      // protected by mu, 0 = disabled
+	smartPacingEnabled            bool     // protected by mu; issue #312 智能配速总开关
+	smartPacingMinConcurrency     int      // protected by mu, 配速并发下限
+	smartPacingWindows            string   // protected by mu, "5h,7d" / "5h" / "7d"
+	groupAutoPauseThresholds      sync.Map // int64 -> [2]float64 {5h, 7d}
+	groupBaseConcurrencyOverrides sync.Map // int64 -> int64; missing means inherit global
+	groupNames                    sync.Map // int64 -> string; 组 ID→名，供 payload 规则按组名匹配
 }
 
 // sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
@@ -2481,7 +2582,13 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 		acc.LastUnauthorizedAt = now
 		acc.LastFailureAt = now
 		acc.HealthTier = HealthTierBanned
-	case "rate_limited", "usage_limited", "usage_limit":
+	case "rate_limited_5h":
+		acc.LastRateLimitedAt = now
+		acc.LastFailureAt = now
+		if acc.HealthTier != HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		}
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
 		acc.LastRateLimitedAt = now
 		acc.LastFailureAt = now
 		if acc.healthTierLocked() == HealthTierHealthy {
@@ -2739,10 +2846,19 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	if settings.CodexModelMapping != "" {
 		s.codexModelMapping.Store(settings.CodexModelMapping)
 	}
+	if settings.PayloadRules != "" {
+		s.payloadRules.Store(settings.PayloadRules)
+	}
 	if settings.ReasoningEffortModels != "" {
 		s.reasoningEffortModels.Store(settings.ReasoningEffortModels)
 	}
-	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
+	promptFilterCfg := promptFilterConfigFromSettings(settings)
+	if s.db != nil {
+		if secret, err := s.db.GetPromptFilterNewAPISecret(context.Background()); err == nil {
+			promptFilterCfg.Advanced.NewAPI.Secret = secret
+		}
+	}
+	s.SetPromptFilterConfig(promptFilterCfg)
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
 	s.fastSchedulerEnabled.Store(fastEnabled)
@@ -3405,6 +3521,10 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			if g.AutoPause5hThreshold > 0 || g.AutoPause7dThreshold > 0 {
 				s.groupAutoPauseThresholds.Store(g.ID, [2]float64{g.AutoPause5hThreshold, g.AutoPause7dThreshold})
 			}
+			if g.BaseConcurrencyOverride.Valid {
+				s.groupBaseConcurrencyOverrides.Store(g.ID, g.BaseConcurrencyOverride.Int64)
+			}
+			s.groupNames.Store(g.ID, strings.TrimSpace(g.Name))
 		}
 	}
 	if memberships, err := s.db.ListAccountGroupMemberships(ctx); err == nil {
@@ -3559,6 +3679,9 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 	if limit, ok := row.GetCredentialInt64("dispatch_count_limit"); ok {
 		account.SetDispatchCountLimit(limit)
+	}
+	if priority, ok := row.GetCredentialInt64("scheduler_priority"); ok {
+		account.SetSchedulerPriority(priority)
 	}
 	account.recomputeEffectiveAutoPause(s)
 	for _, cooldown := range modelCooldowns[row.ID] {
@@ -3742,7 +3865,7 @@ func (s *Store) CleanRateLimitedManual(ctx context.Context) int {
 			continue
 		}
 		status := acc.RuntimeStatus()
-		if status != "rate_limited" && status != "usage_exhausted" {
+		if status != "rate_limited" && status != "rate_limited_5h" && status != "rate_limited_7d" && status != "usage_exhausted" {
 			continue
 		}
 
@@ -3830,6 +3953,7 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 		s.mu.RLock()
 
 		var best *Account
+		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
@@ -3856,11 +3980,15 @@ func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, 
 				continue
 			}
 
+			// 账号调度优先级严格先于健康档位与调度分（issue #358）
+			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			if priority > bestPriority ||
-				(priority == bestPriority && (dispatchScore > bestDispatchScore ||
-					(dispatchScore == bestDispatchScore && load < bestLoad) ||
-					(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))) {
+			if schedulerPriority > bestSchedulerPriority ||
+				(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
+					(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+						(dispatchScore == bestDispatchScore && load < bestLoad) ||
+						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))) {
+				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
 				bestLoad = load
@@ -3992,6 +4120,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 
 		var best *Account
 		var metadataRefreshCandidate *Account
+		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
 		var bestLoad int64 = math.MaxInt64
@@ -4024,11 +4153,15 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 				continue
 			}
 
+			// 账号调度优先级严格先于健康档位与调度分（issue #358）
+			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
-			if priority > bestPriority ||
-				(priority == bestPriority && (dispatchScore > bestDispatchScore ||
-					(dispatchScore == bestDispatchScore && load < bestLoad) ||
-					(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))) {
+			if schedulerPriority > bestSchedulerPriority ||
+				(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
+					(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+						(dispatchScore == bestDispatchScore && load < bestLoad) ||
+						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))) {
+				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
 				bestLoad = load
@@ -4605,6 +4738,19 @@ func (s *Store) GetCodexModelMapping() string {
 	return "{}"
 }
 
+// SetPayloadRules 动态更新 Payload 请求体重写规则 JSON
+func (s *Store) SetPayloadRules(rules string) {
+	s.payloadRules.Store(rules)
+}
+
+// GetPayloadRules 获取当前 Payload 请求体重写规则 JSON
+func (s *Store) GetPayloadRules() string {
+	if v, ok := s.payloadRules.Load().(string); ok && v != "" {
+		return v
+	}
+	return "{}"
+}
+
 // SetReasoningEffortModels 动态更新带思考强度的模型别名 JSON 数组。
 func (s *Store) SetReasoningEffortModels(value string) {
 	s.reasoningEffortModels.Store(value)
@@ -4668,6 +4814,10 @@ func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfil
 	cfg.Mode = settings.PromptFilterMode
 	cfg.Threshold = settings.PromptFilterThreshold
 	cfg.StrictThreshold = settings.PromptFilterStrictThreshold
+	cfg.StrictTerminalEnabled = settings.PromptFilterStrictTerminalEnabled
+	if advanced, err := promptfilter.ParseAdvancedConfig(settings.PromptFilterAdvancedConfig); err == nil {
+		cfg.Advanced = advanced
+	}
 	cfg.LogMatches = settings.PromptFilterLogMatches
 	cfg.MaxTextLength = settings.PromptFilterMaxTextLength
 	cfg.SensitiveWords = settings.PromptFilterSensitiveWords
@@ -4830,6 +4980,38 @@ func (s *Store) DeleteGroupAutoPauseThresholds(groupID int64) {
 	s.groupAutoPauseThresholds.Delete(groupID)
 }
 
+// SetGroupName 记录/更新组 ID→名映射（组创建或改名时调用）。
+func (s *Store) SetGroupName(groupID int64, name string) {
+	if s == nil || groupID <= 0 {
+		return
+	}
+	s.groupNames.Store(groupID, strings.TrimSpace(name))
+}
+
+// DeleteGroupName 移除组 ID→名映射（组删除时调用）。
+func (s *Store) DeleteGroupName(groupID int64) {
+	if s == nil {
+		return
+	}
+	s.groupNames.Delete(groupID)
+}
+
+// ResolveGroupNames 把组 ID 列表解析为组名列表；缺失（未加载/已删除）的项跳过。
+func (s *Store) ResolveGroupNames(groupIDs []int64) []string {
+	if s == nil || len(groupIDs) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(groupIDs))
+	for _, id := range groupIDs {
+		if v, ok := s.groupNames.Load(id); ok {
+			if name, _ := v.(string); name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
+}
+
 func (s *Store) GetGroupAutoPauseThresholds(groupID int64) (float64, float64) {
 	return s.getGroupAutoPauseThresholds(groupID)
 }
@@ -4840,6 +5022,57 @@ func (s *Store) getGroupAutoPauseThresholds(groupID int64) (float64, float64) {
 		return t[0], t[1]
 	}
 	return 0, 0
+}
+
+// SetGroupBaseConcurrencyOverride updates a group's inherited per-account base
+// concurrency. A nil value clears the group override and falls back to other
+// memberships or the global setting.
+func (s *Store) SetGroupBaseConcurrencyOverride(groupID int64, value *int64) {
+	if s == nil || groupID <= 0 {
+		return
+	}
+	if value == nil {
+		s.groupBaseConcurrencyOverrides.Delete(groupID)
+	} else {
+		s.groupBaseConcurrencyOverrides.Store(groupID, *value)
+	}
+	s.recomputeAllGroupBaseConcurrency()
+}
+
+func (s *Store) DeleteGroupBaseConcurrencyOverride(groupID int64) {
+	s.SetGroupBaseConcurrencyOverride(groupID, nil)
+}
+
+func (s *Store) GetGroupBaseConcurrencyOverride(groupID int64) (int64, bool) {
+	return s.getGroupBaseConcurrencyOverride(groupID)
+}
+
+func (s *Store) getGroupBaseConcurrencyOverride(groupID int64) (int64, bool) {
+	if s == nil || groupID <= 0 {
+		return 0, false
+	}
+	value, ok := s.groupBaseConcurrencyOverrides.Load(groupID)
+	if !ok {
+		return 0, false
+	}
+	return value.(int64), true
+}
+
+func (s *Store) recomputeAllGroupBaseConcurrency() {
+	if s == nil {
+		return
+	}
+	baseLimit := atomic.LoadInt64(&s.maxConcurrency)
+	for _, acc := range s.Accounts() {
+		if acc == nil {
+			continue
+		}
+		acc.mu.Lock()
+		acc.recomputeEffectiveGroupBaseConcurrency(s)
+		acc.recomputeSchedulerLocked(baseLimit)
+		acc.mu.Unlock()
+		s.fastSchedulerUpdate(acc)
+	}
 }
 
 func (s *Store) recomputeAllEffectiveAutoPause() {
@@ -4863,6 +5096,7 @@ func (s *Store) AddAccount(acc *Account) {
 	defer s.mu.Unlock()
 	acc.mu.Lock()
 	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
+	acc.recomputeEffectiveGroupBaseConcurrency(s)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
@@ -5056,7 +5290,9 @@ func (s *Store) ApplyAccountGroups(dbID int64, groupIDs []int64) bool {
 	}
 	acc.mu.Lock()
 	acc.GroupIDs = cloneInt64Slice(groupIDs)
+	acc.recomputeEffectiveGroupBaseConcurrency(s)
 	acc.recomputeEffectiveAutoPause(s)
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true
@@ -5091,7 +5327,9 @@ func (s *Store) ApplyAccountGroupMemberships(memberships map[int64][]int64) {
 	for _, acc := range s.Accounts() {
 		acc.mu.Lock()
 		acc.GroupIDs = cloneInt64Slice(memberships[acc.DBID])
+		acc.recomputeEffectiveGroupBaseConcurrency(s)
 		acc.recomputeEffectiveAutoPause(s)
+		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 		acc.mu.Unlock()
 		s.fastSchedulerUpdate(acc)
 	}
@@ -5428,7 +5666,12 @@ func (s *Store) markCooldownUntil(acc *Account, until time.Time, reason string, 
 		acc.LastUnauthorizedAt = now
 		acc.LastFailureAt = now
 		acc.HealthTier = HealthTierBanned
-	case "rate_limited", "usage_limited", "usage_limit":
+	case "rate_limited_5h":
+		acc.LastRateLimitedAt = now
+		if acc.HealthTier != HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		}
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
 		acc.LastRateLimitedAt = now
 		if acc.healthTierLocked() == HealthTierHealthy {
 			acc.HealthTier = HealthTierWarm
@@ -5474,7 +5717,15 @@ func (s *Store) markCooldown(acc *Account, duration time.Duration, reason string
 		acc.FailureStreak++
 		acc.SuccessStreak = 0
 		acc.HealthTier = HealthTierBanned
-	case "rate_limited":
+	case "rate_limited_5h":
+		acc.LastRateLimitedAt = now
+		acc.LastFailureAt = now
+		acc.FailureStreak++
+		acc.SuccessStreak = 0
+		if acc.HealthTier != HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		}
+	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit":
 		acc.LastRateLimitedAt = now
 		acc.LastFailureAt = now
 		acc.FailureStreak++
@@ -5678,25 +5929,87 @@ func (s *Store) ClearCooldown(acc *Account) {
 	}
 }
 
+// ClearUsageLimitCooldownSince clears only a usage/rate-limit cooldown that
+// was already present when observedAt was captured. Authentication failures,
+// generic errors, disabled states, and newer cooldowns are left untouched.
+func (s *Store) ClearUsageLimitCooldownSince(acc *Account, observedAt time.Time) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+
+	acc.mu.Lock()
+	if acc.Status != StatusCooldown || !isUsageLimitCooldownReason(acc.CooldownReason) ||
+		(!acc.LastRateLimitedAt.IsZero() && acc.LastRateLimitedAt.After(observedAt)) {
+		acc.mu.Unlock()
+		return false
+	}
+	reason := acc.CooldownReason
+	until := acc.CooldownUtil
+	acc.Status = StatusReady
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.ErrorMsg = ""
+	acc.LastRateLimitedAt = time.Time{}
+	if acc.HealthTier != HealthTierBanned {
+		acc.HealthTier = HealthTierWarm
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+
+	s.fastSchedulerUpdate(acc)
+	s.deleteCachedAccountCooldown(acc.DBID)
+	acc.mu.RLock()
+	status := acc.Status
+	currentReason := acc.CooldownReason
+	currentUntil := acc.CooldownUtil
+	acc.mu.RUnlock()
+	if status == StatusCooldown && currentReason != "" {
+		s.setCachedAccountCooldown(acc.DBID, currentReason, currentUntil)
+	}
+	if s.db == nil {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := s.db.ClearCooldownIfReasonAndUntil(ctx, acc.DBID, reason, until); err != nil {
+		log.Printf("[账号 %d] 清理过期用量冷却状态失败: %v", acc.DBID, err)
+	}
+	return true
+}
+
 func isUsageLimitCooldownReason(reason string) bool {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limit":
+	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limited", "usage_limit":
 		return true
 	default:
 		return false
 	}
 }
 
-// ConfirmResponsesAvailable clears only a usage/rate-limit cooldown after a
-// completed Responses request succeeds. Authentication and unrelated error
-// states are intentionally untouched.
+// ConfirmResponsesAvailable preserves the original API for callers whose
+// success evidence is current at call time.
 func (s *Store) ConfirmResponsesAvailable(acc *Account) bool {
+	return s.ConfirmResponsesAvailableSince(acc, time.Now())
+}
+
+// ConfirmResponsesAvailableSince clears only a usage/rate-limit cooldown when
+// a completed Responses request started after the latest rate-limit evidence.
+// A stale in-flight success must not undo a newer usage_limit_reached result.
+// Authentication and unrelated error states are intentionally untouched.
+func (s *Store) ConfirmResponsesAvailableSince(acc *Account, requestStartedAt time.Time) bool {
 	if s == nil || acc == nil {
 		return false
 	}
 
 	acc.mu.Lock()
-	if !acc.ignoreUsageLimitStatus || acc.Status != StatusCooldown || !isUsageLimitCooldownReason(acc.CooldownReason) {
+	if !acc.ignoreUsageLimitStatus ||
+		acc.Status != StatusCooldown ||
+		!isUsageLimitCooldownReason(acc.CooldownReason) ||
+		(!acc.LastRateLimitedAt.IsZero() && !requestStartedAt.After(acc.LastRateLimitedAt)) {
 		acc.mu.Unlock()
 		return false
 	}
@@ -5920,6 +6233,48 @@ func (s *Store) UpdateAccountSubscriptionExpiresAt(acc *Account, expiresAt time.
 		log.Printf("[账号 %d] 持久化 subscription_expires_at 失败: %v", acc.DBID, err)
 	}
 	return changed
+}
+
+// StaleSubscriptionExpiry 判断「付费套餐 + 到期时间已过去」的陈旧组合。
+// 订阅到期时间唯一来源是 JWT 的 chatgpt_subscription_active_until，续费后该 claim
+// 不随 token 刷新更新，上游也没有能查到新到期时间的端点（wham/usage 实测不含订阅
+// 字段）；而套餐真到期后上游权威 plan_type 会降回 free。因此付费套餐下已过去的
+// 到期时间必为续费前的旧值，不应再当作「已过期」展示或持久化。(issue #360)
+func StaleSubscriptionExpiry(planType string, expiresAt time.Time, now time.Time) bool {
+	if expiresAt.IsZero() || expiresAt.After(now) {
+		return false
+	}
+	plan := strings.ToLower(strings.TrimSpace(planType))
+	return plan != "" && plan != "free" && plan != "api"
+}
+
+// ClearStaleSubscriptionExpiresAt 在观测到上游权威付费 plan_type 后清理陈旧的
+// 订阅到期时间，避免账号已续费仍长期显示「已过期」。返回是否发生清理。(issue #360)
+func (s *Store) ClearStaleSubscriptionExpiresAt(acc *Account) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	now := time.Now()
+	acc.mu.Lock()
+	stale := StaleSubscriptionExpiry(acc.PlanType, acc.SubscriptionExpiresAt, now)
+	if stale {
+		acc.SubscriptionExpiresAt = time.Time{}
+		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	}
+	acc.mu.Unlock()
+	if !stale {
+		return false
+	}
+	s.fastSchedulerUpdate(acc)
+	log.Printf("[账号 %d] 套餐仍为付费但订阅到期时间已过去（应已续费），清理陈旧到期时间", acc.DBID)
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"subscription_expires_at": ""}); err != nil {
+			log.Printf("[账号 %d] 清理陈旧 subscription_expires_at 失败: %v", acc.DBID, err)
+		}
+	}
+	return true
 }
 
 // UpdateAccountPlanType persists the latest Codex plan type observed from upstream headers.
@@ -6765,6 +7120,8 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	// 4. 更新内存状态
 	appliedPlanType := ""
 	skippedPlanType := ""
+	subExpCredential := ""
+	subExpCredentialSet := false
 	acc.mu.Lock()
 	acc.AccessToken = td.AccessToken
 	if td.RefreshToken != "" {
@@ -6790,8 +7147,16 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 		} else if acc.PlanType == "" {
 			log.Printf("[账号 %d] 刷新后 plan_type 为空，无法识别套餐类型", dbID)
 		}
-		if !info.SubscriptionExpiresAt.IsZero() {
+		// 续费后 JWT 的 chatgpt_subscription_active_until 长期停留在旧值：
+		// 付费套餐下已过去的到期时间视为陈旧，不写入；库里已有的陈旧值一并清掉，
+		// 否则每次刷新都会把旧值写回。(issue #360)
+		if !info.SubscriptionExpiresAt.IsZero() && !StaleSubscriptionExpiry(acc.PlanType, info.SubscriptionExpiresAt, now) {
 			acc.SubscriptionExpiresAt = info.SubscriptionExpiresAt
+			subExpCredential = info.SubscriptionExpiresAt.Format(time.RFC3339)
+			subExpCredentialSet = true
+		} else if StaleSubscriptionExpiry(acc.PlanType, acc.SubscriptionExpiresAt, now) {
+			acc.SubscriptionExpiresAt = time.Time{}
+			subExpCredentialSet = true
 		}
 	}
 	if activeCooldown {
@@ -6838,8 +7203,8 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 		if appliedPlanType != "" {
 			credentials["plan_type"] = appliedPlanType
 		}
-		if !info.SubscriptionExpiresAt.IsZero() {
-			credentials["subscription_expires_at"] = info.SubscriptionExpiresAt.Format(time.RFC3339)
+		if subExpCredentialSet {
+			credentials["subscription_expires_at"] = subExpCredential
 		}
 	}
 	if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {

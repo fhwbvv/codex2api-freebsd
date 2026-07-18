@@ -230,10 +230,6 @@ func (h *Handler) TestConnection(c *gin.Context) {
 					}
 				}
 			}
-			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
-			if !isOpenAIResponsesAccount && !usageState.HasUsage7d && !usageState.HasUsage5h {
-				account.ClearUsageCache()
-			}
 			duration := time.Since(start).Milliseconds()
 			sendTestEvent(c, testEvent{
 				Type: "content",
@@ -943,13 +939,6 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if status != "success" {
 			return status, msg
 		}
-		if !acc.IsOpenAIResponsesAPI() {
-			if _, hasUsage7d := acc.GetUsagePercent7d(); !hasUsage7d {
-				if _, _, hasUsage5h := acc.GetUsageSnapshot5h(); !hasUsage5h {
-					acc.ClearUsageCache()
-				}
-			}
-		}
 		// 测试成功即重置失败/冷却状态，用量限制由调度器自行判断
 		h.store.RecordManualTestSuccess(acc, time.Since(start))
 		return "success", msg
@@ -1162,6 +1151,8 @@ func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account)
 	}
 
 	usageState := proxy.ApplyWhamUsage(h.store, acc, usage)
+	// wham 不含订阅到期字段，按需从网页端 /subscriptions 补权威到期时间。(issue #360)
+	proxy.MaybeSyncSubscriptionExpiry(ctx, h.store, acc, h.store.ResolveProxyForAccount(acc))
 	applyUsageLimitedTestState(h.store, acc, usageState)
 	if msg, limited := formatUsageLimitedTestError(usageState); limited {
 		return "rate_limited", msg, true

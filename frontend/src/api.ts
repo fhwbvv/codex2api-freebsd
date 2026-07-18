@@ -1,5 +1,7 @@
 import type {
   AccountEventTrendPoint,
+  AccountPortalAuthURLResponse,
+  AccountPortalSubmitResponse,
   AccountUsageDetail,
   AddAccountRequest,
   AddATAccountRequest,
@@ -47,6 +49,7 @@ import type {
   SetupHintsResponse,
   CPAExportEntry,
   SystemSettings,
+  ObservedInstructionsResponse,
   UpdateAccountSchedulerRequest,
   UpdateAPIKeyRequest,
   UpdateOAuthAccountRequest,
@@ -172,6 +175,44 @@ async function requestPublic<T>(path: string, options: RequestInit = {}): Promis
   return (await res.json()) as T
 }
 
+// 公开账号自助门户:无鉴权头,错误体形如 {error:{message}}。
+// 单独实现以便解析嵌套的 message 并携带 HTTP 状态码(供 404「门户未开启」判定)。
+async function requestAccountPortal<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers)
+  if (options.body !== undefined && options.body !== null && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  const res = await fetch(path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    let message = body.trim() || `HTTP ${res.status}`
+    try {
+      const parsed = JSON.parse(body) as { error?: { message?: string } | string; message?: string }
+      if (parsed && typeof parsed.error === 'object' && parsed.error?.message) {
+        message = parsed.error.message
+      } else if (typeof parsed.error === 'string' && parsed.error.trim()) {
+        message = parsed.error
+      } else if (typeof parsed.message === 'string' && parsed.message.trim()) {
+        message = parsed.message
+      }
+    } catch {
+      // 保留原始文本
+    }
+    const err = new Error(message) as Error & { status?: number }
+    err.status = res.status
+    throw err
+  }
+
+  const text = await res.text()
+  return (text ? JSON.parse(text) : undefined) as T
+}
+
 async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   headers.set('Authorization', `Bearer ${apiKey}`)
@@ -188,6 +229,52 @@ async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: Requ
   }
 
   return (await res.json()) as T
+}
+
+async function requestImageStudioPortal<T>(path: string, apiKey: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers)
+  headers.set('Authorization', `Bearer ${apiKey}`)
+  if (options.body && !(options.body instanceof FormData) && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  const res = await fetch('/api/image-studio' + path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  if (res.status === 204) {
+    return undefined as T
+  }
+  const text = await res.text()
+  if (!text) {
+    return undefined as T
+  }
+  return JSON.parse(text) as T
+}
+
+async function requestImageStudioPortalBlob(path: string, apiKey: string, options: RequestInit = {}): Promise<Blob> {
+  const headers = new Headers(options.headers)
+  headers.set('Authorization', `Bearer ${apiKey}`)
+
+  const res = await fetch('/api/image-studio' + path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return res.blob()
 }
 
 async function requestBlob(path: string, options: RequestInit = {}): Promise<Blob> {
@@ -245,6 +332,18 @@ function buildOpsErrorSearchParams(params: {
 
 export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
+  // 公开账号自助门户:生成 OpenAI 授权链接(无鉴权)。
+  generateAccountPortalAuthURL: (data: { contact_email: string }) =>
+    requestAccountPortal<AccountPortalAuthURLResponse>('/api/account-portal/generate-auth-url', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  // 公开账号自助门户:提交授权码(无鉴权)。
+  submitAccountPortalCode: (data: { session_id: string; code: string; state: string }) =>
+    requestAccountPortal<AccountPortalSubmitResponse>('/api/account-portal/submit-code', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } = {}) => {
     const search = new URLSearchParams()
     search.set('range', range)
@@ -252,6 +351,39 @@ export const api = {
     if (params.pageSize) search.set('page_size', String(params.pageSize))
     return requestAPIKeyUsage<PublicAPIKeyUsageResponse>(`/summary?${search.toString()}`, apiKey)
   },
+  createPortalImageJob: (apiKey: string, data: CreateImageJobPayload) =>
+    requestImageStudioPortal<ImageJobResponse>('/jobs', apiKey, { method: 'POST', body: JSON.stringify(data) }),
+  createPortalImageEditJob: (apiKey: string, data: CreateImageJobPayload) =>
+    requestImageStudioPortal<ImageJobResponse>('/edit-jobs', apiKey, { method: 'POST', body: JSON.stringify(data) }),
+  getPortalImageJobs: (apiKey: string, params: { page?: number; pageSize?: number } = {}) => {
+    const sp = new URLSearchParams()
+    if (params.page) sp.set('page', String(params.page))
+    if (params.pageSize) sp.set('page_size', String(params.pageSize))
+    return requestImageStudioPortal<ImageJobsResponse>(`/jobs?${sp.toString()}`, apiKey)
+  },
+  getPortalImageJob: (apiKey: string, id: number, params: { includeCache?: boolean } = {}) => {
+    const sp = new URLSearchParams()
+    if (params.includeCache) sp.set('include_cache', '1')
+    const query = sp.toString()
+    return requestImageStudioPortal<ImageJobResponse>(`/jobs/${id}${query ? `?${query}` : ''}`, apiKey)
+  },
+  deletePortalImageJob: (apiKey: string, id: number) =>
+    requestImageStudioPortal<MessageResponse>(`/jobs/${id}`, apiKey, { method: 'DELETE' }),
+  getPortalImageAssets: (apiKey: string, params: { page?: number; pageSize?: number } = {}) => {
+    const sp = new URLSearchParams()
+    if (params.page) sp.set('page', String(params.page))
+    if (params.pageSize) sp.set('page_size', String(params.pageSize))
+    return requestImageStudioPortal<ImageAssetsResponse>(`/assets?${sp.toString()}`, apiKey)
+  },
+  getPortalImageAssetFile: (apiKey: string, id: number, download = false, thumbKB = 0) => {
+    const sp = new URLSearchParams()
+    if (download) sp.set('download', '1')
+    if (thumbKB > 0) sp.set('thumb_kb', String(thumbKB))
+    const query = sp.toString()
+    return requestImageStudioPortalBlob(`/assets/${id}/file${query ? `?${query}` : ''}`, apiKey)
+  },
+  deletePortalImageAsset: (apiKey: string, id: number) =>
+    requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>
@@ -266,6 +398,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
+  updateAccountNote: (id: number, note: string) =>
+    request<MessageResponse>(`/accounts/${id}/note`, { method: 'PATCH', body: JSON.stringify({ note }) }),
   getRecycleBinAccounts: () =>
     request<RecycleBinAccountsResponse>('/accounts/recycle-bin'),
   restoreAccount: (id: number) =>
@@ -325,6 +459,9 @@ export const api = {
   updateAccountCredit: (id: number, data: { credit_enabled: boolean; credit_skip_usage_window: boolean }) =>
     request<MessageResponse>(`/accounts/${id}/credit`, { method: 'PATCH', body: JSON.stringify(data) }),
   getHealth: () => request<HealthResponse>('/health'),
+  getPromptFilterNewAPISecret: () => request<{ configured: boolean; source: 'none' | 'database' | 'environment'; masked: string; secret?: string }>('/prompt-filter/newapi-secret'),
+  generatePromptFilterNewAPISecret: () => request<{ configured: boolean; source: string; masked: string; secret: string }>('/prompt-filter/newapi-secret/generate', { method: 'POST' }),
+  replacePromptFilterNewAPISecret: (secret: string) => request<{ configured: boolean; source: string; masked: string; secret: string }>('/prompt-filter/newapi-secret', { method: 'PUT', body: JSON.stringify({ secret }) }),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),
   getSystemUpdate: () => request<SystemUpdateInfo>('/system/update', { timeoutMs: 20_000 }),
@@ -495,6 +632,8 @@ export const api = {
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
   getSetupHints: () => request<SetupHintsResponse>('/setup-hints'),
   getSettings: () => request<SystemSettings>('/settings'),
+  getObservedInstructions: () =>
+    request<ObservedInstructionsResponse>('/settings/observed-instructions'),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
   uploadBackground: (file: File) => {
@@ -548,6 +687,12 @@ export const api = {
     request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>
     request<PromptFilterRulesResponse>('/prompt-filter/rules'),
+  runPromptIntelligence: () =>
+    request<import('./types').PromptIntelligenceRun>('/prompt-filter/intelligence/run', { method: 'POST' }),
+  getPromptIntelligenceHistory: (page = 1, pageSize = 20) =>
+    request<import('./types').PromptIntelligenceHistoryResponse>(`/prompt-filter/intelligence/history?page=${page}&page_size=${pageSize}`),
+  addPromptIntelligenceRule: (candidate: import('./types').PromptIntelligenceCandidate) =>
+    request<{ added: number; updated: number }>('/prompt-filter/intelligence/rules', { method: 'POST', body: JSON.stringify(candidate) }),
   getModels: () => request<ModelsResponse>('/models'),
   syncModels: () => request<ModelSyncResponse>('/models/sync', { method: 'POST' }),
   syncCodexCLIVersion: () =>

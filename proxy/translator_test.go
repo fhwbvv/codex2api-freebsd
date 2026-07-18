@@ -1851,7 +1851,7 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 		"input":[
 			{"type":"reasoning","id":"rs_123","encrypted_content":"opaque"},
 			{"type":"message","id":"msg_123","role":"user","content":"continue"},
-			{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":"{}"}
+			{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","namespace":"code_tools","arguments":"{}"}
 		]
 	}`)
 
@@ -1870,6 +1870,9 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 	}
 	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_123" {
 		t.Fatalf("function_call call_id should be preserved, got %q; body=%s", callID, got)
+	}
+	if namespace := gjson.GetBytes(got, "input.2.namespace").String(); namespace != "code_tools" {
+		t.Fatalf("function_call namespace should be preserved, got %q; body=%s", namespace, got)
 	}
 }
 

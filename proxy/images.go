@@ -54,7 +54,9 @@ const (
 	maxImageAttempts = 5
 
 	// MaxImageEditInputCount caps the number of input images for edit requests.
-	MaxImageEditInputCount = 10
+	// 与官方 Images API 对 gpt-image 系列的上限一致（16 张）；上游 responses
+	// 通道已实测可接受 16 张 input_image（issue #275）。
+	MaxImageEditInputCount = 16
 
 	imageStreamConnectedComment = ": connected\n\n"
 	imageStreamKeepaliveComment = ": keepalive\n\n"
@@ -971,7 +973,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
-	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/generations", imageModel) {
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/images/generations", imageModel) {
 		return
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
@@ -1204,7 +1206,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
-	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/images/edits", imageModel) {
 		return
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
@@ -1354,9 +1356,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
-			}
+			SyncCodexUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
@@ -1656,7 +1656,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
 	)
-	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
 	var (
 		writeMu   sync.Mutex
 		closeOnce sync.Once
@@ -1798,6 +1798,11 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		return true
 	})
 	stopKeepalive()
+	writeMu.Lock()
+	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
+		readErr = finalizeErr
+	}
+	writeMu.Unlock()
 	if err != nil {
 		if streamErr := getReadErr(); streamErr != nil {
 			return usage, imageCount, firstTokenMs, imageLogInfo, streamErr
@@ -1821,6 +1826,11 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
 		setReadErr(err)
 	}
+	writeMu.Lock()
+	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
+		readErr = finalizeErr
+	}
+	writeMu.Unlock()
 	return usage, imageCount, firstTokenMs, imageLogInfo, getReadErr()
 }
 

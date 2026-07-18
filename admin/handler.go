@@ -51,6 +51,9 @@ type Handler struct {
 	refreshAccount         func(context.Context, int64) error
 	probeUsage             func(context.Context, *auth.Account) error
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
+	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
+	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
+	recordAccountEvent     func(int64, string, string)
 	cpuSampler             *cpuSampler
 	startedAt              time.Time
 	pgMaxConns             int
@@ -71,9 +74,20 @@ type Handler struct {
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
 
-	// 「主动重置次数」消耗操作的账号级互斥锁（dbID -> *sync.Mutex），
-	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
-	resetCreditLocks sync.Map
+	// 「主动重置次数」消耗操作的工作区级互斥锁（workspace -> *sync.Mutex），
+	// 串行化同一上游工作区的并发重置，避免重复消耗与次数计数竞态。
+	resetCreditLocks          sync.Map
+	resetCreditLastSuccess    sync.Map
+	resetCreditSuccessfulIDs  sync.Map
+	autoResetCreditsWake      chan struct{}
+	autoResetCreditsStartOnce sync.Once
+	autoResetCreditsWG        sync.WaitGroup
+	resetCreditPostMu         sync.Mutex
+	resetCreditPostWG         sync.WaitGroup
+	resetCreditPostCtx        context.Context
+	resetCreditPostCancel     context.CancelFunc
+	resetCreditPostClosed     bool
+	settingsUpdateMu          sync.Mutex
 
 	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
 	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
@@ -341,7 +355,11 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.refreshAccount = handler.refreshSingleAccount
 	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
+	handler.queryResetCredits = proxy.QueryWhamResetCredits
+	handler.consumeResetCredit = proxy.ConsumeResetCreditParsed
+	handler.autoResetCreditsWake = make(chan struct{}, 1)
 	if db != nil {
+		handler.recordAccountEvent = db.InsertAccountEventAsync
 		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
 			log.Printf("标记中断生图任务失败: %v", err)
 		}
@@ -364,6 +382,23 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	keyUsage := r.Group("/api/key-usage")
 	keyUsage.GET("/summary", h.GetPublicAPIKeyUsageSummary)
 	keyUsage.GET("/me", h.GetPublicAPIKeyUsageSummary)
+
+	// 账号自助添加公开门户（无 admin 鉴权；开关门控 + IP 限流；见 self_service.go）
+	accountPortal := r.Group("/api/account-portal")
+	accountPortal.Use(h.accountPortalMiddleware())
+	accountPortal.POST("/generate-auth-url", h.GenerateAccountPortalAuthURL)
+	accountPortal.POST("/submit-code", h.SubmitAccountPortalCode)
+
+	imageStudioPortal := r.Group("/api/image-studio")
+	imageStudioPortal.Use(h.imageStudioPortalAuthMiddleware())
+	imageStudioPortal.POST("/jobs", h.CreatePortalImageJob)
+	imageStudioPortal.POST("/edit-jobs", h.CreatePortalImageEditJob)
+	imageStudioPortal.GET("/jobs", h.ListPortalImageJobs)
+	imageStudioPortal.GET("/jobs/:id", h.GetPortalImageJob)
+	imageStudioPortal.DELETE("/jobs/:id", h.DeletePortalImageJob)
+	imageStudioPortal.GET("/assets", h.ListPortalImageAssets)
+	imageStudioPortal.GET("/assets/:id/file", h.GetPortalImageAssetFile)
+	imageStudioPortal.DELETE("/assets/:id", h.DeletePortalImageAsset)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
@@ -394,6 +429,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/accounts/:id/purge", h.PurgeAccount)
 	api.POST("/accounts/:id/refresh", h.RefreshAccount)
 	api.POST("/accounts/:id/enable", h.ToggleAccountEnabled)
+	api.PATCH("/accounts/:id/note", h.UpdateAccountNote)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
 	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
 	api.POST("/accounts/:id/reset-credits", h.ResetCredits)
@@ -441,6 +477,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
@@ -449,6 +486,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
 	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
+	api.GET("/prompt-filter/newapi-secret", h.GetPromptFilterNewAPISecretStatus)
+	api.POST("/prompt-filter/newapi-secret/generate", h.GeneratePromptFilterNewAPISecret)
+	api.PUT("/prompt-filter/newapi-secret", h.ReplacePromptFilterNewAPISecret)
+	api.POST("/prompt-filter/intelligence/run", h.RunPromptIntelligence)
+	api.GET("/prompt-filter/intelligence/history", h.ListPromptIntelligenceHistory)
+	api.POST("/prompt-filter/intelligence/rules", h.AddPromptIntelligenceCandidate)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
 	api.POST("/codex-cli-version/sync", h.SyncCodexCLIVersion)
@@ -702,6 +745,7 @@ type accountResponse struct {
 	DispatchCountUsed        int64                      `json:"dispatch_count_used,omitempty"`
 	DispatchCountResetAt     string                     `json:"dispatch_count_reset_at,omitempty"`
 	DispatchCountLimited     bool                       `json:"dispatch_count_limited,omitempty"`
+	SchedulerPriority        *int64                     `json:"scheduler_priority"`
 	Usage5hDetail            *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
 	Usage7dDetail            *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                string                     `json:"reset_5h_at,omitempty"`
@@ -723,6 +767,7 @@ type accountResponse struct {
 	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
 	Tags                     []string                   `json:"tags"`
 	GroupIDs                 []int64                    `json:"group_ids"`
+	Note                     string                     `json:"note"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -857,6 +902,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Locked:                   row.Locked,
 			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
 			Tags:                     append([]string(nil), row.Tags...),
+			Note:                     row.Note,
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),
 			ScoreBiasEffective:       effectiveScoreBias(planType, row.ScoreBiasOverride),
 			BaseConcurrencyOverride:  nullableInt64Pointer(row.BaseConcurrencyOverride),
@@ -873,6 +919,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 		resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 		resp.DispatchCountLimit = accountDispatchCountLimit(row)
+		resp.SchedulerPriority = accountSchedulerPriority(row)
 		if acc, ok := accountMap[row.ID]; ok {
 			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
 			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
@@ -1056,6 +1103,7 @@ type updateAccountSchedulerReq struct {
 	AutoPause7dDisabled     json.RawMessage `json:"auto_pause_7d_disabled"`
 	UsageLimitOverride      json.RawMessage `json:"ignore_usage_limit_status_override"`
 	DispatchCountLimit      json.RawMessage `json:"dispatch_count_limit"`
+	SchedulerPriority       json.RawMessage `json:"scheduler_priority"`
 	ProxyURL                json.RawMessage `json:"proxy_url"`
 	CustomHeaders           json.RawMessage `json:"custom_headers"`
 }
@@ -1073,6 +1121,7 @@ type accountSchedulerUpdate struct {
 	AutoPause7dDisabled     database.OptionalBool
 	UsageLimitOverride      optionalNullableBool
 	DispatchCountLimit      database.OptionalNullInt64
+	SchedulerPriority       database.OptionalNullInt64
 	ProxyURL                database.OptionalString
 	CustomHeaders           optionalCustomHeaders
 	CredentialUpdates       map[string]interface{}
@@ -1127,6 +1176,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	schedulerPriority, err := parseOptionalIntegerField(req.SchedulerPriority, "scheduler_priority", -100, 100)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 
 	proxyURL, err := parseOptionalStringField(req.ProxyURL, "proxy_url", security.ValidateProxyURL)
 	if err != nil {
@@ -1166,6 +1219,13 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 			credentialUpdates["dispatch_count_limit"] = int64(0)
 		}
 	}
+	if schedulerPriority.Set {
+		if schedulerPriority.Value.Valid {
+			credentialUpdates["scheduler_priority"] = schedulerPriority.Value.Int64
+		} else {
+			credentialUpdates["scheduler_priority"] = int64(0)
+		}
+	}
 	if len(credentialUpdates) == 0 {
 		credentialUpdates = nil
 	}
@@ -1183,6 +1243,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		AutoPause7dDisabled:     autoPause7dDisabled,
 		UsageLimitOverride:      ignoreUsageLimitStatusOverride,
 		DispatchCountLimit:      dispatchCountLimit,
+		SchedulerPriority:       schedulerPriority,
 		ProxyURL:                proxyURL,
 		CustomHeaders:           customHeaders,
 		CredentialUpdates:       credentialUpdates,
@@ -1202,6 +1263,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.AutoPause7dDisabled.Set ||
 		u.UsageLimitOverride.Set ||
 		u.DispatchCountLimit.Set ||
+		u.SchedulerPriority.Set ||
 		u.ProxyURL.Set
 }
 
@@ -1351,6 +1413,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.DispatchCountLimit.Set {
 		h.store.ApplyAccountDispatchCountLimit(id, nullableInt64Pointer(update.DispatchCountLimit.Value))
+	}
+	if update.SchedulerPriority.Set {
+		h.store.ApplyAccountSchedulerPriority(id, nullableInt64Pointer(update.SchedulerPriority.Value))
 	}
 	if update.Tags.Set {
 		h.store.ApplyAccountTags(id, update.Tags.Values)
@@ -1536,6 +1601,20 @@ func accountDispatchCountLimit(row *database.AccountRow) *int64 {
 	}
 	if value > 1000000 {
 		value = 1000000
+	}
+	return &value
+}
+
+func accountSchedulerPriority(row *database.AccountRow) *int64 {
+	value, ok := row.GetCredentialInt64("scheduler_priority")
+	if !ok || value == 0 {
+		return nil
+	}
+	if value > 100 {
+		value = 100
+	}
+	if value < -100 {
+		value = -100
 	}
 	return &value
 }
@@ -4595,13 +4674,51 @@ func (h *Handler) ToggleAccountEnabled(c *gin.Context) {
 		return
 	}
 
-	h.store.ApplyAccountEnabled(id, *req.Enabled)
+	// 若启用一个尚未进入运行时池的账号（如自助门户提交的待审核账号），ApplyAccountEnabled
+	// 因找不到运行时对象返回 false；此时按需加载进调度池，使「批准」立即生效（issue #393）。
+	if !h.store.ApplyAccountEnabled(id, *req.Enabled) && *req.Enabled {
+		if err := h.store.LoadAccountByID(ctx, id); err != nil {
+			log.Printf("启用账号 %d 后加载进调度池失败: %v", id, err)
+		}
+	}
 
 	if *req.Enabled {
 		writeMessage(c, http.StatusOK, "账号已启用")
 	} else {
 		writeMessage(c, http.StatusOK, "账号已禁用")
 	}
+}
+
+// UpdateAccountNote 更新账号备注（通用标识字段）。
+func (h *Handler) UpdateAccountNote(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	var req struct {
+		Note string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	note := security.SanitizeInput(strings.TrimSpace(req.Note))
+	if utf8.RuneCountInString(note) > 500 {
+		writeError(c, http.StatusBadRequest, "备注长度不能超过 500 字符")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	if err := h.db.UpdateAccountNote(ctx, id, note); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "更新备注失败: "+err.Error())
+		return
+	}
+	writeMessage(c, http.StatusOK, "备注已更新")
 }
 
 // ToggleAccountLock 切换账号的锁定状态
@@ -5987,6 +6104,8 @@ type settingsResponse struct {
 	AutoCleanFullUsage                 bool    `json:"auto_clean_full_usage"`
 	AutoCleanError                     bool    `json:"auto_clean_error"`
 	AutoCleanExpired                   bool    `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled            bool    `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin    int     `json:"auto_reset_credits_before_expiry_min"`
 	ProxyPoolEnabled                   bool    `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled               bool    `json:"fast_scheduler_enabled"`
 	CodexForceWebsocket                bool    `json:"codex_force_websocket"`
@@ -6014,6 +6133,7 @@ type settingsResponse struct {
 	ExpiredCleaned                     int     `json:"expired_cleaned,omitempty"`
 	ModelMapping                       string  `json:"model_mapping"`
 	CodexModelMapping                  string  `json:"codex_model_mapping"`
+	PayloadRules                       string  `json:"payload_rules"`
 	ReasoningEffortModels              string  `json:"reasoning_effort_models"`
 	ResinURL                           string  `json:"resin_url"`
 	ResinPlatformName                  string  `json:"resin_platform_name"`
@@ -6021,6 +6141,8 @@ type settingsResponse struct {
 	PromptFilterMode                   string  `json:"prompt_filter_mode"`
 	PromptFilterThreshold              int     `json:"prompt_filter_threshold"`
 	PromptFilterStrictThreshold        int     `json:"prompt_filter_strict_threshold"`
+	PromptFilterStrictTerminalEnabled  bool    `json:"prompt_filter_strict_terminal_enabled"`
+	PromptFilterAdvancedConfig         string  `json:"prompt_filter_advanced_config"`
 	PromptFilterLogMatches             bool    `json:"prompt_filter_log_matches"`
 	PromptFilterMaxTextLength          int     `json:"prompt_filter_max_text_length"`
 	PromptFilterSensitiveWords         string  `json:"prompt_filter_sensitive_words"`
@@ -6046,6 +6168,8 @@ type settingsResponse struct {
 	BillingTierPolicy                  string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               bool    `json:"show_full_usage_numbers"`
 	PublicKeyUsagePageEnabled          bool    `json:"public_key_usage_page_enabled"`
+	PublicImageStudioPageEnabled       bool    `json:"public_image_studio_page_enabled"`
+	PublicAccountPortalPageEnabled     bool    `json:"public_account_portal_page_enabled"`
 	ImageStorageBackend                string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    string  `json:"image_s3_endpoint"`
 	ImageS3Region                      string  `json:"image_s3_region"`
@@ -6092,6 +6216,8 @@ type updateSettingsReq struct {
 	AutoCleanFullUsage                 *bool    `json:"auto_clean_full_usage"`
 	AutoCleanError                     *bool    `json:"auto_clean_error"`
 	AutoCleanExpired                   *bool    `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled            *bool    `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin    *int     `json:"auto_reset_credits_before_expiry_min"`
 	ProxyPoolEnabled                   *bool    `json:"proxy_pool_enabled"`
 	FastSchedulerEnabled               *bool    `json:"fast_scheduler_enabled"`
 	CodexForceWebsocket                *bool    `json:"codex_force_websocket"`
@@ -6113,6 +6239,7 @@ type updateSettingsReq struct {
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
 	ModelMapping                       *string  `json:"model_mapping"`
 	CodexModelMapping                  *string  `json:"codex_model_mapping"`
+	PayloadRules                       *string  `json:"payload_rules"`
 	ReasoningEffortModels              *string  `json:"reasoning_effort_models"`
 	ResinURL                           *string  `json:"resin_url"`
 	ResinPlatformName                  *string  `json:"resin_platform_name"`
@@ -6120,6 +6247,8 @@ type updateSettingsReq struct {
 	PromptFilterMode                   *string  `json:"prompt_filter_mode"`
 	PromptFilterThreshold              *int     `json:"prompt_filter_threshold"`
 	PromptFilterStrictThreshold        *int     `json:"prompt_filter_strict_threshold"`
+	PromptFilterStrictTerminalEnabled  *bool    `json:"prompt_filter_strict_terminal_enabled"`
+	PromptFilterAdvancedConfig         *string  `json:"prompt_filter_advanced_config"`
 	PromptFilterLogMatches             *bool    `json:"prompt_filter_log_matches"`
 	PromptFilterMaxTextLength          *int     `json:"prompt_filter_max_text_length"`
 	PromptFilterSensitiveWords         *string  `json:"prompt_filter_sensitive_words"`
@@ -6144,6 +6273,8 @@ type updateSettingsReq struct {
 	BillingTierPolicy                  *string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               *bool    `json:"show_full_usage_numbers"`
 	PublicKeyUsagePageEnabled          *bool    `json:"public_key_usage_page_enabled"`
+	PublicImageStudioPageEnabled       *bool    `json:"public_image_studio_page_enabled"`
+	PublicAccountPortalPageEnabled     *bool    `json:"public_account_portal_page_enabled"`
 	ImageStorageBackend                *string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    *string  `json:"image_s3_endpoint"`
 	ImageS3Region                      *string  `json:"image_s3_region"`
@@ -6633,6 +6764,12 @@ func (h *Handler) GetBranding(c *gin.Context) {
 }
 
 // GetSettings 获取当前系统设置
+// GetObservedInstructions 返回最近观测到的客户端透传 instructions 样本，
+// 供管理端在配置 payload 重写规则时查看客户端实际发来的系统提示词原文。
+func (h *Handler) GetObservedInstructions(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"samples": proxy.ObservedInstructions()})
+}
+
 func (h *Handler) GetSettings(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
@@ -6643,6 +6780,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
 	publicKeyUsagePageEnabled := true
+	publicImageStudioPageEnabled := true
+	publicAccountPortalPageEnabled := false
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -6651,9 +6790,17 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinPlatformName = dbSettings.ResinPlatformName
 		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
 		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
+		publicImageStudioPageEnabled = dbSettings.PublicImageStudioPageEnabled
+		publicAccountPortalPageEnabled = dbSettings.PublicAccountPortalPageEnabled
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
+	autoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	autoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
+	if dbSettings != nil {
+		autoResetCreditsEnabled = dbSettings.AutoResetCreditsEnabled
+		autoResetCreditsBeforeExpiryMin = dbSettings.AutoResetCreditsBeforeExpiryMin
+	}
 	imgCfg := imagestore.CurrentConfig()
 	imgPrefix := strings.TrimSuffix(imgCfg.Prefix, "/")
 	bgCfg := defaultBackgroundConfig()
@@ -6689,6 +6836,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:                     h.store.GetAutoCleanError(),
 		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:            autoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:    autoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
@@ -6715,6 +6864,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CacheLabel:                         h.cacheLabel,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,
@@ -6722,6 +6872,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterMode:                   promptFilterCfg.Mode,
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
@@ -6747,6 +6899,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
+		PublicImageStudioPageEnabled:       publicImageStudioPageEnabled,
+		PublicAccountPortalPageEnabled:     publicAccountPortalPageEnabled,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
 		ImageS3Region:                      imgCfg.Region,
@@ -6773,6 +6927,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	h.settingsUpdateMu.Lock()
+	defer h.settingsUpdateMu.Unlock()
 	if req.AutoPause5hThreshold != nil {
 		if err := validateAutoPauseThreshold("auto_pause_5h_threshold", *req.AutoPause5hThreshold); err != nil {
 			writeError(c, http.StatusBadRequest, err.Error())
@@ -6812,6 +6968,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			return
 		}
 	}
+	if req.AutoResetCreditsBeforeExpiryMin != nil {
+		if *req.AutoResetCreditsBeforeExpiryMin < 10 || *req.AutoResetCreditsBeforeExpiryMin > 10080 {
+			writeError(c, http.StatusBadRequest, "auto_reset_credits_before_expiry_min 需在 10 到 10080 分钟之间")
+			return
+		}
+	}
 
 	currentAdminSecret := ""
 	siteName := database.DefaultSiteName
@@ -6819,7 +6981,17 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
 	publicKeyUsagePageEnabled := true
-	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
+	publicImageStudioPageEnabled := true
+	publicAccountPortalPageEnabled := false
+	modelPricingOverrides := "{}"
+	modelPricingSyncURL := ""
+	persistedAutoResetCreditsEnabled := false
+	persistedAutoResetCreditsBeforeExpiryMin := 60
+	existingSettings, settingsErr := h.db.GetSystemSettings(c.Request.Context())
+	if settingsErr != nil {
+		writeError(c, http.StatusInternalServerError, "读取现有设置失败："+settingsErr.Error())
+		return
+	}
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
 		siteName = database.NormalizeSiteName(existingSettings.SiteName)
@@ -6827,6 +6999,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
 		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
+		publicImageStudioPageEnabled = existingSettings.PublicImageStudioPageEnabled
+		publicAccountPortalPageEnabled = existingSettings.PublicAccountPortalPageEnabled
+		modelPricingOverrides = existingSettings.ModelPricingOverrides
+		modelPricingSyncURL = existingSettings.ModelPricingSyncURL
+		persistedAutoResetCreditsEnabled = existingSettings.AutoResetCreditsEnabled
+		persistedAutoResetCreditsBeforeExpiryMin = existingSettings.AutoResetCreditsBeforeExpiryMin
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -6876,6 +7054,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	hasAdminSecret := strings.TrimSpace(currentAdminSecret) != "" || strings.TrimSpace(h.adminSecretEnv) != ""
 	runtimeCfg := proxy.CurrentRuntimeSettings()
+	previousAutoResetCreditsEnabled := runtimeCfg.AutoResetCreditsEnabled
+	previousAutoResetCreditsBeforeExpiryMin := runtimeCfg.AutoResetCreditsBeforeExpiryMin
+	// 数据库是多实例下的权威来源；用持久值作为本次 partial update 的基线，
+	// 避免旧实例保存无关字段时把自动消费配置回滚成自己的陈旧快照。
+	runtimeCfg.AutoResetCreditsEnabled = persistedAutoResetCreditsEnabled
+	runtimeCfg.AutoResetCreditsBeforeExpiryMin = persistedAutoResetCreditsBeforeExpiryMin
+	autoResetCreditsChanged := (req.AutoResetCreditsEnabled != nil && *req.AutoResetCreditsEnabled != persistedAutoResetCreditsEnabled) ||
+		(req.AutoResetCreditsBeforeExpiryMin != nil && *req.AutoResetCreditsBeforeExpiryMin != persistedAutoResetCreditsBeforeExpiryMin)
 	usageLogMode := h.db.GetUsageLogMode()
 	usageLogBatchSize := h.db.GetUsageLogBatchSize()
 	usageLogFlushIntervalSeconds := h.db.GetUsageLogFlushIntervalSeconds()
@@ -7201,6 +7387,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetCodexModelMapping(*req.CodexModelMapping)
 		log.Printf("设置已更新: codex_model_mapping")
 	}
+	if req.PayloadRules != nil {
+		normalized, err := proxy.NormalizePayloadRulesJSON(*req.PayloadRules)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := proxy.SetPayloadRulesJSON(normalized); err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		h.store.SetPayloadRules(normalized)
+		log.Printf("设置已更新: payload_rules")
+	}
 	if req.ReasoningEffortModels != nil {
 		normalized, err := proxy.NormalizeReasoningEffortModelsJSON(*req.ReasoningEffortModels, proxy.SupportedModelIDs(c.Request.Context(), h.db))
 		if err != nil {
@@ -7256,6 +7455,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
 		log.Printf("设置已更新: public_key_usage_page_enabled = %t", publicKeyUsagePageEnabled)
 	}
+	if req.PublicImageStudioPageEnabled != nil {
+		publicImageStudioPageEnabled = *req.PublicImageStudioPageEnabled
+		log.Printf("设置已更新: public_image_studio_page_enabled = %t", publicImageStudioPageEnabled)
+	}
+	if req.PublicAccountPortalPageEnabled != nil {
+		publicAccountPortalPageEnabled = *req.PublicAccountPortalPageEnabled
+		log.Printf("设置已更新: public_account_portal_page_enabled = %t", publicAccountPortalPageEnabled)
+	}
 	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
 		t5h := h.store.GetGlobalAutoPause5hThreshold()
 		t7d := h.store.GetGlobalAutoPause7dThreshold()
@@ -7292,7 +7499,28 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetIgnoreUsageLimitStatus(*req.IgnoreUsageLimitStatus)
 		log.Printf("设置已更新: ignore_usage_limit_status = %t", *req.IgnoreUsageLimitStatus)
 	}
-	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
+	if req.AutoResetCreditsEnabled != nil {
+		runtimeCfg.AutoResetCreditsEnabled = *req.AutoResetCreditsEnabled
+		log.Printf("设置已更新: auto_reset_credits_enabled = %t", *req.AutoResetCreditsEnabled)
+	}
+	if req.AutoResetCreditsBeforeExpiryMin != nil {
+		runtimeCfg.AutoResetCreditsBeforeExpiryMin = *req.AutoResetCreditsBeforeExpiryMin
+		log.Printf("设置已更新: auto_reset_credits_before_expiry_min = %d", *req.AutoResetCreditsBeforeExpiryMin)
+	}
+	// 自动消费属于不可逆操作。先归一化待保存值，但在数据库确认保存成功前，
+	// 运行态继续使用旧的自动消费配置，避免持久化失败后后台任务仍然开始消费。
+	runtimeCfg = proxy.NormalizeRuntimeSettings(runtimeCfg)
+	effectiveRuntimeCfg := runtimeCfg
+	if autoResetCreditsChanged {
+		effectiveRuntimeCfg.AutoResetCreditsEnabled = previousAutoResetCreditsEnabled
+		effectiveRuntimeCfg.AutoResetCreditsBeforeExpiryMin = previousAutoResetCreditsBeforeExpiryMin
+	}
+	effectiveRuntimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+		// CodexSyncedCLIVersion 由后台同步任务独立维护；管理员保存其他设置时
+		// 必须保留临界区内读到的最新值，避免反向回滚同步结果。
+		effectiveRuntimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+		return effectiveRuntimeCfg
+	})
 
 	usageLogChanged := false
 	if req.UsageLogMode != nil {
@@ -7333,6 +7561,19 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 	if req.PromptFilterStrictThreshold != nil {
 		promptFilterCfg.StrictThreshold = *req.PromptFilterStrictThreshold
+		promptFilterChanged = true
+	}
+	if req.PromptFilterStrictTerminalEnabled != nil {
+		promptFilterCfg.StrictTerminalEnabled = *req.PromptFilterStrictTerminalEnabled
+		promptFilterChanged = true
+	}
+	if req.PromptFilterAdvancedConfig != nil {
+		advanced, err := promptfilter.ParseAdvancedConfig(*req.PromptFilterAdvancedConfig)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "prompt_filter_advanced_config JSON 无效: " + err.Error()})
+			return
+		}
+		promptFilterCfg.Advanced = advanced
 		promptFilterChanged = true
 	}
 	if req.PromptFilterLogMatches != nil {
@@ -7405,8 +7646,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, "Prompt 检查规则无效: "+err.Error())
 			return
 		}
-		h.store.SetPromptFilterConfig(promptFilterCfg)
-		log.Printf("设置已更新: prompt_filter enabled=%t mode=%s threshold=%d", promptFilterCfg.Enabled, promptFilterCfg.Mode, promptFilterCfg.Threshold)
 	}
 
 	// Resin 粘性代理池配置
@@ -7513,6 +7752,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:                     h.store.GetAutoCleanError(),
 		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:            runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:    runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
@@ -7535,6 +7776,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,
@@ -7542,6 +7784,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterMode:                   promptFilterCfg.Mode,
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
@@ -7566,6 +7810,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
+		PublicImageStudioPageEnabled:       publicImageStudioPageEnabled,
+		PublicAccountPortalPageEnabled:     publicAccountPortalPageEnabled,
 		ImageStorageConfig:                 imgConfigJSON,
 		BackgroundConfig:                   encodeBackgroundConfig(bgCfg),
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
@@ -7576,9 +7822,32 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
 		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
 		IgnoreUsageLimitStatus:             h.store.IgnoreUsageLimitStatus(),
+		ModelPricingOverrides:              modelPricingOverrides,
+		ModelPricingSyncURL:                modelPricingSyncURL,
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if promptFilterChanged {
+			writeError(c, http.StatusInternalServerError, "保存 Prompt 检查设置失败，设置未生效")
+			return
+		}
+		if autoResetCreditsChanged {
+			runtimeCfg = effectiveRuntimeCfg
+			writeError(c, http.StatusInternalServerError, "保存自动消耗设置失败，设置未生效")
+			return
+		}
+	} else {
+		if promptFilterChanged {
+			h.store.SetPromptFilterConfig(promptFilterCfg)
+			log.Printf("设置已更新: prompt_filter enabled=%t mode=%s threshold=%d", promptFilterCfg.Enabled, promptFilterCfg.Mode, promptFilterCfg.Threshold)
+		}
+		if autoResetCreditsChanged {
+			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
+				return runtimeCfg
+			})
+			h.triggerAutoResetCreditsScan()
+		}
 	}
 
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
@@ -7623,6 +7892,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoCleanFullUsage:                 h.store.GetAutoCleanFullUsage(),
 		AutoCleanError:                     h.store.GetAutoCleanError(),
 		AutoCleanExpired:                   h.store.GetAutoCleanExpired(),
+		AutoResetCreditsEnabled:            runtimeCfg.AutoResetCreditsEnabled,
+		AutoResetCreditsBeforeExpiryMin:    runtimeCfg.AutoResetCreditsBeforeExpiryMin,
 		ProxyPoolEnabled:                   h.store.GetProxyPoolEnabled(),
 		FastSchedulerEnabled:               h.store.FastSchedulerEnabled(),
 		CodexForceWebsocket:                h.store.CodexForceWebsocket(),
@@ -7640,6 +7911,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AffinityMode:                       h.store.GetAffinityMode(),
 		MaxRetries:                         h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                h.store.GetMaxRateLimitRetries(),
+		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
+		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,
@@ -7648,6 +7921,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ExpiredCleaned:                     expiredCleaned,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
+		PayloadRules:                       h.store.GetPayloadRules(),
 		ReasoningEffortModels:              h.store.GetReasoningEffortModels(),
 		ResinURL:                           resinURL,
 		ResinPlatformName:                  resinPlatformName,
@@ -7655,6 +7929,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterMode:                   promptFilterCfg.Mode,
 		PromptFilterThreshold:              promptFilterCfg.Threshold,
 		PromptFilterStrictThreshold:        promptFilterCfg.StrictThreshold,
+		PromptFilterStrictTerminalEnabled:  promptFilterCfg.StrictTerminalEnabled,
+		PromptFilterAdvancedConfig:         promptfilter.MarshalAdvancedConfig(promptFilterCfg.Advanced),
 		PromptFilterLogMatches:             promptFilterCfg.LogMatches,
 		PromptFilterMaxTextLength:          promptFilterCfg.MaxTextLength,
 		PromptFilterSensitiveWords:         promptFilterCfg.SensitiveWords,
@@ -8094,7 +8370,11 @@ func (h *Handler) SyncModels(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
-	result, err := proxy.SyncOfficialCodexModels(ctx, h.db)
+	proxyURL := ""
+	if h.store != nil {
+		proxyURL = h.store.GetProxyURL()
+	}
+	result, err := proxy.SyncOfficialCodexModels(ctx, h.db, proxyURL)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return

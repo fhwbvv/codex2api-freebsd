@@ -16,6 +16,15 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Tooltip as UITooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import type { AccountRow } from '../types'
 import { formatBeijingTime } from '../utils/time'
+import {
+  buildPoolRunway,
+  estimatePressureForecast,
+  hasBurnPrediction,
+  isPremiumUsagePlan,
+  isWindowRateLimitLike,
+  type PressureForecast,
+  type RecoveryWindow,
+} from '../lib/poolRunway'
 
 interface AccountRateLimitRecoveryChartProps {
   accounts: AccountRow[]
@@ -35,7 +44,6 @@ interface RecoveryCandidate {
 }
 
 type RecoveryReason = '5h' | '7d' | 'cooldown'
-type RecoveryWindow = '5h' | '7d'
 type RecoveryViewMode = 'recovery' | 'reset'
 
 interface RecoveryGroup {
@@ -46,25 +54,6 @@ interface RecoveryGroup {
   fullLabel: string
   count: number
   fill: string
-}
-
-interface PressureForecast {
-  sampled: number
-  threshold: number
-  predictedAt: number | null
-  predictedCount: number
-  unknown: number
-  rpm: number
-  effectiveRpmLimit: number
-  rpmPressure: number | null
-  activePressure: number
-  rateLimitPressure: number
-  dispatchableAccounts: number
-  avgConcurrency: number
-  highPressureAt: number | null
-  supplyShortageAt: number | null
-  riskLevel: 'low' | 'medium' | 'high'
-  confidence: number
 }
 
 interface ResetCandidate {
@@ -78,22 +67,6 @@ interface ResetStats {
   points: RecoveryGroup[]
   total: number
   unknown: number
-}
-
-interface SupplyEvent {
-  at: number
-  concurrency: number
-  delta: 1 | -1
-  // True when this +1 replenishment pairs with a prior -1 from the same
-  // account. Unpaired +1 events (currently rate-limited accounts that recover
-  // at their reset_at) restore capacity but shouldn't decrement the
-  // "simultaneously exhausted" count used for bulk-limit detection.
-  paired?: boolean
-}
-
-interface SupplyPressurePoint {
-  highPressureAt: number | null
-  supplyShortageAt: number | null
 }
 
 const recoveryWindows: RecoveryWindow[] = ['5h', '7d']
@@ -116,44 +89,6 @@ const tooltipContentStyle = {
 }
 const tooltipLabelStyle = { color: 'var(--color-foreground)', fontWeight: 600 }
 const tooltipItemStyle = { color: 'var(--color-foreground)' }
-// Default throughput per concurrency slot when no avg_duration_ms is provided
-// (6 rpm ≈ 10s avg request duration). At runtime we adapt this to actual
-// avg_duration_ms via getRpmPerSlot — see usage sites below.
-const RPM_PER_CONCURRENCY_SLOT_DEFAULT = 6
-// Adaptive bounds: avg_duration_ms outside [2s, 60s] is treated as noisy and
-// clamped, so the slot rate stays in [1, 30] rpm/slot.
-const RPM_PER_CONCURRENCY_SLOT_MIN = 1
-const RPM_PER_CONCURRENCY_SLOT_MAX = 30
-// Fraction of dispatchable accounts with a 429 in the recent window that we
-// consider "fully saturated" (=> pressure 1). Replaces the prior lifetime
-// rate_limit_attempts/total_requests ratio which never moved for old accounts.
-const RATE_LIMIT_SATURATION_FRACTION = 0.3
-// Treat a 429 as "currently active" only if it happened within this window.
-const RECENT_RATE_LIMIT_WINDOW_MS = 60 * 60_000
-// Bulk-limit threshold: how many sampled accounts must be projected to exhaust
-// before we treat it as a pool-wide event. min 3, otherwise 30% of sample.
-const BULK_LIMIT_RATIO = 0.3
-const BULK_LIMIT_MIN_COUNT = 3
-// Pressure factor: 1.0 = no acceleration, capped at 2.5 (= predicted time / 2.5).
-const PRESSURE_FACTOR_MAX = 2.5
-// Boost weights for the dominant pressure axis vs the secondary one. Switching
-// from sum-of-all-three (could double-count correlated signals like rpm/active)
-// to "dominant + 0.5 × secondMax" gives more stable acceleration.
-const PRESSURE_BOOST_DOMINANT = 1.0
-const PRESSURE_BOOST_SECONDARY = 0.5
-// Threshold above which an axis starts contributing to acceleration.
-const PRESSURE_THRESHOLD_RPM = 0.75
-const PRESSURE_THRESHOLD_ACTIVE = 0.75
-// Confidence floor: predictions made with <40% known samples are downgraded.
-const LOW_CONFIDENCE_THRESHOLD = 0.4
-// Minimum elapsed-window ratio before we trust a single account's burn
-// extrapolation. Below this, a freshly-rotated account at usage=1% can blow up
-// burn rate (because elapsed is tiny) and predict exhaustion within minutes.
-const BURN_MIN_ELAPSED_RATIO = 0.05
-// Fraction of the active window that counts as "soon" for risk-escalation.
-// 20% is the same for 5h (→ 1h) and 7d (→ 33.6h); the previous values were
-// inconsistent (5h:1h=20% vs 7d:24h=14%) leaving 7d under-warned.
-const SOON_WINDOW_RATIO = 0.2
 
 export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0, rpmLimit = 0, avgDurationMs = 0, className = '', compact = false }: AccountRateLimitRecoveryChartProps) {
   const { t } = useTranslation()
@@ -340,7 +275,7 @@ export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0
             </ResponsiveContainer>
           </div>
           {viewMode === 'recovery'
-            ? <PressureForecastCard forecast={recovery.forecast} t={t} />
+            ? <PressureForecastCard forecast={recovery.forecast} windowKey={windowKey} nowMs={nowMs} t={t} />
             : <QuotaResetSummaryCard stats={resetStats} t={t} />}
         </div>
       </CardContent>
@@ -364,94 +299,151 @@ function RecoveryMetric({ label, value, tone = 'neutral', compact = false }: { l
   )
 }
 
-function PressureForecastCard({ forecast, t }: { forecast: PressureForecast; t: (key: string, options?: Record<string, unknown>) => string }) {
-  const pressureAt = forecast.supplyShortageAt ?? forecast.highPressureAt ?? forecast.predictedAt
+function PressureForecastCard({
+  forecast,
+  windowKey,
+  nowMs,
+  t,
+}: {
+  forecast: PressureForecast
+  windowKey: RecoveryWindow
+  nowMs: number
+  t: (key: string, options?: Record<string, unknown>) => string
+}) {
+  const runway = buildPoolRunway(forecast, nowMs, windowKey)
+  const pressureAt = runway.pressureAt
   const predictedText = pressureAt
     ? formatChartTime(pressureAt)
     : t('accounts.pressureForecastNone')
-  const stateText = forecast.supplyShortageAt
+  const stateText = runway.state === 'shortage'
     ? t('accounts.pressureForecastShortage')
-    : forecast.highPressureAt
+    : runway.state === 'high'
       ? t('accounts.pressureForecastHigh')
-      : forecast.predictedAt
+      : runway.state === 'limit_risk'
         ? t('accounts.pressureForecastLimitRisk')
         : t('accounts.pressureForecastStable')
-  const tone = forecast.riskLevel === 'high'
-    ? 'text-red-600 dark:text-red-400'
+  const runwayText = formatRunwayLabel(runway, t)
+  const adviceText = formatRunwayAdvice(runway, t)
+  const pillClass = forecast.riskLevel === 'high'
+    ? 'bg-destructive/12 text-destructive'
     : forecast.riskLevel === 'medium'
-      ? 'text-amber-600 dark:text-amber-400'
-      : 'text-emerald-600 dark:text-emerald-400'
-  const hasSamples = forecast.sampled + forecast.unknown > 0
-  const lowConfidence = hasSamples && forecast.confidence < LOW_CONFIDENCE_THRESHOLD
+      ? 'bg-amber-500/12 text-amber-700 dark:text-amber-300'
+      : 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
+  const dotClass = forecast.riskLevel === 'high'
+    ? 'bg-destructive'
+    : forecast.riskLevel === 'medium'
+      ? 'bg-amber-500'
+      : 'bg-emerald-500'
+  const lowConfidence = runway.lowConfidence
   const logicText = t('accounts.pressureForecastLogic')
-  const descText = t('accounts.pressureForecastDesc', {
-    state: stateText,
-    threshold: forecast.threshold,
-    sampled: forecast.sampled,
-    count: forecast.predictedCount,
-    rpm: formatWholeNumber(forecast.rpm),
-    rpmLimit: forecast.effectiveRpmLimit > 0 ? formatWholeNumber(forecast.effectiveRpmLimit) : '-',
-    rpmPressure: formatPercentText(forecast.rpmPressure),
-    dispatchable: forecast.dispatchableAccounts,
-    activePressure: formatPercentText(forecast.activePressure),
-    rateLimitPressure: formatPercentText(forecast.rateLimitPressure),
-  })
+  const metaParts = [
+    `RPM ${formatWholeNumber(forecast.rpm)}${forecast.effectiveRpmLimit > 0 ? `/${formatWholeNumber(forecast.effectiveRpmLimit)}` : ''}`,
+    t('dashboard.poolRunwayDispatchable') + ' ' + forecast.dispatchableAccounts,
+    `${forecast.sampled}${forecast.unknown > 0 ? `+${forecast.unknown}?` : ''} samples`,
+  ]
 
   return (
     <TooltipProvider>
-      <div className="min-h-0 overflow-hidden rounded-lg border border-border bg-muted/20 px-3 py-2">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
-              <span>{t('accounts.pressureForecastTitle')}</span>
-              <UITooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    className="inline-flex size-4 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    aria-label={t('accounts.pressureForecastHelp')}
-                  >
-                    <CircleHelp className="size-3.5" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="top" sideOffset={6} className="max-w-[340px] whitespace-normal text-left leading-relaxed">
-                  {logicText}
-                </TooltipContent>
-              </UITooltip>
-              {lowConfidence ? (
-                <UITooltip>
-                  <TooltipTrigger asChild>
-                    <span
-                      className="inline-flex items-center rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium text-amber-700 dark:text-amber-300"
-                      tabIndex={0}
-                    >
-                      {t('accounts.pressureForecastLowConfidence', {
-                        percent: Math.round(forecast.confidence * 100),
-                      })}
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top" sideOffset={6} className="max-w-[280px] whitespace-normal text-left leading-relaxed">
-                    {t('accounts.pressureForecastLowConfidenceHint', {
-                      sampled: forecast.sampled,
-                      unknown: forecast.unknown,
-                    })}
-                  </TooltipContent>
-                </UITooltip>
-              ) : null}
-            </div>
-            <div className={`mt-1 truncate text-xs font-semibold ${tone}`}>{stateText}</div>
+      <div className="min-h-0 overflow-hidden rounded-xl border border-border/70 bg-background/40 px-3 py-2.5">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0 flex items-center gap-2">
+            <span className="text-xs font-semibold text-foreground">
+              {t('accounts.pressureForecastTitle')}
+            </span>
+            <UITooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className="inline-flex size-4 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  aria-label={t('accounts.pressureForecastHelp')}
+                >
+                  <CircleHelp className="size-3.5" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="top" sideOffset={6} className="max-w-[340px] whitespace-normal text-left leading-relaxed">
+                {logicText}
+              </TooltipContent>
+            </UITooltip>
+            {lowConfidence ? (
+              <span className="rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
+                {t('accounts.pressureForecastLowConfidence', {
+                  percent: Math.round(forecast.confidence * 100),
+                })}
+              </span>
+            ) : null}
           </div>
-          <div className="shrink-0 text-right">
-            <div className="text-[11px] font-medium text-muted-foreground">{t('accounts.pressureForecastEta')}</div>
-            <div className={`text-sm font-semibold ${tone}`}>{predictedText}</div>
+          <div className="shrink-0 text-right text-[11px] text-muted-foreground">
+            <span className="font-medium">{t('accounts.pressureForecastEta')}</span>
+            {' '}
+            <span className="font-semibold tabular-nums text-foreground">{predictedText}</span>
+            <span className="ml-1.5 text-muted-foreground/70">{windowKey}</span>
           </div>
         </div>
-        <div className="mt-1 truncate text-[11px] text-muted-foreground" title={descText}>
-          {descText}
+
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          <span className="text-lg font-bold tabular-nums tracking-tight text-foreground">
+            {runwayText}
+          </span>
+          <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold ${pillClass}`}>
+            <span className={`size-1.5 rounded-full ${dotClass}`} />
+            {stateText}
+          </span>
         </div>
+
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground">
+          {metaParts.map((part, i) => (
+            <span key={part} className="inline-flex items-center gap-2">
+              {i > 0 ? <span className="text-border">·</span> : null}
+              {part}
+            </span>
+          ))}
+        </div>
+        {adviceText ? (
+          <div className="mt-1 truncate text-[11px] text-muted-foreground" title={adviceText}>
+            {adviceText}
+          </div>
+        ) : null}
       </div>
     </TooltipProvider>
   )
+}
+
+function formatRunwayLabel(
+  runway: ReturnType<typeof buildPoolRunway>,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  switch (runway.kind) {
+    case 'critical':
+      return t('accounts.poolRunwayCritical')
+    case 'hours':
+      return t('accounts.poolRunwayHours', { hours: runway.remainingHours ?? 1 })
+    case 'day_plus':
+      return t('accounts.poolRunwayDayPlus')
+    case 'stable':
+      return t('accounts.poolRunwayStable')
+    default:
+      return t('accounts.poolRunwayUnknown')
+  }
+}
+
+function formatRunwayAdvice(
+  runway: ReturnType<typeof buildPoolRunway>,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  switch (runway.adviceCode) {
+    case 'critical':
+      return runway.suggestedAddAccounts > 0
+        ? t('accounts.poolRunwayAdviceCriticalAdd', { count: runway.suggestedAddAccounts })
+        : t('accounts.poolRunwayAdviceCriticalLoad')
+    case 'add_accounts':
+      return t('accounts.poolRunwayAdviceAdd', { count: runway.suggestedAddAccounts })
+    case 'reduce_load':
+      return t('accounts.poolRunwayAdviceReduceLoad')
+    case 'low_confidence':
+      return t('accounts.poolRunwayAdviceLowConfidence')
+    default:
+      return ''
+  }
 }
 
 function QuotaResetSummaryCard({ stats, t }: { stats: ResetStats; t: (key: string, options?: Record<string, unknown>) => string }) {
@@ -522,18 +514,6 @@ function buildRecoveryCandidate(account: AccountRow, recoveryAt: number, nowMs: 
     secondsUntil: Math.max(0, Math.ceil((recoveryAt - nowMs) / 1000)),
     reason,
   }
-}
-
-function isWindowRateLimitLike(account: AccountRow, windowKey: RecoveryWindow): boolean {
-  if (windowKey === '5h') {
-    return (isPremiumUsagePlan(account.plan_type) && isUsageExhausted(account.usage_percent_5h)) || isShortRateLimitLike(account)
-  }
-  const status = (account.status || '').toLowerCase()
-  const reason = (account.cooldown_reason || '').toLowerCase()
-  return isUsageExhausted(account.usage_percent_7d) ||
-    status === 'usage_exhausted' ||
-    status === 'rate_limited_7d' ||
-    reason === 'rate_limited_7d'
 }
 
 function isShortRateLimitLike(account: AccountRow): boolean {
@@ -674,334 +654,6 @@ function getNiceTickStep(rawStep: number): number {
   return 10 * magnitude
 }
 
-function estimatePressureForecast(accounts: AccountRow[], windowKey: RecoveryWindow, nowMs: number, currentRpm: number, rpmLimit: number, avgDurationMs: number): PressureForecast {
-  const windowMs = getWindowMs(windowKey)
-  const burnMinElapsedMs = windowMs * BURN_MIN_ELAPSED_RATIO
-  const rpmPerSlot = getRpmPerSlot(avgDurationMs)
-  const projectedLimitTimes: number[] = []
-  const supplyEvents: SupplyEvent[] = []
-  const dispatchableAccounts = accounts.filter((account) => isInSupplyPool(account, windowKey))
-  const totalConcurrency = dispatchableAccounts.reduce((sum, account) => sum + getEffectiveConcurrency(account), 0)
-  const avgConcurrency = dispatchableAccounts.length > 0 ? totalConcurrency / dispatchableAccounts.length : 0
-  const activeRequests = dispatchableAccounts.reduce((sum, account) => sum + normalizeNumber(account.active_requests), 0)
-  const activePressure = totalConcurrency > 0 ? clamp(activeRequests / totalConcurrency, 0, 3) : 0
-  // Real-time 429 signal: include both (a) accounts currently in a window
-  // rate-limit (not in dispatchable pool right now) and (b) dispatchable
-  // accounts that hit a 429 within RECENT_RATE_LIMIT_WINDOW_MS. Denominator is
-  // the full eligible pool — dispatchable plus those currently rate-limited.
-  // Replaces the prior sum(rate_limit_attempts)/sum(total_requests) which used
-  // lifetime counters and was therefore nearly static once accounts had history.
-  const currentlyRateLimited = accounts.filter((account) => {
-    const status = (account.status || '').toLowerCase()
-    if (status === 'unauthorized') return false
-    if (account.enabled === false) return false
-    return isWindowRateLimitLike(account, windowKey)
-  })
-  const recentlyRateLimitedFromPool = dispatchableAccounts.filter((account) => {
-    if (!account.last_rate_limited_at) return false
-    const ts = new Date(account.last_rate_limited_at).getTime()
-    return Number.isFinite(ts) && ts > 0 && nowMs - ts <= RECENT_RATE_LIMIT_WINDOW_MS
-  })
-  const rateLimitedSignalDenominator = dispatchableAccounts.length + currentlyRateLimited.length
-  const rateLimitedSignalNumerator = recentlyRateLimitedFromPool.length + currentlyRateLimited.length
-  const recentRateLimitedFraction = rateLimitedSignalDenominator > 0
-    ? rateLimitedSignalNumerator / rateLimitedSignalDenominator
-    : 0
-  const rateLimitPressure = clamp(recentRateLimitedFraction / RATE_LIMIT_SATURATION_FRACTION, 0, 1)
-  const normalizedRpm = normalizeNumber(currentRpm)
-  const configuredRpmLimit = normalizeNumber(rpmLimit)
-  // Simplified from accounts.length × avgConcurrency × slot: the product is
-  // mathematically equal to totalConcurrency × slot but the latter makes intent
-  // explicit ("each concurrency slot contributes ~6 rpm of headroom").
-  const concurrencyRpmLimit = totalConcurrency > 0
-    ? Math.max(1, Math.round(totalConcurrency * rpmPerSlot))
-    : 0
-  const effectiveRpmLimit = getEffectiveRpmLimit(configuredRpmLimit, concurrencyRpmLimit)
-  const rpmPressure = effectiveRpmLimit > 0 ? normalizedRpm / effectiveRpmLimit : null
-  const pressureFactor = getPressureFactor(rpmPressure, activePressure, rateLimitPressure)
-  let sampled = 0
-  let unknown = 0
-
-  for (const account of accounts) {
-    // Burn prediction requires a quota window — skip Responses API accounts
-    // and 5h-on-non-premium entirely (they still contribute to supply via the
-    // dispatchableAccounts filter above, just not to burn forecasting).
-    if (!hasBurnPrediction(account, windowKey)) {
-      continue
-    }
-    const inSupply = isInSupplyPool(account, windowKey)
-    const concurrency = getEffectiveConcurrency(account)
-    const usage = windowKey === '5h' ? account.usage_percent_5h : account.usage_percent_7d
-    const rawResetAt = windowKey === '5h' ? account.reset_5h_at : account.reset_7d_at
-    // Fallback: if upstream reset_at is missing but usage is readable, assume a
-    // fresh window starting now. This keeps newly-rotated accounts in the
-    // supply pool instead of dropping them into "unknown" where they can't
-    // influence the forecast.
-    const knownResetAt = futureTimestamp(rawResetAt, nowMs)
-    const resetAt = knownResetAt ?? (nowMs + windowMs)
-
-    // Currently rate-limited (or otherwise out of supply pool right now) but
-    // burn-predictable: not in totalConcurrency, but will replenish at reset.
-    // Schedule an unpaired +1 event so the supply curve models recovery, while
-    // findBulkLimitTime won't decrement exhaust count for it.
-    if (!inSupply) {
-      if (knownResetAt) {
-        supplyEvents.push({ at: knownResetAt, concurrency, delta: 1 })
-      }
-      if (typeof usage !== 'number' || !Number.isFinite(usage)) {
-        unknown += 1
-      }
-      continue
-    }
-
-    if (typeof usage !== 'number' || !Number.isFinite(usage)) {
-      unknown += 1
-      continue
-    }
-
-    sampled += 1
-    const usedPercent = clamp(usage, 0, 100)
-    if (usedPercent >= 100) {
-      projectedLimitTimes.push(nowMs)
-      supplyEvents.push({ at: nowMs, concurrency, delta: -1 })
-      supplyEvents.push({ at: resetAt, concurrency, delta: 1, paired: true })
-      continue
-    }
-
-    const windowStartAt = resetAt - windowMs
-    const elapsedMs = Math.max(60_000, nowMs - windowStartAt)
-    // Demand a minimum elapsed slice before trusting linear extrapolation —
-    // otherwise a freshly-rotated account at usage=1% with elapsed=2min would
-    // predict exhaustion in minutes. Account still stays in supply pool.
-    if (elapsedMs < burnMinElapsedMs) {
-      continue
-    }
-    const burnRatePerMs = usedPercent / elapsedMs
-    if (burnRatePerMs <= 0) {
-      unknown += 1
-      continue
-    }
-    const predictedAt = nowMs + ((100 - usedPercent) / burnRatePerMs)
-    if (Number.isFinite(predictedAt) && predictedAt <= resetAt) {
-      projectedLimitTimes.push(predictedAt)
-      supplyEvents.push({ at: predictedAt, concurrency, delta: -1 })
-      supplyEvents.push({ at: resetAt, concurrency, delta: 1, paired: true })
-    }
-  }
-
-  projectedLimitTimes.sort((a, b) => a - b)
-  supplyEvents.sort((a, b) => a.at - b.at)
-  const supplyPressurePoint = estimateSupplyPressurePoint(
-    supplyEvents,
-    normalizedRpm,
-    configuredRpmLimit,
-    totalConcurrency,
-    nowMs,
-    rpmPerSlot,
-  )
-  // Capacity-driven threshold: how many accounts can vanish before remaining
-  // concurrency can no longer absorb currentRpm at the current rpm/slot rate.
-  // Falls back to the historical 30% ratio when there's no traffic.
-  const minAccountsForRpm = (normalizedRpm > 0 && avgConcurrency > 0)
-    ? Math.ceil(normalizedRpm / (avgConcurrency * rpmPerSlot))
-    : 0
-  const capacityThreshold = minAccountsForRpm > 0 && dispatchableAccounts.length > 0
-    ? Math.max(BULK_LIMIT_MIN_COUNT, dispatchableAccounts.length - minAccountsForRpm)
-    : Math.max(BULK_LIMIT_MIN_COUNT, Math.ceil(sampled * BULK_LIMIT_RATIO))
-  const threshold = sampled > 0 ? Math.min(sampled, capacityThreshold) : 0
-  const quotaPredictedAt = findBulkLimitTime(supplyEvents, threshold)
-  const predictedAt = quotaPredictedAt
-    ? nowMs + ((quotaPredictedAt - nowMs) / pressureFactor)
-    : null
-  const totalEligible = sampled + unknown
-  const confidence = totalEligible > 0 ? sampled / totalEligible : 0
-  const riskLevel = getForecastRiskLevel(
-    predictedAt,
-    supplyPressurePoint.highPressureAt,
-    supplyPressurePoint.supplyShortageAt,
-    nowMs,
-    windowKey,
-    rpmPressure,
-    activePressure,
-    rateLimitPressure,
-    confidence,
-  )
-
-  return {
-    sampled,
-    threshold,
-    predictedAt,
-    predictedCount: quotaPredictedAt ? projectedLimitTimes.filter((item) => item <= quotaPredictedAt).length : projectedLimitTimes.length,
-    unknown,
-    rpm: normalizedRpm,
-    effectiveRpmLimit,
-    rpmPressure,
-    activePressure,
-    rateLimitPressure,
-    dispatchableAccounts: dispatchableAccounts.length,
-    avgConcurrency,
-    highPressureAt: supplyPressurePoint.highPressureAt,
-    supplyShortageAt: supplyPressurePoint.supplyShortageAt,
-    riskLevel,
-    confidence,
-  }
-}
-
-// Walks the sorted supply event stream and finds the earliest time at which
-// at least `threshold` accounts are simultaneously exhausted. Only +1 events
-// tagged as `paired` (i.e. recovery of a previously exhausted account)
-// decrement the exhaust count; unpaired +1 events (currently rate-limited
-// accounts recovering) restore capacity but were never in the exhaust count.
-function findBulkLimitTime(events: SupplyEvent[], threshold: number): number | null {
-  if (threshold <= 0) return null
-  let exhausted = 0
-  for (const event of events) {
-    if (event.delta === -1) {
-      exhausted += 1
-      if (exhausted >= threshold) return event.at
-    } else if (event.paired) {
-      exhausted = Math.max(0, exhausted - 1)
-    }
-  }
-  return null
-}
-
-// Account contributes RPM/concurrency to the supply pool. We include all
-// account classes that actually serve proxy traffic — OAuth + Responses API +
-// non-premium-on-5h — and only filter out hard-disabled/unauthorized or
-// currently rate-limited entries. This corrects a prior bias that dropped
-// Responses accounts from totalConcurrency and made mixed deployments look
-// far smaller than they really are.
-function isInSupplyPool(account: AccountRow, windowKey: RecoveryWindow): boolean {
-  const status = (account.status || '').toLowerCase()
-  if (status === 'unauthorized') return false
-  if (account.enabled === false) return false
-  if (isWindowRateLimitLike(account, windowKey)) return false
-  return true
-}
-
-// Account has a quota window we can linearly extrapolate to an exhaustion
-// time. Excludes Responses API accounts (no per-user quota tracking) and 5h
-// for non-premium plans (no 5h quota cap). Unauthorized is also excluded
-// since burn data won't be refreshed.
-function hasBurnPrediction(account: AccountRow, windowKey: RecoveryWindow): boolean {
-  const status = (account.status || '').toLowerCase()
-  if (status === 'unauthorized') return false
-  if (account.openai_responses_api) return false
-  if (windowKey === '5h') return isPremiumUsagePlan(account.plan_type)
-  return true
-}
-
-function getEffectiveConcurrency(account: AccountRow): number {
-  const value = account.dynamic_concurrency_limit ??
-    account.base_concurrency_effective ??
-    account.base_concurrency_override ??
-    1
-  return clamp(normalizeNumber(value), 1, 50)
-}
-
-// Adaptive RPM/slot: 60000ms / avgDurationMs gives "requests a slot can finish
-// per minute". Falls back to the historical 6 (≈10s/req) when avg_duration_ms
-// is unavailable, and is clamped to [1, 30] so a freakishly fast/slow sample
-// (single request, batched timeouts) doesn't dominate the supply estimate.
-function getRpmPerSlot(avgDurationMs: number): number {
-  if (!avgDurationMs || avgDurationMs <= 0 || !Number.isFinite(avgDurationMs)) {
-    return RPM_PER_CONCURRENCY_SLOT_DEFAULT
-  }
-  return clamp(60_000 / avgDurationMs, RPM_PER_CONCURRENCY_SLOT_MIN, RPM_PER_CONCURRENCY_SLOT_MAX)
-}
-
-function getEffectiveRpmLimit(configuredRpmLimit: number, concurrencyRpmLimit: number): number {
-  if (concurrencyRpmLimit <= 0) {
-    return 0
-  }
-  if (configuredRpmLimit > 0 && concurrencyRpmLimit > 0) {
-    return Math.min(configuredRpmLimit, concurrencyRpmLimit)
-  }
-  return concurrencyRpmLimit
-}
-
-function getPressureFactor(rpmPressure: number | null, activePressure: number, rateLimitPressure: number): number {
-  // RPM and active-request signals are typically correlated (high RPM saturates
-  // concurrency), so summing all three boosts double-counts. Use dominant +
-  // weighted second-largest instead — softer, stays under PRESSURE_FACTOR_MAX
-  // even when every signal is maxed out.
-  const rpmBoost = Math.max(0, (rpmPressure ?? 0) - PRESSURE_THRESHOLD_RPM)
-  const activeBoost = Math.max(0, activePressure - PRESSURE_THRESHOLD_ACTIVE)
-  const rateLimitBoost = rateLimitPressure
-  const boosts = [rpmBoost, activeBoost, rateLimitBoost].sort((a, b) => b - a)
-  const composite = boosts[0] * PRESSURE_BOOST_DOMINANT + boosts[1] * PRESSURE_BOOST_SECONDARY
-  return clamp(1 + composite, 1, PRESSURE_FACTOR_MAX)
-}
-
-function estimateSupplyPressurePoint(events: SupplyEvent[], currentRpm: number, configuredRpmLimit: number, totalConcurrency: number, nowMs: number, rpmPerSlot: number): SupplyPressurePoint {
-  if (currentRpm <= 0) {
-    return { highPressureAt: null, supplyShortageAt: null }
-  }
-
-  let remainingConcurrency = totalConcurrency
-  let capacity = getEffectiveRpmLimit(configuredRpmLimit, Math.round(remainingConcurrency * rpmPerSlot))
-  let pressure = capacity > 0 ? currentRpm / capacity : Number.POSITIVE_INFINITY
-  let highPressureAt = pressure >= 0.9 ? nowMs : null
-  let supplyShortageAt = pressure >= 1 ? nowMs : null
-
-  for (const event of events) {
-    // Delta-based: -1 events (exhaustion) shrink the pool, +1 events
-    // (replenishment from reset) grow it. Pool can transiently dip below the
-    // RPM ceiling and then recover — that's expected, the forecast surfaces the
-    // earliest crossing only.
-    remainingConcurrency = Math.max(0, remainingConcurrency + event.delta * event.concurrency)
-    capacity = getEffectiveRpmLimit(configuredRpmLimit, Math.round(remainingConcurrency * rpmPerSlot))
-    pressure = capacity > 0 ? currentRpm / capacity : Number.POSITIVE_INFINITY
-
-    if (!highPressureAt && pressure >= 0.9) {
-      highPressureAt = event.at
-    }
-    if (!supplyShortageAt && pressure >= 1) {
-      supplyShortageAt = event.at
-      break
-    }
-  }
-
-  return { highPressureAt, supplyShortageAt }
-}
-
-function getWindowMs(windowKey: RecoveryWindow): number {
-  return windowKey === '5h' ? 5 * 60 * 60_000 : 7 * 24 * 60 * 60_000
-}
-
-function getForecastRiskLevel(
-  predictedAt: number | null,
-  highPressureAt: number | null,
-  supplyShortageAt: number | null,
-  nowMs: number,
-  windowKey: RecoveryWindow,
-  rpmPressure: number | null,
-  activePressure: number,
-  rateLimitPressure: number,
-  confidence: number,
-): PressureForecast['riskLevel'] {
-  const soonWindowMs = getWindowMs(windowKey) * SOON_WINDOW_RATIO
-  // Real-time signals (RPM, active queue, historical 429s) are always reliable,
-  // so they can independently raise risk. The quota-burn projection however
-  // depends on sample coverage — gate predictedAt-based escalation behind a
-  // minimum confidence so a single observed account can't flip the badge.
-  const burnSignalReliable = confidence >= LOW_CONFIDENCE_THRESHOLD
-  if (
-    (supplyShortageAt && supplyShortageAt - nowMs <= soonWindowMs) ||
-    (burnSignalReliable && predictedAt && predictedAt - nowMs <= soonWindowMs) ||
-    (rpmPressure ?? 0) >= 1 ||
-    activePressure >= 0.9 ||
-    rateLimitPressure >= 0.8
-  ) {
-    return 'high'
-  }
-  if (highPressureAt || (burnSignalReliable && predictedAt) || (rpmPressure ?? 0) >= 0.7 || activePressure >= 0.7 || rateLimitPressure >= 0.4) {
-    return 'medium'
-  }
-  return 'low'
-}
-
 function futureTimestamp(value: string | undefined, nowMs: number): number | null {
   if (!value) return null
   const timestamp = new Date(value).getTime()
@@ -1015,34 +667,8 @@ function isUsageExhausted(value?: number | null): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value >= 100
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value))
-}
-
-function normalizeNumber(value?: number | null): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
 function formatWholeNumber(value: number): string {
   return Number.isFinite(value) ? String(Math.round(value)) : '-'
-}
-
-function formatPercentText(value: number | null): string {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return '-'
-  }
-  return `${Math.round(value * 100)}%`
-}
-
-function normalizePlanType(planType?: string): string {
-  const raw = (planType || '').toLowerCase().trim()
-  if (raw === 'prolite' || raw === 'pro_lite' || raw === 'pro-lite') return 'pro'
-  return raw
-}
-
-// Plans that carry a rolling 5h usage window (mirrors Go isPremium5hPlan).
-function isPremiumUsagePlan(planType?: string): boolean {
-  return ['plus', 'pro', 'team', 'teamplus', 'k12', 'edu', 'education', 'go'].includes(normalizePlanType(planType))
 }
 
 function formatChartTime(timestamp: number): string {

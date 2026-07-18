@@ -345,6 +345,36 @@ func TestResponsesSuccessClearsOnlyUsageCooldownWhenIgnored(t *testing.T) {
 	}
 }
 
+func TestConfirmResponsesAvailableSinceRespectsLatestRateLimit(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &Account{DBID: 107, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	store.AddAccount(account)
+
+	staleRequestStartedAt := time.Now()
+	store.MarkCooldown(account, time.Hour, "rate_limited")
+	if store.ConfirmResponsesAvailableSince(account, staleRequestStartedAt) {
+		t.Fatal("a request started before the latest rate limit must not clear its cooldown")
+	}
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("newer rate-limit evidence should keep the account unavailable")
+	}
+
+	account.mu.RLock()
+	freshRequestStartedAt := account.LastRateLimitedAt.Add(time.Nanosecond)
+	account.mu.RUnlock()
+	if !store.ConfirmResponsesAvailableSince(account, freshRequestStartedAt) {
+		t.Fatal("a request started after the latest rate limit should clear its cooldown")
+	}
+	if account.HasActiveCooldown() || !account.IsAvailable() {
+		t.Fatal("fresh successful Responses evidence should restore account availability")
+	}
+}
+
 func TestNeedsUsageProbeRateLimitedAllowsResetCreditsRefresh(t *testing.T) {
 	// 429 冷却 + 重置次数从未探测过（stale）：应允许探针（wham-only）刷新「主动重置次数」。
 	acc := &Account{
@@ -412,7 +442,8 @@ func TestNeedsUsageProbeRefreshesStaleResetCreditsDespiteFreshUsage(t *testing.T
 	}
 }
 
-func TestNeedsUsageProbeRequires5hSnapshotWhen5hAutoPauseEnabled(t *testing.T) {
+func TestNeedsUsageProbeDoesNotRequireMissing5hWhenAutoPauseEnabled(t *testing.T) {
+	// issue #382：上游可永久不返回 5h。auto-pause 5h 配置在无快照时不应强制探测。
 	acc := &Account{
 		AccessToken:          "token",
 		Status:               StatusReady,
@@ -422,10 +453,32 @@ func TestNeedsUsageProbeRequires5hSnapshotWhen5hAutoPauseEnabled(t *testing.T) {
 		AutoPause5hThreshold: 0.95,
 	}
 	acc.recomputeEffectiveAutoPause(nil)
-	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响，专测 5h 快照缺失路径
+	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响
+
+	if acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = true, want false when 5h auto-pause is enabled but 5h window is absent")
+	}
+}
+
+func TestNeedsUsageProbeRefreshesStale5hWhenAutoPauseEnabled(t *testing.T) {
+	now := time.Now()
+	acc := &Account{
+		AccessToken:          "token",
+		Status:               StatusReady,
+		UsagePercent7d:       12,
+		UsagePercent7dValid:  true,
+		UsageUpdatedAt:       now,
+		AutoPause5hThreshold: 0.95,
+		UsagePercent5h:       40,
+		UsagePercent5hValid:  true,
+		Reset5hAt:            now.Add(2 * time.Hour),
+		UsageUpdatedAt5h:     now.Add(-20 * time.Minute),
+	}
+	acc.recomputeEffectiveAutoPause(nil)
+	acc.MarkResetCreditsProbed(now)
 
 	if !acc.NeedsUsageProbe(10 * time.Minute) {
-		t.Fatal("NeedsUsageProbe() = false, want true when 5h auto-pause is enabled but 5h snapshot is missing")
+		t.Fatal("NeedsUsageProbe() = false, want true when valid 5h snapshot is stale under auto-pause")
 	}
 }
 
@@ -459,7 +512,8 @@ func TestNeedsUsageProbeRefreshesStale5hAfterWindowReset(t *testing.T) {
 	}
 }
 
-func TestPersistUsageSnapshotKeeps5hProbeRequiredWhen5hSnapshotMissing(t *testing.T) {
+func TestPersistUsageSnapshotDoesNotRequireMissing5hAfter7dOnly(t *testing.T) {
+	// issue #382：7d-only 持久化后，缺失 5h 不再因 auto-pause 配置强制探测。
 	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	acc := &Account{
 		DBID:                 1,
@@ -473,10 +527,10 @@ func TestPersistUsageSnapshotKeeps5hProbeRequiredWhen5hSnapshotMissing(t *testin
 	acc.recomputeEffectiveAutoPause(store)
 
 	store.PersistUsageSnapshot(acc, 20)
-	acc.MarkResetCreditsProbed(time.Now()) // 隔离 reset-credits 过期影响，专测 5h 快照缺失路径
+	acc.MarkResetCreditsProbed(time.Now())
 
-	if !acc.NeedsUsageProbe(10 * time.Minute) {
-		t.Fatal("NeedsUsageProbe() = false, want true after 7d-only persistence when 5h snapshot is still missing")
+	if acc.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = true, want false after 7d-only persistence when 5h window is absent")
 	}
 }
 

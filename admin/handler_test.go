@@ -21,6 +21,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -663,7 +664,7 @@ func TestUpdateAPIKeyRefreshesRuntimeStoreAndCache(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
-	groupID, err := db.CreateAccountGroup(ctx, "Team", "", "#2563eb", 0, 0, 0)
+	groupID, err := db.CreateAccountGroup(ctx, "Team", "", "#2563eb", 0, 0, sql.NullInt64{}, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
 	}
@@ -956,6 +957,255 @@ func TestRuntimeStatusRouteReturnsDependencySnapshot(t *testing.T) {
 	}
 	if payload.UsageLog.Mode != database.UsageLogModeFull || !payload.UsageLog.Enabled {
 		t.Fatalf("usage log = mode:%q enabled:%v, want full enabled", payload.UsageLog.Mode, payload.UsageLog.Enabled)
+	}
+}
+
+func TestUpdateSettingsPersistsAutoResetCreditsAcrossPartialUpdates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	settings.ModelPricingOverrides = `{"gpt-5":{"input":1}}`
+	settings.ModelPricingSyncURL = "https://example.com/pricing.json"
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	update := func(body string) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+
+		handler.UpdateSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+	}
+
+	// 阈值必须能在开关关闭时先保存，避免启用后的即时扫描使用旧默认值。
+	update(`{"auto_reset_credits_before_expiry_min":90}`)
+	select {
+	case <-handler.autoResetCreditsWake:
+	default:
+		t.Fatal("threshold change did not queue an immediate scan")
+	}
+	beforeEnable := proxy.CurrentRuntimeSettings()
+	if beforeEnable.AutoResetCreditsEnabled {
+		t.Fatal("AutoResetCreditsEnabled = true before explicit enable")
+	}
+	if beforeEnable.AutoResetCreditsBeforeExpiryMin != 90 {
+		t.Fatalf("runtime threshold before enable = %d, want 90", beforeEnable.AutoResetCreditsBeforeExpiryMin)
+	}
+	update(`{"auto_reset_credits_enabled":true}`)
+	select {
+	case <-handler.autoResetCreditsWake:
+	default:
+		t.Fatal("enable change did not queue an immediate scan")
+	}
+	update(`{"auto_reset_credits_enabled":true,"auto_reset_credits_before_expiry_min":90}`)
+	select {
+	case <-handler.autoResetCreditsWake:
+		t.Fatal("same-value auto-reset settings queued another scan")
+	default:
+	}
+	update(`{"site_name":"Codex2API Test"}`)
+	for _, boundary := range []int{10, 10080, 90} {
+		update(fmt.Sprintf(`{"auto_reset_credits_before_expiry_min":%d}`, boundary))
+		if got := proxy.CurrentRuntimeSettings().AutoResetCreditsBeforeExpiryMin; got != boundary {
+			t.Fatalf("runtime boundary = %d, want %d", got, boundary)
+		}
+		select {
+		case <-handler.autoResetCreditsWake:
+		default:
+			t.Fatalf("boundary %d did not queue an immediate scan", boundary)
+		}
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil {
+		t.Fatal("GetSystemSettings returned nil")
+	}
+	if !persisted.AutoResetCreditsEnabled {
+		t.Fatal("AutoResetCreditsEnabled = false, want true after unrelated partial update")
+	}
+	if persisted.AutoResetCreditsBeforeExpiryMin != 90 {
+		t.Fatalf("AutoResetCreditsBeforeExpiryMin = %d, want 90", persisted.AutoResetCreditsBeforeExpiryMin)
+	}
+	if persisted.ModelPricingOverrides != settings.ModelPricingOverrides {
+		t.Fatalf("ModelPricingOverrides = %q, want %q", persisted.ModelPricingOverrides, settings.ModelPricingOverrides)
+	}
+	if persisted.ModelPricingSyncURL != settings.ModelPricingSyncURL {
+		t.Fatalf("ModelPricingSyncURL = %q, want %q", persisted.ModelPricingSyncURL, settings.ModelPricingSyncURL)
+	}
+}
+
+func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"retry_interval_ms":2500,"transport_retry_policy":"sticky"}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.RetryIntervalMS != 2500 {
+		t.Fatalf("retry_interval_ms = %d, want 2500", response.RetryIntervalMS)
+	}
+	if response.TransportRetryPolicy != "sticky" {
+		t.Fatalf("transport_retry_policy = %q, want sticky", response.TransportRetryPolicy)
+	}
+}
+
+func TestUpdateSettingsRejectsAutoResetCreditsWindowOutOfRange(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{}
+
+	for _, value := range []int{9, 10081} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		body := fmt.Sprintf(`{"auto_reset_credits_before_expiry_min":%d}`, value)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+
+		handler.UpdateSettings(ctx)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("value=%d status=%d, want %d body=%s", value, recorder.Code, http.StatusBadRequest, recorder.Body.String())
+		}
+	}
+}
+
+func TestUpdateSettingsDoesNotEnableAutoResetCreditsWhenPersistenceFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"auto_reset_credits_enabled":true}`))
+	ctx.Request = request.WithContext(requestCtx)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want %d body=%s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	if current := proxy.CurrentRuntimeSettings(); current.AutoResetCreditsEnabled {
+		t.Fatal("AutoResetCreditsEnabled became true after persistence failure")
+	}
+}
+
+func TestAutoResetCreditsSettingsUseDatabaseAuthorityOnStaleInstance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	settings.AutoResetCreditsEnabled = false
+	settings.AutoResetCreditsBeforeExpiryMin = 60
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	staleRuntime := proxy.DefaultRuntimeSettings()
+	staleRuntime.AutoResetCreditsEnabled = true
+	staleRuntime.AutoResetCreditsBeforeExpiryMin = 90
+	proxy.ApplyRuntimeSettings(staleRuntime)
+
+	getRecorder := httptest.NewRecorder()
+	getCtx, _ := gin.CreateTestContext(getRecorder)
+	getCtx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil)
+	handler.GetSettings(getCtx)
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("GET status=%d body=%s", getRecorder.Code, getRecorder.Body.String())
+	}
+	var response settingsResponse
+	if err := json.Unmarshal(getRecorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode GET settings: %v", err)
+	}
+	if response.AutoResetCreditsEnabled || response.AutoResetCreditsBeforeExpiryMin != 60 {
+		t.Fatalf("GET auto settings=(%v,%d), want DB authority (false,60)", response.AutoResetCreditsEnabled, response.AutoResetCreditsBeforeExpiryMin)
+	}
+
+	updateRecorder := httptest.NewRecorder()
+	updateCtx, _ := gin.CreateTestContext(updateRecorder)
+	updateCtx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"site_name":"Stale Replica"}`))
+	updateCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(updateCtx)
+	if updateRecorder.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", updateRecorder.Code, updateRecorder.Body.String())
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted.AutoResetCreditsEnabled || persisted.AutoResetCreditsBeforeExpiryMin != 60 {
+		t.Fatalf("persisted auto settings=(%v,%d), want (false,60)", persisted.AutoResetCreditsEnabled, persisted.AutoResetCreditsBeforeExpiryMin)
+	}
+	current := proxy.CurrentRuntimeSettings()
+	if current.AutoResetCreditsEnabled || current.AutoResetCreditsBeforeExpiryMin != 60 {
+		t.Fatalf("runtime auto settings=(%v,%d), want refreshed DB authority (false,60)", current.AutoResetCreditsEnabled, current.AutoResetCreditsBeforeExpiryMin)
+	}
+	select {
+	case <-handler.autoResetCreditsWake:
+		t.Fatal("unrelated stale-instance update queued an auto-reset scan")
+	default:
 	}
 }
 
@@ -1585,7 +1835,7 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccount 2: %v", err)
 	}
-	groupID, err := db.CreateAccountGroup(ctx, "Batch Group", "", "#2563eb", 0, 0, 0)
+	groupID, err := db.CreateAccountGroup(ctx, "Batch Group", "", "#2563eb", 0, 0, sql.NullInt64{}, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup: %v", err)
 	}
@@ -1597,7 +1847,7 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 	store.AddAccount(runtimeAccount2)
 	handler := &Handler{db: db, store: store}
 
-	body := fmt.Sprintf(`{"ids":[%d,%d,%d,%d],"enabled":false,"locked":true,"tags":["Ops","ops","blue"],"group_ids":[%d],"auto_pause_5h_threshold":0.8,"auto_pause_7d_disabled":true}`,
+	body := fmt.Sprintf(`{"ids":[%d,%d,%d,%d],"enabled":false,"locked":true,"tags":["Ops","ops","blue"],"group_ids":[%d],"score_bias_override":33,"base_concurrency_override":5,"scheduler_priority":7,"auto_pause_5h_threshold":0.8,"auto_pause_7d_disabled":true}`,
 		accountID1, accountID2, accountID1, accountID2+1000, groupID)
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
@@ -1636,6 +1886,15 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 		if len(row.Tags) != 2 || row.Tags[0] != "Ops" || row.Tags[1] != "blue" {
 			t.Fatalf("account %d tags = %v, want [Ops blue]", id, row.Tags)
 		}
+		if !row.ScoreBiasOverride.Valid || row.ScoreBiasOverride.Int64 != 33 {
+			t.Fatalf("account %d score_bias_override = %+v, want 33", id, row.ScoreBiasOverride)
+		}
+		if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 5 {
+			t.Fatalf("account %d base_concurrency_override = %+v, want 5", id, row.BaseConcurrencyOverride)
+		}
+		if priority, ok := row.GetCredentialInt64("scheduler_priority"); !ok || priority != 7 {
+			t.Fatalf("account %d scheduler_priority = (%d, %t), want (7, true)", id, priority, ok)
+		}
 		threshold5h, ok := row.GetCredentialFloat64("auto_pause_5h_threshold")
 		if !ok || threshold5h != 0.8 {
 			t.Fatalf("account %d auto_pause_5h_threshold = (%v, %t), want (0.8, true)", id, threshold5h, ok)
@@ -1663,6 +1922,57 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 		t.Fatalf("runtime account 1 metadata tags=%v groups=%v", runtimeAccount1.Tags, runtimeAccount1.GroupIDs)
 	}
 	runtimeAccount1.Mu().RUnlock()
+	for _, account := range []*auth.Account{runtimeAccount1, runtimeAccount2} {
+		if scoreBias, ok := account.GetScoreBiasOverride(); !ok || scoreBias != 33 {
+			t.Fatalf("runtime account %d score bias = (%d, %t), want (33, true)", account.ID(), scoreBias, ok)
+		}
+		if baseConcurrency, ok := account.GetBaseConcurrencyOverride(); !ok || baseConcurrency != 5 {
+			t.Fatalf("runtime account %d base concurrency = (%d, %t), want (5, true)", account.ID(), baseConcurrency, ok)
+		}
+		if priority := account.GetSchedulerPriority(); priority != 7 {
+			t.Fatalf("runtime account %d scheduler priority = %d, want 7", account.ID(), priority)
+		}
+	}
+
+	resetRecorder := httptest.NewRecorder()
+	resetCtx, _ := gin.CreateTestContext(resetRecorder)
+	resetCtx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/admin/accounts/batch-update",
+		strings.NewReader(fmt.Sprintf(`{"ids":[%d,%d],"score_bias_override":null,"base_concurrency_override":null,"scheduler_priority":null}`, accountID1, accountID2)),
+	)
+	resetCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.BatchUpdateAccounts(resetCtx)
+	if resetRecorder.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want %d, body=%s", resetRecorder.Code, http.StatusOK, resetRecorder.Body.String())
+	}
+	rows, err = db.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive after reset: %v", err)
+	}
+	for _, row := range rows {
+		if row.ID != accountID1 && row.ID != accountID2 {
+			continue
+		}
+		if row.ScoreBiasOverride.Valid || row.BaseConcurrencyOverride.Valid {
+			t.Fatalf("account %d overrides after reset = score %+v concurrency %+v, want null", row.ID, row.ScoreBiasOverride, row.BaseConcurrencyOverride)
+		}
+		if priority, _ := row.GetCredentialInt64("scheduler_priority"); priority != 0 {
+			t.Fatalf("account %d scheduler_priority after reset = %d, want 0", row.ID, priority)
+		}
+	}
+	for _, account := range []*auth.Account{runtimeAccount1, runtimeAccount2} {
+		if _, ok := account.GetScoreBiasOverride(); ok {
+			t.Fatalf("runtime account %d score bias still overridden after reset", account.ID())
+		}
+		if _, ok := account.GetBaseConcurrencyOverride(); ok {
+			t.Fatalf("runtime account %d base concurrency still overridden after reset", account.ID())
+		}
+		if priority := account.GetSchedulerPriority(); priority != 0 {
+			t.Fatalf("runtime account %d scheduler priority after reset = %d, want 0", account.ID(), priority)
+		}
+	}
 }
 
 func TestBatchUpdateAccountsRejectsMissingUpdateFields(t *testing.T) {

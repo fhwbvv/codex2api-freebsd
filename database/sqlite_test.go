@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -736,7 +737,7 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "client_user_agent", "upstream_user_agent", "user_agent_overridden", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
@@ -1064,57 +1065,62 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.UpdateSystemSettings(ctx, &SystemSettings{
-		SiteName:                         "CodexProxy",
-		MaxConcurrency:                   2,
-		GlobalRPM:                        0,
-		TestModel:                        "gpt-5.4",
-		TestContent:                      "say pong",
-		TestConcurrency:                  50,
-		BackgroundRefreshIntervalMinutes: 2,
-		UsageProbeMaxAgeMinutes:          10,
-		UsageProbeConcurrency:            16,
-		RecoveryProbeIntervalMinutes:     30,
-		PgMaxConns:                       50,
-		RedisPoolSize:                    30,
-		MaxRetries:                       2,
-		MaxRateLimitRetries:              1,
-		ModelMapping:                     "{}",
-		CodexModelMapping:                `{"gpt-5.2":"gpt-5.5"}`,
-		ReasoningEffortModels:            `[{"model":"gpt-5.5","effort":"xhigh"}]`,
-		PromptFilterMode:                 "monitor",
-		PromptFilterThreshold:            50,
-		PromptFilterStrictThreshold:      90,
-		PromptFilterLogMatches:           true,
-		PromptFilterMaxTextLength:        81920,
-		PromptFilterCustomPatterns:       "[]",
-		PromptFilterDisabledPatterns:     "[]",
-		PromptFilterReviewEnabled:        true,
-		PromptFilterReviewAPIKey:         "sk-review-test",
-		PromptFilterReviewBaseURL:        "https://review.example.com",
-		PromptFilterReviewModel:          "review-model",
-		PromptFilterReviewTimeoutSeconds: 7,
-		PromptFilterReviewFailClosed:     false,
-		ClientCompatMode:                 "preserve",
-		CodexMinCLIVersion:               "0.118.0",
-		CodexUserAgentConfig:             `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
-		UsageLogMode:                     "full",
-		UsageLogBatchSize:                200,
-		UsageLogFlushIntervalSeconds:     5,
-		StreamFlushPolicy:                "immediate",
-		StreamFlushIntervalMS:            20,
-		FirstTokenMode:                   "loose",
-		FirstTokenTimeoutSeconds:         17,
-		BillingTierPolicy:                "requested",
-		ImageStorageConfig:               "{}",
-		SchedulerMode:                    "round_robin",
-		AffinityMode:                     "bounded",
-		BackgroundConfig:                 "{}",
-		ShowFullUsageNumbers:             true,
-		PublicKeyUsagePageEnabled:        true,
-		CodexWSHideUpstreamErrors:        true,
-		CodexWSSilentRetryEnabled:        true,
-		CodexWSSilentMaxRetries:          4,
-		IgnoreUsageLimitStatus:           true,
+		SiteName:                          "CodexProxy",
+		MaxConcurrency:                    2,
+		GlobalRPM:                         0,
+		TestModel:                         "gpt-5.4",
+		TestContent:                       "say pong",
+		TestConcurrency:                   50,
+		BackgroundRefreshIntervalMinutes:  2,
+		UsageProbeMaxAgeMinutes:           10,
+		UsageProbeConcurrency:             16,
+		RecoveryProbeIntervalMinutes:      30,
+		PgMaxConns:                        50,
+		RedisPoolSize:                     30,
+		MaxRetries:                        2,
+		MaxRateLimitRetries:               1,
+		ModelMapping:                      "{}",
+		CodexModelMapping:                 `{"gpt-5.2":"gpt-5.5"}`,
+		ReasoningEffortModels:             `[{"model":"gpt-5.5","effort":"xhigh"}]`,
+		PromptFilterMode:                  "monitor",
+		PromptFilterThreshold:             50,
+		PromptFilterStrictThreshold:       90,
+		PromptFilterStrictTerminalEnabled: true,
+		PromptFilterAdvancedConfig:        `{"normalization":{"enabled":true}}`,
+		PromptFilterLogMatches:            true,
+		PromptFilterMaxTextLength:         81920,
+		PromptFilterCustomPatterns:        "[]",
+		PromptFilterDisabledPatterns:      "[]",
+		PromptFilterReviewEnabled:         true,
+		PromptFilterReviewAPIKey:          "sk-review-test",
+		PromptFilterReviewBaseURL:         "https://review.example.com",
+		PromptFilterReviewModel:           "review-model",
+		PromptFilterReviewTimeoutSeconds:  7,
+		PromptFilterReviewFailClosed:      false,
+		ClientCompatMode:                  "preserve",
+		CodexMinCLIVersion:                "0.118.0",
+		CodexUserAgentConfig:              `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
+		UsageLogMode:                      "full",
+		UsageLogBatchSize:                 200,
+		UsageLogFlushIntervalSeconds:      5,
+		StreamFlushPolicy:                 "immediate",
+		StreamFlushIntervalMS:             20,
+		FirstTokenMode:                    "loose",
+		FirstTokenTimeoutSeconds:          17,
+		BillingTierPolicy:                 "requested",
+		ImageStorageConfig:                "{}",
+		SchedulerMode:                     "round_robin",
+		AffinityMode:                      "bounded",
+		BackgroundConfig:                  "{}",
+		ShowFullUsageNumbers:              true,
+		PublicKeyUsagePageEnabled:         true,
+		PublicImageStudioPageEnabled:      true,
+		CodexWSHideUpstreamErrors:         true,
+		CodexWSSilentRetryEnabled:         true,
+		CodexWSSilentMaxRetries:           4,
+		IgnoreUsageLimitStatus:            true,
+		AutoResetCreditsEnabled:           true,
+		AutoResetCreditsBeforeExpiryMin:   75,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1129,8 +1135,20 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
 	}
+	if !settings.PromptFilterStrictTerminalEnabled {
+		t.Fatal("PromptFilterStrictTerminalEnabled = false, want true")
+	}
+	if settings.PromptFilterAdvancedConfig != `{"normalization":{"enabled":true}}` {
+		t.Fatalf("PromptFilterAdvancedConfig = %q", settings.PromptFilterAdvancedConfig)
+	}
 	if !settings.IgnoreUsageLimitStatus {
 		t.Fatal("IgnoreUsageLimitStatus = false, want true")
+	}
+	if !settings.AutoResetCreditsEnabled {
+		t.Fatal("AutoResetCreditsEnabled = false, want true")
+	}
+	if settings.AutoResetCreditsBeforeExpiryMin != 75 {
+		t.Fatalf("AutoResetCreditsBeforeExpiryMin = %d, want 75", settings.AutoResetCreditsBeforeExpiryMin)
 	}
 	if settings.TestContent != "say pong" {
 		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
@@ -1143,6 +1161,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if !settings.PublicKeyUsagePageEnabled {
 		t.Fatal("PublicKeyUsagePageEnabled = false, want true")
+	}
+	if !settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled = false, want true")
 	}
 	if settings.BillingTierPolicy != "requested" {
 		t.Fatalf("BillingTierPolicy = %q, want requested", settings.BillingTierPolicy)
@@ -1195,6 +1216,18 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if settings.PublicKeyUsagePageEnabled {
 		t.Fatal("PublicKeyUsagePageEnabled = true, want false")
 	}
+
+	settings.PublicImageStudioPageEnabled = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false PublicImageStudioPageEnabled 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false PublicImageStudioPageEnabled 返回错误: %v", err)
+	}
+	if settings.PublicImageStudioPageEnabled {
+		t.Fatal("PublicImageStudioPageEnabled = true, want false")
+	}
 }
 
 func TestSystemSettingsNormalizeBlankBillingTierPolicy(t *testing.T) {
@@ -1235,6 +1268,145 @@ func TestSystemSettingsNormalizeBlankBillingTierPolicy(t *testing.T) {
 	}
 }
 
+func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{
+		AutoResetCreditsEnabled:         true,
+		AutoResetCreditsBeforeExpiryMin: 90,
+		ModelPricingOverrides:           `{"old":{"input":1}}`,
+		ModelPricingSyncURL:             "https://old.example/pricing.json",
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+	if err := db.UpdateCodexSyncedCLIVersion(ctx, "9.9.9"); err != nil {
+		t.Fatalf("UpdateCodexSyncedCLIVersion: %v", err)
+	}
+	if err := db.UpdateModelPricingSettings(ctx, `{"new":{"input":2}}`, "https://new.example/pricing.json"); err != nil {
+		t.Fatalf("UpdateModelPricingSettings: %v", err)
+	}
+
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSystemSettings returned nil")
+	}
+	// 模拟管理员从旧快照保存无关设置；后台刚写入的模型定价不能被回滚。
+	staleFullUpdate := *got
+	staleFullUpdate.SiteName = "Concurrent Admin Save"
+	staleFullUpdate.CodexSyncedCLIVersion = "0.0.1"
+	staleFullUpdate.ModelPricingOverrides = `{"old":{"input":1}}`
+	staleFullUpdate.ModelPricingSyncURL = "https://old.example/pricing.json"
+	if err := db.UpdateSystemSettings(ctx, &staleFullUpdate); err != nil {
+		t.Fatalf("UpdateSystemSettings(stale full update): %v", err)
+	}
+	got, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after stale full update: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetSystemSettings after stale full update returned nil")
+	}
+	if !got.AutoResetCreditsEnabled || got.AutoResetCreditsBeforeExpiryMin != 90 {
+		t.Fatalf("auto reset settings = (%v,%d), want (true,90)", got.AutoResetCreditsEnabled, got.AutoResetCreditsBeforeExpiryMin)
+	}
+	if got.CodexSyncedCLIVersion != "9.9.9" {
+		t.Fatalf("CodexSyncedCLIVersion = %q, want 9.9.9", got.CodexSyncedCLIVersion)
+	}
+	if got.ModelPricingOverrides != `{"new":{"input":2}}` || got.ModelPricingSyncURL != "https://new.example/pricing.json" {
+		t.Fatalf("model pricing = %q / %q", got.ModelPricingOverrides, got.ModelPricingSyncURL)
+	}
+}
+
+func TestSQLiteMigratesAccountGroupBaseConcurrencyOverride(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open legacy sqlite 返回错误: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE account_groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)`); err != nil {
+		legacy.Close()
+		t.Fatalf("创建旧 account_groups 表返回错误: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("关闭旧 SQLite 返回错误: %v", err)
+	}
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 迁移旧库返回错误: %v", err)
+	}
+	defer db.Close()
+
+	var columnCount int
+	if err := db.conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM pragma_table_info('account_groups') WHERE name = 'base_concurrency_override'`).Scan(&columnCount); err != nil {
+		t.Fatalf("查询迁移列返回错误: %v", err)
+	}
+	if columnCount != 1 {
+		t.Fatalf("base_concurrency_override column count = %d, want 1", columnCount)
+	}
+}
+
+func TestAccountGroupBaseConcurrencyOverrideCRUD(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	groupID, err := db.CreateAccountGroup(ctx, "Concurrency", "", "", 0, 0, sql.NullInt64{Int64: 6, Valid: true})
+	if err != nil {
+		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
+	}
+
+	assertOverride := func(want sql.NullInt64) {
+		t.Helper()
+		groups, err := db.ListAccountGroups(ctx)
+		if err != nil {
+			t.Fatalf("ListAccountGroups 返回错误: %v", err)
+		}
+		if len(groups) != 1 || groups[0].ID != groupID {
+			t.Fatalf("groups = %#v, want group %d", groups, groupID)
+		}
+		got := groups[0].BaseConcurrencyOverride
+		if got.Valid != want.Valid || (got.Valid && got.Int64 != want.Int64) {
+			t.Fatalf("BaseConcurrencyOverride = %+v, want %+v", got, want)
+		}
+	}
+
+	assertOverride(sql.NullInt64{Int64: 6, Valid: true})
+	if err := db.UpdateAccountGroup(ctx, groupID, nil, nil, nil, &UpdateAccountGroupOpts{
+		BaseConcurrencyOverride: OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 3, Valid: true}},
+	}); err != nil {
+		t.Fatalf("UpdateAccountGroup set override 返回错误: %v", err)
+	}
+	assertOverride(sql.NullInt64{Int64: 3, Valid: true})
+
+	name := "Concurrency renamed"
+	if err := db.UpdateAccountGroup(ctx, groupID, &name, nil, nil, nil); err != nil {
+		t.Fatalf("UpdateAccountGroup unrelated field 返回错误: %v", err)
+	}
+	assertOverride(sql.NullInt64{Int64: 3, Valid: true})
+
+	if err := db.UpdateAccountGroup(ctx, groupID, nil, nil, nil, &UpdateAccountGroupOpts{
+		BaseConcurrencyOverride: OptionalNullInt64{Set: true},
+	}); err != nil {
+		t.Fatalf("UpdateAccountGroup clear override 返回错误: %v", err)
+	}
+	assertOverride(sql.NullInt64{})
+}
+
 func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1245,11 +1417,11 @@ func TestDeleteAccountGroupDoesNotBroadenScopedAPIKey(t *testing.T) {
 	defer db.Close()
 
 	ctx := context.Background()
-	groupA, err := db.CreateAccountGroup(ctx, "Group A", "", "#2563eb", 0, 0, 0)
+	groupA, err := db.CreateAccountGroup(ctx, "Group A", "", "#2563eb", 0, 0, sql.NullInt64{}, 0)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup A 返回错误: %v", err)
 	}
-	groupB, err := db.CreateAccountGroup(ctx, "Group B", "", "#16a34a", 0, 0, 1)
+	groupB, err := db.CreateAccountGroup(ctx, "Group B", "", "#16a34a", 0, 0, sql.NullInt64{}, 1)
 	if err != nil {
 		t.Fatalf("CreateAccountGroup B 返回错误: %v", err)
 	}
@@ -1332,6 +1504,47 @@ func TestUsageLogsPersistEffectiveModel(t *testing.T) {
 	}
 	if logs[0].ReasoningEffort != "high" {
 		t.Fatalf("ReasoningEffort = %q, want high", logs[0].ReasoningEffort)
+	}
+}
+
+func TestUsageLogsPersistUserAgentAudit(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:           1,
+		Endpoint:            "/v1/responses",
+		Model:               "gpt-5.4",
+		StatusCode:          200,
+		ClientUserAgent:     "curl/8.7.1",
+		UpstreamUserAgent:   "codex-tui/0.151.0 (Mac OS 15.5.0; arm64) xterm-256color (codex-tui; 0.151.0)",
+		UserAgentOverridden: true,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+	if got := logs[0].ClientUserAgent; got != "curl/8.7.1" {
+		t.Fatalf("ClientUserAgent = %q, want curl/8.7.1", got)
+	}
+	if got := logs[0].UpstreamUserAgent; !strings.HasPrefix(got, "codex-tui/0.151.0 ") {
+		t.Fatalf("UpstreamUserAgent = %q, want generated codex-tui UA", got)
+	}
+	if !logs[0].UserAgentOverridden {
+		t.Fatal("UserAgentOverridden = false, want true")
 	}
 }
 

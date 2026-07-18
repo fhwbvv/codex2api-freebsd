@@ -82,6 +82,13 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 
 <table>
 <tr>
+<td width="180" align="center" valign="middle"><a href="https://aixor.org/sign-up?aff=LaKs"><img src="assets/aixor-logo.jpg" width="160" alt="AiXor"></a></td>
+<td valign="middle"><b><a href="https://aixor.org/sign-up?aff=LaKs">AiXor</a></b> provides cost-effective AI model API access with support for mainstream models including OpenAI, Claude, and Gemini. Top-up ratio of ¥0.2 = $1 credit, bringing per-call costs down to under 10% of official pricing. Plans start at ¥25/28 days; the Premium plan (¥129/28 days) includes about $4,752 in model credit (plans cover OpenAI models only), with high-concurrency support and 95%+ SLA stability.</td>
+</tr>
+</table>
+
+<table>
+<tr>
 <td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
 <td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> is a high-availability AI model API relay platform for individual developers and enterprise teams. Supports Codex/Claude Code at ~1/10 official pricing. Register using the link and promo code <code>CODEX2API</code> to get $3 test credit. </td>
 </tr>
@@ -403,6 +410,7 @@ Open `/admin/` in a browser.
 | API Keys | `/admin/api-keys` | API key creation, inspection, deletion, and credential management |
 | Proxies | `/admin/proxies` | Proxy pool management, account proxy assignment, connectivity checks |
 | Image Studio | `/admin/images/studio` | Text-to-image, image-to-image, prompt templates, task history, server-side image library |
+| Image Studio portal (non-admin) | `/image-studio` | Standalone studio for teammates using their own API key; toggle on the API Keys page |
 | Prompt Filter | `/admin/prompt-filter/overview` | Rules, hit logs, testing, and handling mode configuration |
 | Usage | `/admin/usage` | Request logs, metric cards, charts, log cleanup |
 | Operations | `/admin/ops` | Runtime monitoring and system overview |
@@ -440,7 +448,7 @@ Browser -> embedded /admin frontend -> /api/admin/* -> database / account pool /
 
 ### Scheduler
 
-The scheduler lives in `auth.Store`. It evaluates availability, health tier, dynamic concurrency, historical errors, and recent usage before selecting an account.
+The scheduler lives in `auth.Store`. It evaluates availability, scheduler priority, health tier, dynamic concurrency, historical errors, and recent usage before selecting an account.
 
 Runtime state:
 
@@ -448,14 +456,17 @@ Runtime state:
 - `HealthTier`: `healthy`, `warm`, `risky`, `banned`
 - `SchedulerScore`: real-time scheduling score based on a baseline of 100
 - `DynamicConcurrencyLimit`: concurrency limit adjusted by health tier
+- `SchedulerPriority`: strict account priority; higher-priority accounts are considered before health tier, score, or current load
 
 Selection strategy:
 
 1. Filter unavailable accounts, including `error`, `banned`, cooldown accounts, and accounts without an Access Token.
 2. Recompute health tier, scheduler score, and dynamic concurrency.
 3. Exclude accounts that have reached their concurrency limit.
-4. Prefer `healthy > warm > risky > banned`; within the same tier, prefer higher score and lower concurrency.
+4. Prefer higher `SchedulerPriority`, then `healthy > warm > risky > banned`; within the same priority and tier, prefer higher score and lower concurrency.
 5. Apply a 15% random shuffle to reduce hotspots and starvation.
+
+When multiple end users share one downstream API key, send `X-Codex2API-Affinity-Key` with a stable user or conversation identifier. Codex2API hashes it for local account affinity only and never forwards it upstream.
 
 Concurrency rules:
 
@@ -465,6 +476,8 @@ Concurrency rules:
 | `warm` | Base concurrency / 2, at least 1 |
 | `risky` | Fixed at 1 |
 | `banned` | Fixed at 0, not schedulable |
+
+The persistent upstream WebSocket pool is also capped by each account's current `DynamicConcurrencyLimit`, so connection reuse cannot grow beyond the account's effective concurrency.
 
 Observability:
 

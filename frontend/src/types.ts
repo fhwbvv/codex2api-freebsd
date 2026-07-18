@@ -54,6 +54,8 @@ export interface AccountRow {
   dynamic_concurrency_limit?: number
   allowed_api_key_ids?: number[]
   tags?: string[]
+  // 通用备注;自助提交的账号会带上「自助提交联系人: ...」这类说明。
+  note?: string
   group_ids?: number[]
   scheduler_breakdown?: {
     unauthorized_penalty: number
@@ -93,6 +95,7 @@ export interface AccountRow {
   ignore_usage_limit_status_override?: boolean | null
   ignore_usage_limit_status_effective?: boolean
   dispatch_count_limit?: number | null
+  scheduler_priority?: number | null
   dispatch_count_used?: number
   dispatch_count_reset_at?: ISODateString
   dispatch_count_limited?: boolean
@@ -258,6 +261,7 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_status_override?: boolean | null
   dispatch_count_limit?: number | null
+  scheduler_priority?: number | null
   custom_headers?: Record<string, string> | null
 }
 
@@ -274,6 +278,7 @@ export interface AccountGroup {
   color: string
   sort_order: number
   member_count: number
+  base_concurrency_override: number | null
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
   created_at: ISODateString
@@ -289,6 +294,7 @@ export interface CreateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
 }
@@ -298,6 +304,7 @@ export interface UpdateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  base_concurrency_override?: number | null
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
 }
@@ -606,6 +613,8 @@ export interface SystemSettings {
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
   auto_clean_expired: boolean
+  auto_reset_credits_enabled: boolean
+  auto_reset_credits_before_expiry_min: number
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   codex_force_websocket: boolean
@@ -630,6 +639,7 @@ export interface SystemSettings {
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string
+  payload_rules: string
   reasoning_effort_models: string
   resin_url: string
   resin_platform_name: string
@@ -637,6 +647,8 @@ export interface SystemSettings {
   prompt_filter_mode: 'monitor' | 'warn' | 'block' | string
   prompt_filter_threshold: number
   prompt_filter_strict_threshold: number
+  prompt_filter_strict_terminal_enabled: boolean
+  prompt_filter_advanced_config: string
   prompt_filter_log_matches: boolean
   prompt_filter_max_text_length: number
   prompt_filter_sensitive_words: string
@@ -666,6 +678,8 @@ export interface SystemSettings {
   billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
   public_key_usage_page_enabled: boolean
+  public_image_studio_page_enabled: boolean
+  public_account_portal_page_enabled: boolean
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
   image_s3_region: string
@@ -787,6 +801,33 @@ export interface PromptFilterRulesResponse {
   builtin_patterns: PromptFilterRule[]
   custom_patterns: PromptFilterRule[]
   disabled_patterns: string[]
+}
+
+export interface PromptIntelligenceCandidate {
+  name: string
+  pattern: string
+  weight: number
+  category: string
+  strict: boolean
+  rationale?: string
+  source_url?: string
+  status?: 'new' | 'update' | string
+}
+
+export interface PromptIntelligenceHistoryResponse {
+  runs: PromptIntelligenceRun[]
+  total: number
+}
+
+export interface PromptIntelligenceRun {
+  started_at: string
+  finished_at: string
+  queries: string[]
+  sources: Array<{ provider: string; title: string; url: string; description: string; updated_at: string }>
+  candidates: PromptIntelligenceCandidate[]
+  model_calls: number
+  added: number
+  errors: string[]
 }
 
 export interface ModelInfo {
@@ -922,6 +963,9 @@ export interface UsageLog {
   id: number
   account_id: number
   client_ip: string
+  client_user_agent: string
+  upstream_user_agent: string
+  user_agent_overridden: boolean
   endpoint: string
   model: string
   effective_model: string
@@ -1320,6 +1364,17 @@ export interface OAuthURLResponse {
   session_id: string
 }
 
+// 公开账号自助门户:生成授权链接的响应。
+export interface AccountPortalAuthURLResponse {
+  auth_url: string
+  session_id: string
+}
+
+// 公开账号自助门户:提交授权码的响应。
+export interface AccountPortalSubmitResponse {
+  message: string
+}
+
 export interface UpdateOAuthAccountRequest {
   session_id: string
   code: string
@@ -1332,4 +1387,17 @@ export interface OAuthExchangeResponse {
   id: number
   email: string
   plan_type: string
+}
+
+export interface ObservedInstructionsSample {
+  model: string
+  originator: string
+  instructions: string
+  length: number
+  truncated: boolean
+  observed_at: string
+}
+
+export interface ObservedInstructionsResponse {
+  samples: ObservedInstructionsSample[]
 }

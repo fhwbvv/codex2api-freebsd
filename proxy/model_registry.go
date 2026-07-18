@@ -466,11 +466,13 @@ func isAllowedUpstreamCodexModel(id string) bool {
 }
 
 // SyncOfficialCodexModels fetches the fixed official docs page and merges discovered models.
-func SyncOfficialCodexModels(ctx context.Context, db *database.DB) (*ModelSyncResult, error) {
+// proxyURL 为全局出站代理（可为空串直连）：官方模型页与其他上游链路一样可能
+// 被网络环境阻断，同步请求必须遵循全局 ProxyURL（issue #371）。
+func SyncOfficialCodexModels(ctx context.Context, db *database.DB, proxyURL string) (*ModelSyncResult, error) {
 	if db == nil {
 		return nil, fmt.Errorf("数据库不可用，无法同步模型注册表")
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Transport: newCodexStandardTransport(proxyURL), Timeout: 10 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, OfficialCodexModelsURL, nil)
 	if err != nil {
 		return nil, err

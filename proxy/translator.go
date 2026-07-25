@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -633,6 +634,34 @@ func applyResponsesImageGenerationBridgeInstructions(body map[string]any) bool {
 	return true
 }
 
+// removeCodexImageGenerationBridgeText 移除 instructions 中的生图桥接标记块，
+// 是 applyResponsesImageGenerationBridgeInstructions 的逆操作。剥除随注入工具
+// 一同追加的桥接文案时使用；标记块不在场则原样返回。
+func removeCodexImageGenerationBridgeText(instructions string) string {
+	const bridgeEndTag = "</codex2api-codex-image-generation>"
+	for {
+		start := strings.Index(instructions, codexImageGenerationBridgeMarker)
+		if start < 0 {
+			return instructions
+		}
+		rest := instructions[start:]
+		end := strings.Index(rest, bridgeEndTag)
+		head := strings.TrimRight(instructions[:start], " \t\r\n")
+		if end < 0 {
+			return head
+		}
+		tail := strings.TrimLeft(rest[end+len(bridgeEndTag):], " \t\r\n")
+		switch {
+		case head == "":
+			instructions = tail
+		case tail == "":
+			instructions = head
+		default:
+			instructions = head + "\n\n" + tail
+		}
+	}
+}
+
 func hasTopLevelResponsesImageOptions(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -836,6 +865,39 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 	return modified
 }
 
+// normalizeResponsesSystemRoleMessages 把 input[] 中 role=system 的消息项改写为
+// developer 角色。上游 Codex /responses 不接受 system 角色（报 "System messages
+// are not allowed"），而 chat 与 Anthropic 两条翻译链路均已把 system 落到
+// developer（buildInput / buildCodexInput）；原生 Responses 直通路径在此补齐
+// 同样的语义（issue #409）。内容保持原样，content part 类型交由后续
+// normalizeResponsesContentPartTypes 按角色归一。
+func normalizeResponsesSystemRoleMessages(body map[string]any) bool {
+	if len(body) == 0 {
+		return false
+	}
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		itemMap, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if !isResponsesMessageInputItem(itemMap) {
+			continue
+		}
+		if strings.TrimSpace(firstNonEmptyAnyString(itemMap["role"])) != "system" {
+			continue
+		}
+		itemMap["role"] = "developer"
+		modified = true
+	}
+	return modified
+}
+
 // normalizeResponsesToolCallArgumentTypes 修正 input[] 中工具调用项 arguments 的
 // JSON 类型。上游对不同 item 类型的要求不对称：function_call.arguments 必须是
 // string（JSON 编码），tool_search_call.arguments 必须是 object。客户端与缓存
@@ -883,6 +945,152 @@ func normalizeResponsesToolCallArgumentTypes(body map[string]any) bool {
 		}
 	}
 	return modified
+}
+
+// repairResponsesToolCallPairing 修复 input[] 中工具调用项与输出项的 call_id 配对。
+// 部分客户端（如 VSCode Copilot 的 Responses 直连）在长会话做上下文裁剪/摘要时，
+// 会丢掉配对中的一半：只剩 *_call_output 时上游 400 "No tool call found for
+// function call output with call_id ..."（issue #414），只剩 *_call 时上游 400
+// "No tool output found for function call ..."。修复策略：
+//   - 孤儿 *_call_output（含缺 call_id 的）：改写为 user message 保留输出文本，
+//     避免直接丢弃造成上下文缺失；
+//   - 孤儿 function_call / custom_tool_call：紧随其后补一条占位 output；
+//     其余 *_call 类型形态不明，原样保留不做合成。
+func repairResponsesToolCallPairing(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok || len(inputItems) == 0 {
+		return false
+	}
+
+	callIDs := make(map[string]bool)
+	outputIDs := make(map[string]bool)
+	for _, raw := range inputItems {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		callID := strings.TrimSpace(firstNonEmptyAnyString(item["call_id"]))
+		if callID == "" {
+			continue
+		}
+		typ := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
+		switch {
+		case isCodexToolCallContextType(typ):
+			callIDs[callID] = true
+		case isCodexToolCallOutputType(typ):
+			outputIDs[callID] = true
+		}
+	}
+
+	orphanOutputs, orphanCalls := 0, 0
+	out := make([]any, 0, len(inputItems))
+	for _, raw := range inputItems {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			out = append(out, raw)
+			continue
+		}
+		typ := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
+		callID := strings.TrimSpace(firstNonEmptyAnyString(item["call_id"]))
+		switch {
+		case isCodexToolCallOutputType(typ):
+			if callID != "" && callIDs[callID] {
+				out = append(out, raw)
+				continue
+			}
+			out = append(out, orphanToolOutputAsMessage(callID, item["output"]))
+			orphanOutputs++
+		case isCodexToolCallContextType(typ):
+			out = append(out, raw)
+			if callID == "" || outputIDs[callID] {
+				continue
+			}
+			outputType := codexToolCallOutputTypeForCall(typ)
+			if outputType == "" {
+				continue
+			}
+			out = append(out, map[string]any{
+				"type":    outputType,
+				"call_id": callID,
+				"output":  "[tool output was not recorded]",
+			})
+			// 标记已补齐，同 call_id 重复出现时不再重复合成
+			outputIDs[callID] = true
+			orphanCalls++
+		default:
+			out = append(out, raw)
+		}
+	}
+
+	if orphanOutputs == 0 && orphanCalls == 0 {
+		return false
+	}
+	body["input"] = out
+	log.Printf("已修复 input 工具调用配对: 孤儿输出转消息 %d 条, 孤儿调用补占位输出 %d 条", orphanOutputs, orphanCalls)
+	return true
+}
+
+// orphanToolOutputAsMessage 把无法配对的工具输出项改写为 user message，
+// 保留输出文本供模型继续参考。
+func orphanToolOutputAsMessage(callID string, output any) map[string]any {
+	label := "[Tool output from an earlier turn]"
+	if callID != "" {
+		label = "[Tool output from an earlier turn, call_id " + callID + "]"
+	}
+	return map[string]any{
+		"type": "message",
+		"role": "user",
+		"content": []any{
+			map[string]any{
+				"type": "input_text",
+				"text": label + "\n" + flattenToolOutputText(output),
+			},
+		},
+	}
+}
+
+// flattenToolOutputText 把 *_call_output 的 output 字段拍平成纯文本。
+// output 可能是 string，也可能是 [{type:"output_text",text:"..."}] 形式的内容数组。
+func flattenToolOutputText(output any) string {
+	switch v := output.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []any:
+		var sb strings.Builder
+		for _, raw := range v {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if text := firstNonEmptyAnyString(part["text"]); text != "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(text)
+			}
+		}
+		if sb.Len() > 0 {
+			return sb.String()
+		}
+	}
+	if encoded, err := json.Marshal(output); err == nil {
+		return string(encoded)
+	}
+	return ""
+}
+
+// codexToolCallOutputTypeForCall 返回可安全合成占位输出的调用项对应的输出项类型。
+func codexToolCallOutputTypeForCall(callType string) string {
+	switch callType {
+	case "function_call":
+		return "function_call_output"
+	case "custom_tool_call":
+		return "custom_tool_call_output"
+	default:
+		return ""
+	}
 }
 
 func normalizeResponsesInputMessageContent(body map[string]any) bool {
@@ -1413,55 +1621,47 @@ func validateChatCompletionFunctionNames(req openAIRequest) error {
 // ValidateResponsesFunctionNames rejects malformed tool-call names before they
 // reach the upstream Responses API. The upstream reports these as HTTP 400
 // empty_string errors; local validation makes the bad client field obvious.
+// ValidateResponsesFunctionNames 校验 input[] 中 function_call 与 tools[] 中
+// function 工具的 name 非空。采用 gjson 惰性遍历，只走 input/tools 两个数组，
+// 不把整份请求体反序列化成 map[string]any——大请求体(曾 16MB)上全量 Unmarshal
+// 会带来秒级开销且随后 prepare 阶段还会再解析一次(issue #417)。
 func ValidateResponsesFunctionNames(rawBody []byte) error {
-	var body map[string]any
-	if err := json.Unmarshal(rawBody, &body); err != nil {
-		return nil
-	}
-	return validateResponsesFunctionNames(body)
-}
-
-func validateResponsesFunctionNames(body map[string]any) error {
-	inputItems, _ := body["input"].([]any)
-	for itemIdx, rawItem := range inputItems {
-		item, ok := rawItem.(map[string]any)
-		if !ok {
-			continue
+	// 无效 JSON 时 gjson 查询返回空结果、校验直接通过（与旧版 Unmarshal 失败即
+	// 放行一致），无需先做一次全量 ValidBytes 扫描。
+	var funcErr error
+	gjson.GetBytes(rawBody, "input").ForEach(func(idx, item gjson.Result) bool {
+		if strings.TrimSpace(item.Get("type").String()) != "function_call" {
+			return true
 		}
-		if strings.TrimSpace(firstNonEmptyAnyString(item["type"])) != "function_call" {
-			continue
+		if strings.TrimSpace(item.Get("name").String()) == "" {
+			funcErr = invalidFunctionNameError(fmt.Sprintf("input[%d].name", idx.Int()))
+			return false
 		}
-		if strings.TrimSpace(firstNonEmptyAnyString(item["name"])) == "" {
-			return invalidFunctionNameError(fmt.Sprintf("input[%d].name", itemIdx))
-		}
+		return true
+	})
+	if funcErr != nil {
+		return funcErr
 	}
 
-	tools, _ := body["tools"].([]any)
-	for toolIdx, rawTool := range tools {
-		tool, ok := rawTool.(map[string]any)
-		if !ok || strings.TrimSpace(firstNonEmptyAnyString(tool["type"])) != "function" {
-			continue
+	gjson.GetBytes(rawBody, "tools").ForEach(func(idx, tool gjson.Result) bool {
+		if strings.TrimSpace(tool.Get("type").String()) != "function" {
+			return true
 		}
-		if responsesFunctionToolName(tool) == "" {
-			path := fmt.Sprintf("tools[%d].name", toolIdx)
-			if _, ok := tool["function"].(map[string]any); ok {
-				path = fmt.Sprintf("tools[%d].function.name", toolIdx)
+		name := strings.TrimSpace(tool.Get("name").String())
+		if name == "" {
+			name = strings.TrimSpace(tool.Get("function.name").String())
+		}
+		if name == "" {
+			path := fmt.Sprintf("tools[%d].name", idx.Int())
+			if tool.Get("function").IsObject() {
+				path = fmt.Sprintf("tools[%d].function.name", idx.Int())
 			}
-			return invalidFunctionNameError(path)
+			funcErr = invalidFunctionNameError(path)
+			return false
 		}
-	}
-	return nil
-}
-
-func responsesFunctionToolName(tool map[string]any) string {
-	if name := strings.TrimSpace(firstNonEmptyAnyString(tool["name"])); name != "" {
-		return name
-	}
-	function, _ := tool["function"].(map[string]any)
-	if function == nil {
-		return ""
-	}
-	return strings.TrimSpace(firstNonEmptyAnyString(function["name"]))
+		return true
+	})
+	return funcErr
 }
 
 func normalizeResponsesFunctionTools(body map[string]any) bool {
@@ -1775,11 +1975,19 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 	// 6b. 把 input[] 中的 compaction 项翻译为 developer message（上游不识别 compaction）
 	normalizeResponsesCompactionItems(body)
+	// system 角色消息 → developer（上游不接受 system 角色，issue #409）
+	normalizeResponsesSystemRoleMessages(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	normalizeResponsesToolCallArgumentTypes(body)
 	normalizeResponsesInputItemIDs(body)
 	dropBareReasoningInputItems(body)
+	// 6c. 修复工具调用/输出的 call_id 配对（issue #414）。
+	// previous_response_id 保留给上游的原生续链场景跳过：历史存于上游服务端，
+	// 本地看似孤儿的输出项是合法续链，不能改写。
+	if !(opts.preservePreviousResponseID && prevID != "") {
+		repairResponsesToolCallPairing(body)
+	}
 
 	// 保存展开后的 input 原始 JSON（用于响应缓存链路）
 	var expandedInputRaw string

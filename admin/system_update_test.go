@@ -8,11 +8,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 type fakeSystemReleaseClient struct {
@@ -223,6 +228,31 @@ func TestSystemUpdaterCachesLatestRelease(t *testing.T) {
 	}
 	if client.fetches != 1 {
 		t.Fatalf("FetchLatestRelease calls = %d, want 1", client.fetches)
+	}
+}
+
+func TestGetSystemUpdateDegradesGracefullyWhenReleaseSourceIsUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{systemUpdate: &systemUpdater{
+		currentVersion: "v2.4.3",
+		client:         &fakeSystemReleaseClient{fetchErr: errors.New("release source unavailable")},
+		goos:           "linux",
+		goarch:         "amd64",
+	}}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/api/admin/system/update", nil)
+
+	handler.GetSystemUpdate(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"latest_version":"2.4.3"`) {
+		t.Fatalf("fallback response should retain the current version: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"warning"`) {
+		t.Fatalf("fallback response should expose a non-fatal warning: %s", recorder.Body.String())
 	}
 }
 

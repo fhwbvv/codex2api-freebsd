@@ -48,6 +48,7 @@ type anthropicContentBlock struct {
 	Type      string                `json:"type"`
 	Text      string                `json:"text,omitempty"`
 	Thinking  string                `json:"thinking,omitempty"`
+	Signature string                `json:"signature,omitempty"`
 	Source    *anthropicImageSource `json:"source,omitempty"`
 	ID        string                `json:"id,omitempty"`
 	Name      string                `json:"name,omitempty"`
@@ -62,6 +63,7 @@ func (b anthropicContentBlock) MarshalJSON() ([]byte, error) {
 		Type      string                `json:"type"`
 		Text      *string               `json:"text,omitempty"`
 		Thinking  *string               `json:"thinking,omitempty"`
+		Signature string                `json:"signature,omitempty"`
 		Source    *anthropicImageSource `json:"source,omitempty"`
 		ID        string                `json:"id,omitempty"`
 		Name      string                `json:"name,omitempty"`
@@ -73,6 +75,7 @@ func (b anthropicContentBlock) MarshalJSON() ([]byte, error) {
 
 	out := contentBlock{
 		Type:      b.Type,
+		Signature: b.Signature,
 		Source:    b.Source,
 		ID:        b.ID,
 		Name:      b.Name,
@@ -140,6 +143,7 @@ type anthropicDelta struct {
 	Text        string `json:"text,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
 	Thinking    string `json:"thinking,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 	StopReason  string `json:"stop_reason,omitempty"`
 }
 
@@ -460,7 +464,30 @@ func appendAssistantBlocks(input []any, blocks []anthropicContentBlock) []any {
 				"arguments": args,
 			})
 		case "thinking":
-			// thinking 块跳过（Codex 不接受 thinking 作为输入）
+			// 带 signature 的 thinking 块重建为 reasoning item 回传：signature 即
+			// 输出侧下发的 reasoning encrypted_content，同账号上游可解，保留完整
+			// 推理上下文。无 signature 的块仍跳过——凭空构造的 reasoning item
+			// 无密文可解，上游可能拒绝。
+			if b.Signature == "" {
+				continue
+			}
+			if len(textParts) > 0 {
+				input = append(input, map[string]any{
+					"type":    "message",
+					"role":    "assistant",
+					"content": textParts,
+				})
+				textParts = nil
+			}
+			summary := []any{}
+			if b.Thinking != "" {
+				summary = append(summary, map[string]any{"type": "summary_text", "text": b.Thinking})
+			}
+			input = append(input, map[string]any{
+				"type":              "reasoning",
+				"summary":           summary,
+				"encrypted_content": b.Signature,
+			})
 		}
 	}
 	if len(textParts) > 0 {
@@ -619,7 +646,7 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 		return t.handleContentDone()
 
 	case "response.output_item.done":
-		return t.handleOutputItemDone()
+		return t.handleOutputItemDone(eventData)
 
 	case "response.completed":
 		return t.handleCompleted(eventData)
@@ -809,11 +836,34 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 
 // handleContentDone 处理内容完成（文本/推理块）
 func (t *anthropicStreamTranslator) handleContentDone() []anthropicStreamEvent {
+	// thinking 块不在 *_text.done 关闭：reasoning item 的 encrypted_content 要到
+	// output_item.done 才出现，提前关块就发不出 signature_delta。多段 summary part
+	// 也因此合并进同一个 thinking 块。
+	if t.contentBlockOpen && t.currentBlockType == "thinking" {
+		return nil
+	}
 	return t.closeCurrentBlock()
 }
 
-// handleOutputItemDone 处理输出项完成
-func (t *anthropicStreamTranslator) handleOutputItemDone() []anthropicStreamEvent {
+// handleOutputItemDone 处理输出项完成。
+// reasoning item 携带 encrypted_content 时先发 signature_delta 再关块：
+// signature 即密文本身，输入侧据此重建 reasoning item 回传上游。
+func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropicStreamEvent {
+	if t.contentBlockOpen && t.currentBlockType == "thinking" &&
+		gjson.GetBytes(data, "item.type").String() == "reasoning" {
+		if sig := gjson.GetBytes(data, "item.encrypted_content").String(); sig != "" {
+			idx := t.contentBlockIndex - 1
+			events := []anthropicStreamEvent{{
+				Type:  "content_block_delta",
+				Index: &idx,
+				Delta: &anthropicDelta{
+					Type:      "signature_delta",
+					Signature: sig,
+				},
+			}}
+			return append(events, t.closeCurrentBlock()...)
+		}
+	}
 	return t.closeCurrentBlock()
 }
 
@@ -920,28 +970,6 @@ func (t *anthropicStreamTranslator) closeCurrentBlock() []anthropicStreamEvent {
 	return events
 }
 
-// finalize 在流结束时补齐缺失的事件
-func (t *anthropicStreamTranslator) finalize() []anthropicStreamEvent {
-	var events []anthropicStreamEvent
-	if !t.messageStartSent {
-		events = append(events, t.handleCreated()...)
-	}
-	events = append(events, t.closeCurrentBlock()...)
-	events = append(events, anthropicStreamEvent{
-		Type: "message_delta",
-		Delta: &anthropicDelta{
-			Type:       "message_delta",
-			StopReason: "end_turn",
-		},
-		Usage: &anthropicUsage{
-			InputTokens:  t.inputTokens,
-			OutputTokens: t.outputTokens,
-		},
-	})
-	events = append(events, anthropicStreamEvent{Type: "message_stop"})
-	return events
-}
-
 // anthropicEventToSSE 将 Anthropic 事件序列化为 SSE 格式
 func anthropicEventToSSE(evt anthropicStreamEvent) string {
 	data, _ := json.Marshal(evt)
@@ -993,6 +1021,8 @@ func (a *anthropicResponseAccumulator) apply(events []anthropicStreamEvent) {
 				a.content[*evt.Index].Text += evt.Delta.Text
 			case "thinking_delta":
 				a.content[*evt.Index].Thinking += evt.Delta.Thinking
+			case "signature_delta":
+				a.content[*evt.Index].Signature += evt.Delta.Signature
 			case "input_json_delta":
 				a.content[*evt.Index].Input = json.RawMessage(evt.Delta.PartialJSON)
 			}
@@ -1042,7 +1072,8 @@ func compactAnthropicContent(content []anthropicContentBlock) []anthropicContent
 				continue
 			}
 		case "thinking":
-			if block.Thinking == "" {
+			// 只有 signature 没有摘要文本的块也保留：密文是回传推理上下文的载体。
+			if block.Thinking == "" && block.Signature == "" {
 				continue
 			}
 		case "tool_use":
@@ -1081,7 +1112,8 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 		itemType := item.Get("type").String()
 		switch itemType {
 		case "reasoning":
-			// reasoning → thinking block
+			// reasoning → thinking block（encrypted_content 作为 signature 下发，
+			// 供客户端多轮回传重建推理上下文）
 			summaryText := ""
 			item.Get("summary").ForEach(func(_, s gjson.Result) bool {
 				if s.Get("type").String() == "summary_text" {
@@ -1089,10 +1121,12 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 				}
 				return true
 			})
-			if summaryText != "" {
+			signature := item.Get("encrypted_content").String()
+			if summaryText != "" || signature != "" {
 				content = append(content, anthropicContentBlock{
-					Type:     "thinking",
-					Thinking: summaryText,
+					Type:      "thinking",
+					Thinking:  summaryText,
+					Signature: signature,
 				})
 				lastBlockIsToolUse = false
 			}

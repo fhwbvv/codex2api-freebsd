@@ -489,6 +489,61 @@ func TestPrepareCodexResponsesLiteTransportBridgesRequestScopedSignal(t *testing
 	}
 }
 
+func TestNormalizeCodexResponsesLiteBodyEnforcesUpstreamConstraints(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"parallel_tool_calls":true,
+		"reasoning":{"effort":"low"},
+		"tools":[{"type":"function","name":"run"},{"type":"image_generation","model":"gpt-image-2"}],
+		"instructions":"Base prompt.\n\n` + "<codex2api-codex-image-generation>\\nbridge text\\n</codex2api-codex-image-generation>" + `"
+	}`)
+
+	wsBody := normalizeCodexResponsesLiteBody(body, false)
+	if got := gjson.GetBytes(wsBody, "parallel_tool_calls").Bool(); got {
+		t.Fatalf("WS parallel_tool_calls = %v, want false", got)
+	}
+	if got := gjson.GetBytes(wsBody, "reasoning.context").String(); got != "all_turns" {
+		t.Fatalf("WS reasoning.context = %q, want all_turns", got)
+	}
+	if got := gjson.GetBytes(wsBody, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("WS reasoning.effort = %q, want low (preserved)", got)
+	}
+	if got := gjson.GetBytes(wsBody, "tools.#").Int(); got != 2 {
+		t.Fatalf("WS tools count = %d, want 2 (image tool kept on WS)", got)
+	}
+
+	httpBody := normalizeCodexResponsesLiteBody(body, true)
+	if got := gjson.GetBytes(httpBody, "tools.#").Int(); got != 1 {
+		t.Fatalf("HTTP tools count = %d, want 1; body=%s", got, httpBody)
+	}
+	if got := gjson.GetBytes(httpBody, "tools.0.type").String(); got != "function" {
+		t.Fatalf("HTTP surviving tool type = %q, want function", got)
+	}
+	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "Base prompt." {
+		t.Fatalf("HTTP instructions = %q, want bridge text removed", instructions)
+	}
+}
+
+func TestNormalizeCodexResponsesLiteBodyStripsImageOnlyToolSet(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"tools":[{"type":"image_generation","model":"gpt-image-2"}],
+		"tool_choice":{"type":"image_generation"},
+		"instructions":"` + "<codex2api-codex-image-generation>\\nbridge text\\n</codex2api-codex-image-generation>" + `"
+	}`)
+
+	httpBody := normalizeCodexResponsesLiteBody(body, true)
+	if tools := gjson.GetBytes(httpBody, "tools"); tools.Exists() {
+		t.Fatalf("HTTP tools should be removed entirely, got %s", tools.Raw)
+	}
+	if choice := gjson.GetBytes(httpBody, "tool_choice"); choice.Exists() {
+		t.Fatalf("HTTP tool_choice should be removed, got %s", choice.Raw)
+	}
+	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "" {
+		t.Fatalf("HTTP instructions = %q, want empty after bridge removal", instructions)
+	}
+}
+
 func TestApplyOpenAIResponsesRequestHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
 	if err != nil {

@@ -2,7 +2,9 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -128,6 +130,186 @@ func (db *DB) ListAPIKeyTokenStats(ctx context.Context, rangeStart, rangeEnd tim
 		return nil, err
 	}
 	return items, nil
+}
+
+// APIKeyAccountGroup 是上游账号所属分组的精简展示项（Token 用量明细用）。
+type APIKeyAccountGroup struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
+// APIKeyAccountStat 是单个 API Key 在某时间区间内、按上游账号拆分的用量项。
+// 与 AccountKeyStat（账号 → 各 Key）互为转置：这里是 Key → 各账号。
+type APIKeyAccountStat struct {
+	AccountID     int64                `json:"account_id"`
+	AccountName   string               `json:"account_name"`
+	AccountEmail  string               `json:"account_email"`
+	Groups        []APIKeyAccountGroup `json:"groups,omitempty"`
+	Requests      int64                `json:"requests"`
+	InputTokens   int64                `json:"input_tokens"`
+	OutputTokens  int64                `json:"output_tokens"`
+	CachedTokens  int64                `json:"cached_tokens"`
+	TotalTokens   int64                `json:"total_tokens"`
+	ErrorCount    int64                `json:"error_count"`
+	AccountBilled float64              `json:"account_billed"`
+	UserBilled    float64              `json:"user_billed"`
+}
+
+// ListAPIKeyAccountStats 返回某个 API Key 在 [rangeStart, rangeEnd) 内按上游账号聚合的用量。
+// rangeStart 零值表示"今日 0 点"，rangeEnd 零值表示"至今"，与 ListAPIKeyTokenStats 语义一致。
+// account 标签(name/email)从 accounts 表 JOIN 得到；email 存在 credentials JSON 中，在 Go 侧解析。
+func (db *DB) ListAPIKeyAccountStats(ctx context.Context, apiKeyID int64, rangeStart, rangeEnd time.Time) ([]APIKeyAccountStat, error) {
+	now := time.Now()
+	if rangeStart.IsZero() {
+		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	}
+
+	query := `
+		SELECT
+			u.account_id,
+			COALESCE(a.name, '') AS account_name,
+			COALESCE(CAST(a.credentials AS TEXT), '{}') AS credentials,
+			COUNT(*) AS requests,
+			COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+			COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+			COALESCE(SUM(u.cached_tokens), 0) AS cached_tokens,
+			COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
+			COALESCE(SUM(CASE WHEN u.status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
+			COALESCE(SUM(u.account_billed), 0) AS account_billed,
+			COALESCE(SUM(u.user_billed), 0) AS user_billed
+		FROM usage_logs u
+		LEFT JOIN accounts a ON u.account_id = a.id
+		WHERE u.api_key_id = $1
+		  AND u.status_code <> 499
+		  AND u.created_at >= $2
+	`
+	args := []interface{}{apiKeyID, db.timeArg(rangeStart)}
+	if !rangeEnd.IsZero() {
+		query += " AND u.created_at < $3"
+		args = append(args, db.timeArg(rangeEnd))
+	}
+	query += " GROUP BY u.account_id, a.name, a.credentials ORDER BY requests DESC, total_tokens DESC"
+
+	rows, err := db.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]APIKeyAccountStat, 0, 16)
+	for rows.Next() {
+		var item APIKeyAccountStat
+		var credentials string
+		if err := rows.Scan(
+			&item.AccountID,
+			&item.AccountName,
+			&credentials,
+			&item.Requests,
+			&item.InputTokens,
+			&item.OutputTokens,
+			&item.CachedTokens,
+			&item.TotalTokens,
+			&item.ErrorCount,
+			&item.AccountBilled,
+			&item.UserBilled,
+		); err != nil {
+			return nil, err
+		}
+		item.AccountEmail = emailFromCredentialsJSON(credentials)
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := db.attachAPIKeyAccountGroups(ctx, items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// attachAPIKeyAccountGroups 批量补齐上游账号的分组标签，避免 N+1。
+func (db *DB) attachAPIKeyAccountGroups(ctx context.Context, items []APIKeyAccountStat) error {
+	if len(items) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(items))
+	seen := make(map[int64]struct{}, len(items))
+	for _, item := range items {
+		if item.AccountID <= 0 {
+			continue
+		}
+		if _, ok := seen[item.AccountID]; ok {
+			continue
+		}
+		seen[item.AccountID] = struct{}{}
+		ids = append(ids, item.AccountID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		if db.isSQLite() {
+			placeholders[i] = "?"
+		} else {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+		}
+		args[i] = id
+	}
+	query := fmt.Sprintf(`
+		SELECT m.account_id, g.id, g.name, COALESCE(g.color, '')
+		FROM account_group_members m
+		INNER JOIN account_groups g ON g.id = m.group_id
+		WHERE m.account_id IN (%s)
+		ORDER BY m.account_id, g.sort_order, g.name`, strings.Join(placeholders, ","))
+
+	groupRows, err := db.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer groupRows.Close()
+
+	byAccount := make(map[int64][]APIKeyAccountGroup, len(ids))
+	for groupRows.Next() {
+		var accountID int64
+		var group APIKeyAccountGroup
+		if err := groupRows.Scan(&accountID, &group.ID, &group.Name, &group.Color); err != nil {
+			return err
+		}
+		byAccount[accountID] = append(byAccount[accountID], group)
+	}
+	if err := groupRows.Err(); err != nil {
+		return err
+	}
+
+	for i := range items {
+		if groups := byAccount[items[i].AccountID]; len(groups) > 0 {
+			items[i].Groups = groups
+		}
+	}
+	return nil
+}
+
+// emailFromCredentialsJSON 从账号 credentials JSON 文本里取展示用邮箱；
+// email 缺省时回落到 base_url（覆盖 openai_responses 直连账号的展示需要）。
+func emailFromCredentialsJSON(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return ""
+	}
+	if s, ok := m["email"].(string); ok && s != "" {
+		return s
+	}
+	if s, ok := m["base_url"].(string); ok {
+		return s
+	}
+	return ""
 }
 
 // ListAPIKeyLastUsedAt 返回每个 API Key 最近一次请求时间（来自 usage_logs）。

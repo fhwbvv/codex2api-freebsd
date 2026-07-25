@@ -1,8 +1,15 @@
 import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
 import { createPortal } from "react-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api, getAdminKey, resetAdminAuthState } from "../api";
+import type { ProxyRow } from "../api";
+import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
 import Modal from "../components/Modal";
+import ChannelLogo from "../components/ChannelLogo";
+import ModelLogo from "../components/ModelLogo";
+import { cn } from "@/lib/utils";
+import GrokAccounts from "./GrokAccounts";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
@@ -30,6 +37,7 @@ import type {
   AccountGroup,
   SystemSettings,
   RecycleBinAccountRow,
+  AgentIdentityImportItem,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -74,12 +82,16 @@ import {
   Search,
   Fingerprint,
   FolderOpen,
+  Layers,
   Cloud,
   Lock,
   Unlock,
   RotateCcw,
   Pencil,
   Check,
+  CheckCircle,
+  XCircle,
+  Loader2,
   ChevronDown,
   Copy,
   Cookie,
@@ -98,6 +110,7 @@ import {
   ToggleLeft,
   ToggleRight,
   MoreHorizontal,
+  Sparkles,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
@@ -290,6 +303,14 @@ function formatAccountListEmail(account: AccountRow): string {
 
 function formatAccessTokenBadge(account: AccountRow): string {
   return account.access_token_type === "codex_at" ? "codex_at" : "AT";
+}
+
+// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测）返回 null。
+function getCreditBalanceDisplay(account: AccountRow): string | null {
+  if (!account.credits_has_credits) return null;
+  if (account.credits_unlimited) return "∞";
+  const balance = (account.credits_balance ?? "").trim();
+  return balance ? balance : null;
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -497,7 +518,7 @@ function mergeModelLists(current: string[], incoming: string[]): string[] {
 }
 
 function formatAccountName(account: AccountRow): string {
-  if (account.openai_responses_api) {
+  if (account.openai_responses_api || account.grok_api) {
     return account.name?.trim() || `ID ${account.id}`;
   }
   return account.email || account.name || `ID ${account.id}`;
@@ -706,6 +727,19 @@ export default function Accounts() {
   const { t, i18n } = useTranslation();
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [showAdd, setShowAdd] = useState(false);
+  // providerView 决定账号管理页顶部展示哪一套上游：codex(现有页) 或 grok(独立黑白视图)。
+  // 由路由驱动（/accounts vs /accounts/grok），刷新浏览器后停留在当前视图。
+  const location = useLocation();
+  const navigate = useNavigate();
+  const providerView: "codex" | "grok" = location.pathname.replace(/\/+$/, "").endsWith("/accounts/grok")
+    ? "grok"
+    : "codex";
+  const setProviderView = useCallback(
+    (view: "codex" | "grok") => {
+      navigate(view === "grok" ? "/accounts/grok" : "/accounts");
+    },
+    [navigate],
+  );
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = usePersistedPageSize(
     "accounts",
@@ -728,7 +762,7 @@ export default function Accounts() {
     "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | "schedulerPriority" | null
+    "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -798,6 +832,23 @@ export default function Accounts() {
   const [editProxyUrl, setEditProxyUrl] = useState("");
   const [editCustomHeadersText, setEditCustomHeadersText] = useState("");
   const [testingProxyKey, setTestingProxyKey] = useState<string | null>(null);
+  // 代理池条目：账号表单里"从代理池选择"下拉的数据源。加载失败静默留空
+  // （选择器为空时自动隐藏，不影响手动填代理）。
+  const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .listProxies()
+      .then((res) => {
+        if (!cancelled) setProxyPool(res.proxies ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setProxyPool([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [editOpenAIForm, setEditOpenAIForm] =
     useState<UpdateOpenAIResponsesAccountRequest>({
       name: "",
@@ -859,8 +910,19 @@ export default function Accounts() {
     done: false,
   });
   const [addMethod, setAddMethod] = useState<
-    "rt" | "st" | "at" | "session" | "openai" | "oauth"
+    "rt" | "st" | "at" | "session" | "openai" | "oauth" | "agentIdentity"
   >("oauth");
+  const [agentIdentityJson, setAgentIdentityJson] = useState("");
+  const [agentIdentityProxyUrl, setAgentIdentityProxyUrl] = useState("");
+  const agentIdentityFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [agentIdentityFilesImporting, setAgentIdentityFilesImporting] =
+    useState(false);
+  const [agentIdentityFilesResult, setAgentIdentityFilesResult] = useState<{
+    total: number;
+    imported: number;
+    failed: number;
+    items: AgentIdentityImportItem[];
+  } | null>(null);
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
@@ -914,6 +976,15 @@ export default function Accounts() {
   );
   const [quickGroupIds, setQuickGroupIds] = useState<number[]>([]);
   const [quickGroupSubmitting, setQuickGroupSubmitting] = useState(false);
+  // OAuth 账号“支持模型”白名单编辑器状态;空白名单表示该账号可调度所有模型。
+  const [modelsAccount, setModelsAccount] = useState<AccountRow | null>(null);
+  const [modelsDraft, setModelsDraft] = useState<string[]>([]);
+  const [modelsInputDraft, setModelsInputDraft] = useState("");
+  const [modelsSyncing, setModelsSyncing] = useState(false);
+  const [modelsProbing, setModelsProbing] = useState(false);
+  const [modelsSaving, setModelsSaving] = useState(false);
+  // 探测看板：逐模型的实时测试状态（pending→testing→结果）。
+  const [probeBoard, setProbeBoard] = useState<ModelProbeItem[]>([]);
   const [tagFilter, setTagFilter] = useState<string>("");
   const [domainFilter, setDomainFilter] = useState<string>("");
   const [groupFilter, setGroupFilter] = useState<AccountGroupFilterValue>(
@@ -1043,13 +1114,15 @@ export default function Accounts() {
   }) => {
     const isTesting = testingProxyKey === testKey;
     const testDisabled = disabled || !value.trim() || testingProxyKey !== null;
+    const hasProxyPool = proxyPool.length > 0;
 
     return (
-      <div>
-        <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+      <div className="space-y-2.5">
+        <label className="block text-sm font-semibold text-muted-foreground">
           {label}
         </label>
-        <div className="flex flex-col gap-2 sm:flex-row">
+        {/* 第一行：手动填写代理 URL + 测试 */}
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
           <Input
             className="min-w-0 flex-1"
             placeholder={placeholder}
@@ -1070,6 +1143,15 @@ export default function Accounts() {
             {isTesting ? t("accounts.testingProxy") : t("accounts.testProxy")}
           </Button>
         </div>
+        {/* 第二行：从代理池选择（有池条目时单独占一行，与上方 URL 输入左对齐） */}
+        {hasProxyPool ? (
+          <ProxyPoolSelect
+            className="w-full"
+            proxies={proxyPool}
+            disabled={disabled}
+            onSelect={onChange}
+          />
+        ) : null}
       </div>
     );
   };
@@ -1426,7 +1508,8 @@ export default function Accounts() {
       healthBars,
     ] =
       await Promise.all([
-        api.getAccounts(),
+        // Codex 页只拉非 Grok 账号，与 Grok 页 channel=grok 对称，减少大号池传输。
+        api.getAccounts({ channel: "codex" }),
         api.getAPIKeys(),
         api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
         api.listAccountGroups().catch(() => ({ groups: [] })),
@@ -1467,7 +1550,13 @@ export default function Accounts() {
     },
     load: loadAccounts,
   });
-  const accounts = data.accounts;
+  // Codex 视图的统计卡/额度分布/列表/批量操作一律排除 Grok 账号
+  // （Grok 账号由顶部切换后的 Grok 页单独统计与管理）。
+  const allAccounts = data.accounts;
+  const accounts = useMemo(
+    () => allAccounts.filter((account) => !account.grok_api),
+    [allAccounts],
+  );
   const apiKeys = data.apiKeys;
   const opsOverview = data.opsOverview;
   const lazyMode = data.lazyMode;
@@ -1734,10 +1823,18 @@ export default function Accounts() {
       } else if (sortKey === "schedulerPriority") {
         diff = getSchedulerPriority(a) - getSchedulerPriority(b);
         if (diff === 0) return a.id - b.id;
+      } else if (sortKey === "group") {
+        const aMeta = getAccountGroupSortMeta(a, allGroups);
+        const bMeta = getAccountGroupSortMeta(b, allGroups);
+        diff = aMeta.order - bMeta.order;
+        if (diff === 0) {
+          diff = aMeta.key.localeCompare(bMeta.key, "zh");
+        }
+        if (diff === 0) return a.id - b.id;
       }
       return sortDir === "asc" ? diff : -diff;
     });
-  }, [filteredAccounts, sortDir, sortKey]);
+  }, [allGroups, filteredAccounts, sortDir, sortKey]);
 
   const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize));
   const currentPage = Math.min(page, totalPages);
@@ -2038,6 +2135,67 @@ export default function Accounts() {
       setSubmitting(false);
     }
   };
+  const handleAddAgentIdentity = async () => {
+    if (!agentIdentityJson.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      const res = await api.importCodexAgentIdentity({
+        auth_json: agentIdentityJson,
+        proxy_url: agentIdentityProxyUrl.trim() || undefined,
+      });
+      showToast(
+        res.email
+          ? t("accounts.agentIdentitySuccess", { email: res.email })
+          : t("accounts.addSuccess"),
+      );
+      setShowAdd(false);
+      setAgentIdentityJson("");
+      setAgentIdentityProxyUrl("");
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.addFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleImportAgentIdentityFiles = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    setAgentIdentityFilesImporting(true);
+    setAgentIdentityFilesResult(null);
+    try {
+      const files = await Promise.all(
+        Array.from(fileList).map((file) => file.text()),
+      );
+      const res = await api.batchImportCodexAgentIdentity({
+        files,
+        proxy_url: agentIdentityProxyUrl.trim() || undefined,
+      });
+      setAgentIdentityFilesResult(res);
+      if (res.imported > 0) {
+        showToast(
+          t("accounts.agentIdentityFileImportDone", {
+            imported: res.imported,
+            total: res.total,
+          }),
+        );
+        void reload();
+      }
+    } catch (error) {
+      showToast(
+        t("accounts.addFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setAgentIdentityFilesImporting(false);
+      if (agentIdentityFileInputRef.current)
+        agentIdentityFileInputRef.current.value = "";
+    }
+  };
+
   const handleAddOpenAIResponses = async () => {
     const models = openAIForm.models;
     if (!openAIForm.api_key.trim() || models.length === 0) return;
@@ -3218,6 +3376,171 @@ export default function Accounts() {
     }
   };
 
+  const openModelsEditor = (account: AccountRow) => {
+    setModelsAccount(account);
+    setModelsDraft([...(account.models ?? [])]);
+    setModelsInputDraft("");
+    setProbeBoard([]);
+  };
+
+  const closeModelsEditor = () => {
+    if (modelsSaving || modelsSyncing || modelsProbing) return;
+    setModelsAccount(null);
+    setModelsDraft([]);
+    setModelsInputDraft("");
+    setProbeBoard([]);
+  };
+
+  const addModelsDraftValues = (raw: string) => {
+    const next = parseModelTokens(raw);
+    if (next.length === 0) return;
+    setModelsDraft((current) => mergeModelLists(current, next));
+    setModelsInputDraft("");
+  };
+
+  const removeModelsDraftValue = (model: string) => {
+    setModelsDraft((current) => current.filter((item) => item !== model));
+  };
+
+  const clearModelsDraft = () => {
+    setModelsDraft([]);
+  };
+
+  const handleSyncModelsUpstream = async () => {
+    if (!modelsAccount) return;
+    setModelsSyncing(true);
+    try {
+      const result = await api.syncAccountModelsUpstream(modelsAccount.id);
+      const fetched = result.models ?? [];
+      setModelsDraft((current) => mergeModelLists(current, fetched));
+      showToast(
+        t("accounts.supportedModelsSyncDone", { count: fetched.length }),
+      );
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsSyncFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsSyncing(false);
+    }
+  };
+
+  const handleProbeModels = async () => {
+    if (!modelsAccount) return;
+    setModelsProbing(true);
+    setProbeBoard([]);
+    let available: string[] = [];
+    try {
+      const res = await fetch(
+        `/api/admin/accounts/${modelsAccount.id}/models/probe?stream=true`,
+        {
+          method: "POST",
+          headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
+        },
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("no stream");
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const ev = JSON.parse(line.slice(6)) as {
+              type: string;
+              models?: string[];
+              model?: string;
+              outcome?: string;
+              detail?: string;
+              available?: string[];
+            };
+            if (ev.type === "start") {
+              setProbeBoard(
+                (ev.models ?? []).map((m) => ({
+                  model: m,
+                  status: "pending" as ModelProbeStatus,
+                })),
+              );
+            } else if (ev.type === "testing") {
+              setProbeBoard((board) =>
+                board.map((it) =>
+                  it.model === ev.model ? { ...it, status: "testing" } : it,
+                ),
+              );
+            } else if (ev.type === "result") {
+              setProbeBoard((board) =>
+                board.map((it) =>
+                  it.model === ev.model
+                    ? {
+                        ...it,
+                        status: (ev.outcome as ModelProbeStatus) ?? "error",
+                        detail: ev.detail,
+                      }
+                    : it,
+                ),
+              );
+            } else if (ev.type === "done") {
+              available = ev.available ?? [];
+            }
+          } catch {
+            /* 忽略解析异常 */
+          }
+        }
+      }
+      if (available.length === 0) {
+        showToast(t("accounts.supportedModelsProbeNone"), "error");
+      } else {
+        setModelsDraft((current) => mergeModelLists(current, available));
+        showToast(
+          t("accounts.supportedModelsProbeDone", { count: available.length }),
+        );
+      }
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsProbeFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsProbing(false);
+    }
+  };
+
+  const handleSaveModels = async () => {
+    if (!modelsAccount) return;
+    setModelsSaving(true);
+    try {
+      await api.updateAccountModels(modelsAccount.id, modelsDraft);
+      showToast(t("accounts.supportedModelsSaveDone"));
+      void reloadSilently();
+      setModelsAccount(null);
+      setModelsDraft([]);
+      setModelsInputDraft("");
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsSaveFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsSaving(false);
+    }
+  };
+
   const batchScoreBiasTrimmed = batchScoreBiasInput.trim();
   const batchScoreBiasValue = batchScoreBiasTrimmed
     ? parseIntegerInput(batchScoreBiasTrimmed)
@@ -3731,6 +4054,29 @@ export default function Accounts() {
     setAllGroups(res.groups ?? []);
   };
 
+  /** Inline create from multi-select (batch / quick / account editor). Returns new group id. */
+  const handleCreateGroupInline = async (
+    name: string,
+  ): Promise<number | null> => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      showToast(t("accounts.groupNameRequired"), "error");
+      return null;
+    }
+    try {
+      const res = await api.createAccountGroup({
+        name: trimmed,
+        color: ACCOUNT_GROUP_COLORS[allGroups.length % ACCOUNT_GROUP_COLORS.length],
+      });
+      await reloadGroups();
+      showToast(t("accounts.groupCreated"));
+      return res.id;
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
+      return null;
+    }
+  };
+
   const parsedGroupBaseConcurrency = parseIntegerInput(
     groupDraft.baseConcurrencyInput,
   );
@@ -3840,9 +4186,54 @@ export default function Accounts() {
     }
   };
 
+  // Codex/Grok 顶部段控切换：两套账号视图共用同一切换器（Grok 通过 headerSlot 注入）。
+  // 滑块动画 + 品牌 logo，与仪表盘渠道过滤器视觉一致。
+  // 不复用 Codex 侧的导入/导出/邀请/回收站等入口，Grok 页只保留账号本身的增删启停。
+  const providerSwitcher = (
+    <div className="relative grid grid-cols-2 items-center rounded-lg border border-border bg-muted/40 p-0.5">
+      <span
+        aria-hidden
+        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/2)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
+        style={{ transform: `translateX(${providerView === "grok" ? 100 : 0}%)` }}
+      />
+      {(
+        [
+          ["codex", t("accounts.providerViewCodex")],
+          ["grok", t("accounts.providerViewGrok")],
+        ] as const
+      ).map(([key, label]) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => setProviderView(key)}
+          aria-pressed={providerView === key}
+          className={cn(
+            "relative z-10 inline-flex items-center justify-center gap-2 rounded-md px-5 py-2 text-base font-semibold transition-all duration-200 active:scale-[0.97]",
+            providerView === key
+              ? "text-foreground"
+              : "text-muted-foreground opacity-75 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
+          )}
+        >
+          <ChannelLogo channel={key} size={20} />
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (providerView === "grok") {
+    // key 触发渠道切换时整块内容淡入过渡，切换器由 headerSlot 常驻不闪。
+    return (
+      <div key="provider-grok" className="animate-channel-switch-in">
+        <GrokAccounts headerSlot={providerSwitcher} />
+      </div>
+    );
+  }
+
   return (
     <div
-      className="relative @container/accounts"
+      key="provider-codex"
+      className="relative @container/accounts animate-channel-switch-in"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -3894,23 +4285,27 @@ export default function Accounts() {
             title={t("accounts.title")}
             description={t("accounts.description")}
             onRefresh={() => void reload()}
+            hideTitle
             titleAdornment={
-              <Select
-                className="w-32"
-                compact
-                value={pageMode}
-                onValueChange={(value) => {
-                  const mode = value === "personal" ? "personal" : "pool";
-                  // 用户手动选择：标记并持久化，之后一律尊重用户、不再自动判定。
-                  pageModeUserSetRef.current = true;
-                  persistAccountPageMode(mode);
-                  setPageMode(mode);
-                }}
-                options={[
-                  { value: "pool", label: t("accounts.pageModePool") },
-                  { value: "personal", label: t("accounts.pageModePersonal") },
-                ]}
-              />
+              <div className="flex items-center gap-2">
+                {providerSwitcher}
+                <Select
+                  className="w-32"
+                  compact
+                  value={pageMode}
+                  onValueChange={(value) => {
+                    const mode = value === "personal" ? "personal" : "pool";
+                    // 用户手动选择：标记并持久化，之后一律尊重用户、不再自动判定。
+                    pageModeUserSetRef.current = true;
+                    persistAccountPageMode(mode);
+                    setPageMode(mode);
+                  }}
+                  options={[
+                    { value: "pool", label: t("accounts.pageModePool") },
+                    { value: "personal", label: t("accounts.pageModePersonal") },
+                  ]}
+                />
+              </div>
             }
             actions={
               <>
@@ -4404,6 +4799,35 @@ export default function Accounts() {
                   variant="outline"
                   size="sm"
                   className="min-w-0"
+                  aria-pressed={sortKey === "group"}
+                  title={t("accounts.groupSortHint")}
+                  onClick={() => {
+                    if (sortKey === "group") {
+                      setSortDir((current) =>
+                        current === "desc" ? "asc" : "desc",
+                      );
+                    } else {
+                      setSortKey("group");
+                      setSortDir("asc");
+                    }
+                    setPage(1);
+                  }}
+                >
+                  <Layers className="size-3.5" />
+                  <span className="truncate">
+                    {t("accounts.groupSort")}
+                  </span>
+                  {sortKey === "group" ? (
+                    <span aria-hidden="true">
+                      {sortDir === "desc" ? "↓" : "↑"}
+                    </span>
+                  ) : null}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-w-0"
                   aria-pressed={sortKey === "schedulerPriority"}
                   title={t("accounts.schedulerPrioritySortHint")}
                   onClick={() => {
@@ -4820,6 +5244,7 @@ export default function Accounts() {
                           onResetCredits={() =>
                             void handleResetCredits(account)
                           }
+                          onEditModels={() => openModelsEditor(account)}
                           onDelete={() => void handleDelete(account)}
                           onUsageRefreshed={() => void reloadSilently()}
                         />
@@ -4862,8 +5287,26 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.groups && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.groupsLabel")}
+                          <TableHead
+                            className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                            onClick={() => {
+                              if (sortKey === "group") {
+                                setSortDir((current) =>
+                                  current === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("group");
+                                setSortDir("asc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.groupsLabel")}{" "}
+                            {sortKey === "group"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.priority && (
@@ -5031,6 +5474,14 @@ export default function Accounts() {
                             )}
                             {visibleColumns.email && (
                               <TableCell className="min-w-[220px] whitespace-normal text-[14px] text-muted-foreground">
+                                <div className="flex min-w-0 items-center gap-2.5">
+                                <span className="flex size-8 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-card ring-1 ring-border shadow-sm">
+                                  {account.openai_responses_api ? (
+                                    <ModelLogo model="openai" variant="plain" size={17} />
+                                  ) : (
+                                    <ChannelLogo channel="codex" size={32} className="rounded-lg" />
+                                  )}
+                                </span>
                                 <div className="flex min-w-0 flex-col items-start gap-1">
                                   <button
                                     type="button"
@@ -5041,7 +5492,7 @@ export default function Accounts() {
                                       openAccountDetail(account);
                                     }}
                                   >
-                                    {account.openai_responses_api
+                                    {account.openai_responses_api || account.grok_api
                                       ? formatAccountName(account)
                                       : formatAccountListEmail(account)}
                                   </button>
@@ -5062,19 +5513,35 @@ export default function Accounts() {
                                   )}
                                   {(account.at_only ||
                                     account.openai_responses_api ||
+                                    account.grok_api ||
+                                    account.agent_identity ||
                                     account.enabled === false ||
                                     account.locked ||
                                     (account.rate_limit_reset_credits ?? 0) >
-                                      0) && (
+                                      0 ||
+                                    getCreditBalanceDisplay(account) !==
+                                      null) && (
                                     <div className="flex flex-wrap gap-1">
                                       {account.at_only && (
                                         <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                                           {formatAccessTokenBadge(account)}
                                         </span>
                                       )}
+                                      {account.agent_identity && (
+                                        <span className="inline-flex items-center gap-0.5 rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                                          <Fingerprint className="size-2.5" />
+                                          Agent Identity
+                                        </span>
+                                      )}
                                       {account.openai_responses_api && (
                                         <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                                           Responses API
+                                        </span>
+                                      )}
+                                      {account.grok_api && (
+                                        <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                                          <Sparkles className="size-2.5" />
+                                          Grok
                                         </span>
                                       )}
                                       {account.enabled === false && (
@@ -5108,8 +5575,38 @@ export default function Accounts() {
                                           {account.rate_limit_reset_credits ?? 0}
                                         </button>
                                       )}
+                                      {getCreditBalanceDisplay(account) !==
+                                        null && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setUsageAccount(account);
+                                          }}
+                                          className="inline-flex items-center rounded-md bg-teal-50 px-1.5 py-0.5 text-[10px] font-medium text-teal-700 ring-1 ring-inset ring-teal-600/20 transition-colors hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-400 dark:ring-teal-400/20 dark:hover:bg-teal-900"
+                                          title={
+                                            account.credits_unlimited
+                                              ? t(
+                                                  "accounts.creditsBalanceUnlimited",
+                                                )
+                                              : t(
+                                                  "accounts.creditsBalanceBadge",
+                                                  {
+                                                    balance:
+                                                      getCreditBalanceDisplay(
+                                                        account,
+                                                      ),
+                                                  },
+                                                )
+                                          }
+                                        >
+                                          <Coins className="mr-0.5 size-2.5" />
+                                          {getCreditBalanceDisplay(account)}
+                                        </button>
+                                      )}
                                     </div>
                                   )}
+                                </div>
                                 </div>
                               </TableCell>
                             )}
@@ -5349,6 +5846,7 @@ export default function Accounts() {
                                     onResetCredits={() =>
                                       void handleResetCredits(account)
                                     }
+                                    onEditModels={() => openModelsEditor(account)}
                                     onDelete={() => void handleDelete(account)}
                                   />
                                 </div>
@@ -5485,6 +5983,15 @@ export default function Accounts() {
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
+                ) : addMethod === "agentIdentity" ? (
+                  <Button
+                    onClick={() => void handleAddAgentIdentity()}
+                    disabled={submitting || !agentIdentityJson.trim()}
+                  >
+                    {submitting
+                      ? t("accounts.adding")
+                      : t("accounts.agentIdentityImportBtn")}
+                  </Button>
                 ) : oauthStep === "generate" ? (
                   <Button
                     onClick={() => void handleOAuthGenerate()}
@@ -5508,7 +6015,7 @@ export default function Accounts() {
             }
           >
             {/* Tab switcher */}
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
                 onClick={() => {
                   setAddMethod("oauth");
@@ -5579,6 +6086,17 @@ export default function Accounts() {
               >
                 <KeyRound className="size-3.5" />
                 {t("accounts.addMethodOpenAI")}
+              </button>
+              <button
+                onClick={() => setAddMethod("agentIdentity")}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "agentIdentity"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Fingerprint className="size-3.5" />
+                {t("accounts.addMethodAgentIdentity")}
               </button>
             </div>
 
@@ -5883,6 +6401,110 @@ export default function Accounts() {
                 {renderCustomHeadersTextarea({
                   value: addCustomHeadersText,
                   onChange: setAddCustomHeadersText,
+                })}
+              </div>
+            ) : addMethod === "agentIdentity" ? (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-300">
+                  {t("accounts.agentIdentityHint")}
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.agentIdentityJsonLabel")} *
+                  </label>
+                  <textarea
+                    className="w-full min-h-[240px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder={t("accounts.agentIdentityJsonPlaceholder")}
+                    value={agentIdentityJson}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                      setAgentIdentityJson(event.target.value)
+                    }
+                    rows={10}
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.agentIdentityNote")}
+                  </p>
+                </div>
+
+                {/* 多文件批量导入 */}
+                <div className="rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-foreground">
+                        {t("accounts.agentIdentityFileImportTitle")}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {t("accounts.agentIdentityFileImportDesc")}
+                      </p>
+                    </div>
+                    <input
+                      ref={agentIdentityFileInputRef}
+                      type="file"
+                      accept=".json,application/json"
+                      multiple
+                      className="hidden"
+                      onChange={(e) =>
+                        void handleImportAgentIdentityFiles(e.target.files)
+                      }
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={agentIdentityFilesImporting}
+                      onClick={() => agentIdentityFileInputRef.current?.click()}
+                    >
+                      {agentIdentityFilesImporting ? (
+                        <>
+                          <Loader2 className="size-3.5 animate-spin" />
+                          {t("accounts.agentIdentityFileImporting")}
+                        </>
+                      ) : (
+                        <>
+                          <Upload className="size-3.5" />
+                          {t("accounts.agentIdentityFileImportBtn")}
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                  {agentIdentityFilesResult ? (
+                    <div className="mt-3 space-y-2 border-t border-border pt-3">
+                      <p className="text-sm font-semibold text-foreground">
+                        {t("accounts.agentIdentityFileImportSummary", {
+                          imported: agentIdentityFilesResult.imported,
+                          total: agentIdentityFilesResult.total,
+                        })}
+                      </p>
+                      <div className="max-h-40 space-y-1 overflow-y-auto">
+                        {agentIdentityFilesResult.items.map((item, index) => (
+                          <div
+                            key={index}
+                            className="flex items-start gap-1.5 text-xs"
+                          >
+                            {item.ok ? (
+                              <CheckCircle className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+                            ) : (
+                              <XCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+                            )}
+                            <span className="min-w-0 flex-1 break-all text-muted-foreground">
+                              {item.email || `#${index + 1}`}
+                              {item.ok
+                                ? null
+                                : item.error
+                                  ? ` — ${item.error}`
+                                  : ""}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                {renderProxyInput({
+                  value: agentIdentityProxyUrl,
+                  testKey: "add-agent-identity",
+                  onChange: setAgentIdentityProxyUrl,
                 })}
               </div>
             ) : (
@@ -7119,7 +7741,7 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4">
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
                         <div className="text-sm font-semibold text-foreground">
                           {t("accounts.allowedAPIKeysLabel")}
                         </div>
@@ -7146,7 +7768,7 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4">
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
                         {renderProxyInput({
                           value: editProxyUrl,
                           testKey: "edit-account-proxy",
@@ -7211,6 +7833,11 @@ export default function Accounts() {
                             placeholder={t("accounts.groupsPlaceholder")}
                             emptyLabel={t("accounts.groupsNone")}
                             emptyHint={t("accounts.groupsSelectHint")}
+                            onCreateGroup={handleCreateGroupInline}
+                            createLabel={t("accounts.groupCreate")}
+                            createPlaceholder={t("accounts.groupNamePlaceholder")}
+                            creatingLabel={t("accounts.groupCreating")}
+                            createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
                           />
                         </div>
                       </div>
@@ -7292,6 +7919,18 @@ export default function Accounts() {
                 </div>
                 <div className="mt-1">{t("accounts.groupQuickDesc")}</div>
               </div>
+              <div className="flex items-center justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={quickGroupSubmitting}
+                  onClick={() => setShowGroupManager(true)}
+                >
+                  <FolderOpen className="size-3" />
+                  {t("accounts.groupManage")}
+                </Button>
+              </div>
               <AccountGroupMultiSelect
                 groups={allGroups}
                 value={quickGroupIds}
@@ -7304,7 +7943,156 @@ export default function Accounts() {
                 emptyLabel={t("accounts.groupsNone")}
                 emptyHint={t("accounts.groupsSelectHint")}
                 disabled={quickGroupSubmitting}
+                onCreateGroup={handleCreateGroupInline}
+                createLabel={t("accounts.groupCreate")}
+                createPlaceholder={t("accounts.groupNamePlaceholder")}
+                creatingLabel={t("accounts.groupCreating")}
+                createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
               />
+            </div>
+          </Modal>
+
+          <Modal
+            show={Boolean(modelsAccount)}
+            title={t("accounts.supportedModelsTitle")}
+            contentClassName="sm:max-w-[560px]"
+            onClose={closeModelsEditor}
+            footer={
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={modelsSaving || modelsSyncing || modelsProbing}
+                  onClick={closeModelsEditor}
+                >
+                  {t("common.cancel")}
+                </Button>
+                <Button
+                  type="button"
+                  disabled={modelsSaving || modelsSyncing || modelsProbing}
+                  onClick={() => void handleSaveModels()}
+                >
+                  {modelsSaving
+                    ? t("common.saving")
+                    : modelsDraft.length === 0
+                      ? t("accounts.supportedModelsClearSave")
+                      : t("common.save")}
+                </Button>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
+                <div className="font-semibold text-foreground">
+                  {modelsAccount ? formatAccountName(modelsAccount) : ""}
+                </div>
+                <div className="mt-1">{t("accounts.supportedModelsDesc")}</div>
+              </div>
+
+              {/* 自动获取：探测/同步按钮 + 说明，成一体 */}
+              <div className="rounded-lg border border-border bg-muted/10 p-3">
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={modelsSyncing || modelsSaving || modelsProbing}
+                    onClick={() => void handleProbeModels()}
+                  >
+                    <Zap
+                      className={`size-3.5 ${modelsProbing ? "animate-pulse" : ""}`}
+                    />
+                    {modelsProbing
+                      ? t("accounts.supportedModelsProbing")
+                      : t("accounts.supportedModelsProbe")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={modelsSyncing || modelsSaving || modelsProbing}
+                    onClick={() => void handleSyncModelsUpstream()}
+                  >
+                    <RefreshCw
+                      className={`size-3.5 ${modelsSyncing ? "animate-spin" : ""}`}
+                    />
+                    {modelsSyncing
+                      ? t("accounts.supportedModelsSyncing")
+                      : t("accounts.supportedModelsSync")}
+                  </Button>
+                </div>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {t("accounts.supportedModelsProbeHint")}
+                </p>
+                {probeBoard.length > 0 && (
+                  <div className="mt-3">
+                    <ModelProbeBoard items={probeBoard} t={t} />
+                  </div>
+                )}
+              </div>
+
+              {/* 手动添加 */}
+              <div className="flex gap-2">
+                <Input
+                  placeholder={t("accounts.openaiModelsPlaceholder")}
+                  value={modelsInputDraft}
+                  disabled={modelsSaving}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setModelsInputDraft(event.target.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addModelsDraftValues(modelsInputDraft);
+                    }
+                  }}
+                  onPaste={(event) => {
+                    const pasted = event.clipboardData.getData("text");
+                    if (parseModelTokens(pasted).length > 1) {
+                      event.preventDefault();
+                      addModelsDraftValues(pasted);
+                    }
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => addModelsDraftValues(modelsInputDraft)}
+                  disabled={!modelsInputDraft.trim() || modelsSaving}
+                >
+                  <Plus className="size-3.5" />
+                  {t("accounts.openaiModelsAdd")}
+                </Button>
+              </div>
+
+              {/* 白名单列表：计数 + 清空 在上，紧凑 pills 在下 */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {modelsDraft.length === 0
+                      ? t("accounts.supportedModelsHintAll")
+                      : t("accounts.supportedModelsHintCount", {
+                          count: modelsDraft.length,
+                        })}
+                  </span>
+                  {modelsDraft.length > 0 && (
+                    <button
+                      type="button"
+                      className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                      disabled={modelsSaving}
+                      onClick={clearModelsDraft}
+                    >
+                      {t("accounts.supportedModelsClearAll")}
+                    </button>
+                  )}
+                </div>
+                <ModelChipGrid
+                  variant="pills"
+                  models={modelsDraft}
+                  onRemove={removeModelsDraftValue}
+                  emptyLabel={t("accounts.supportedModelsEmpty")}
+                />
+              </div>
             </div>
           </Modal>
 
@@ -7525,22 +8313,35 @@ export default function Accounts() {
                       )}
                     </div>
                   </div>
-                  {batchMetaMode === "all" ? (
-                    <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
-                      <span>
-                        {t(
-                          batchUpdateGroups
-                            ? "common.enabled"
-                            : "common.disabled",
-                        )}
-                      </span>
-                      <Switch
-                        checked={batchUpdateGroups}
-                        onCheckedChange={setBatchUpdateGroups}
-                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
-                      />
-                    </label>
-                  ) : null}
+                  <div className="flex shrink-0 items-center gap-2">
+                    {batchUpdateGroups ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        onClick={() => setShowGroupManager(true)}
+                      >
+                        <FolderOpen className="size-3" />
+                        {t("accounts.groupManage")}
+                      </Button>
+                    ) : null}
+                    {batchMetaMode === "all" ? (
+                      <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
+                        <span>
+                          {t(
+                            batchUpdateGroups
+                              ? "common.enabled"
+                              : "common.disabled",
+                          )}
+                        </span>
+                        <Switch
+                          checked={batchUpdateGroups}
+                          onCheckedChange={setBatchUpdateGroups}
+                          aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
+                        />
+                      </label>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="mt-3">
                   <AccountGroupMultiSelect
@@ -7567,6 +8368,13 @@ export default function Accounts() {
                         : "accounts.batchMetaFieldHint",
                     )}
                     disabled={!batchUpdateGroups}
+                    onCreateGroup={
+                      batchUpdateGroups ? handleCreateGroupInline : undefined
+                    }
+                    createLabel={t("accounts.groupCreate")}
+                    createPlaceholder={t("accounts.groupNamePlaceholder")}
+                    creatingLabel={t("accounts.groupCreating")}
+                    createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
                   />
                 </div>
               </div>
@@ -9120,19 +9928,153 @@ function APIKeyMultiSelect({
   );
 }
 
+type ModelProbeStatus =
+  | "pending"
+  | "testing"
+  | "available"
+  | "unsupported"
+  | "throttled"
+  | "error";
+
+type ModelProbeItem = {
+  model: string;
+  status: ModelProbeStatus;
+  detail?: string;
+};
+
+// ModelProbeBoard 逐模型实时探测看板：每个模型显示 等待/测试中/结果 的动画状态。
+function ModelProbeBoard({
+  items,
+  t,
+}: {
+  items: ModelProbeItem[];
+  t: ReturnType<typeof useTranslation>["t"];
+}) {
+  const tested = items.filter(
+    (it) => it.status !== "pending" && it.status !== "testing",
+  ).length;
+  const availableCount = items.filter(
+    (it) => it.status === "available",
+  ).length;
+
+  const statusMeta: Record<
+    ModelProbeStatus,
+    { icon: ReactNode; ring: string; text: string; label: string }
+  > = {
+    pending: {
+      icon: <Hourglass className="size-3.5" />,
+      ring: "border-border bg-muted/20",
+      text: "text-muted-foreground/70",
+      label: t("accounts.probeStatePending"),
+    },
+    testing: {
+      icon: <RefreshCw className="size-3.5 animate-spin" />,
+      ring: "border-primary/40 bg-primary/5",
+      text: "text-primary",
+      label: t("accounts.probeStateTesting"),
+    },
+    available: {
+      icon: <Check className="size-3.5" />,
+      ring: "border-emerald-500/30 bg-emerald-500/5",
+      text: "text-emerald-600 dark:text-emerald-400",
+      label: t("accounts.probeStateAvailable"),
+    },
+    unsupported: {
+      icon: <Ban className="size-3.5" />,
+      ring: "border-rose-500/30 bg-rose-500/5",
+      text: "text-rose-600 dark:text-rose-400",
+      label: t("accounts.probeStateUnsupported"),
+    },
+    throttled: {
+      icon: <Timer className="size-3.5" />,
+      ring: "border-amber-500/30 bg-amber-500/5",
+      text: "text-amber-600 dark:text-amber-400",
+      label: t("accounts.probeStateThrottled"),
+    },
+    error: {
+      icon: <AlertTriangle className="size-3.5" />,
+      ring: "border-border bg-muted/30",
+      text: "text-muted-foreground",
+      label: t("accounts.probeStateError"),
+    },
+  };
+
+  return (
+    <div className="space-y-2 rounded-lg border border-border bg-card p-3">
+      <div className="flex items-center justify-between text-xs">
+        <span className="font-medium text-foreground">
+          {t("accounts.probeBoardTitle")}
+        </span>
+        <span className="tabular-nums text-muted-foreground">
+          {t("accounts.probeBoardProgress", {
+            tested,
+            total: items.length,
+            available: availableCount,
+          })}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+        {items.map((it) => {
+          const meta = statusMeta[it.status];
+          return (
+            <div
+              key={it.model}
+              className={`flex items-center gap-2 rounded-md border px-2.5 py-1.5 transition-colors duration-300 ${meta.ring}`}
+              title={it.detail || meta.label}
+            >
+              <span className={`shrink-0 ${meta.text}`}>{meta.icon}</span>
+              <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
+                {it.model}
+              </span>
+              <span className={`shrink-0 text-[11px] ${meta.text}`}>
+                {meta.label}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ModelChipGrid({
   models,
   onRemove,
   emptyLabel,
+  variant = "grid",
 }: {
   models: string[];
   onRemove: (model: string) => void;
   emptyLabel: string;
+  variant?: "grid" | "pills";
 }) {
   if (models.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-border bg-muted/20 px-3 py-3 text-sm text-muted-foreground">
         {emptyLabel}
+      </div>
+    );
+  }
+  if (variant === "pills") {
+    return (
+      <div className="flex flex-wrap gap-1.5 rounded-lg border border-border bg-muted/10 p-2.5">
+        {models.map((model) => (
+          <span
+            key={model}
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-background py-1 pl-2 pr-1 text-[12px]"
+            title={model}
+          >
+            <span className="font-mono text-foreground">{model}</span>
+            <button
+              type="button"
+              className="inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              onClick={() => onRemove(model)}
+              aria-label={`Remove ${model}`}
+            >
+              <X className="size-3" />
+            </button>
+          </span>
+        ))}
       </div>
     );
   }
@@ -9381,7 +10323,7 @@ function isRateLimitedAccount(account: AccountRow): boolean {
 
 function isUnsampledQuotaAccount(account: AccountRow): boolean {
   const status = (account.status || "").toLowerCase();
-  if (status === "unauthorized" || account.openai_responses_api) {
+  if (status === "unauthorized" || account.openai_responses_api || account.grok_api) {
     return false;
   }
   // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
@@ -10171,6 +11113,7 @@ function AccountRowActionsMenu({
   onToggleLock,
   onResetStatus,
   onResetCredits,
+  onEditModels,
   onDelete,
 }: {
   t: ReturnType<typeof useTranslation>["t"];
@@ -10186,12 +11129,17 @@ function AccountRowActionsMenu({
   onToggleLock: () => void;
   onResetStatus: () => void;
   onResetCredits: () => void;
+  onEditModels?: () => void;
   onDelete: () => void;
 }) {
   const refreshDisabled =
     refreshing || account.at_only || account.openai_responses_api;
   const authJsonDisabled =
-    authJsonExporting || account.at_only || account.openai_responses_api;
+    authJsonExporting ||
+    account.at_only ||
+    account.openai_responses_api ||
+    account.grok_api ||
+    account.agent_identity;
   const resetCredits = account.rate_limit_reset_credits ?? 0;
 
   const items: HeaderActionMenuItem[] = [
@@ -10226,7 +11174,10 @@ function AccountRowActionsMenu({
       icon: <FileJson className="size-3.5" />,
       disabled: authJsonDisabled,
       title:
-        account.at_only || account.openai_responses_api
+        account.at_only ||
+        account.openai_responses_api ||
+        account.grok_api ||
+        account.agent_identity
           ? t("accounts.authJsonDisabled")
           : undefined,
       onSelect: onGenerateAuthJson,
@@ -10270,6 +11221,17 @@ function AccountRowActionsMenu({
       disabled: resetCredits <= 0,
       onSelect: onResetCredits,
     },
+    // 支持模型白名单仅适用于 OAuth(ChatGPT)账号,relay/Grok 账号不显示。
+    ...(onEditModels && !account.openai_responses_api && !account.grok_api
+      ? [
+          {
+            key: "edit-models",
+            label: t("accounts.supportedModelsAction"),
+            icon: <SlidersHorizontal className="size-3.5" />,
+            onSelect: onEditModels,
+          },
+        ]
+      : []),
     ...(includeDelete
       ? [
           {
@@ -10361,6 +11323,26 @@ function resolveAccountGroups(
   if (ids.length === 0 || groups.length === 0) return [];
   const byID = new Map(groups.map((group) => [group.id, group]));
   return ids.map((id) => byID.get(id)).filter(Boolean) as AccountGroup[];
+}
+
+/** Sort key for clustering accounts that share the same group membership. */
+function getAccountGroupSortMeta(
+  account: { group_ids?: number[] | null },
+  groups: AccountGroup[],
+): { order: number; key: string } {
+  const resolved = resolveAccountGroups(account.group_ids ?? [], groups);
+  if (resolved.length === 0) {
+    // Ungrouped accounts sort after every named group in ascending order.
+    return { order: Number.MAX_SAFE_INTEGER, key: "" };
+  }
+  const sorted = [...resolved].sort((a, b) => {
+    if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
+    return a.name.localeCompare(b.name, "zh");
+  });
+  return {
+    order: sorted[0].sort_order,
+    key: sorted.map((group) => group.name).join("\0"),
+  };
 }
 
 function GroupChipList({
@@ -10527,6 +11509,7 @@ function AccountMobileCard({
   onToggleLock,
   onResetStatus,
   onResetCredits,
+  onEditModels,
   onDelete,
   onUsageRefreshed,
 }: {
@@ -10554,6 +11537,7 @@ function AccountMobileCard({
   onToggleLock: () => void;
   onResetStatus: () => void;
   onResetCredits: () => void;
+  onEditModels?: () => void;
   onDelete: () => void;
   onUsageRefreshed?: () => void;
 }) {
@@ -10570,6 +11554,7 @@ function AccountMobileCard({
   const hasStateBadges =
     account.at_only ||
     account.openai_responses_api ||
+    account.grok_api ||
     account.enabled === false ||
     account.locked;
   const modelCooldownCount = account.model_cooldowns?.length ?? 0;
@@ -10613,6 +11598,26 @@ function AccountMobileCard({
               >
                 <RotateCcw className="size-2.5" />
                 {resetCredits}
+              </button>
+            )}
+            {getCreditBalanceDisplay(account) !== null && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onUsage();
+                }}
+                className="inline-flex items-center gap-1 rounded-md bg-teal-50 px-1.5 py-0.5 text-[10px] font-medium text-teal-700 ring-1 ring-inset ring-teal-600/20 transition-colors hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-300 dark:ring-teal-400/20 dark:hover:bg-teal-900"
+                title={
+                  account.credits_unlimited
+                    ? t("accounts.creditsBalanceUnlimited")
+                    : t("accounts.creditsBalanceBadge", {
+                        balance: getCreditBalanceDisplay(account),
+                      })
+                }
+              >
+                <Coins className="size-2.5" />
+                {getCreditBalanceDisplay(account)}
               </button>
             )}
           </div>
@@ -10679,6 +11684,13 @@ function AccountMobileCard({
                 {account.openai_responses_api && (
                   <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                     Responses API
+                  </span>
+                )}
+                {account.grok_api && (
+                  <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                    <Sparkles className="size-2.5" />
+                    Grok
+                    {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
                   </span>
                 )}
                 {account.enabled === false && (
@@ -10864,6 +11876,7 @@ function AccountMobileCard({
               onToggleLock={onToggleLock}
               onResetStatus={onResetStatus}
               onResetCredits={onResetCredits}
+              onEditModels={onEditModels}
               onDelete={onDelete}
             />
           </div>
@@ -10946,6 +11959,13 @@ function AccountMobileCard({
             {account.openai_responses_api && (
               <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                 Responses API
+              </span>
+            )}
+            {account.grok_api && (
+              <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                <Sparkles className="size-2.5" />
+                Grok
+                {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
               </span>
             )}
             {account.enabled === false && (
@@ -11090,6 +12110,7 @@ function AccountMobileCard({
           onToggleLock={onToggleLock}
           onResetStatus={onResetStatus}
           onResetCredits={onResetCredits}
+          onEditModels={onEditModels}
           onDelete={onDelete}
         />
       </div>
@@ -11363,7 +12384,11 @@ function TestConnectionModal({
     onSettledRef.current();
   }, []);
 
-  const isOpenAIResponsesAccount = Boolean(account.openai_responses_api);
+  // Grok 与 openai_responses 同属"账号自带模型清单"的 relay 风格账号，
+  // 测试模型选择逻辑一致（用 account.models 而非上游 /v1/models 全量）。
+  const isOpenAIResponsesAccount = Boolean(
+    account.openai_responses_api || account.grok_api,
+  );
 
   const modelSelectOptions = useMemo(
     () =>
@@ -11606,12 +12631,19 @@ function TestConnectionModal({
     outputEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [output]);
 
-  const statusLabel = {
-    connecting: `⏳ ${t("accounts.connecting")}`,
-    streaming: `🔄 ${t("accounts.receivingResponse")}`,
-    success: `✅ ${t("accounts.testSuccess")}`,
-    error: `❌ ${t("accounts.testFailed")}`,
+  const statusText = {
+    connecting: t("accounts.connecting"),
+    streaming: t("accounts.receivingResponse"),
+    success: t("accounts.testSuccess"),
+    error: t("accounts.testFailed"),
   }[status];
+  const StatusIcon = {
+    connecting: Loader2,
+    streaming: Loader2,
+    success: CheckCircle,
+    error: XCircle,
+  }[status];
+  const statusIconSpin = status === "connecting" || status === "streaming";
 
   const statusColor = {
     connecting: "text-muted-foreground",
@@ -11649,7 +12681,10 @@ function TestConnectionModal({
           <span
             className={`flex items-center gap-1.5 text-sm font-semibold ${statusColor}`}
           >
-            {statusLabel}
+            <StatusIcon
+              className={cn("size-4", statusIconSpin && "animate-spin")}
+            />
+            {statusText}
           </span>
           <Select
             className="w-52 max-w-full"

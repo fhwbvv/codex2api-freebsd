@@ -162,12 +162,39 @@ func newDefaultSystemReleaseClient() *defaultSystemReleaseClient {
 }
 
 func (h *Handler) GetSystemUpdate(c *gin.Context) {
-	info, err := h.systemUpdater().Check(c.Request.Context())
+	updater := h.systemUpdater()
+	info, err := updater.Check(c.Request.Context())
 	if err != nil {
-		writeError(c, http.StatusBadGateway, "检查更新失败: "+err.Error())
+		log.Printf("检查系统更新失败，已静默降级: %v", err)
+		c.JSON(http.StatusOK, updater.unavailableInfo())
 		return
 	}
 	c.JSON(http.StatusOK, info)
+}
+
+func (u *systemUpdater) unavailableInfo() *systemUpdateInfo {
+	current := normalizeSystemVersion(u.currentVersion)
+	info := &systemUpdateInfo{
+		CurrentVersion: current,
+		LatestVersion:  current,
+		RuntimeOS:      u.goos,
+		RuntimeArch:    u.goarch,
+		Mode:           "binary",
+		Supported:      true,
+		Warning:        "更新源暂时不可用，已跳过本次自动检查",
+	}
+	if current == "" || current == "dev" {
+		info.Supported = false
+		info.UnsupportedReason = "开发构建未注入版本号，无法安全判断升级目标"
+	} else if _, ok := parseSystemVersion(current); !ok {
+		info.Supported = false
+		info.UnsupportedReason = "当前构建版本不是语义版本，无法安全判断升级目标"
+	}
+	if u.goos == "windows" {
+		info.Supported = false
+		info.UnsupportedReason = "Windows 运行时暂不支持在线替换正在运行的可执行文件"
+	}
+	return info
 }
 
 func (h *Handler) PerformSystemUpdate(c *gin.Context) {

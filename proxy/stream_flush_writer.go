@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/security/promptfilter"
+	"github.com/gin-gonic/gin"
 )
 
 const pendingFirstTokenFlushBytes = 1024 * 1024
@@ -24,12 +26,16 @@ type streamFlushWriter struct {
 	lastFlush     time.Time
 	buffer        bytes.Buffer
 	outputScanner *promptfilter.OutputScanner
+	writtenBytes  atomic.Int64
 }
 
-func (h *Handler) newStreamFlushWriter(writer io.Writer, flusher http.Flusher) *streamFlushWriter {
+func (h *Handler) newStreamFlushWriter(c *gin.Context, writer io.Writer, flusher http.Flusher) *streamFlushWriter {
 	w := newStreamFlushWriter(writer, flusher)
 	if h != nil && h.store != nil {
-		w.outputScanner = promptfilter.NewOutputScanner(h.store.GetPromptFilterConfig())
+		cfg := h.promptFilterConfigForRequest(c)
+		if cfg.Enabled && cfg.Advanced.Output.Enabled {
+			w.outputScanner = promptfilter.NewOutputScannerFromNormalizedConfig(cfg)
+		}
 	}
 	return w
 }
@@ -74,19 +80,50 @@ func writeDeferredSSEData(streamWriter *streamFlushWriter, pending *bytes.Buffer
 		if !shouldDefer {
 			appendSSEData(pending, data)
 		}
+		before := streamWriter.deliveredBytes()
 		if err := streamWriter.WriteBytes(pending.Bytes()); err != nil {
 			return false, err
 		}
 		pending.Reset()
-		return true, nil
+		return streamWriter.deliveredBytes() > before, nil
 	}
 	if shouldDefer {
 		return false, nil
 	}
+	before := streamWriter.deliveredBytes()
 	if err := streamWriter.WriteSSEData(data); err != nil {
 		return false, err
 	}
-	return true, nil
+	return streamWriter.deliveredBytes() > before, nil
+}
+
+func (w *streamFlushWriter) deliveredBytes() int64 {
+	if w == nil {
+		return 0
+	}
+	return w.writtenBytes.Load()
+}
+
+func (w *streamFlushWriter) writeUnderlying(data []byte) error {
+	if w == nil || w.writer == nil || len(data) == 0 {
+		return nil
+	}
+	written, err := w.writer.Write(data)
+	if written > 0 {
+		w.writtenBytes.Add(int64(written))
+	}
+	return err
+}
+
+func (w *streamFlushWriter) writeUnderlyingString(data string) error {
+	if w == nil || w.writer == nil || data == "" {
+		return nil
+	}
+	written, err := io.WriteString(w.writer, data)
+	if written > 0 {
+		w.writtenBytes.Add(int64(written))
+	}
+	return err
 }
 
 func (w *streamFlushWriter) WriteString(data string) error {
@@ -99,7 +136,7 @@ func (w *streamFlushWriter) WriteString(data string) error {
 	}
 	data = string(filtered)
 	if w.policy != StreamFlushPolicyCoalesce {
-		if _, err := io.WriteString(w.writer, data); err != nil {
+		if err := w.writeUnderlyingString(data); err != nil {
 			return err
 		}
 		w.flushTransport()
@@ -124,7 +161,7 @@ func (w *streamFlushWriter) WriteBytes(data []byte) error {
 		return err
 	}
 	if w.policy != StreamFlushPolicyCoalesce {
-		if _, err := w.writer.Write(data); err != nil {
+		if err := w.writeUnderlying(data); err != nil {
 			return err
 		}
 		w.flushTransport()
@@ -153,7 +190,7 @@ func (w *streamFlushWriter) WriteSSEData(data []byte) error {
 		return err
 	}
 	if w.policy != StreamFlushPolicyCoalesce {
-		if _, err := w.writer.Write(framed); err != nil {
+		if err := w.writeUnderlying(framed); err != nil {
 			return err
 		}
 		w.flushTransport()
@@ -171,7 +208,7 @@ func (w *streamFlushWriter) Flush() error {
 		return nil
 	}
 	if w.buffer.Len() > 0 {
-		if _, err := w.writer.Write(w.buffer.Bytes()); err != nil {
+		if err := w.writeUnderlying(w.buffer.Bytes()); err != nil {
 			return err
 		}
 		w.buffer.Reset()
@@ -182,7 +219,7 @@ func (w *streamFlushWriter) Flush() error {
 			return err
 		}
 		if len(pending) > 0 {
-			if _, err := w.writer.Write(pending); err != nil {
+			if err := w.writeUnderlying(pending); err != nil {
 				return err
 			}
 		}
@@ -198,7 +235,7 @@ func (w *streamFlushWriter) Finalize() error {
 		return nil
 	}
 	if w.buffer.Len() > 0 {
-		if _, err := w.writer.Write(w.buffer.Bytes()); err != nil {
+		if err := w.writeUnderlying(w.buffer.Bytes()); err != nil {
 			return err
 		}
 		w.buffer.Reset()
@@ -209,7 +246,7 @@ func (w *streamFlushWriter) Finalize() error {
 			return err
 		}
 		if len(pending) > 0 {
-			if _, err := w.writer.Write(pending); err != nil {
+			if err := w.writeUnderlying(pending); err != nil {
 				return err
 			}
 		}

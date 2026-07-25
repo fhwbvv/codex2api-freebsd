@@ -516,11 +516,16 @@ curl --request POST \\
       title: copy(locale, "列出账号", "List accounts"),
       description: copy(
         locale,
-        "列出所有账号的状态、用量、标签、账号分组和基础元数据。",
-        "List all accounts with status, usage, tags, account groups, and basic metadata.",
+        "列出账号的状态、用量、标签、账号分组和基础元数据。可选 query channel=codex|grok 仅返回对应上游（Grok 管理页用 channel=grok，避免拉全站账号）。",
+        "List accounts with status, usage, tags, account groups, and basic metadata. Optional query channel=codex|grok returns only that upstream (use channel=grok for the Grok admin page).",
       ),
       curl: `curl --request GET \\
   --url ${baseUrl}/api/admin/accounts \\
+  --header 'X-Admin-Key: <admin_secret>'
+
+# Grok only
+curl --request GET \\
+  --url '${baseUrl}/api/admin/accounts?channel=grok' \\
   --header 'X-Admin-Key: <admin_secret>'`,
       responses: [
         {

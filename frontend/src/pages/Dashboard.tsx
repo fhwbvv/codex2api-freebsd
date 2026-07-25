@@ -8,11 +8,14 @@ import StateShell from '../components/StateShell'
 import StatCard from '../components/StatCard'
 import UsageStatsSummary from '../components/UsageStatsSummary'
 import TimeRangeSelector from '../components/TimeRangeSelector'
+import ChannelFilter, { useUsageChannel, type UsageChannel } from '../components/ChannelFilter'
+import ChannelLogo from '../components/ChannelLogo'
 import SystemHealthBar from '../components/SystemHealthBar'
 import type {
   AccountRow,
   OpsOverviewResponse,
   StatsResponse,
+  StatsChannelCounts,
   SystemSettings,
   UsageStats,
   ChartAggregation,
@@ -76,6 +79,8 @@ function ChartsSkeleton() {
 export default function Dashboard() {
   const { t } = useTranslation()
   const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
+  const [channel, setChannel] = useUsageChannel()
+  const channelRef = useRef<UsageChannel>(channel)
   const [showPoolRunway, setShowPoolRunway] = useState(getInitialPoolRunwayVisibility)
   const [chartData, setChartData] = useState<ChartAggregation | null>(null)
   const [chartRefreshedAt, setChartRefreshedAt] = useState<number | null>(null)
@@ -91,7 +96,7 @@ export default function Dashboard() {
     const includePoolRunway = showPoolRunwayRef.current
     const [stats, usageStats, settings, accountsRes, opsOverview] = await Promise.all([
       api.getStats(),
-      api.getUsageStats({ start, end }),
+      api.getUsageStats({ start, end, channel: channelRef.current || undefined }),
       api.getSettings().catch((): SystemSettings | null => null),
       includePoolRunway
         ? api.getAccounts().catch(() => ({ accounts: [] as AccountRow[] }))
@@ -144,12 +149,13 @@ export default function Dashboard() {
 
   useEffect(() => {
     timeRangeRef.current = timeRange
+    channelRef.current = channel
     if (!usageStatsRangeInitialized.current) {
       usageStatsRangeInitialized.current = true
       return
     }
     void reloadSilently()
-  }, [timeRange, reloadSilently])
+  }, [timeRange, channel, reloadSilently])
 
   // 加载服务端聚合的图表数据（12~48 个聚合点，非原始行）
   const loadChartData = useCallback(async () => {
@@ -160,7 +166,7 @@ export default function Dashboard() {
     try {
       const { start, end } = getTimeRangeISO(timeRange)
       const { bucketMinutes } = getBucketConfig(timeRange)
-      const res = await api.getChartData({ start, end, bucketMinutes })
+      const res = await api.getChartData({ start, end, bucketMinutes, channel: channel || undefined })
       if (!controller.signal.aborted) {
         setChartData(res)
         setChartRefreshedAt(Date.now())
@@ -172,7 +178,7 @@ export default function Dashboard() {
         setChartLoading(false)
       }
     }
-  }, [timeRange])
+  }, [timeRange, channel])
 
   // 首次加载 + timeRange 变更时重新拉取图表数据
   useEffect(() => {
@@ -194,11 +200,25 @@ export default function Dashboard() {
 
   const { stats, usageStats, settings, accounts, opsOverview } = data
   const showFullUsageNumbers = settings?.show_full_usage_numbers ?? false
-  const total = stats?.total ?? 0
-  const available = stats?.available ?? 0
-  const rateLimited = stats?.rate_limited ?? 0
-  const errorCount = stats?.error ?? 0
-  const todayRequests = stats?.today_requests ?? 0
+  // 渠道视图下账号池概览与统计卡切换为该渠道的计数；全部视图保持总量并展示分渠道徽标。
+  // 旧后端响应无 channels 字段时回退全量，有字段但该渠道无账号时如实显示 0。
+  const emptyChannelCounts: StatsChannelCounts = {
+    total: 0, available: 0, rate_limited: 0, error: 0, today_requests: 0,
+  }
+  const effectiveCounts = channel && stats?.channels
+    ? (stats.channels[channel] ?? emptyChannelCounts)
+    : stats
+  const total = effectiveCounts?.total ?? 0
+  const available = effectiveCounts?.available ?? 0
+  const rateLimited = effectiveCounts?.rate_limited ?? 0
+  const errorCount = effectiveCounts?.error ?? 0
+  const todayRequests = effectiveCounts?.today_requests ?? 0
+  const channelBreakdown = !channel && stats?.channels
+    ? (['codex', 'grok'] as const)
+        .map((key) => ({ key, counts: stats.channels?.[key] }))
+        .filter((item): item is { key: 'codex' | 'grok'; counts: StatsChannelCounts } =>
+          Boolean(item.counts && item.counts.total > 0))
+    : []
   const currentRpm = opsOverview?.traffic?.rpm ?? 0
   const rpmLimit = opsOverview?.traffic?.rpm_limit ?? 0
   const avgDurationMs = opsOverview?.traffic?.avg_duration_ms ?? 0
@@ -226,6 +246,7 @@ export default function Dashboard() {
           title={t('dashboard.title')}
           description={t('dashboard.description')}
           onRefresh={() => { void reload(); void loadChartData() }}
+          titleAdornment={<ChannelFilter value={channel} onChange={setChannel} />}
           actions={
             <div className="flex flex-wrap items-center gap-2">
               <Button
@@ -256,6 +277,8 @@ export default function Dashboard() {
           }
         />
 
+        {/* 渠道切换时整块内容淡入过渡（key 变化触发重播） */}
+        <div key={channel || 'all'} className="animate-channel-switch-in">
         {/* Hero summary */}
         <div className="relative mb-5 overflow-hidden rounded-2xl border border-border/80 bg-card p-4 shadow-sm sm:mb-6 sm:p-5">
           <div
@@ -288,6 +311,25 @@ export default function Dashboard() {
                 <span className="inline-flex items-center rounded-full bg-muted/80 px-2.5 py-1 font-medium">
                   {t('dashboard.heroTodayRequests', { count: todayRequests })}
                 </span>
+                {channelBreakdown.map(({ key, counts }) => (
+                  <span
+                    key={key}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-muted/80 px-2.5 py-1 font-medium"
+                    title={t('dashboard.heroChannelTitle', {
+                      channel: key === 'grok' ? 'Grok' : 'Codex',
+                      available: counts.available,
+                      total: counts.total,
+                      requests: counts.today_requests,
+                    })}
+                  >
+                    <ChannelLogo channel={key} size={13} />
+                    <span className="tabular-nums">
+                      {counts.available}/{counts.total}
+                    </span>
+                    <span className="text-muted-foreground/70">·</span>
+                    <span className="tabular-nums">{counts.today_requests}</span>
+                  </span>
+                ))}
                 {errorCount > 0 ? (
                   <span className="inline-flex items-center rounded-full bg-destructive/12 px-2.5 py-1 font-semibold text-destructive">
                     {t('dashboard.heroErrors', { count: errorCount })}
@@ -360,6 +402,7 @@ export default function Dashboard() {
             </Suspense>
           </div>
         )}
+        </div>
       </>
     </StateShell>
   )

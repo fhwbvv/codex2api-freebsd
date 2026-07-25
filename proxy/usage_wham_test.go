@@ -150,10 +150,11 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "free", AccountID: "acc"}
 
 	now := time.Now()
+	subscriptionExpiresAt := now.Add(30 * 24 * time.Hour).UTC().Truncate(time.Second)
 	reset5h := now.Add(3 * time.Hour).Unix()
 	reset7d := now.Add(5 * 24 * time.Hour).Unix()
 	usage := &WhamUsage{PlanType: "plus"}
-	usage.SubscriptionExpiresAtRaw = whamTimeRaw("2026-07-17T09:30:23Z")
+	usage.SubscriptionExpiresAtRaw = whamTimeRaw(subscriptionExpiresAt.Format(time.RFC3339))
 	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 83, LimitWindowSeconds: 18000, ResetAt: reset5h}
 	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 30, LimitWindowSeconds: 604800, ResetAt: reset7d}
 
@@ -179,7 +180,7 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	if got := row.GetCredential("plan_type"); got != "plus" {
 		t.Errorf("persisted plan_type = %q, want plus", got)
 	}
-	wantSubscriptionExpiresAt := time.Date(2026, 7, 17, 9, 30, 23, 0, time.UTC)
+	wantSubscriptionExpiresAt := subscriptionExpiresAt
 	if !account.SubscriptionExpiresAt.Equal(wantSubscriptionExpiresAt) {
 		t.Errorf("account SubscriptionExpiresAt = %s, want %s", account.SubscriptionExpiresAt.Format(time.RFC3339), wantSubscriptionExpiresAt.Format(time.RFC3339))
 	}
@@ -247,7 +248,7 @@ func TestApplyWhamUsage_PersistsSubscriptionExpiresAtWhenMemoryAlreadyMatches(t 
 	}
 
 	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
-	expiresAt := time.Date(2026, 7, 17, 9, 30, 23, 0, time.UTC)
+	expiresAt := time.Now().Add(30 * 24 * time.Hour).UTC().Truncate(time.Second)
 	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "plus", AccountID: "acc", SubscriptionExpiresAt: expiresAt}
 	usage := &WhamUsage{PlanType: "plus"}
 	usage.SubscriptionExpiresAtRaw = whamTimeRaw(expiresAt.Format(time.RFC3339))

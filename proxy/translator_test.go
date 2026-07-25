@@ -565,6 +565,157 @@ func TestPrepareResponsesBody_NormalizesUserOutputTextToInputText(t *testing.T) 
 	}
 }
 
+// 上游 Codex 不接受 role=system（"System messages are not allowed"），原生
+// Responses 直通路径须与 chat/Anthropic 链路一致改写为 developer（issue #409）。
+func TestPrepareResponsesBody_RewritesSystemRoleToDeveloper(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{
+				"type":"message",
+				"role":"system",
+				"content":[
+					{"type":"input_text","text":"you are a helpful assistant"}
+				]
+			},
+			{"role":"system","content":"bare system without type"},
+			{"type":"message","role":"user","content":"hi"},
+			{"type":"function_call","call_id":"c1","name":"foo","arguments":"{}"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("typed system message should become developer, got %q; body=%s", role, got)
+	}
+	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); text != "you are a helpful assistant" {
+		t.Fatalf("system content should be preserved, got %q; body=%s", text, got)
+	}
+	if role := gjson.GetBytes(got, "input.1.role").String(); role != "developer" {
+		t.Fatalf("bare system message should become developer, got %q; body=%s", role, got)
+	}
+	if role := gjson.GetBytes(got, "input.2.role").String(); role != "user" {
+		t.Fatalf("user message must stay untouched, got %q; body=%s", role, got)
+	}
+	if name := gjson.GetBytes(got, "input.3.name").String(); name != "foo" {
+		t.Fatalf("non-message item must stay untouched; body=%s", got)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_RewritesSystemRoleToDeveloper(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"message","role":"system","content":"system prompt"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+		t.Fatalf("WS path should also rewrite system to developer, got %q; body=%s", role, got)
+	}
+}
+
+func TestPrepareResponsesBody_ConvertsOrphanToolOutputToMessage(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"message","role":"user","content":"what is the weather?"},
+			{"type":"function_call_output","call_id":"call_orphan1","output":"{\"temp\":21}"},
+			{"type":"function_call","call_id":"call_ok","name":"get_weather","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_ok","output":"sunny"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "message" {
+		t.Fatalf("orphan output should become a message, got %q; body=%s", typ, got)
+	}
+	if role := gjson.GetBytes(got, "input.1.role").String(); role != "user" {
+		t.Fatalf("orphan output message should be user role, got %q; body=%s", role, got)
+	}
+	text := gjson.GetBytes(got, "input.1.content.0.text").String()
+	if !strings.Contains(text, "call_orphan1") || !strings.Contains(text, `{"temp":21}`) {
+		t.Fatalf("orphan output text should keep call_id and content, got %q", text)
+	}
+	if typ := gjson.GetBytes(got, "input.3.type").String(); typ != "function_call_output" {
+		t.Fatalf("paired output must stay untouched, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesBody_SynthesizesOutputForOrphanToolCall(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"message","role":"user","content":"hi"},
+			{"type":"function_call","call_id":"call_orphan2","name":"get_weather","arguments":"{}"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.2.type").String(); typ != "function_call_output" {
+		t.Fatalf("orphan call should get a placeholder output right after it, got %q; body=%s", typ, got)
+	}
+	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_orphan2" {
+		t.Fatalf("placeholder output call_id mismatch, got %q; body=%s", callID, got)
+	}
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call" {
+		t.Fatalf("orphan call itself must be preserved; body=%s", got)
+	}
+}
+
+func TestPrepareResponsesBody_FlattensOrphanOutputContentParts(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"function_call_output","call_id":"call_parts","output":[{"type":"output_text","text":"part a"},{"type":"output_text","text":"part b"}]}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	text := gjson.GetBytes(got, "input.0.content.0.text").String()
+	if !strings.Contains(text, "part a") || !strings.Contains(text, "part b") {
+		t.Fatalf("content-part outputs should be flattened into text, got %q", text)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_SkipsPairingRepairWithPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"previous_response_id":"resp_123",
+		"input":[
+			{"type":"function_call_output","call_id":"call_linked","output":"result"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "function_call_output" {
+		t.Fatalf("orphan output is legitimate when previous_response_id is preserved, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_RepairsPairingWithoutPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"function_call_output","call_id":"call_ws_orphan","output":"result"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("WS path without previous_response_id should repair orphan output, got %q; body=%s", typ, got)
+	}
+}
+
 func TestPrepareResponsesBody_NormalizesLegacyTopLevelFileInput(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -1597,13 +1748,15 @@ func TestPrepareResponsesBody_DefaultsMissingMessageContent(t *testing.T) {
 
 	got, expandedInputRaw := PrepareResponsesBody(raw)
 
-	if content := gjson.GetBytes(got, "input.2.content"); !content.Exists() || content.String() != "" {
+	// 孤儿 function_call 会被配对修复在其后补一条占位 output，
+	// 缺省 content 的 message 顺移到下标 3。
+	if content := gjson.GetBytes(got, "input.3.content"); !content.Exists() || content.String() != "" {
 		t.Fatalf("missing message content should be defaulted to empty string, got %s; body=%s", content.Raw, got)
 	}
 	if gjson.GetBytes(got, "input.1.content").Exists() {
 		t.Fatalf("non-message tool context item should not receive content, got %s", got)
 	}
-	if content := gjson.Get(expandedInputRaw, "2.content"); !content.Exists() || content.String() != "" {
+	if content := gjson.Get(expandedInputRaw, "3.content"); !content.Exists() || content.String() != "" {
 		t.Fatalf("expanded input should include normalized empty content, got %s; expanded=%s", content.Raw, expandedInputRaw)
 	}
 }
@@ -1670,6 +1823,42 @@ func TestValidateResponsesFunctionNamesAllowsValidFunctionNames(t *testing.T) {
 
 	if err := ValidateResponsesFunctionNames(raw); err != nil {
 		t.Fatalf("valid function names should pass, got %v", err)
+	}
+}
+
+func TestValidateResponsesFunctionNamesIgnoresInvalidJSON(t *testing.T) {
+	if err := ValidateResponsesFunctionNames([]byte(`{not json`)); err != nil {
+		t.Fatalf("invalid JSON must pass through (upstream validates), got %v", err)
+	}
+}
+
+// buildManyTurnResponsesBody 模拟 issue #417 的长会话形态：大量小文本轮次。
+func buildManyTurnResponsesBody(turns int) []byte {
+	var b strings.Builder
+	b.WriteString(`{"model":"gpt-5.5","input":[`)
+	txt := strings.Repeat("analyze this module carefully ", 40)
+	for i := 0; i < turns; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":"`)
+		b.WriteString(txt)
+		b.WriteString(`"}]}`)
+	}
+	b.WriteString(`],"tools":[{"type":"function","name":"lookup","parameters":{}}]}`)
+	return []byte(b.String())
+}
+
+// BenchmarkValidateResponsesFunctionNamesManyTurns 守护 issue #417 的优化：校验器
+// 只做惰性 gjson 遍历，不再对大请求体做全量 map[string]any 反序列化。
+func BenchmarkValidateResponsesFunctionNamesManyTurns(b *testing.B) {
+	body := buildManyTurnResponsesBody(4000)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for i := 0; i < b.N; i++ {
+		if err := ValidateResponsesFunctionNames(body); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -2000,8 +2189,10 @@ func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
 
 	got, expandedInputRaw := PrepareResponsesBody(raw)
 
+	// 无 output 的 function_call 会被配对修复补一条占位 output，
+	// 因此裸 reasoning 清理后剩 3 条原始项 + 1 条合成 output。
 	items := gjson.GetBytes(got, "input").Array()
-	if len(items) != 3 {
+	if len(items) != 4 {
 		t.Fatalf("expected bare reasoning items to be dropped before upstream, got %d items: %s", len(items), got)
 	}
 	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
@@ -2012,6 +2203,9 @@ func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
 	}
 	if typ := gjson.GetBytes(got, "input.2.type").String(); typ != "function_call" {
 		t.Fatalf("function call should remain, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.GetBytes(got, "input.3.type").String(); typ != "function_call_output" {
+		t.Fatalf("orphan function call should get a placeholder output, got %q; body=%s", typ, got)
 	}
 	if strings.Contains(expandedInputRaw, `"summary_text"`) {
 		t.Fatalf("expanded input cache should use cleaned input, got %s", expandedInputRaw)

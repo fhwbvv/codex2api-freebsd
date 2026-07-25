@@ -16,6 +16,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const promptFilterAuditContextMaxRunes = 2000
+
 type promptFilterSecretRequest struct {
 	Secret string `json:"secret"`
 }
@@ -159,6 +161,7 @@ func (h *Handler) inspectImagePromptFilter(c *gin.Context, text string, model st
 		Threshold:       verdict.Threshold,
 		MatchedPatterns: promptfilter.MatchesJSON(verdict.Matched),
 		TextPreview:     textPreview,
+		MatchContext:    promptfilter.RedactedPreview(verdict.MatchContext, promptFilterAuditContextMaxRunes),
 		APIKeyID:        keyID,
 		APIKeyName:      keyName,
 		APIKeyMasked:    keyMasked,
@@ -179,9 +182,11 @@ func (h *Handler) recordPromptFilterLog(c *gin.Context, input *database.PromptFi
 	if h == nil || h.db == nil || input == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	_ = h.db.InsertPromptFilterLog(ctx, input)
+	priority := database.PromptFilterLogPriorityLow
+	if input.Action == promptfilter.ActionWarn || input.Action == promptfilter.ActionBlock {
+		priority = database.PromptFilterLogPriorityHigh
+	}
+	_ = h.db.EnqueuePromptFilterLog(input, priority)
 }
 
 func (h *Handler) ListPromptFilterLogs(c *gin.Context) {
@@ -355,9 +360,6 @@ func positiveQueryInt(c *gin.Context, key string, fallback int) int {
 }
 
 func shouldReviewPromptFilterVerdict(verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
-	if verdict.TerminalStrictHit {
-		return false
-	}
 	if verdict.Action != promptfilter.ActionWarn && verdict.Action != promptfilter.ActionBlock {
 		return false
 	}

@@ -13,6 +13,8 @@ interface PageHeaderProps {
   actionMeta?: ReactNode
   // titleAdornment 渲染在标题文字右侧（如模式切换下拉）。
   titleAdornment?: ReactNode
+  // hideTitle 时标题文字视觉隐藏（保留在无障碍树），由 titleAdornment 占位。
+  hideTitle?: boolean
   className?: string
 }
 
@@ -24,6 +26,7 @@ export default function PageHeader({
   actions,
   actionMeta,
   titleAdornment,
+  hideTitle,
   className,
 }: PageHeaderProps) {
   const { t } = useTranslation()
@@ -40,7 +43,12 @@ export default function PageHeader({
     >
       <div className="min-w-0 max-w-[760px]">
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-          <h2 className="text-[22px] font-semibold leading-tight tracking-tight text-foreground sm:text-[28px]">
+          <h2
+            className={cn(
+              'text-[22px] font-semibold leading-tight tracking-tight text-foreground sm:text-[28px]',
+              hideTitle && 'sr-only',
+            )}
+          >
             {title}
           </h2>
           {titleAdornment}

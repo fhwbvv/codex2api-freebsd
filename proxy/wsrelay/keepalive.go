@@ -20,7 +20,8 @@ import (
 // PingIdleConnections 对连接池中所有【已连接且空闲】的 WS 连接发送一次 Ping 保活。
 // 空闲 = 该连接的 session 当前没有 pending 请求（PendingCount() == 0），
 // 避免与正在进行的请求争用写锁或干扰其读写时序。
-// 返回 (pinged, failed)：成功 Ping 数 与 失败数（失败的连接会被 SendHeartbeat 关闭并移除）。
+// 返回 (pinged, failed)：成功 Ping 数 与 失败数（失败的空闲连接会被 SendHeartbeat
+// 关闭并移除；快照后恰好被请求取走的连接只摘池，不关 socket，见 issue #436）。
 func (m *Manager) PingIdleConnections() (pinged int, failed int) {
 	if m == nil {
 		return 0, 0

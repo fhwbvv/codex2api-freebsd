@@ -21,6 +21,8 @@ import {
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
 import AccountHealthBar from "./AccountHealthBar";
+import ChannelLogo from "./ChannelLogo";
+import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -171,10 +173,18 @@ export default function AccountDetailSheet({
       : account.email || account.name || `#${account.id}`
     : "";
   const rateWindow = account ? getRateLimitWindow(account) : null;
+  const isGrok = Boolean(account?.grok_api);
+  // Grok API Key 无 refresh_token；Codex AT-only / Responses 也不走 AT 刷新。
   const refreshDisabled = Boolean(
     account &&
-      (refreshing || account.at_only || account.openai_responses_api),
+      (refreshing ||
+        account.at_only ||
+        account.openai_responses_api ||
+        (isGrok && account.grok_auth_kind !== "oauth")),
   );
+  // auth.json / 额度券是 Codex 订阅路径专属，Grok 不展示。
+  const showAuthJson = Boolean(account && !isGrok);
+  const showResetCredits = Boolean(account && !isGrok);
   const authJsonDisabled = Boolean(
     account &&
       (authJsonExporting || account.at_only || account.openai_responses_api),
@@ -220,7 +230,17 @@ export default function AccountDetailSheet({
         >
           <SheetHeader>
             <div className="flex items-start justify-between gap-3 pr-2">
-              <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 flex-1 items-start gap-3">
+                <span className="mt-0.5 flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-card ring-1 ring-border shadow-sm">
+                  {account.grok_api ? (
+                    <ChannelLogo channel="grok" size={22} />
+                  ) : account.openai_responses_api ? (
+                    <ModelLogo model="openai" variant="plain" size={22} />
+                  ) : (
+                    <ChannelLogo channel="codex" size={40} className="rounded-xl" />
+                  )}
+                </span>
+                <div className="min-w-0 flex-1">
                 <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                   {sequence != null && (
                     <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px] font-semibold text-muted-foreground">
@@ -243,11 +263,16 @@ export default function AccountDetailSheet({
                   <SheetDescription className="mt-1 break-all font-mono text-[11px]">
                     {account.chatgpt_account_id}
                   </SheetDescription>
+                ) : isGrok && account.email && account.name && account.email !== account.name ? (
+                  <SheetDescription className="mt-1 break-all text-[12px]">
+                    {account.email}
+                  </SheetDescription>
                 ) : (
                   <SheetDescription className="mt-1">
                     {t("accounts.detailSubtitle")}
                   </SheetDescription>
                 )}
+                </div>
               </div>
               <div className="flex shrink-0 items-center gap-0.5">
                 <Button
@@ -462,7 +487,10 @@ export default function AccountDetailSheet({
             {(account.proxy_url ||
               account.at_only ||
               account.openai_responses_api ||
-              account.base_url) && (
+              account.grok_api ||
+              account.base_url ||
+              (!account.openai_responses_api &&
+                (account.models?.length ?? 0) > 0)) && (
               <Section title={t("accounts.detailTechnical")}>
                 <div className="space-y-2 rounded-xl border border-border bg-card p-3 text-[12px]">
                   {account.at_only && (
@@ -482,6 +510,18 @@ export default function AccountDetailSheet({
                       </span>
                       <span className="font-medium text-foreground">
                         {t("accounts.detailApiResponses")}
+                      </span>
+                    </div>
+                  )}
+                  {isGrok && (
+                    <div className="flex justify-between gap-3">
+                      <span className="text-muted-foreground">
+                        {t("accounts.detailAuthType")}
+                      </span>
+                      <span className="font-medium text-foreground">
+                        {account.grok_auth_kind === "oauth"
+                          ? t("grok.authKindOAuthShort")
+                          : t("grok.authKindApiKey")}
                       </span>
                     </div>
                   )}
@@ -505,7 +545,7 @@ export default function AccountDetailSheet({
                       </span>
                     </div>
                   )}
-                  {resetCredits > 0 && (
+                  {showResetCredits && resetCredits > 0 && (
                     <div className="flex justify-between gap-3">
                       <span className="text-muted-foreground">
                         {t("accounts.resetCreditsButton")}
@@ -515,6 +555,18 @@ export default function AccountDetailSheet({
                       </span>
                     </div>
                   )}
+                  {(account.models?.length ?? 0) > 0 && (
+                      <div className="flex justify-between gap-3">
+                        <span className="shrink-0 text-muted-foreground">
+                          {t("accounts.supportedModelsAction")}
+                        </span>
+                        <span className="font-medium tabular-nums text-foreground">
+                          {t("accounts.supportedModelsCount", {
+                            count: account.models?.length ?? 0,
+                          })}
+                        </span>
+                      </div>
+                    )}
                 </div>
               </Section>
             )}
@@ -544,18 +596,22 @@ export default function AccountDetailSheet({
                 <RefreshCw
                   className={`size-3.5 ${refreshing ? "animate-spin" : ""}`}
                 />
-                {t("accounts.actionRefreshAT")}
+                {isGrok
+                  ? t("grok.actionRefresh")
+                  : t("accounts.actionRefreshAT")}
               </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={authJsonDisabled}
-                onClick={onGenerateAuthJson}
-              >
-                <FileJson className="size-3.5" />
-                {t("accounts.actionAuthJson")}
-              </Button>
+              {showAuthJson && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={authJsonDisabled}
+                  onClick={onGenerateAuthJson}
+                >
+                  <FileJson className="size-3.5" />
+                  {t("accounts.actionAuthJson")}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant="outline"
@@ -595,16 +651,18 @@ export default function AccountDetailSheet({
                 <RotateCcw className="size-3.5" />
                 {t("accounts.resetStatus")}
               </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={resetCredits <= 0}
-                onClick={onResetCredits}
-              >
-                <Timer className="size-3.5" />
-                {t("accounts.resetCreditsButton")}
-              </Button>
+              {showResetCredits && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={resetCredits <= 0}
+                  onClick={onResetCredits}
+                >
+                  <Timer className="size-3.5" />
+                  {t("accounts.resetCreditsButton")}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant="destructive"

@@ -12,7 +12,9 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
-import type { PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, PromptIntelligenceCandidate, PromptIntelligenceRun, SystemSettings } from '../types'
+import { getPromptFilterScoreBand, normalizePromptFilterScore } from '../lib/promptFilterScore'
+import { parseAdvancedConfigDocument, patchAdvancedConfigDocument, readAdvancedConfigPath } from '../types'
+import type { AdvancedConfigObject, AdvancedConfigPatch, PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptIntelligenceCandidate, PromptIntelligenceRun, SystemSettings } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -91,47 +93,223 @@ type CustomRuleDraft = {
   strict: boolean
 }
 
+type PromptGuardEditorConfig = Omit<PromptGuardConfig, 'rollout' | 'performance'>
+
 type AdvancedProtectionConfig = {
+  guard: PromptGuardEditorConfig
   enforcement: { terminal_categories: string[] }
-  normalization: { enabled: boolean; decode_url: boolean; decode_html: boolean; decode_base64: boolean; max_decode_runs: number }
+  normalization: {
+    enabled: boolean
+    decode_url: boolean
+    decode_html: boolean
+    decode_base64: boolean
+    decode_hex: boolean
+    decode_rot13: boolean
+    decode_escapes: boolean
+    decode_compression: boolean
+    max_decode_runs: number
+    max_decoded_bytes: number
+    max_encoded_blocks: number
+  }
+  context_discount: { enabled: boolean; intent_aware: boolean; max_discount: number; operational_max_discount: number }
   risk: { enabled: boolean; window_seconds: number; block_threshold: number; review_threshold: number; user_weight_percent: number; ip_weight_percent: number; session_weight_percent: number }
-  sidecar: { enabled: boolean; base_url: string; timeout_seconds: number; fail_closed: boolean; min_score: number }
-  output: { enabled: boolean; buffer_bytes: number; overlap_bytes: number; strict_only: boolean }
+  sidecar: {
+    enabled: boolean
+    base_url: string
+    fail_closed: boolean
+    mode: 'shadow' | 'warn' | 'enforce'
+  }
+  session: {
+    enabled: boolean
+    window_seconds: number
+    max_fragments: number
+    max_text_length: number
+    combine_short_fragments: boolean
+    short_fragment_max_chars: number
+    require_signed_identity: boolean
+  }
+  attachment: {
+    enabled: boolean
+    base_url: string
+    allow_remote_urls: boolean
+  }
+  output: { enabled: boolean; strict_only: boolean }
   intelligence: { enabled: boolean; interval_hours: number; queries: string[]; max_search_results: number; model_enabled: boolean; model: string; max_model_calls: number; auto_add: boolean }
-  newapi: { enabled: boolean; max_clock_skew_seconds: number; offense_window_seconds: number; ban_after: number }
+  newapi: { enabled: boolean }
+}
+
+const promptGuardModes: PromptGuardMode[] = ['inherit', 'off', 'shadow', 'warn', 'enforce']
+const promptGuardAuxiliaryModes: PromptGuardMode[] = ['off', 'shadow']
+const promptGuardProfiles: PromptGuardProfile[] = ['balanced', 'strict', 'research']
+const promptGuardProviders: PromptGuardProvider[] = ['openai', 'anthropic', 'xai', 'unknown']
+const promptGuardLayers: PromptGuardLayer[] = ['current_user', 'history', 'system', 'developer', 'instructions', 'tool_output', 'tool_arguments', 'attachment_refs', 'session_context', 'attachment_content']
+const sidecarModes: AdvancedProtectionConfig['sidecar']['mode'][] = ['shadow', 'warn', 'enforce']
+const inheritedPromptGuardProfile = '__default__'
+
+type LocalizedSelectOption = { value: string; label: string }
+
+function selectWithPreservedUnknown(
+  rawValue: unknown,
+  fallback: string,
+  options: LocalizedSelectOption[],
+  unknownLabel: string,
+): { value: string; options: LocalizedSelectOption[]; unknown: boolean } {
+  if (typeof rawValue === 'string' && !options.some((option) => option.value === rawValue)) {
+    return {
+      value: rawValue,
+      options: [{ value: rawValue, label: unknownLabel }, ...options],
+      unknown: true,
+    }
+  }
+  return {
+    value: typeof rawValue === 'string' ? rawValue : fallback,
+    options,
+    unknown: false,
+  }
+}
+
+const defaultPromptGuard: PromptGuardEditorConfig = {
+  mode: 'inherit',
+  default_profile: 'balanced',
+  allow_trusted_overrides: false,
+  provider_profiles: {},
+  layers: {
+    current_user: { mode: 'enforce' },
+    history: { mode: 'off' },
+    system: { mode: 'off' },
+    developer: { mode: 'off' },
+    instructions: { mode: 'off' },
+    tool_output: { mode: 'shadow' },
+    tool_arguments: { mode: 'off' },
+    attachment_refs: { mode: 'shadow' },
+    session_context: { mode: 'shadow' },
+    attachment_content: { mode: 'shadow' },
+  },
 }
 
 const defaultAdvancedProtection: AdvancedProtectionConfig = {
+  guard: defaultPromptGuard,
   enforcement: { terminal_categories: [] },
-  normalization: { enabled: false, decode_url: false, decode_html: false, decode_base64: false, max_decode_runs: 1 },
-  risk: { enabled: false, window_seconds: 600, block_threshold: 100, review_threshold: 60, user_weight_percent: 50, ip_weight_percent: 30, session_weight_percent: 20 },
-  sidecar: { enabled: false, base_url: '', timeout_seconds: 3, fail_closed: true, min_score: 30 },
-  output: { enabled: false, buffer_bytes: 4096, overlap_bytes: 512, strict_only: true },
+  normalization: {
+    enabled: true,
+    decode_url: true,
+    decode_html: true,
+    decode_base64: true,
+    decode_hex: true,
+    decode_rot13: true,
+    decode_escapes: true,
+    decode_compression: true,
+    max_decode_runs: 2,
+    max_decoded_bytes: 32768,
+    max_encoded_blocks: 16,
+  },
+  context_discount: { enabled: true, intent_aware: true, max_discount: 90, operational_max_discount: 0 },
+  risk: { enabled: false, window_seconds: 600, block_threshold: 100, review_threshold: 60, user_weight_percent: 60, ip_weight_percent: 20, session_weight_percent: 20 },
+  sidecar: {
+    enabled: false,
+    base_url: '',
+    fail_closed: false,
+    mode: 'shadow',
+  },
+  session: {
+    enabled: false,
+    window_seconds: 300,
+    max_fragments: 3,
+    max_text_length: 4096,
+    combine_short_fragments: false,
+    short_fragment_max_chars: 24,
+    require_signed_identity: true,
+  },
+  attachment: {
+    enabled: false,
+    base_url: '',
+    allow_remote_urls: false,
+  },
+  output: { enabled: false, strict_only: true },
   intelligence: { enabled: false, interval_hours: 24, queries: ['LLM jailbreak prompt injection', 'ChatGPT jailbreak prompt', 'Codex prompt injection jailbreak', '大模型 破限 提示词', 'GPT 破甲 提示词', 'AI 越狱 提示词', '中文 prompt injection 绕过'], max_search_results: 20, model_enabled: false, model: 'gpt-5.4', max_model_calls: 1, auto_add: false },
-  newapi: { enabled: false, max_clock_skew_seconds: 120, offense_window_seconds: 86400, ban_after: 2 },
+  newapi: { enabled: false },
 }
 
-function parseAdvancedProtection(raw: string): AdvancedProtectionConfig {
-  try {
-    const value = JSON.parse(raw || '{}')
-    return {
-      enforcement: { ...defaultAdvancedProtection.enforcement, ...(value.enforcement || {}) },
-      normalization: { ...defaultAdvancedProtection.normalization, ...(value.normalization || {}) },
-      risk: { ...defaultAdvancedProtection.risk, ...(value.risk || {}) },
-      sidecar: { ...defaultAdvancedProtection.sidecar, ...(value.sidecar || {}) },
-      output: { ...defaultAdvancedProtection.output, ...(value.output || {}) },
-      intelligence: { ...defaultAdvancedProtection.intelligence, ...(value.intelligence || {}) },
-      newapi: { ...defaultAdvancedProtection.newapi, ...(value.newapi || {}) },
+function parsePromptGuardMode(value: unknown, fallback: PromptGuardMode = 'inherit'): PromptGuardMode {
+  return typeof value === 'string' && promptGuardModes.includes(value as PromptGuardMode) ? value as PromptGuardMode : fallback
+}
+
+function parsePromptGuardProfile(value: unknown, fallback: PromptGuardProfile = 'balanced'): PromptGuardProfile {
+  return typeof value === 'string' && promptGuardProfiles.includes(value as PromptGuardProfile) ? value as PromptGuardProfile : fallback
+}
+
+function parsePromptGuard(value: unknown): PromptGuardEditorConfig {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  const rawProviders = raw.provider_profiles && typeof raw.provider_profiles === 'object'
+    ? raw.provider_profiles as Record<string, unknown>
+    : {}
+  const rawLayers = raw.layers && typeof raw.layers === 'object'
+    ? raw.layers as Record<string, unknown>
+    : {}
+
+  const providerProfiles: PromptGuardEditorConfig['provider_profiles'] = {}
+  for (const provider of promptGuardProviders) {
+    const profile = rawProviders[provider]
+    if (typeof profile === 'string' && promptGuardProfiles.includes(profile as PromptGuardProfile)) {
+      providerProfiles[provider] = profile as PromptGuardProfile
     }
-  } catch { return defaultAdvancedProtection }
+  }
+
+  const layers = { ...defaultPromptGuard.layers }
+  for (const layer of promptGuardLayers) {
+    const rawLayer = rawLayers[layer] && typeof rawLayers[layer] === 'object'
+      ? rawLayers[layer] as Record<string, unknown>
+      : {}
+    layers[layer] = { mode: parsePromptGuardMode(rawLayer.mode) }
+  }
+
+  return {
+    mode: parsePromptGuardMode(raw.mode),
+    default_profile: parsePromptGuardProfile(raw.default_profile),
+    allow_trusted_overrides: raw.allow_trusted_overrides === true,
+    provider_profiles: providerProfiles,
+    layers,
+  }
+}
+
+function parseAdvancedProtection(value: AdvancedConfigObject): AdvancedProtectionConfig {
+  const enforcement = { ...defaultAdvancedProtection.enforcement, ...(value.enforcement || {}) }
+  const intelligence = { ...defaultAdvancedProtection.intelligence, ...(value.intelligence || {}) }
+  const sidecar = { ...defaultAdvancedProtection.sidecar, ...(value.sidecar || {}) }
+  return {
+    guard: parsePromptGuard(value.guard),
+    enforcement: {
+      ...enforcement,
+      terminal_categories: Array.isArray(enforcement.terminal_categories)
+        ? enforcement.terminal_categories.filter((category: unknown): category is string => typeof category === 'string')
+        : [],
+    },
+    normalization: { ...defaultAdvancedProtection.normalization, ...(value.normalization || {}) },
+    context_discount: { ...defaultAdvancedProtection.context_discount, ...(value.context_discount || {}) },
+    risk: { ...defaultAdvancedProtection.risk, ...(value.risk || {}) },
+    sidecar: {
+      ...sidecar,
+      mode: sidecarModes.includes(sidecar.mode) ? sidecar.mode : defaultAdvancedProtection.sidecar.mode,
+    },
+    session: { ...defaultAdvancedProtection.session, ...(value.session || {}) },
+    attachment: { ...defaultAdvancedProtection.attachment, ...(value.attachment || {}) },
+    output: { ...defaultAdvancedProtection.output, ...(value.output || {}) },
+    intelligence: {
+      ...intelligence,
+      queries: Array.isArray(intelligence.queries)
+        ? intelligence.queries.filter((query: unknown): query is string => typeof query === 'string')
+        : [...defaultAdvancedProtection.intelligence.queries],
+    },
+    newapi: { ...defaultAdvancedProtection.newapi, ...(value.newapi || {}) },
+  }
 }
 
 const defaultForm: PromptFilterForm = {
   prompt_filter_enabled: false,
-  prompt_filter_mode: 'monitor',
+  prompt_filter_mode: 'block',
   prompt_filter_threshold: 50,
   prompt_filter_strict_threshold: 90,
-  prompt_filter_strict_terminal_enabled: false,
+  prompt_filter_strict_terminal_enabled: true,
   prompt_filter_advanced_config: '{}',
   prompt_filter_log_matches: true,
   prompt_filter_max_text_length: 81920,
@@ -192,10 +370,10 @@ function customRuleDraftFromRule(rule: PromptFilterRule): CustomRuleDraft {
 
 const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilterForm => ({
   prompt_filter_enabled: Boolean(settings?.prompt_filter_enabled),
-  prompt_filter_mode: settings?.prompt_filter_mode || 'monitor',
+  prompt_filter_mode: settings?.prompt_filter_mode || 'block',
   prompt_filter_threshold: settings?.prompt_filter_threshold || 50,
   prompt_filter_strict_threshold: settings?.prompt_filter_strict_threshold || 90,
-  prompt_filter_strict_terminal_enabled: Boolean(settings?.prompt_filter_strict_terminal_enabled),
+  prompt_filter_strict_terminal_enabled: settings?.prompt_filter_strict_terminal_enabled ?? true,
   prompt_filter_advanced_config: settings?.prompt_filter_advanced_config || '{}',
   prompt_filter_log_matches: settings?.prompt_filter_log_matches ?? true,
   prompt_filter_max_text_length: settings?.prompt_filter_max_text_length || 81920,
@@ -243,6 +421,10 @@ export default function PromptFilter() {
   const { toast, showToast } = useToast()
   const [form, setForm] = useState<PromptFilterForm>(defaultForm)
   const [saving, setSaving] = useState(false)
+  const advancedConfigError = useMemo(
+    () => parseAdvancedConfigDocument(form.prompt_filter_advanced_config).error,
+    [form.prompt_filter_advanced_config],
+  )
   const [clearing, setClearing] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testText, setTestText] = useState('')
@@ -302,25 +484,40 @@ export default function PromptFilter() {
   ]
 
   const saveSettings = async (partial?: Partial<SystemSettings>) => {
+    if (advancedConfigError) {
+      showToast(t('promptFilter.advancedConfigInvalidSave'), 'error')
+      return
+    }
     setSaving(true)
+    let updated: SystemSettings
     try {
       const payload = partial ?? promptFilterSavePayload(form)
-      const updated = await api.updateSettings(payload)
-      setForm(normalizePromptFilterForm(updated))
-      const rules = await api.getPromptFilterRules()
-      const logsResp = await api.getPromptFilterLogs({ limit: 5 })
-      setData((current) => ({
-        ...current,
-        settings: updated,
-        rules,
-        recentLogs: logsResp.logs ?? [],
-        totalLogs: logsResp.total ?? current.totalLogs,
-      }))
-      showToast(t('promptFilter.saveSuccess'))
+      updated = await api.updateSettings(payload)
     } catch (err) {
       showToast(`${t('promptFilter.saveFailed')}: ${getErrorMessage(err)}`, 'error')
-    } finally {
       setSaving(false)
+      return
+    }
+
+    setForm(normalizePromptFilterForm(updated))
+    setData((current) => ({ ...current, settings: updated }))
+    setSaving(false)
+    showToast(t('promptFilter.saveSuccess'))
+
+    const [rulesResult, logsResult] = await Promise.allSettled([
+      api.getPromptFilterRules(),
+      api.getPromptFilterLogs({ limit: 5 }),
+    ])
+    setData((current) => ({
+      ...current,
+      rules: rulesResult.status === 'fulfilled' ? rulesResult.value : current.rules,
+      recentLogs: logsResult.status === 'fulfilled' ? (logsResult.value.logs ?? []) : current.recentLogs,
+      totalLogs: logsResult.status === 'fulfilled'
+        ? (logsResult.value.total ?? current.totalLogs)
+        : current.totalLogs,
+    }))
+    if (rulesResult.status === 'rejected' || logsResult.status === 'rejected') {
+      showToast(t('promptFilter.saveRefreshFailed'), 'warning')
     }
   }
 
@@ -380,7 +577,7 @@ export default function PromptFilter() {
                   <RefreshCw className="size-3.5" />
                   {t('common.refresh')}
                 </Button>
-                <Button onClick={() => void saveSettings()} disabled={saving}>
+                <Button onClick={() => void saveSettings()} disabled={saving || Boolean(advancedConfigError)}>
                   <Save className="size-4" />
                   {saving ? t('common.saving') : t('common.save')}
                 </Button>
@@ -417,6 +614,7 @@ export default function PromptFilter() {
             runTest={runTest}
             clearLogs={clearLogs}
             clearing={clearing}
+            advancedConfigError={advancedConfigError}
             onSave={() => void saveSettings()}
           />
         ) : null}
@@ -486,7 +684,13 @@ function PromptFilterTabs({ activeView }: { activeView: PromptFilterView }) {
   )
 }
 
-function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+function AdvancedProtectionEditor({
+  value,
+  onChange,
+}: {
+  value: string
+  onChange: (value: string) => void
+}) {
   const { t } = useTranslation()
   const [generatedNewAPISecret, setGeneratedNewAPISecret] = useState('')
   const [secretCopied, setSecretCopied] = useState(false)
@@ -495,9 +699,18 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
   const [secretError, setSecretError] = useState('')
   const [secretRevealOpen, setSecretRevealOpen] = useState(false)
   const [secretCloseConfirmOpen, setSecretCloseConfirmOpen] = useState(false)
-  const config = useMemo(() => parseAdvancedProtection(value), [value])
+  const document = useMemo(() => parseAdvancedConfigDocument(value), [value])
+  const config = useMemo(
+    () => parseAdvancedProtection(document.value ?? {}),
+    [document.value],
+  )
+  const applyPatches = (patches: readonly AdvancedConfigPatch[]) => {
+    const result = patchAdvancedConfigDocument(value, patches)
+    if (!result.ok) return
+    onChange(result.serialized)
+  }
   const update = <K extends keyof AdvancedProtectionConfig>(section: K, patch: Partial<AdvancedProtectionConfig[K]>) => {
-    onChange(JSON.stringify({ ...config, [section]: { ...config[section], ...patch } }))
+    applyPatches(Object.entries(patch).map(([key, next]) => ({ path: [section, key], value: next })))
   }
   const setBool = <K extends keyof AdvancedProtectionConfig>(section: K, key: string, next: boolean) => {
     update(section, { [key]: next } as never)
@@ -528,42 +741,328 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
   }
   const terminalCategoriesText = config.enforcement.terminal_categories.join(', ')
   const queryCount = config.intelligence.queries.length
+  const guardModeOptions = promptGuardModes.map((mode) => ({
+    value: mode,
+    label: t(`promptFilter.guard.modes.${mode}.label`),
+  }))
+  const guardAuxiliaryModeOptions = promptGuardAuxiliaryModes.map((mode) => ({
+    value: mode,
+    label: t(`promptFilter.guard.modes.${mode}.label`),
+  }))
+  const guardProfileOptions = promptGuardProfiles.map((profile) => ({
+    value: profile,
+    label: t(`promptFilter.guard.profiles.${profile}.label`),
+  }))
+  const guardProviderProfileOptions = [
+    { value: inheritedPromptGuardProfile, label: t('promptFilter.guard.inheritDefaultProfile') },
+    ...guardProfileOptions,
+  ]
+  const sidecarModeOptions = sidecarModes.map((mode) => ({
+    value: mode,
+    label: t(`promptFilter.extensions.sidecar.modes.${mode}`),
+  }))
+  const unknownEnumLabel = t('promptFilter.guard.unknownEnumPreserved')
+  const guardModeSelection = selectWithPreservedUnknown(
+    readAdvancedConfigPath(document.value, ['guard', 'mode']),
+    config.guard.mode,
+    guardModeOptions,
+    unknownEnumLabel,
+  )
+  const guardProfileSelection = selectWithPreservedUnknown(
+    readAdvancedConfigPath(document.value, ['guard', 'default_profile']),
+    config.guard.default_profile,
+    guardProfileOptions,
+    unknownEnumLabel,
+  )
+  const sidecarModeSelection = selectWithPreservedUnknown(
+    readAdvancedConfigPath(document.value, ['sidecar', 'mode']),
+    config.sidecar.mode,
+    sidecarModeOptions,
+    unknownEnumLabel,
+  )
+  const updateGuard = (patch: Partial<PromptGuardEditorConfig>) => update('guard', patch)
+  const updateGuardProvider = (provider: PromptGuardProvider, profile: PromptGuardProfile | null) => {
+    applyPatches([{
+      path: ['guard', 'provider_profiles', provider],
+      value: profile ?? undefined,
+      remove: profile === null,
+    }])
+  }
+  const updateGuardLayer = (layer: PromptGuardLayer, mode: PromptGuardMode) => {
+    applyPatches([{ path: ['guard', 'layers', layer, 'mode'], value: mode }])
+  }
+
+  if (!document.ok) {
+    return (
+      <div role="alert" className="rounded-lg border border-destructive/30 bg-destructive/[0.06] p-4">
+        <div className="flex items-start gap-3">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <div className="min-w-0">
+            <div className="font-semibold text-foreground">{t('promptFilter.advancedConfigInvalidTitle')}</div>
+            <p className="mt-1 text-sm leading-6 text-muted-foreground">{t('promptFilter.advancedConfigInvalidDescription')}</p>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-3">
       <SectionTitle title={t('promptFilter.advancedVisualTitle')} />
 
-      {/* Core defense: compact 2×2 dashboard — equal-height cards, unified control grid */}
+      <AdvancedPanel title={t('promptFilter.guard.title')} hint={t('promptFilter.guard.description')}>
+        <div className="space-y-4">
+          <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-4">
+            <div className="rounded-lg border border-foreground/10 bg-muted/15 p-3 dark:border-foreground/15">
+              <CompactField label={t('promptFilter.guard.globalMode')} hint={t('promptFilter.guard.globalModeHint')}>
+                <Select
+                  value={guardModeSelection.value}
+                  onValueChange={(next) => updateGuard({ mode: next as PromptGuardMode })}
+                  options={guardModeSelection.options}
+                />
+              </CompactField>
+            </div>
+            <div className="rounded-lg border border-foreground/10 bg-muted/15 p-3 dark:border-foreground/15">
+              <CompactField label={t('promptFilter.guard.defaultProfile')} hint={t('promptFilter.guard.defaultProfileHint')}>
+                <Select
+                  value={guardProfileSelection.value}
+                  onValueChange={(next) => updateGuard({ default_profile: next as PromptGuardProfile })}
+                  options={guardProfileSelection.options}
+                />
+              </CompactField>
+            </div>
+            <div className="rounded-lg border border-foreground/10 bg-muted/15 p-3 dark:border-foreground/15">
+              <SwitchField
+                label={t('promptFilter.guard.trustedOverrides')}
+                hint={t('promptFilter.guard.trustedOverridesHint')}
+                checked={config.guard.allow_trusted_overrides}
+                onCheckedChange={(next) => updateGuard({ allow_trusted_overrides: next })}
+              />
+            </div>
+            <div className="flex items-start gap-3 rounded-lg border border-sky-500/20 bg-sky-500/[0.06] p-3 text-sm dark:border-sky-400/20 dark:bg-sky-400/[0.07]">
+              <Shield className="mt-0.5 size-4 shrink-0 text-sky-600 dark:text-sky-300" />
+              <div className="min-w-0">
+                <div className="font-medium text-foreground">{t('promptFilter.guard.compatibilityTitle')}</div>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.guard.compatibilityHint')}</p>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+            {promptGuardModes.map((mode) => (
+              <div
+                key={mode}
+                className={cn(
+                  'rounded-lg border px-3 py-2.5 transition-colors',
+                  guardModeSelection.value === mode
+                    ? 'border-primary/35 bg-primary/[0.07]'
+                    : 'border-foreground/10 bg-background dark:border-foreground/15',
+                )}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold">{t(`promptFilter.guard.modes.${mode}.label`)}</span>
+                  {guardModeSelection.value === mode ? <Badge className="h-5 px-1.5 text-[10px]">{t('promptFilter.guard.active')}</Badge> : null}
+                </div>
+                <p className="mt-1 text-[11px] leading-[1.45] text-muted-foreground">{t(`promptFilter.guard.modes.${mode}.description`)}</p>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid gap-3 xl:grid-cols-2">
+            <div className="rounded-lg border border-foreground/10 p-3 dark:border-foreground/15">
+              <div className="mb-3 flex items-start gap-2.5">
+                <Network className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <div>
+                  <h4 className="text-sm font-semibold">{t('promptFilter.guard.providerTitle')}</h4>
+                  <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{t('promptFilter.guard.providerDescription')}</p>
+                </div>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {promptGuardProviders.map((provider) => {
+                  const selection = selectWithPreservedUnknown(
+                    readAdvancedConfigPath(document.value, ['guard', 'provider_profiles', provider]),
+                    config.guard.provider_profiles[provider] ?? inheritedPromptGuardProfile,
+                    guardProviderProfileOptions,
+                    unknownEnumLabel,
+                  )
+                  return (
+                    <CompactField
+                      key={provider}
+                      label={t(`promptFilter.guard.providers.${provider}.label`)}
+                      hint={t(`promptFilter.guard.providers.${provider}.description`)}
+                    >
+                      <Select
+                        value={selection.value}
+                        onValueChange={(next) => updateGuardProvider(
+                          provider,
+                          next === inheritedPromptGuardProfile ? null : next as PromptGuardProfile,
+                        )}
+                        options={selection.options}
+                      />
+                    </CompactField>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-foreground/10 p-3 dark:border-foreground/15">
+              <div className="mb-3 flex items-start gap-2.5">
+                <Gauge className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <div>
+                  <h4 className="text-sm font-semibold">{t('promptFilter.guard.profileTitle')}</h4>
+                  <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{t('promptFilter.guard.profileDescription')}</p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                {promptGuardProfiles.map((profile) => (
+                  <div
+                    key={profile}
+                    className={cn(
+                      'rounded-md border px-3 py-2',
+                      guardProfileSelection.value === profile
+                        ? 'border-primary/30 bg-primary/[0.06]'
+                        : 'border-foreground/10 bg-muted/10 dark:border-foreground/15',
+                    )}
+                  >
+                    <div className="text-xs font-semibold">{t(`promptFilter.guard.profiles.${profile}.label`)}</div>
+                    <p className="mt-0.5 text-[11px] leading-[1.45] text-muted-foreground">{t(`promptFilter.guard.profiles.${profile}.description`)}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-foreground/10 p-3 dark:border-foreground/15">
+            <div className="mb-3 flex items-start gap-2.5">
+              <Layers className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+              <div>
+                <h4 className="text-sm font-semibold">{t('promptFilter.guard.layersTitle')}</h4>
+                <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{t('promptFilter.guard.layersDescription')}</p>
+              </div>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {promptGuardLayers.map((layer) => {
+                const layerModeOptions = layer === 'current_user' ? guardModeOptions : guardAuxiliaryModeOptions
+                const selection = selectWithPreservedUnknown(
+                  readAdvancedConfigPath(document.value, ['guard', 'layers', layer, 'mode']),
+                  config.guard.layers[layer].mode,
+                  layerModeOptions,
+                  unknownEnumLabel,
+                )
+                return (
+                  <CompactField
+                    key={layer}
+                    label={t(`promptFilter.guard.layers.${layer}.label`)}
+                    hint={t(`promptFilter.guard.layers.${layer}.description`)}
+                  >
+                    <Select
+                      value={selection.value}
+                      onValueChange={(next) => updateGuardLayer(layer, next as PromptGuardMode)}
+                      options={selection.options}
+                    />
+                  </CompactField>
+                )
+              })}
+            </div>
+          </div>
+
+        </div>
+      </AdvancedPanel>
+
+      {/* Core defense: bounded decoding and intent-aware scoring keep the default preset useful without widening penalties. */}
       <div className="grid gap-3 lg:grid-cols-2">
-        <AdvancedPanel title={t('promptFilter.normalizationTitle')}>
-          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-3">
+        <div className="lg:col-span-2">
+          <AdvancedPanel title={t('promptFilter.normalizationTitle')} hint={t('promptFilter.help.normalizationPanel')}>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-3 xl:grid-cols-6">
+              <SwitchField
+                label={t('promptFilter.enabled')}
+                hint={t('promptFilter.help.normalizationEnabled')}
+                checked={config.normalization.enabled}
+                onCheckedChange={(next) => setBool('normalization', 'enabled', next)}
+              />
+              <CompactField label={t('promptFilter.decodeRuns')} hint={t('promptFilter.help.decodeRuns')}>
+                <DraftNumberInput min={1} max={2} value={config.normalization.max_decode_runs} onValueChange={(v) => update('normalization', { max_decode_runs: v })} />
+              </CompactField>
+              <CompactField label={t('promptFilter.maxDecodedBytes')} hint={t('promptFilter.help.maxDecodedBytes')}>
+                <DraftNumberInput min={1024} max={65536} value={config.normalization.max_decoded_bytes} onValueChange={(v) => update('normalization', { max_decoded_bytes: v })} />
+              </CompactField>
+              <CompactField label={t('promptFilter.maxEncodedBlocks')} hint={t('promptFilter.help.maxEncodedBlocks')}>
+                <DraftNumberInput min={1} max={32} value={config.normalization.max_encoded_blocks} onValueChange={(v) => update('normalization', { max_encoded_blocks: v })} />
+              </CompactField>
+              <SwitchField
+                label={t('promptFilter.decoders.url')}
+                hint={t('promptFilter.help.decodeUrl')}
+                checked={config.normalization.decode_url}
+                onCheckedChange={(next) => setBool('normalization', 'decode_url', next)}
+              />
+              <SwitchField
+                label={t('promptFilter.decoders.html')}
+                hint={t('promptFilter.help.decodeHtml')}
+                checked={config.normalization.decode_html}
+                onCheckedChange={(next) => setBool('normalization', 'decode_html', next)}
+              />
+              <SwitchField
+                label={t('promptFilter.decoders.base64')}
+                hint={t('promptFilter.help.decodeBase64')}
+                checked={config.normalization.decode_base64}
+                onCheckedChange={(next) => setBool('normalization', 'decode_base64', next)}
+              />
+              <SwitchField
+                label={t('promptFilter.decoders.hex')}
+                hint={t('promptFilter.help.decodeHex')}
+                checked={config.normalization.decode_hex}
+                onCheckedChange={(next) => setBool('normalization', 'decode_hex', next)}
+              />
+              <SwitchField
+                label={t('promptFilter.decoders.rot13')}
+                hint={t('promptFilter.help.decodeRot13')}
+                checked={config.normalization.decode_rot13}
+                onCheckedChange={(next) => setBool('normalization', 'decode_rot13', next)}
+              />
+              <SwitchField
+                label={t('promptFilter.decoders.escapes')}
+                hint={t('promptFilter.help.decodeEscapes')}
+                checked={config.normalization.decode_escapes}
+                onCheckedChange={(next) => setBool('normalization', 'decode_escapes', next)}
+              />
+              <SwitchField
+                label={t('promptFilter.decoders.compression')}
+                hint={t('promptFilter.help.decodeCompression')}
+                checked={config.normalization.decode_compression}
+                onCheckedChange={(next) => setBool('normalization', 'decode_compression', next)}
+              />
+            </div>
+          </AdvancedPanel>
+        </div>
+
+        <AdvancedPanel title={t('promptFilter.contextDiscount.title')} hint={t('promptFilter.contextDiscount.description')}>
+          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
             <SwitchField
-              label={t('promptFilter.enabled')}
-              hint={t('promptFilter.help.normalizationEnabled')}
-              checked={config.normalization.enabled}
-              onCheckedChange={(next) => setBool('normalization', 'enabled', next)}
+              label={t('promptFilter.contextDiscount.enabled')}
+              hint={t('promptFilter.contextDiscount.enabledHint')}
+              checked={config.context_discount.enabled}
+              onCheckedChange={(next) => setBool('context_discount', 'enabled', next)}
             />
-            <CompactField label={t('promptFilter.decodeRuns')} hint={t('promptFilter.help.decodeRuns')}>
-              <DraftNumberInput min={1} max={2} value={config.normalization.max_decode_runs} onValueChange={(v) => update('normalization', { max_decode_runs: v })} />
+            <SwitchField
+              label={t('promptFilter.contextDiscount.intentAware')}
+              hint={t('promptFilter.contextDiscount.intentAwareHint')}
+              checked={config.context_discount.intent_aware}
+              onCheckedChange={(next) => setBool('context_discount', 'intent_aware', next)}
+            />
+            <CompactField label={t('promptFilter.contextDiscount.maxDiscount')} hint={t('promptFilter.contextDiscount.maxDiscountHint')}>
+              <DraftNumberInput
+                min={0}
+                max={90}
+                value={config.context_discount.max_discount}
+                onValueChange={(v) => update('context_discount', {
+                  max_discount: v,
+                  operational_max_discount: Math.min(config.context_discount.operational_max_discount, v),
+                })}
+              />
             </CompactField>
-            <SwitchField
-              label="URL Decode"
-              hint={t('promptFilter.help.decodeUrl')}
-              checked={config.normalization.decode_url}
-              onCheckedChange={(next) => setBool('normalization', 'decode_url', next)}
-            />
-            <SwitchField
-              label="HTML Decode"
-              hint={t('promptFilter.help.decodeHtml')}
-              checked={config.normalization.decode_html}
-              onCheckedChange={(next) => setBool('normalization', 'decode_html', next)}
-            />
-            <SwitchField
-              label="Base64 Decode"
-              hint={t('promptFilter.help.decodeBase64')}
-              checked={config.normalization.decode_base64}
-              onCheckedChange={(next) => setBool('normalization', 'decode_base64', next)}
-            />
+            <CompactField label={t('promptFilter.contextDiscount.operationalMaxDiscount')} hint={t('promptFilter.contextDiscount.operationalMaxDiscountHint')}>
+              <DraftNumberInput min={0} max={config.context_discount.max_discount} value={config.context_discount.operational_max_discount} onValueChange={(v) => update('context_discount', { operational_max_discount: v })} />
+            </CompactField>
           </div>
         </AdvancedPanel>
 
@@ -571,7 +1070,7 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
           <CompactField label={t('promptFilter.terminalCategories')} hint={t('promptFilter.help.terminalCategories')}>
             <Input
               value={terminalCategoriesText}
-              placeholder="reverse_engineering, malware"
+              placeholder="malware, credential_attack"
               onChange={(e) => update('enforcement', {
                 terminal_categories: e.target.value.split(',').map((item) => item.trim()).filter(Boolean),
               })}
@@ -581,7 +1080,7 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
         </AdvancedPanel>
 
         <AdvancedPanel title={t('promptFilter.riskTitle')}>
-          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
+          <div className="grid grid-cols-1 gap-x-3 gap-y-3 sm:grid-cols-2">
             <SwitchField
               label={t('promptFilter.enabled')}
               hint={t('promptFilter.help.riskEnabled')}
@@ -601,7 +1100,7 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
         </AdvancedPanel>
 
         <AdvancedPanel title={t('promptFilter.outputScanTitle')}>
-          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
+          <div className="grid grid-cols-1 gap-x-3 gap-y-3 sm:grid-cols-2">
             <SwitchField
               label={t('promptFilter.enabled')}
               hint={t('promptFilter.help.outputEnabled')}
@@ -614,14 +1113,109 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
               checked={config.output.strict_only}
               onCheckedChange={(next) => setBool('output', 'strict_only', next)}
             />
-            <CompactField label={t('promptFilter.bufferBytes')} hint={t('promptFilter.help.bufferBytes')}>
-              <DraftNumberInput min={512} max={65536} value={config.output.buffer_bytes} onValueChange={(v) => update('output', { buffer_bytes: v })} />
+          </div>
+        </AdvancedPanel>
+      </div>
+
+      <SectionTitle title={t('promptFilter.extensions.title')} />
+      <div className="grid gap-3 xl:grid-cols-2">
+        <AdvancedPanel
+          title={t('promptFilter.extensions.sidecar.title')}
+          hint={t('promptFilter.extensions.sidecar.description')}
+        >
+          <div className="grid grid-cols-1 gap-x-3 gap-y-3 sm:grid-cols-3">
+            <SwitchField
+              label={t('promptFilter.extensions.sidecar.enabled')}
+              hint={t('promptFilter.extensions.sidecar.enabledHint')}
+              checked={config.sidecar.enabled}
+              onCheckedChange={(next) => setBool('sidecar', 'enabled', next)}
+            />
+            <CompactField label={t('promptFilter.extensions.sidecar.mode')} hint={t('promptFilter.extensions.sidecar.modeHint')}>
+              <Select value={sidecarModeSelection.value} onValueChange={(next) => update('sidecar', { mode: next as AdvancedProtectionConfig['sidecar']['mode'] })} options={sidecarModeSelection.options} />
             </CompactField>
-            <CompactField label={t('promptFilter.overlapBytes')} hint={t('promptFilter.help.overlapBytes')}>
-              <DraftNumberInput min={64} max={16384} value={config.output.overlap_bytes} onValueChange={(v) => update('output', { overlap_bytes: v })} />
+            <SwitchField
+              label={t('promptFilter.extensions.sidecar.failClosed')}
+              hint={t('promptFilter.extensions.sidecar.failClosedHint')}
+              checked={config.sidecar.fail_closed}
+              onCheckedChange={(next) => setBool('sidecar', 'fail_closed', next)}
+            />
+            <div className="sm:col-span-3">
+              <CompactField label={t('promptFilter.extensions.serviceURL')} hint={t('promptFilter.extensions.sidecar.baseURLHint')}>
+                <Input value={config.sidecar.base_url} placeholder="http://127.0.0.1:18110" onChange={(e) => update('sidecar', { base_url: e.target.value })} />
+              </CompactField>
+            </div>
+          </div>
+        </AdvancedPanel>
+
+        <AdvancedPanel
+          title={t('promptFilter.extensions.session.title')}
+          hint={t('promptFilter.extensions.session.description')}
+          footer={(
+            <div className="rounded-lg border border-sky-500/20 bg-sky-500/[0.06] p-3 text-xs leading-5 text-muted-foreground dark:border-sky-400/20 dark:bg-sky-400/[0.07]">
+              {t('promptFilter.extensions.session.recommendedHint')}
+            </div>
+          )}
+        >
+          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-3">
+            <SwitchField
+              label={t('promptFilter.extensions.session.enabled')}
+              hint={t('promptFilter.extensions.session.enabledHint')}
+              checked={config.session.enabled}
+              onCheckedChange={(next) => setBool('session', 'enabled', next)}
+            />
+            <SwitchField
+              label={t('promptFilter.extensions.session.requireSignedIdentity')}
+              hint={t('promptFilter.extensions.session.requireSignedIdentityHint')}
+              checked={config.session.require_signed_identity}
+              onCheckedChange={(next) => setBool('session', 'require_signed_identity', next)}
+            />
+            <SwitchField
+              label={t('promptFilter.extensions.session.combineShortFragments')}
+              hint={t('promptFilter.extensions.session.combineShortFragmentsHint')}
+              checked={config.session.combine_short_fragments}
+              onCheckedChange={(next) => setBool('session', 'combine_short_fragments', next)}
+            />
+            <CompactField label={t('promptFilter.extensions.session.window')} hint={t('promptFilter.extensions.session.windowHint')}>
+              <DraftNumberInput min={30} max={3600} value={config.session.window_seconds} onValueChange={(v) => update('session', { window_seconds: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.extensions.session.maxFragments')} hint={t('promptFilter.extensions.session.maxFragmentsHint')}>
+              <DraftNumberInput min={1} max={10} value={config.session.max_fragments} onValueChange={(v) => update('session', { max_fragments: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.extensions.session.maxTextLength')} hint={t('promptFilter.extensions.session.maxTextLengthHint')}>
+              <DraftNumberInput min={512} max={16384} value={config.session.max_text_length} onValueChange={(v) => update('session', { max_text_length: v })} />
+            </CompactField>
+            <CompactField label={t('promptFilter.extensions.session.shortFragmentMaxChars')} hint={t('promptFilter.extensions.session.shortFragmentMaxCharsHint')}>
+              <DraftNumberInput min={1} max={256} value={config.session.short_fragment_max_chars} onValueChange={(v) => update('session', { short_fragment_max_chars: v })} />
             </CompactField>
           </div>
         </AdvancedPanel>
+
+        <div className="xl:col-span-2">
+          <AdvancedPanel
+            title={t('promptFilter.extensions.attachment.title')}
+            hint={t('promptFilter.extensions.attachment.description')}
+          >
+            <div className="grid grid-cols-1 gap-x-3 gap-y-3 sm:grid-cols-3">
+              <SwitchField
+                label={t('promptFilter.extensions.attachment.enabled')}
+                hint={t('promptFilter.extensions.attachment.enabledHint')}
+                checked={config.attachment.enabled}
+                onCheckedChange={(next) => setBool('attachment', 'enabled', next)}
+              />
+              <SwitchField
+                label={t('promptFilter.extensions.attachment.allowRemoteURLs')}
+                hint={t('promptFilter.extensions.attachment.allowRemoteURLsHint')}
+                checked={config.attachment.allow_remote_urls}
+                onCheckedChange={(next) => setBool('attachment', 'allow_remote_urls', next)}
+              />
+              <div className="sm:col-span-3">
+                <CompactField label={t('promptFilter.extensions.serviceURL')} hint={t('promptFilter.extensions.attachment.baseURLHint')}>
+                  <Input value={config.attachment.base_url} placeholder="http://127.0.0.1:18120" onChange={(e) => update('attachment', { base_url: e.target.value })} />
+                </CompactField>
+              </div>
+            </div>
+          </AdvancedPanel>
+        </div>
       </div>
 
       {/* Integration row: NewAPI + Intelligence — matched structure & equal height */}
@@ -674,22 +1268,13 @@ function AdvancedProtectionEditor({ value, onChange }: { value: string; onChange
             </details>
           )}
         >
-          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
+          <div className="grid grid-cols-1 gap-x-3 gap-y-3">
             <SwitchField
               label={t('promptFilter.newapi.enabled')}
               hint={t('promptFilter.newapi.enabledHint')}
               checked={config.newapi.enabled}
               onCheckedChange={(next) => setBool('newapi', 'enabled', next)}
             />
-            <CompactField label={t('promptFilter.newapi.clockSkew')} hint={t('promptFilter.newapi.clockSkewHint')}>
-              <DraftNumberInput min={30} max={600} value={config.newapi.max_clock_skew_seconds} onValueChange={(v) => update('newapi', { max_clock_skew_seconds: v })} />
-            </CompactField>
-            <CompactField label={t('promptFilter.newapi.offenseWindow')} hint={t('promptFilter.newapi.offenseWindowHint')}>
-              <DraftNumberInput min={60} max={2592000} value={config.newapi.offense_window_seconds} onValueChange={(v) => update('newapi', { offense_window_seconds: v })} />
-            </CompactField>
-            <CompactField label={t('promptFilter.newapi.banAfter')} hint={t('promptFilter.newapi.banAfterHint')}>
-              <DraftNumberInput min={2} max={10} value={config.newapi.ban_after} onValueChange={(v) => update('newapi', { ban_after: v })} />
-            </CompactField>
           </div>
         </AdvancedPanel>
 
@@ -861,7 +1446,15 @@ function SoftCodeBlock({ children, className }: { children: ReactNode; className
   )
 }
 
-function CompactField({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+function CompactField({
+  label,
+  hint,
+  children,
+}: {
+  label: string
+  hint?: string
+  children: ReactNode
+}) {
   return (
     <label className="flex min-w-0 flex-col gap-1.5">
       <span className="flex h-4 items-center gap-1 truncate text-xs font-medium leading-none text-muted-foreground">
@@ -1580,6 +2173,7 @@ function OverviewView({
   runTest,
   clearLogs,
   clearing,
+  advancedConfigError,
   onSave,
 }: {
   form: PromptFilterForm
@@ -1601,6 +2195,7 @@ function OverviewView({
   runTest: () => void
   clearLogs: () => Promise<void>
   clearing: boolean
+  advancedConfigError: string | null
   onSave: () => void
 }) {
   const { t } = useTranslation()
@@ -1619,7 +2214,7 @@ function OverviewView({
           </Badge>
         </MetricTile>
         <MetricTile label={t('promptFilter.currentMode')}>
-          {modeOptions.find((item) => item.value === form.prompt_filter_mode)?.label ?? form.prompt_filter_mode}
+          {modeOptions.find((item) => item.value === form.prompt_filter_mode)?.label ?? t('promptFilter.unknownMode')}
         </MetricTile>
         <MetricTile label={t('promptFilter.recentBlockedLogs')}>{stats.blocks}</MetricTile>
         <MetricTile label={t('promptFilter.totalLogs')}>{totalLogs}</MetricTile>
@@ -1653,9 +2248,8 @@ function OverviewView({
               <Field label={t('promptFilter.strictThreshold')}>
                 <DraftNumberInput min={1} max={100} value={form.prompt_filter_strict_threshold} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_strict_threshold: value }))} />
               </Field>
-              <Field label={t('promptFilter.strictTerminal')}>
+              <Field label={t('promptFilter.strictTerminal')} hint={t('promptFilter.strictTerminalHint')}>
                 <Select value={form.prompt_filter_strict_terminal_enabled ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_strict_terminal_enabled: value === 'true' }))} options={booleanOptions} />
-                <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.strictTerminalHint')}</span>
               </Field>
               <Field label={t('promptFilter.logMatches')}>
                 <Select value={form.prompt_filter_log_matches ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_log_matches: value === 'true' }))} options={booleanOptions} />
@@ -1666,6 +2260,7 @@ function OverviewView({
             </div>
             <Field label={t('promptFilter.sensitiveWords')}>
               <Textarea rows={5} value={form.prompt_filter_sensitive_words} placeholder={t('promptFilter.sensitiveWordsPlaceholder')} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_sensitive_words: event.target.value }))} />
+              <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.sensitiveWordsHint')}</span>
             </Field>
           </CardContent>
         </Card>
@@ -1754,7 +2349,7 @@ function OverviewView({
             </Field>
           </div>
 
-          <Button onClick={onSave} disabled={saving}>
+          <Button onClick={onSave} disabled={saving || Boolean(advancedConfigError)}>
             <Save className="size-4" />
             {saving ? t('common.saving') : t('common.save')}
           </Button>
@@ -1852,7 +2447,7 @@ function LogsView({ clearLogs, clearing }: { clearLogs: () => Promise<void>; cle
 
         <div className="mb-4 grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3">
           <Field label={t('promptFilter.colAction')}>
-            <Select value={draftFilters.action} onValueChange={(value) => setDraftFilters((current) => ({ ...current, action: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'block', value: 'block' }, { label: 'warn', value: 'warn' }, { label: 'allow', value: 'allow' }]} />
+            <Select value={draftFilters.action} onValueChange={(value) => setDraftFilters((current) => ({ ...current, action: value }))} options={[{ label: t('common.all'), value: '' }, { label: t('promptFilter.modeBlock'), value: 'block' }, { label: t('promptFilter.modeWarn'), value: 'warn' }, { label: t('promptFilter.actionAllow'), value: 'allow' }]} />
           </Field>
           <Field label={t('promptFilter.source')}>
             <Select value={draftFilters.source} onValueChange={(value) => setDraftFilters((current) => ({ ...current, source: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'local_filter', value: 'local_filter' }, { label: 'upstream_cyber_policy', value: 'upstream_cyber_policy' }]} />
@@ -2537,7 +3132,7 @@ function PromptFilterLogsTable({ logs, compact = false }: { logs: PromptFilterLo
             <TableHead className={compact ? 'w-[92px]' : 'w-[150px]'}>{t('promptFilter.colTime')}</TableHead>
             <TableHead className={compact ? 'w-[82px]' : 'w-[96px]'}>{t('promptFilter.colAction')}</TableHead>
             <TableHead className={compact ? 'w-[150px]' : 'w-[180px]'}>{t('promptFilter.colEndpoint')}</TableHead>
-            <TableHead className={compact ? 'w-[72px]' : 'w-[88px]'}>{t('promptFilter.colScore')}</TableHead>
+            <TableHead className={compact ? 'w-[132px]' : 'w-[156px]'}>{t('promptFilter.colScore')}</TableHead>
             <TableHead className={compact ? 'w-[150px]' : 'w-[220px]'}>{t('promptFilter.colMatch')}</TableHead>
             <TableHead className={compact ? 'w-[118px]' : 'w-[160px]'}>{t('promptFilter.colApiKey')}</TableHead>
             <TableHead>{t('promptFilter.colPreview')}</TableHead>
@@ -2593,12 +3188,13 @@ function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTextAreaEl
 }
 
 function VerdictBadge({ verdict }: { verdict: PromptFilterVerdict }) {
+  const { t } = useTranslation()
   const action = verdict.action
   if (action === 'block') {
     return (
       <Badge variant="destructive" className="gap-1.5">
         <ShieldAlert className="size-3" />
-        Block
+        {t('promptFilter.modeBlock')}
       </Badge>
     )
   }
@@ -2606,26 +3202,39 @@ function VerdictBadge({ verdict }: { verdict: PromptFilterVerdict }) {
     return (
       <Badge variant="outline" className="gap-1.5 border-amber-500/30 text-amber-700 dark:text-amber-300">
         <AlertTriangle className="size-3" />
-        Warn
+        {t('promptFilter.modeWarn')}
       </Badge>
     )
   }
   return (
     <Badge variant="outline" className="gap-1.5 border-emerald-500/30 text-emerald-700 dark:text-emerald-300">
       <CheckCircle2 className="size-3" />
-      Allow
+      {t('promptFilter.actionAllow')}
     </Badge>
   )
 }
 
 function VerdictPanel({ verdict }: { verdict: PromptFilterVerdict }) {
+  const { t } = useTranslation()
+  const localizedMode = verdict.mode === 'block'
+    ? t('promptFilter.modeBlock')
+    : verdict.mode === 'warn'
+      ? t('promptFilter.modeWarn')
+      : verdict.mode === 'monitor'
+        ? t('promptFilter.modeMonitor')
+        : promptGuardModes.includes(verdict.mode as PromptGuardMode)
+          ? t(`promptFilter.guard.modes.${verdict.mode}.label`)
+          : t('promptFilter.unknownMode')
+  const localizedReview = verdict.reviewed
+    ? (verdict.review_flagged ? t('promptFilter.testReviewFlagged') : t('promptFilter.testReviewCleared'))
+    : t('promptFilter.testReviewSkipped')
   return (
     <div className="rounded-lg border border-border bg-muted/25 p-3">
       <div className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-2 text-sm">
-        <MiniStat label="Mode" value={verdict.mode || '-'} />
-        <MiniStat label="Score" value={`${verdict.score} / ${verdict.threshold}`} />
-        <MiniStat label="Matches" value={String(verdict.matched?.length ?? 0)} />
-        <MiniStat label="Review" value={verdict.reviewed ? (verdict.review_flagged ? 'Flagged' : 'Cleared') : '-'} />
+        <MiniStat label={t('promptFilter.testResultMode')} value={localizedMode} />
+        <MiniStat label={t('promptFilter.testResultScore')} value={`${verdict.score} / ${verdict.threshold}`} />
+        <MiniStat label={t('promptFilter.testResultMatches')} value={String(verdict.matched?.length ?? 0)} />
+        <MiniStat label={t('promptFilter.testResultReview')} value={localizedReview} />
       </div>
       {verdict.reason ? <p className="mt-3 text-sm text-muted-foreground">{verdict.reason}</p> : null}
       {verdict.review_error ? <p className="mt-2 text-sm text-destructive">{verdict.review_error}</p> : null}
@@ -2754,7 +3363,23 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
   const [expanded, setExpanded] = useState(false)
   const fullText = (log.full_text || '').trim()
   const hasFull = fullText.length > 0
-  const hitTerms = extractHitTerms(log.text_preview || '')
+  const matchContext = (log.match_context || '').trim()
+  const userPrompt = (log.text_preview || '').trim()
+  const primaryOriginLabel = log.primary_origin
+    ? t(`promptFilter.origins.${log.primary_origin}`, { defaultValue: log.primary_origin })
+    : t('promptFilter.origins.unknown')
+  const policyProfileLabel = log.policy_profile && promptGuardProfiles.includes(log.policy_profile as PromptGuardProfile)
+    ? t(`promptFilter.guard.profiles.${log.policy_profile}.label`)
+    : t('promptFilter.guard.unknownProfile')
+  const hitTerms = extractHitTerms(matchContext || userPrompt)
+  const fallbackPreview = log.error_code || log.review_error || ''
+  const auxiliaryOrigin = Boolean(log.primary_origin && log.primary_origin !== 'current_user')
+  const userPromptLabel = !matchContext && auxiliaryOrigin
+    ? t('promptFilter.legacyRequestPreviewLabel')
+    : t('promptFilter.userPromptLabel')
+  const legacyMissingMatchContext = !matchContext && !userPrompt && !fullText &&
+    auxiliaryOrigin
+  const auditScore = typeof log.audit_score === 'number' ? log.audit_score : undefined
   return (
     <>
     <TableRow>
@@ -2762,20 +3387,55 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         <div className="font-medium text-foreground">{formatRelativeTime(log.created_at, { variant: 'compact' })}</div>
         {!compact ? <div className="text-xs text-muted-foreground">{formatBeijingTime(log.created_at)}</div> : null}
       </TableCell>
-      <TableCell>
-        <div className="flex flex-col items-start gap-1">
+      <TableCell className="min-w-0 align-top">
+        {/* table-fixed 下动作列较窄；徽章默认 whitespace-nowrap 会按内容自然宽度
+            横向溢出盖住相邻端点列（如"当前用户 Prompt"这类长 origin 标签）。
+            允许列内换行，把内容约束在单元格宽度内。 */}
+        <div className="flex min-w-0 flex-col items-start gap-1">
           <ActionBadge action={log.action} />
+          {log.policy_profile ? <Badge variant="outline" className="h-auto max-w-full whitespace-normal break-words text-left leading-tight text-[11px]">{policyProfileLabel}</Badge> : null}
+          {log.primary_origin ? (
+            <Badge
+              variant="secondary"
+              className="h-auto max-w-full whitespace-normal break-words text-left leading-tight text-[11px]"
+              title={`${t('promptFilter.triggerOrigin')}: ${primaryOriginLabel}`}
+            >
+              {primaryOriginLabel}
+            </Badge>
+          ) : null}
+          {log.strike_eligible ? <Badge variant="destructive" className="text-[11px]">strike</Badge> : null}
           {log.source === 'upstream_cyber_policy' ? <Badge variant="outline" className="text-[11px]">upstream</Badge> : null}
-          {log.review_model ? <Badge variant="outline" className="text-[11px]">{log.review_flagged ? 'review flagged' : 'review cleared'}</Badge> : null}
+          {log.review_model ? <Badge variant="outline" className="h-auto max-w-full whitespace-normal break-words text-left leading-tight text-[11px]">{log.review_flagged ? 'review flagged' : 'review cleared'}</Badge> : null}
         </div>
       </TableCell>
       <TableCell>
         <div className="truncate font-mono text-xs text-foreground">{log.endpoint || '-'}</div>
         <div className="truncate font-mono text-xs text-muted-foreground">{log.model || '-'}</div>
+        {log.protocol || log.provider ? (
+          <div className="mt-1 flex flex-wrap gap-1">
+            {log.protocol ? <Badge variant="outline" className="text-[10px]">{log.protocol}</Badge> : null}
+            {log.provider ? <Badge variant="secondary" className="text-[10px]">{log.provider}</Badge> : null}
+          </div>
+        ) : null}
       </TableCell>
       <TableCell>
-        <span className="font-semibold">{log.score}</span>
-        <span className="text-muted-foreground"> / {log.threshold}</span>
+        <div className="space-y-2">
+          <LogScoreMeter
+            label={t('promptFilter.executionScore')}
+            score={log.score}
+            suffix={` / ${log.threshold}`}
+            tone="execution"
+            description={t('promptFilter.executionScoreHint')}
+          />
+          {auditScore !== undefined ? (
+            <LogScoreMeter
+              label={t('promptFilter.shadowAuditScore')}
+              score={auditScore}
+              tone="audit"
+              description={t('promptFilter.shadowAuditScoreHint')}
+            />
+          ) : null}
+        </div>
       </TableCell>
       <TableCell className={compact ? 'w-[150px] min-w-0' : 'w-[220px] min-w-0'}>
         {matches.length ? (
@@ -2790,7 +3450,40 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         {!compact && log.client_ip ? <div className="text-xs text-muted-foreground">{log.client_ip}</div> : null}
       </TableCell>
       <TableCell className="min-w-0">
-        <div className="truncate text-muted-foreground" title={stripHitMarkers(log.text_preview || log.error_code || log.review_error || '')}>{log.text_preview ? <HighlightedPromptPreview text={log.text_preview} /> : (log.error_code || log.review_error || '-')}</div>
+        <div className="space-y-1.5">
+          {matchContext ? (
+            <div className="min-w-0 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-2 py-1.5">
+              <div className="mb-0.5 flex min-w-0 items-center gap-1 text-[10px] font-semibold text-amber-700 dark:text-amber-300">
+                <span className="shrink-0">{t('promptFilter.matchContextLabel')}</span>
+                <span aria-hidden="true" className="text-amber-600/60 dark:text-amber-300/60">·</span>
+                <span className="truncate" title={`${t('promptFilter.triggerOrigin')}: ${primaryOriginLabel}`}>{primaryOriginLabel}</span>
+              </div>
+              <div
+                className={cn('break-words text-xs leading-5 text-foreground', compact ? 'line-clamp-2' : 'line-clamp-3')}
+                title={stripHitMarkers(matchContext)}
+              >
+                <HighlightedPromptPreview text={matchContext} />
+              </div>
+            </div>
+          ) : null}
+          {userPrompt ? (
+            <div className="min-w-0 px-0.5">
+              <div className="mb-0.5 text-[10px] font-semibold text-muted-foreground">{userPromptLabel}</div>
+              <div className="truncate text-xs leading-5 text-muted-foreground" title={stripHitMarkers(userPrompt)}>
+                <HighlightedPromptPreview text={userPrompt} />
+              </div>
+            </div>
+          ) : null}
+          {!matchContext && !userPrompt ? (
+            legacyMissingMatchContext ? (
+              <div className="rounded-md border border-dashed border-border bg-muted/30 px-2 py-1.5 text-xs leading-5 text-muted-foreground">
+                {t('promptFilter.legacyMissingMatchContext')}
+              </div>
+            ) : (
+              <div className="truncate text-muted-foreground" title={fallbackPreview}>{fallbackPreview || '-'}</div>
+            )
+          ) : null}
+        </div>
         {hasFull ? (
           <button
             type="button"
@@ -2825,10 +3518,65 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
   )
 }
 
+function LogScoreMeter({
+  label,
+  score,
+  suffix = '',
+  tone,
+  description,
+}: {
+  label: string
+  score: number
+  suffix?: string
+  tone: 'execution' | 'audit'
+  description: string
+}) {
+  const normalizedScore = normalizePromptFilterScore(score)
+  const scoreBand = getPromptFilterScoreBand(score)
+  const meterClass = tone === 'audit'
+    ? scoreBand === 'high'
+      ? 'bg-violet-500'
+      : scoreBand === 'medium'
+        ? 'bg-indigo-500'
+        : 'bg-sky-500'
+    : scoreBand === 'high'
+      ? 'bg-red-500'
+      : scoreBand === 'medium'
+        ? 'bg-amber-500'
+        : 'bg-emerald-500'
+
+  return (
+    <div className="min-w-0" title={description}>
+      <div className="flex items-baseline justify-between gap-1 text-[11px]">
+        <span className="truncate font-medium text-muted-foreground">{label}</span>
+        <span className="shrink-0 font-semibold text-foreground">
+          {score}
+          <span className="font-normal text-muted-foreground">{suffix}</span>
+        </span>
+      </div>
+      <div
+        className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={normalizedScore}
+        aria-valuetext={String(score)}
+      >
+        <div className={cn('h-full rounded-full transition-[width]', meterClass)} style={{ width: `${normalizedScore}%` }} />
+      </div>
+      {tone === 'audit' ? (
+        <div className="mt-1 text-[10px] leading-4 text-muted-foreground">{description}</div>
+      ) : null}
+    </div>
+  )
+}
+
 function ActionBadge({ action }: { action: string }) {
-  if (action === 'block') return <Badge variant="destructive">block</Badge>
-  if (action === 'warn') return <Badge variant="outline" className="border-amber-500/30 text-amber-700 dark:text-amber-300">warn</Badge>
-  return <Badge variant="outline">allow</Badge>
+  const { t } = useTranslation()
+  if (action === 'block') return <Badge variant="destructive">{t('promptFilter.modeBlock')}</Badge>
+  if (action === 'warn') return <Badge variant="outline" className="border-amber-500/30 text-amber-700 dark:text-amber-300">{t('promptFilter.modeWarn')}</Badge>
+  return <Badge variant="outline">{t('promptFilter.actionAllow')}</Badge>
 }
 
 function parseLogMatches(raw: string): PromptFilterMatch[] {

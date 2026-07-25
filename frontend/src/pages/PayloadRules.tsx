@@ -78,9 +78,13 @@ interface RuleEntry {
   /** 下游 API Key 身份匹配门（字符串数组，支持通配符 *，组内 OR） */
   apiKeyIds: string[]
   apiKeyNames: string[]
-  /** 账号分组身份匹配门（字符串数组，支持通配符 *，组内 OR） */
+  /** 账号分组身份匹配门（字符串数组，支持通配符 *，组内 OR）——匹配 Key 允许的组 */
   groupIds: string[]
   groupNames: string[]
+  /** 账号门——匹配本次实际调度选中账号的组/套餐（issue #410） */
+  accountGroupIds: string[]
+  accountGroupNames: string[]
+  accountPlans: string[]
   /** filter 组为字段路径数组，其余组为 路径→值 */
   params: Record<string, unknown> | string[]
 }
@@ -113,6 +117,9 @@ function parseRuleEntries(raw: string): RuleEntry[] | null {
         apiKeyNames: Array.isArray(r.api_key_names) ? r.api_key_names.map(String) : [],
         groupIds: Array.isArray(r.group_ids) ? r.group_ids.map(String) : [],
         groupNames: Array.isArray(r.group_names) ? r.group_names.map(String) : [],
+        accountGroupIds: Array.isArray(r.account_group_ids) ? r.account_group_ids.map(String) : [],
+        accountGroupNames: Array.isArray(r.account_group_names) ? r.account_group_names.map(String) : [],
+        accountPlans: Array.isArray(r.account_plans) ? r.account_plans.map(String) : [],
         params: group === 'filter'
           ? (Array.isArray(r.params) ? r.params.map(String) : [])
           : ((r.params && typeof r.params === 'object' && !Array.isArray(r.params) ? r.params : {}) as Record<string, unknown>),
@@ -139,6 +146,9 @@ function serializeRuleEntries(entries: RuleEntry[]): string {
         if (entry.apiKeyNames.length > 0) rule.api_key_names = entry.apiKeyNames
         if (entry.groupIds.length > 0) rule.group_ids = entry.groupIds
         if (entry.groupNames.length > 0) rule.group_names = entry.groupNames
+        if (entry.accountGroupIds.length > 0) rule.account_group_ids = entry.accountGroupIds
+        if (entry.accountGroupNames.length > 0) rule.account_group_names = entry.accountGroupNames
+        if (entry.accountPlans.length > 0) rule.account_plans = entry.accountPlans
         rule.params = entry.params
         return rule
       })
@@ -218,6 +228,9 @@ const EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh'].map((v) => (
 // 上游实际只接受 priority（fast 会映射为 priority），其余值会在发往上游前被剔除
 const SERVICE_TIER_OPTIONS = ['priority', 'fast', 'auto', 'default', 'flex', 'scale'].map((v) => ({ label: v, value: v }))
 
+// 账号套餐门候选值,与后端 knownAPIKeyPlanFilters / Key 限额的套餐白名单选项一致
+const ACCOUNT_PLAN_OPTIONS = ['free', 'plus', 'pro', 'prolite', 'team', 'k12', 'go']
+
 interface KVRow {
   path: string
   value: string
@@ -238,6 +251,9 @@ interface RuleFormState {
   apiKeyNames: string[]
   groupIds: string[]
   groupNames: string[]
+  accountGroupIds: string[]
+  accountGroupNames: string[]
+  accountPlans: string[]
   /** 编辑时透传表单未暴露的条件字段，避免保存后静默丢失 */
   carry: Pick<RuleEntry, 'headers' | 'notMatch' | 'exist' | 'notExist'>
 }
@@ -259,8 +275,12 @@ function emptyFormState(template: TemplateKey): RuleFormState {
     apiKeyIds: [],
     apiKeyNames: [],
     groupIds: [],
-    // fastGroup 模板默认对名为 fast 的分组生效
-    groupNames: template === 'fastGroup' ? ['fast'] : [],
+    groupNames: [],
+    accountGroupIds: [],
+    // fastGroup 模板默认对实际调度到名为 fast 的分组账号生效（issue #410：
+    // 按实际选中账号的组匹配，而非 Key 允许的组）
+    accountGroupNames: template === 'fastGroup' ? ['fast'] : [],
+    accountPlans: [],
     carry: EMPTY_CARRY,
   }
 }
@@ -312,6 +332,9 @@ function formStateFromEntry(entry: RuleEntry): RuleFormState {
     apiKeyNames: entry.apiKeyNames,
     groupIds: entry.groupIds,
     groupNames: entry.groupNames,
+    accountGroupIds: entry.accountGroupIds,
+    accountGroupNames: entry.accountGroupNames,
+    accountPlans: entry.accountPlans,
     carry: { headers: entry.headers, notMatch: entry.notMatch, exist: entry.exist, notExist: entry.notExist },
   }
 }
@@ -329,6 +352,9 @@ function formStateToEntry(form: RuleFormState): RuleEntry | null {
   const apiKeyNames = form.apiKeyNames.map((v) => v.trim()).filter(Boolean)
   const groupIds = form.groupIds.map((v) => v.trim()).filter(Boolean)
   const groupNames = form.groupNames.map((v) => v.trim()).filter(Boolean)
+  const accountGroupIds = form.accountGroupIds.map((v) => v.trim()).filter(Boolean)
+  const accountGroupNames = form.accountGroupNames.map((v) => v.trim()).filter(Boolean)
+  const accountPlans = form.accountPlans.map((v) => v.trim()).filter(Boolean)
   const base: RuleEntry = {
     group: form.group,
     models,
@@ -341,6 +367,9 @@ function formStateToEntry(form: RuleFormState): RuleEntry | null {
     apiKeyNames,
     groupIds,
     groupNames,
+    accountGroupIds,
+    accountGroupNames,
+    accountPlans,
     params: {},
   }
   switch (form.template) {
@@ -365,10 +394,12 @@ function formStateToEntry(form: RuleFormState): RuleEntry | null {
       }
     }
     case 'fastGroup': {
+      // 按本次实际调度选中账号的组匹配（issue #410）：Key 允许多组时，
+      // 只有真正路由到目标组的账号才覆写 tier。
       return {
         ...base,
         group: 'override',
-        groupNames: groupNames.length > 0 ? groupNames : ['fast'],
+        accountGroupNames: accountGroupNames.length > 0 ? accountGroupNames : ['fast'],
         params: { service_tier: form.tierValue.trim() || 'priority' },
       }
     }
@@ -434,6 +465,15 @@ function GateChips({ entry }: { entry: RuleEntry }) {
   }
   if (entry.groupIds.length > 0) {
     chips.push({ key: 'gi', label: `${t('payloadRules.chipGroupId')}: ${entry.groupIds.join(', ')}`, mono: true })
+  }
+  if (entry.accountGroupNames.length > 0) {
+    chips.push({ key: 'agn', label: `${t('payloadRules.chipAccountGroupName')}: ${entry.accountGroupNames.join(', ')}`, mono: true })
+  }
+  if (entry.accountGroupIds.length > 0) {
+    chips.push({ key: 'agi', label: `${t('payloadRules.chipAccountGroupId')}: ${entry.accountGroupIds.join(', ')}`, mono: true })
+  }
+  if (entry.accountPlans.length > 0) {
+    chips.push({ key: 'ap', label: `${t('payloadRules.chipAccountPlan')}: ${entry.accountPlans.join(', ')}`, mono: true })
   }
   return (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -1059,10 +1099,10 @@ export default function PayloadRules() {
               {form.template === 'fastGroup' ? (
                 <div className="space-y-4">
                   <div className="space-y-1.5">
-                    <label className="text-xs font-semibold text-foreground">{t('payloadRules.groupNamesLabel')}</label>
+                    <label className="text-xs font-semibold text-foreground">{t('payloadRules.accountGroupNamesLabel')}</label>
                     <ChipInput
-                      value={form.groupNames}
-                      onChange={(groupNames) => setForm({ ...form, groupNames })}
+                      value={form.accountGroupNames}
+                      onChange={(accountGroupNames) => setForm({ ...form, accountGroupNames })}
                       options={groupNameOptions}
                       placeholder={t('payloadRules.groupNamesPlaceholder')}
                     />
@@ -1106,6 +1146,25 @@ export default function PayloadRules() {
                         onChange={(apiKeyNames) => setForm({ ...form, apiKeyNames })}
                         options={apiKeyNameOptions}
                         placeholder={t('payloadRules.apiKeyNamesPlaceholder')}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-semibold text-foreground">{t('payloadRules.accountGroupNamesLabel')}</label>
+                      <ChipInput
+                        value={form.accountGroupNames}
+                        onChange={(accountGroupNames) => setForm({ ...form, accountGroupNames })}
+                        options={groupNameOptions}
+                        placeholder={t('payloadRules.groupNamesPlaceholder')}
+                      />
+                      <p className="text-[11px] leading-relaxed text-muted-foreground">{t('payloadRules.accountGroupNamesHint')}</p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-semibold text-foreground">{t('payloadRules.accountPlansLabel')}</label>
+                      <ChipInput
+                        value={form.accountPlans}
+                        onChange={(accountPlans) => setForm({ ...form, accountPlans })}
+                        options={ACCOUNT_PLAN_OPTIONS}
+                        placeholder={t('payloadRules.accountPlansPlaceholder')}
                       />
                     </div>
                   </div>
@@ -1206,6 +1265,34 @@ export default function PayloadRules() {
                           onChange={(groupIds) => setForm({ ...form, groupIds })}
                           options={groupIdOptions}
                           placeholder={t('payloadRules.groupIdsPlaceholder')}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-semibold text-foreground">{t('payloadRules.accountGroupNamesLabel')}</label>
+                        <ChipInput
+                          value={form.accountGroupNames}
+                          onChange={(accountGroupNames) => setForm({ ...form, accountGroupNames })}
+                          options={groupNameOptions}
+                          placeholder={t('payloadRules.groupNamesPlaceholder')}
+                        />
+                        <p className="text-[11px] leading-relaxed text-muted-foreground">{t('payloadRules.accountGroupNamesHint')}</p>
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-semibold text-foreground">{t('payloadRules.accountGroupIdsLabel')}</label>
+                        <ChipInput
+                          value={form.accountGroupIds}
+                          onChange={(accountGroupIds) => setForm({ ...form, accountGroupIds })}
+                          options={groupIdOptions}
+                          placeholder={t('payloadRules.groupIdsPlaceholder')}
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-semibold text-foreground">{t('payloadRules.accountPlansLabel')}</label>
+                        <ChipInput
+                          value={form.accountPlans}
+                          onChange={(accountPlans) => setForm({ ...form, accountPlans })}
+                          options={ACCOUNT_PLAN_OPTIONS}
+                          placeholder={t('payloadRules.accountPlansPlaceholder')}
                         />
                       </div>
                     </div>

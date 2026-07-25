@@ -23,9 +23,12 @@ import (
 )
 
 const (
-	responsesWSFirstMessageTimeout = 30 * time.Second
-	responsesWSWriteTimeout        = 30 * time.Second
-	responsesWSFriendlyUpstreamErr = "上游服务临时繁忙，请稍后重试"
+	responsesWSFirstMessageTimeout        = 30 * time.Second
+	responsesWSWriteTimeout               = 30 * time.Second
+	responsesWSFriendlyUpstreamErr        = "上游服务临时繁忙，请稍后重试"
+	newAPIPolicyWebSocketEventField       = "__newapi_policy_event_id"
+	newAPIPolicyWebSocketCapabilityHeader = "X-Codex2API-Policy-Event-ID"
+	newAPIPolicyWebSocketCapabilityV1     = "v1"
 )
 
 var responsesWSUpgrader = websocket.Upgrader{
@@ -52,6 +55,12 @@ type responsesWSCloseError struct {
 	code   int
 	reason string
 	err    error
+}
+
+type responsesWSForwardOptions struct {
+	auditEndpoint        string
+	transformClientEvent func([]byte) []byte
+	onResponseCompleted  func([]byte)
 }
 
 func (e *responsesWSCloseError) Error() string {
@@ -84,7 +93,7 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 		return
 	}
 
-	conn, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, newAPIPolicyWebSocketUpgradeHeaders())
 	if err != nil {
 		log.Printf("Responses WebSocket upgrade failed: %v", err)
 		return
@@ -118,7 +127,11 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 			return
 		}
 
-		if err := h.forwardResponsesWebSocketTurn(c, conn, payload); err != nil {
+		payload, forwardedEventID := stripNewAPIPolicyWebSocketEventID(payload)
+		if forwardedEventID == "" {
+			forwardedEventID = fmt.Sprintf("responses:%d", turn)
+		}
+		if err := h.forwardResponsesWebSocketTurn(c, conn, payload, forwardedEventID, nil); err != nil {
 			if errors.Is(err, errResponsesWSClientGone) {
 				return
 			}
@@ -133,7 +146,29 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 	}
 }
 
-func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.Conn, rawPayload []byte) error {
+func newAPIPolicyWebSocketUpgradeHeaders() http.Header {
+	header := make(http.Header)
+	header.Set(newAPIPolicyWebSocketCapabilityHeader, newAPIPolicyWebSocketCapabilityV1)
+	return header
+}
+
+func stripNewAPIPolicyWebSocketEventID(payload []byte) ([]byte, string) {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload, ""
+	}
+	eventID := normalizeNewAPIPolicyWebSocketEventID(gjson.GetBytes(payload, newAPIPolicyWebSocketEventField).String())
+	cleaned, err := sjson.DeleteBytes(payload, newAPIPolicyWebSocketEventField)
+	if err != nil {
+		return payload, ""
+	}
+	return cleaned, eventID
+}
+
+func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.Conn, rawPayload []byte, policyEventID string, options *responsesWSForwardOptions) error {
+	// Each response.create is a separate logical request. Keep the verified
+	// connection identity, but never reuse a prior frame's config or body digest.
+	resetPromptRequestSecurityFrame(c)
+	c.Set(promptGuardPolicyEventIDContextKey, policyEventID)
 	rawBody, model, apiErr := normalizeResponsesWebSocketClientPayload(rawPayload)
 	if apiErr != nil {
 		_ = writeResponsesWSError(conn, apiErr)
@@ -170,7 +205,20 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
 	}
-	if h.inspectPromptFilterOpenAIForWebSocket(c, conn, rawBody, "/v1/responses", model) {
+	auditEndpoint := "/v1/responses"
+	if options != nil {
+		if configured := strings.TrimSpace(options.auditEndpoint); configured != "" {
+			auditEndpoint = configured
+		}
+	}
+	if blocked, delegated := h.inspectPromptFilterOpenAIForWebSocket(c, conn, rawBody, auditEndpoint, model, policyEventID); blocked {
+		// A verified NewAPI connection owns warning/ban state. Keep the upstream
+		// WebSocket alive after returning the signed decision so NewAPI can show
+		// the first warning and accept another frame; it closes both peers only
+		// when its own configured punishment threshold is reached.
+		if delegated {
+			return nil
+		}
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, "prompt blocked", nil)
 	}
 
@@ -195,6 +243,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	}
 
 	codexBody, expandedInputRaw := PrepareResponsesWebSocketBody(rawBody)
+	// strip 策略：剥离图片工具能力声明后作为普通文本请求继续（issue #411）。
+	codexBody = applyImageGenerationStripPolicy(c, codexBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
 		apiErr = api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest)
 		_ = writeResponsesWSError(conn, apiErr)
@@ -287,7 +337,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
+		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
+		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(firstTokenTimeoutForRequest(currentFirstTokenTimeout(), bodySignalCompact), upstreamCancel)
 		useWebsocket := !wsHTTPFallback.ForceHTTP()
@@ -302,7 +354,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
-		serviceTier = EffectiveRequestedServiceTier(upstreamBody, effectiveModel, downstreamHeaders, ruleIdentity)
+		serviceTier = EffectiveRequestedServiceTier(upstreamBody, effectiveModel, downstreamHeaders, attemptIdentity)
 		// 在 useWebsocket 最终确定后再派生上游身份键：与 handler.go 的
 		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
 		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。
@@ -413,7 +465,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := false
 			if silentRetryEnabled && attempt < maxRetries {
-				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
@@ -458,7 +510,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			fallbackLog = &wsHTTPFallback
 		}
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -519,6 +571,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	viaWebsocket bool,
 	fallbackLog *websocketHTTPFallbackState,
 	fallbackAttempt int,
+	options *responsesWSForwardOptions,
 ) error {
 	SyncCodexUsageState(h.store, account, resp)
 
@@ -530,7 +583,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	c.Set("x-reasoning-effort", reasoningEffort)
 
 	var firstTokenMs int
-	outputBuffer := newWSPromptOutputBuffer(h.store.GetPromptFilterConfig())
+	outputBuffer := newWSPromptOutputBuffer(h.promptFilterConfigForRequest(c))
 	var usage *UsageInfo
 	var actualServiceTier string
 	ttftRecorded := false
@@ -575,6 +628,12 @@ func (h *Handler) streamResponsesWSUpstream(
 	readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 		parsed := gjson.ParseBytes(data)
 		eventType := parsed.Get("type").String()
+		clientData := data
+		if options != nil && options.transformClientEvent != nil {
+			if transformed := options.transformClientEvent(data); len(transformed) > 0 {
+				clientData = transformed
+			}
+		}
 		ttftGuard.MarkProgress(eventType)
 		isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 		if !ttftRecorded && isFirstToken {
@@ -589,6 +648,9 @@ func (h *Handler) streamResponsesWSUpstream(
 		}
 		if eventType == "response.completed" {
 			usage = extractUsageFromResult(parsed.Get("response.usage"))
+			if options != nil && options.onResponseCompleted != nil {
+				options.onResponseCompleted(append([]byte(nil), data...))
+			}
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
 			}
@@ -602,8 +664,8 @@ func (h *Handler) streamResponsesWSUpstream(
 		if !clientGone {
 			shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
 			if shouldDefer {
-				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), data...))
-				pendingFirstTokenBytes += len(data)
+				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), clientData...))
+				pendingFirstTokenBytes += len(clientData)
 				if pendingFirstTokenBytes <= 1024*1024 {
 					return eventType != "response.completed" && eventType != "response.failed"
 				}
@@ -635,7 +697,7 @@ func (h *Handler) streamResponsesWSUpstream(
 				if len(pendingFirstTokenMessages) > 0 && !flushPendingFirstTokenMessages() {
 					return false
 				}
-				release, filterErr := outputBuffer.Push(data)
+				release, filterErr := outputBuffer.Push(clientData)
 				if filterErr != nil {
 					writeErr = filterErr
 					return false
@@ -835,34 +897,31 @@ func normalizeResponsesWebSocketClientPayload(raw []byte) ([]byte, string, *api.
 	return normalized, model, nil
 }
 
-func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *websocket.Conn, rawBody []byte, endpoint string, model string) bool {
+func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *websocket.Conn, rawBody []byte, endpoint string, model string, policyEventID string) (blocked bool, delegatedToNewAPI bool) {
 	if h == nil || h.store == nil {
-		return false
+		return false, false
 	}
-	cfg := h.store.GetPromptFilterConfig()
-	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
-	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
-		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
+	cfg := h.promptFilterConfigForRequest(c)
+	// Keep disabled filters off the WebSocket request-body hot path too.
+	if !promptfilter.RequiresRequestText(cfg) {
+		return false, false
 	}
-	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
+	evaluation := h.evaluatePromptGuardWithConfig(c, cfg, rawBody, nil, endpoint, model, promptfilter.TransportWebSocket)
+	verdict := evaluation.Verdict
+	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
 	if verdict.Action != promptfilter.ActionBlock {
-		return false
+		return false, false
 	}
 	errorCode := api.ErrorCode("prompt_blocked")
 	errorMessage := "Request contains content blocked by prompt filter"
-	if identity, verified := h.verifyNewAPIIdentity(c, cfg.Advanced.NewAPI, nil); verified {
-		strike, ban := h.recordNewAPIOffense(c, cfg, identity)
-		h.writeNewAPIPolicyHeaders(c, strike, ban)
-		errorCode = api.ErrorCode("request_policy_violation")
-		errorMessage = "请求违规"
-		apiErr := api.NewAPIError(errorCode, errorMessage, api.ErrorTypeInvalidRequest)
-		apiErr.Details = gin.H{"strike": strike, "ban": ban}
-		_ = writeResponsesWSError(conn, apiErr)
-		return true
+	if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, nil); verified {
+		metadata := buildNewAPIPolicyDecisionMetadataForEvent(policyContext.Identity, evaluation.Decision, verdict, cfg, rawBody, endpoint, model, policyEventID)
+		writeNewAPIPolicyDecisionHeaders(c, metadata)
+		_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
+		return true, true
 	}
 	_ = writeResponsesWSError(conn, api.NewAPIError(errorCode, errorMessage, api.ErrorTypeInvalidRequest))
-	return true
+	return true, false
 }
 
 func isResponsesWebSocketUpgradeRequest(r *http.Request) bool {

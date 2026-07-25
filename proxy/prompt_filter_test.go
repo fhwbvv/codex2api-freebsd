@@ -30,23 +30,24 @@ func TestPromptFilterReviewClearsLocalBlock(t *testing.T) {
 	})
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:                   2,
-		TestConcurrency:                  1,
-		TestModel:                        "gpt-5.4",
-		PromptFilterEnabled:              true,
-		PromptFilterMode:                 promptfilter.ModeBlock,
-		PromptFilterThreshold:            50,
-		PromptFilterStrictThreshold:      90,
-		PromptFilterLogMatches:           true,
-		PromptFilterMaxTextLength:        promptfilter.DefaultMaxTextLength,
-		PromptFilterCustomPatterns:       "[]",
-		PromptFilterDisabledPatterns:     "[]",
-		PromptFilterReviewEnabled:        true,
-		PromptFilterReviewAPIKey:         "review-key",
-		PromptFilterReviewBaseURL:        reviewServer.URL,
-		PromptFilterReviewModel:          "omni-moderation-latest",
-		PromptFilterReviewTimeoutSeconds: 2,
-		PromptFilterReviewFailClosed:     true,
+		MaxConcurrency:                    2,
+		TestConcurrency:                   1,
+		TestModel:                         "gpt-5.4",
+		PromptFilterEnabled:               true,
+		PromptFilterMode:                  promptfilter.ModeBlock,
+		PromptFilterThreshold:             50,
+		PromptFilterStrictThreshold:       90,
+		PromptFilterStrictTerminalEnabled: true,
+		PromptFilterLogMatches:            true,
+		PromptFilterMaxTextLength:         promptfilter.DefaultMaxTextLength,
+		PromptFilterCustomPatterns:        "[]",
+		PromptFilterDisabledPatterns:      "[]",
+		PromptFilterReviewEnabled:         true,
+		PromptFilterReviewAPIKey:          "review-key",
+		PromptFilterReviewBaseURL:         reviewServer.URL,
+		PromptFilterReviewModel:           "omni-moderation-latest",
+		PromptFilterReviewTimeoutSeconds:  2,
+		PromptFilterReviewFailClosed:      true,
 	})
 	handler := NewHandler(store, nil, nil, nil)
 
@@ -79,23 +80,24 @@ func TestPromptFilterReviewFlaggedKeepsBlock(t *testing.T) {
 	})
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:                   2,
-		TestConcurrency:                  1,
-		TestModel:                        "gpt-5.4",
-		PromptFilterEnabled:              true,
-		PromptFilterMode:                 promptfilter.ModeBlock,
-		PromptFilterThreshold:            50,
-		PromptFilterStrictThreshold:      90,
-		PromptFilterLogMatches:           true,
-		PromptFilterMaxTextLength:        promptfilter.DefaultMaxTextLength,
-		PromptFilterCustomPatterns:       "[]",
-		PromptFilterDisabledPatterns:     "[]",
-		PromptFilterReviewEnabled:        true,
-		PromptFilterReviewAPIKey:         "review-key",
-		PromptFilterReviewBaseURL:        reviewServer.URL,
-		PromptFilterReviewModel:          "omni-moderation-latest",
-		PromptFilterReviewTimeoutSeconds: 2,
-		PromptFilterReviewFailClosed:     true,
+		MaxConcurrency:                    2,
+		TestConcurrency:                   1,
+		TestModel:                         "gpt-5.4",
+		PromptFilterEnabled:               true,
+		PromptFilterMode:                  promptfilter.ModeBlock,
+		PromptFilterThreshold:             50,
+		PromptFilterStrictThreshold:       90,
+		PromptFilterStrictTerminalEnabled: true,
+		PromptFilterLogMatches:            true,
+		PromptFilterMaxTextLength:         promptfilter.DefaultMaxTextLength,
+		PromptFilterCustomPatterns:        "[]",
+		PromptFilterDisabledPatterns:      "[]",
+		PromptFilterReviewEnabled:         true,
+		PromptFilterReviewAPIKey:          "review-key",
+		PromptFilterReviewBaseURL:         reviewServer.URL,
+		PromptFilterReviewModel:           "omni-moderation-latest",
+		PromptFilterReviewTimeoutSeconds:  2,
+		PromptFilterReviewFailClosed:      true,
 	})
 	handler := NewHandler(store, nil, nil, nil)
 
@@ -109,5 +111,40 @@ func TestPromptFilterReviewFlaggedKeepsBlock(t *testing.T) {
 	}
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+func TestPromptFilterWarningMessageNeverEmpty(t *testing.T) {
+	tests := []struct {
+		name       string
+		evaluation promptGuardEvaluation
+		want       string
+	}{
+		{
+			name: "human readable reason",
+			evaluation: promptGuardEvaluation{
+				Verdict: promptfilter.Verdict{Reason: "matched strict policy"},
+			},
+			want: "matched strict policy",
+		},
+		{
+			name: "decision reason code fallback",
+			evaluation: promptGuardEvaluation{
+				Decision: promptfilter.Decision{ReasonCode: "prompt_policy_warning"},
+			},
+			want: "prompt_policy_warning",
+		},
+		{
+			name:       "stable final fallback",
+			evaluation: promptGuardEvaluation{},
+			want:       "prompt_policy_warning",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := promptFilterWarningMessage(tc.evaluation); got != tc.want {
+				t.Fatalf("warning = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

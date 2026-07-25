@@ -33,6 +33,12 @@ func TestShouldMarkUsageProbeAccountError(t *testing.T) {
 			want:       true,
 		},
 		{
+			name:       "forbidden deleted agent runtime",
+			statusCode: http.StatusForbidden,
+			body:       []byte(`{"error":{"message":"Agent runtime has been deleted.","code":"biscuit_baker_service_agent_error_status"},"status":403}`),
+			want:       true,
+		},
+		{
 			name:       "generic payment required is not account error",
 			statusCode: http.StatusPaymentRequired,
 			body:       []byte(`{"error":{"code":"billing_hard_limit_reached"}}`),
@@ -52,6 +58,43 @@ func TestShouldMarkUsageProbeAccountError(t *testing.T) {
 				t.Fatalf("shouldMarkUsageProbeAccountError() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDeletedAgentRuntimeCooldownPersistsFor24Hours 验证用量探针会持久化 24 小时封禁冷却。
+func TestDeletedAgentRuntimeCooldownPersistsFor24Hours(t *testing.T) {
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(db, nil, nil)
+	account := &auth.Account{
+		DBID:        accountID,
+		AccessToken: "at-test",
+		Status:      auth.StatusReady,
+		HealthTier:  auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+
+	store.MarkCooldownWithErrorExactDuration(
+		account,
+		24*time.Hour,
+		"unauthorized",
+		"用量探针上游返回 403: Agent runtime has been deleted.",
+	)
+
+	_, cooldownUntil := account.GetCooldownSnapshot()
+	if remaining := time.Until(cooldownUntil); remaining < 23*time.Hour+59*time.Minute || remaining > 24*time.Hour {
+		t.Fatalf("runtime cooldown remaining = %s, want approximately 24h", remaining)
+	}
+
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if row.CooldownReason != "unauthorized" || !row.CooldownUntil.Valid {
+		t.Fatalf("persisted cooldown = (%q, %v), want active unauthorized cooldown", row.CooldownReason, row.CooldownUntil)
+	}
+	if remaining := time.Until(row.CooldownUntil.Time); remaining < 23*time.Hour+59*time.Minute || remaining > 24*time.Hour {
+		t.Fatalf("persisted cooldown remaining = %s, want approximately 24h", remaining)
 	}
 }
 

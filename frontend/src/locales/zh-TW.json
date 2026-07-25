@@ -1,0 +1,332 @@
+{
+  "promptFilter": {
+    "saveRefreshFailed": "設定已儲存，但規則或日誌重新整理失敗；可稍後單獨重新整理頁面",
+    "advancedConfigInvalidTitle": "進階防護設定無法解析",
+    "advancedConfigInvalidDescription": "原始設定已完整保留，目前不會以預設值覆蓋。請修正設定 JSON，或重新整理頁面取得伺服器內容後再儲存。",
+    "advancedConfigInvalidSave": "進階防護設定無效，已阻止儲存以避免覆蓋原始內容",
+    "unknownMode": "未知模式（已保留）",
+    "testResultMode": "處理模式",
+    "testResultScore": "風險分數",
+    "testResultMatches": "命中規則",
+    "testResultReview": "二次審查",
+    "testReviewFlagged": "審查判定違規",
+    "testReviewCleared": "審查判定通過",
+    "testReviewSkipped": "未進行審查",
+    "modeWarn": "警告",
+    "modeBlock": "攔截",
+    "actionAllow": "放行",
+    "colScore": "執行 / 稽核",
+    "executionScore": "執行分",
+    "executionScoreHint": "執行分與目前門檻共同決定本次請求是否進入警告或攔截流程。",
+    "shadowAuditScore": "影子稽核分",
+    "shadowAuditScoreHint": "影子稽核分不參與目前攔截。",
+    "strictTerminal": "嚴格規則終局攔截",
+    "strictTerminalHint": "開啟後，目前使用者 Prompt 只有在命中 strict:true 高可信規則，且經意圖、門檻與上下文判定後仍達攔截門檻時，才會進入終局流程；稽核型敏感詞與雙用途工具名稱不會單獨觸發。均衡檔案仍可二次審查，嚴格檔案才跳過降級。",
+    "sensitiveWordsPlaceholder": "每行一個詞；命中只作為稽核訊號計分，仍需明確高危意圖或組合規則才會攔截",
+    "sensitiveWordsHint": "敏感詞只進入稽核分，不會提高執行分；如需攔截特定組合，請設定帶意圖條件的自訂規則或 strict 終局規則。",
+    "guard": {
+      "title": "統一 GuardPipeline",
+      "description": "為 Responses、Chat Completions、Messages 與 WebSocket 提供統一的來源感知審核。頁面只保留會改變審核範圍或處理結果的策略設定，執行預算、快取與佇列由系統管理。",
+      "globalMode": "全域執行模式",
+      "globalModeHint": "控制新 GuardPipeline 的整體行為。選擇繼承舊設定時，不會改變現有 Prompt 過濾、門檻與終局規則的處理方式。",
+      "defaultProfile": "預設審核檔案",
+      "defaultProfileHint": "模型家族沒有個別設定，或日後接入未知提供者時所使用的預設審核強度。",
+      "trustedOverrides": "允許可信請求覆寫",
+      "trustedOverridesHint": "僅接受通過 NewAPI HMAC 驗簽的檔案或模式覆寫。關閉時忽略所有請求標頭中的審核檔案與模式，避免客戶端自行降低審核強度。",
+      "compatibilityTitle": "相容現有設定",
+      "compatibilityHint": "預設使用「繼承舊設定」。關閉或調整新管線不會自動刪除現有規則、敏感詞、二次審查或累計風險設定。",
+      "rollout": {
+        "title": "穩定灰度",
+        "description": "依可信身分、協定與模型提供者逐步啟用全域執行模式，方便先觀察小範圍真實流量再擴大覆蓋。預設關閉，不改變目前請求處理。",
+        "safetyNotice": "灰度只會把全域「執行」降級為所選回退模式，不會把「警告」或「影子記錄」提升為執行。沒有可信 NewAPI 使用者 ID 或 API Key ID 時，一律使用回退模式。",
+        "enabled": "啟用穩定灰度",
+        "enabledHint": "關閉時完全忽略灰度比例與篩選條件，所有請求繼續使用全域 Guard 模式。建議驗證稽核日誌後再開啟。",
+        "percent": "灰度比例（%）",
+        "percentHint": "對白名單以外、具有可信身分且符合篩選條件的請求依穩定身分分桶。0% 表示只對白名單啟用，100% 表示覆蓋所有符合條件的可信身分。",
+        "fallbackMode": "未命中回退",
+        "fallbackModeHint": "未進入灰度、缺少可信身分或不符合篩選條件時使用的安全模式。只能選擇「僅警告」或「僅觀察」。",
+        "fallbackModes": {
+          "warn": "僅警告",
+          "shadow": "僅觀察"
+        },
+        "newapiUserAllowlist": "NewAPI 使用者白名單",
+        "newapiUserAllowlistHint": "通過 HMAC 驗簽的 NewAPI 使用者 ID 優先進入灰度，不受比例限制；可逐一輸入多個 ID。",
+        "newapiUserAllowlistPlaceholder": "輸入可信 NewAPI 使用者 ID 後按 Enter",
+        "apiKeyAllowlist": "API Key ID 白名單",
+        "apiKeyAllowlistHint": "可信 API Key ID 可直接進入灰度，不受比例限制。請填寫內部 Key ID，不要填寫完整密鑰。",
+        "apiKeyAllowlistPlaceholder": "輸入 API Key ID 後按 Enter",
+        "protocols": "協定篩選",
+        "protocolsHint": "只對選取的協定套用灰度；全部不選表示不限制協定。篩選不會改變未命中請求的安全回退。",
+        "providers": "模型提供者篩選",
+        "providersHint": "只對選取的模型提供者套用灰度；全部不選表示不限制提供者，未知模型可單獨選取。",
+        "protocolOptions": {
+          "responses": "Responses",
+          "chat_completions": "聊天補全",
+          "messages": "Messages",
+          "images": "圖像生成",
+          "unknown": "未知 / 其他協定"
+        }
+      },
+      "active": "目前",
+      "providerTitle": "模型家族審核檔案",
+      "providerDescription": "預設繼承上方審核檔案；只有需要差異化審核時，才為 GPT、Claude Code、Grok 或其他模型家族設定獨立檔案。",
+      "inheritDefaultProfile": "繼承預設審核檔案",
+      "unknownEnumPreserved": "未知設定值（已保留）",
+      "unknownProfile": "未知審核檔案（已保留）",
+      "profileTitle": "審核檔案說明",
+      "profileDescription": "檔案會調整檢測深度，不會把單一安全技術名詞直接判定為終局違規。",
+      "layersTitle": "請求來源層",
+      "layersDescription": "目前使用者 Prompt 是同步攔截與處罰證據；其他來源只允許關閉或影子稽核，不會直接觸發同步攔截。",
+      "performance": {
+        "title": "審核效能與首字延遲",
+        "description": "重用完全相同的片段檢測結果，並可把純影子輔助層移出使用者等待路徑，在不降低執行層審核強度的前提下減少重複掃描。",
+        "syncSafetyNotice": "無論如何設定，目前使用者輸入、應用候選內容以及警告／攔截層一律同步完成審核；這些效能選項無法略過目前使用者 Prompt 的攔截。",
+        "budgetTitle": "掃描預算與分段邊界",
+        "budgetDescription": "目前使用者輸入與歷史、工具、附件等輔助來源分別使用獨立總預算；建議值兼顧深度審核、首字速度與記憶體穩定性。",
+        "maxCurrentUserBytes": "目前使用者同步掃描上限",
+        "maxCurrentUserBytesHint": "本次請求中目前使用者可控文字共享的 UTF-8 位元組總預算，範圍 8192–1048576，建議 131072。",
+        "maxAuxiliaryBytes": "輔助上下文掃描上限",
+        "maxAuxiliaryBytesHint": "歷史、系統、工具輸出、附件與工作階段上下文共享的 UTF-8 位元組總預算，範圍 0–262144，建議 32768；設為 0 表示不掃描輔助來源。",
+        "scanChunkBytes": "單次掃描分塊大小",
+        "scanChunkBytesHint": "有界掃描工作使用的目標分塊大小，範圍 1024–65536，建議 8192；不得大於目前使用者預算。",
+        "scanOverlapBytes": "相鄰分塊重疊大小",
+        "scanOverlapBytesHint": "相鄰掃描塊保留的 UTF-8 安全重疊位元組，範圍 64–8192，建議 512；必須小於分塊大小。",
+        "maxSegments": "最大文字段數量",
+        "maxSegmentsHint": "一次邏輯請求最多保留的文字段數量，範圍 1–256，建議 64；目前使用者段優先於輔助段。",
+        "overBudgetNotice": "超過預算只會標記為已截斷並進入有界稽核，不會只因內容過長而攔截、處罰或封鎖。",
+        "maxSegmentsError": "請輸入 1–256 的整數。",
+        "maxCurrentUserBytesError": "請輸入 8192–1048576 的整數。",
+        "maxAuxiliaryBytesError": "請輸入 0–262144 的整數。",
+        "scanChunkBytesError": "請輸入 1024–65536 的整數。",
+        "scanChunkBudgetError": "分塊大小不得超過目前使用者同步掃描上限。",
+        "scanOverlapBytesError": "請輸入 64–8192 的整數。",
+        "scanOverlapChunkError": "重疊大小必須小於分塊大小。",
+        "asyncShadowAuxiliary": "非同步處理影子輔助層",
+        "asyncShadowAuxiliaryHint": "只把最終模式為 Shadow 的工具輸出、歷史、系統/開發者上下文、工作階段與附件等輔助內容放入背景佇列；關閉時這些影子層仍同步掃描。舊設定預設關閉。",
+        "exactSegmentCache": "精確片段快取",
+        "exactSegmentCacheHint": "依完整規則設定與片段摘要重用完全相同的檢測結論，不做模糊比對，也不改變分數或攔截結果。",
+        "cacheEntries": "快取項目上限",
+        "cacheEntriesHint": "記憶體中最多保留的精確片段結論數量，範圍 1–32768；達到上限後優先淘汰最久未使用的項目。",
+        "cacheTTL": "快取有效期（秒）",
+        "cacheTTLHint": "精確片段結論的最長重用時間，範圍 1–86400 秒；規則設定變更會使用新的快取鍵。",
+        "shadowWorkers": "影子工作執行緒",
+        "shadowWorkersHint": "背景並行處理純 Shadow 輔助片段的工作執行緒數，範圍 1–16；建議從 2 開始觀察 CPU。",
+        "shadowQueue": "影子佇列容量",
+        "shadowQueueHint": "等待背景審核的純 Shadow 輔助工作上限，範圍 1–4096。預設溢出策略不會把掃描壓回請求執行緒。",
+        "shadowOverflowMode": "佇列溢出策略",
+        "shadowOverflowModeHint": "佇列滿時略過本次純影子輔助稽核並記錄丟棄計數，不會把掃描壓回請求執行緒；目前使用者提示詞與警告、攔截層不受影響。",
+        "overflowModes": {
+          "drop": "佇列滿時丟棄並記錄"
+        }
+      },
+      "modes": {
+        "inherit": {
+          "label": "繼承舊設定",
+          "description": "沿用目前 Prompt 過濾開關、模式、門檻與規則，不引入新的執行變更。"
+        },
+        "off": {
+          "label": "關閉",
+          "description": "關閉此 GuardPipeline 範圍；現有舊過濾設定仍依原本邏輯執行。"
+        },
+        "shadow": {
+          "label": "影子記錄",
+          "description": "檢測並記錄決策差異，但不攔截、不警告，也不累計處罰。"
+        },
+        "warn": {
+          "label": "警告",
+          "description": "記錄並回傳警告，不增加 strike，也不觸發帳號或 IP 處罰。"
+        },
+        "enforce": {
+          "label": "執行",
+          "description": "正式執行允許、複核與攔截決策；只有確認違規才能產生處罰事件。"
+        }
+      },
+      "profiles": {
+        "balanced": {
+          "label": "均衡",
+          "description": "預設正式環境檔案，優先降低誤殺；攔截明確危險意圖，模糊內容保留審查空間。"
+        },
+        "strict": {
+          "label": "嚴格",
+          "description": "啟用更深的關聯檢測與更高審計密度，但終局攔截仍要求高可信證據。"
+        },
+        "research": {
+          "label": "研究",
+          "description": "允許防禦分析與雙用途研究討論；明確惡意執行、竊取或規避請求仍會被攔截。"
+        }
+      },
+      "providers": {
+        "openai": {
+          "label": "OpenAI / Codex",
+          "description": "適用於 GPT、Codex CLI 與 OpenAI Responses/Chat 相容模型。"
+        },
+        "anthropic": {
+          "label": "Anthropic / Claude Code",
+          "description": "適用於 Claude 模型、Claude Code 與 Anthropic Messages 協定。"
+        },
+        "xai": {
+          "label": "xAI / Grok",
+          "description": "適用於 Grok，以及透過 OpenAI 相容協定接入的 xAI 模型。"
+        },
+        "unknown": {
+          "label": "未知 / 其他模型家族",
+          "description": "無法識別提供者或未來新增模型家族時使用，避免新接入沒有明確審核檔案。"
+        }
+      },
+      "layers": {
+        "current_user": {
+          "label": "目前使用者 Prompt",
+          "description": "目前請求中由使用者明確提交的內容，是主要審核與處罰證據來源。"
+        },
+        "history": {
+          "label": "關聯歷史",
+          "description": "僅在繼續執行、別名引用或分段組合等明確關聯時檢查歷史使用者內容。"
+        },
+        "system": {
+          "label": "System 上下文",
+          "description": "系統角色內容通常由應用程式注入；啟用執行前建議先用影子模式觀察誤報。"
+        },
+        "developer": {
+          "label": "Developer 上下文",
+          "description": "開發者角色內容通常屬於應用程式策略，不應預設歸因給最終使用者。"
+        },
+        "instructions": {
+          "label": "Responses Instructions",
+          "description": "檢查 /v1/responses 頂層 instructions；適合識別客戶端可修改指令與基準差異。"
+        },
+        "tool_output": {
+          "label": "工具輸出",
+          "description": "將工具回傳內容視為不可信資料進行檢測，但避免直接作為使用者處罰證據。"
+        },
+        "tool_arguments": {
+          "label": "工具參數",
+          "description": "在執行檔案、網路、終端等工具前檢查結構化參數與目標。"
+        },
+        "attachment_refs": {
+          "label": "附件引用",
+          "description": "檢查附件、file_id、URL 與引用中繼資料；後續可連接獨立附件解析服務。"
+        },
+        "session_context": {
+          "label": "會話關聯上下文",
+          "description": "只檢查經可信身分關聯、且目前請求明確要求繼續的歷史片段；預設影子記錄，不直接處罰。"
+        },
+        "attachment_content": {
+          "label": "附件解析內容",
+          "description": "檢查獨立解析服務擷取的附件文字；預設影子記錄，避免把文件引用內容直接歸因給使用者。"
+        }
+      }
+    },
+    "normalizationTitle": "輸入正規化與編碼還原",
+    "decodeRuns": "最大解碼輪數",
+    "maxDecodedBytes": "最大還原位元組數",
+    "maxEncodedBlocks": "最大編碼片段數",
+    "decoders": {
+      "url": "URL 編碼",
+      "html": "HTML 實體",
+      "base64": "Base64 編碼",
+      "hex": "十六進位編碼",
+      "rot13": "ROT13 編碼",
+      "escapes": "跳脫序列",
+      "compression": "壓縮資料"
+    },
+    "contextDiscount": {
+      "title": "合法上下文降分",
+      "description": "識別稽核、修復、教學等防禦語境，降低雙用途詞誤報；明確執行、竊取、規避等操作意圖不會被普通免責聲明抵消。",
+      "enabled": "啟用上下文降分",
+      "enabledHint": "關閉後所有規則使用原始執行分，安全研究與日誌分析更容易被誤判。",
+      "intentAware": "依意圖區分",
+      "intentAwareHint": "先判斷請求是否包含可執行的攻擊動作，再決定允許多少降分；建議保持開啟。",
+      "maxDiscount": "一般語境最大降分",
+      "maxDiscountHint": "防禦、修復或解釋場景最多可扣除的分數。數值越高，一般安全討論越不容易誤攔截。",
+      "operationalMaxDiscount": "操作意圖最大降分",
+      "operationalMaxDiscountHint": "已包含執行、投遞、竊取或繞過動作時仍允許的最大降分。建議設為 0，防止用「僅供研究」抵消明確惡意意圖。"
+    },
+    "extensions": {
+      "title": "深度防護擴充",
+      "runtimeLimits": "執行限制、快取與熔斷",
+      "serviceURL": "服務位址",
+      "timeout": "逾時（秒）",
+      "cacheTTL": "快取時間（秒）",
+      "maxConcurrent": "最大並行數",
+      "breakerFailures": "熔斷失敗次數",
+      "breakerSeconds": "熔斷時間（秒）",
+      "sidecar": {
+        "title": "語意審查 Sidecar",
+        "description": "可連接本機或內網語意模型補充規則檢測。預設關閉並使用影子模式，先觀察命中品質再決定是否警告或攔截。",
+        "enabled": "啟用語意審查",
+        "enabledHint": "只有設定可用的 Sidecar 服務位址後才應開啟；關閉時不會產生外部呼叫。",
+        "scanClean": "抽樣檢查本機放行請求",
+        "scanCleanHint": "依抽樣比例複核本機規則判定為正常的請求，用於發現語意漏檢；預設關閉以控制延遲和費用。",
+        "mode": "執行模式",
+        "modeHint": "影子僅記錄，警告向使用者提示，執行模式才允許 Sidecar 結論參與攔截。建議先用影子模式校準。",
+        "modes": {
+          "shadow": "影子記錄",
+          "warn": "警告",
+          "enforce": "執行攔截"
+        },
+        "baseURLHint": "固定的本機或內網語意審查服務根位址，不要填入使用者可控制的位址。",
+        "timeoutHint": "單次語意審查最多等待時間；逾時後依失敗策略處理。",
+        "minScore": "最低送審分數",
+        "minScoreHint": "本機執行分達到此值後才呼叫 Sidecar；抽中的正常請求不受此限制。",
+        "samplePercent": "正常請求抽樣比例（%）",
+        "samplePercentHint": "只對本機已放行請求生效。建議從 1%—10% 開始，避免所有正常流量都進入模型。",
+        "failClosed": "服務失敗時攔截",
+        "failClosedHint": "開啟後 Sidecar 逾時或異常可能導致攔截。正式環境預設關閉，避免擴充服務故障影響可用性。",
+        "maxTextLength": "最大送審文字長度",
+        "maxTextLengthHint": "送給 Sidecar 的文字上限；超長內容保留首尾並截斷，避免單一請求耗盡資源。",
+        "cacheTTLHint": "相同內容的語意結論快取時間。設為 0 表示不快取。",
+        "maxConcurrentHint": "同時進行的 Sidecar 請求上限，防止語意服務過載。",
+        "breakerFailuresHint": "連續失敗達到此次數後暫停呼叫 Sidecar。",
+        "breakerSecondsHint": "觸發熔斷後暫停呼叫的時間，之後自動嘗試恢復。"
+      },
+      "session": {
+        "title": "會話分段關聯",
+        "description": "把同一可信會話內明確要求「繼續」的短請求與最近片段聯合檢查，減少將高風險指令拆成多輪逃避檢測的缺口。",
+        "enabled": "啟用會話關聯",
+        "enabledHint": "目前會話寫入仍需同步存取快取，開啟後可能增加請求延遲；建議暫時保持關閉。",
+        "requireSignedIdentity": "僅接受簽名身分",
+        "requireSignedIdentityHint": "只使用通過 NewAPI HMAC 驗證的使用者與會話識別，避免客戶端偽造會話串聯他人內容。",
+        "combineShortFragments": "自動合併一般短句",
+        "combineShortFragmentsHint": "開啟後即使沒有「繼續」等明確語意，也會合併短片段。預設關閉可降低一般對話誤關聯。",
+        "window": "關聯視窗（秒）",
+        "windowHint": "只關聯此時間範圍內的同一會話片段；視窗越長，跨任務誤關聯風險越高。",
+        "maxFragments": "最大片段數",
+        "maxFragmentsHint": "每次聯合檢查最多包含多少個最近片段，用於限制計算量和上下文漂移。",
+        "maxTextLength": "關聯文字上限",
+        "maxTextLengthHint": "聯合後的歷史與目前文字最大長度，超出部分會被有界截斷。",
+        "shortFragmentMaxChars": "短片段字元上限",
+        "shortFragmentMaxCharsHint": "只在開啟自動合併一般短句時使用；超過此長度的訊息不會作為一般短片段自動串聯。",
+        "recommendedHint": "建議預設：關閉會話關聯、保留簽名身分要求並關閉一般短句自動合併。待支援有序非同步寫入後再開啟，可避免快取延遲進入首字路徑。"
+      },
+      "attachment": {
+        "title": "附件內容解析",
+        "description": "透過獨立服務擷取受支援附件的文字後再檢查。Codex2API 不直接下載任意使用者 URL，預設關閉並以影子層記錄。",
+        "enabled": "啟用附件解析",
+        "enabledHint": "只有部署受控的附件解析服務後才開啟；關閉時仍可檢查附件引用中繼資料。",
+        "allowRemoteURLs": "允許解析遠端 URL",
+        "allowRemoteURLsHint": "允許取得遠端位址會增加 SSRF、超大檔案和內容變更風險。預設關閉，只處理可信檔案引用。",
+        "baseURLHint": "固定的本機或內網附件解析服務根位址，不要由請求參數動態覆寫。",
+        "timeoutHint": "單次附件擷取最多等待時間。解析失敗會記錄稽核錯誤，不應預設阻斷正常請求。",
+        "maxFiles": "單次最大檔案數",
+        "maxFilesHint": "每個請求最多送往解析服務的附件數量，超出部分不再解析。",
+        "maxBytes": "單檔最大位元組數",
+        "maxBytesHint": "解析服務接受的單一附件大小上限，用於限制壓縮炸彈和大檔案資源消耗。",
+        "maxExtractedChars": "最大擷取字元數",
+        "maxExtractedCharsHint": "每次回傳給 Prompt 檢查的附件文字上限，超過後截斷。",
+        "cacheTTLHint": "依檔案摘要快取解析結果的時間。設為 0 表示不快取。",
+        "maxConcurrentHint": "同時進行的附件解析請求上限，避免解析器拖慢主要代理。",
+        "breakerFailuresHint": "連續解析失敗達到此次數後暫停呼叫附件服務。",
+        "breakerSecondsHint": "附件服務熔斷後暫停呼叫的時間，之後自動探測恢復。"
+      }
+    },
+    "help": {
+      "normalizationPanel": "對常見編碼和壓縮片段進行有界還原；位元組、片段和輪數上限可避免解碼炸彈拖垮服務。",
+      "maxDecodedBytes": "單次請求所有還原結果允許占用的最大位元組數，達到上限後停止繼續解碼。",
+      "maxEncodedBlocks": "單次請求最多嘗試還原的獨立編碼片段數，限制惡意批量小片段消耗。",
+      "decodeHex": "識別連續十六進位或 0x 風格編碼片段，並在大小限制內還原。",
+      "decodeRot13": "識別符合結構條件的 ROT13 文字，只把有意義的還原結果加入檢查。",
+      "decodeEscapes": "還原 Unicode、十六進位和常見反斜線跳脫序列。",
+      "decodeCompression": "在大小和輪數限制內識別 Base64 包裝的 gzip 或 zlib 壓縮文字。"
+    }
+  }
+}

@@ -53,10 +53,27 @@ func NewValidator(body []byte) *Validator {
 	}
 }
 
-// ValidateRequest validates the request body against validation rules
+// ValidateRequest validates the request body against validation rules.
+//
+// 顶层键只遍历一次并缓存，避免对每条规则路径都重新全量扫描请求体。gjson 查一个
+// 顶层键时，若该键缺失或排在大字段（如 input）之后，需扫到对象末尾；规则里多为
+// 可选键（temperature/top_p/stop/... 通常不存在），逐条 GetBytes 会退化成
+// O(rules × body)。大请求体（曾 16MB）上这会造成秒级开销（issue #417）。
 func (v *Validator) ValidateRequest(rules map[string][]ValidationRule) *ValidationResult {
+	topLevel := make(map[string]gjson.Result)
+	gjson.ParseBytes(v.Body).ForEach(func(key, value gjson.Result) bool {
+		topLevel[key.String()] = value
+		return true
+	})
+	resolve := func(path string) gjson.Result {
+		if head, rest, nested := strings.Cut(path, "."); nested {
+			return topLevel[head].Get(rest)
+		}
+		return topLevel[path]
+	}
+
 	for path, ruleList := range rules {
-		value := gjson.GetBytes(v.Body, path)
+		value := resolve(path)
 		for _, rule := range ruleList {
 			if err := rule(value, path); err != nil {
 				v.Errors = append(v.Errors, *err)
@@ -650,20 +667,12 @@ func ValidateInput() ValidationRule {
 			return nil
 		}
 
-		if int(value.Get("#").Int()) == 0 {
-			return &ValidationError{
-				Field:   path,
-				Message: "Input array cannot be empty",
-				Code:    "empty_input",
-			}
-		}
-
 		validTypes := map[string]bool{
 			"message": true,
 			// multi-agent 会话的代理间消息历史项,续会话时随 input 回放,上游原生接受
-			"agent_message": true,
-			"reasoning":     true,
-			"function_call": true,
+			"agent_message":           true,
+			"reasoning":               true,
+			"function_call":           true,
 			"function_call_output":    true,
 			"tool_call":               true,
 			"local_shell_call":        true,
@@ -704,21 +713,38 @@ func ValidateInput() ValidationRule {
 			"image":                   true,
 		}
 
-		for i := 0; i < int(value.Get("#").Int()); i++ {
-			itemType := value.Get(fmt.Sprintf("%d.type", i)).String()
+		// 单次 ForEach 遍历，避免按下标 value.Get("i.type") 随机访问——gjson 数组按
+		// 索引访问每次都从头扫描，对大 input 数组是 O(N²)，大请求体上退化到秒级
+		// (issue #417)。空数组由 sawItem 判定。
+		var verr *ValidationError
+		idx := 0
+		sawItem := false
+		value.ForEach(func(_, item gjson.Result) bool {
+			sawItem = true
+			itemType := item.Get("type").String()
 			// If no explicit type is provided, accept the item. This allows
 			// message-style inputs (e.g., {role, content}) and other variants
 			// that are handled elsewhere in the codebase without requiring
 			// clients to set type explicitly.
-			if itemType == "" {
-				continue
-			}
-			if !validTypes[itemType] {
-				return &ValidationError{
-					Field:   fmt.Sprintf("%s.%d.type", path, i),
-					Message: fmt.Sprintf("Invalid input type '%s' at index %d", itemType, i),
+			if itemType != "" && !validTypes[itemType] {
+				verr = &ValidationError{
+					Field:   fmt.Sprintf("%s.%d.type", path, idx),
+					Message: fmt.Sprintf("Invalid input type '%s' at index %d", itemType, idx),
 					Code:    "invalid_input_type",
 				}
+				return false
+			}
+			idx++
+			return true
+		})
+		if verr != nil {
+			return verr
+		}
+		if !sawItem {
+			return &ValidationError{
+				Field:   path,
+				Message: "Input array cannot be empty",
+				Code:    "empty_input",
 			}
 		}
 		return nil

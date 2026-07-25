@@ -87,6 +87,7 @@ func TestLogUpstreamCyberPolicyRecordsStreamingFailure(t *testing.T) {
 
 	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"cyber security risk detected"}}}`)
 	handler.logUpstreamCyberPolicy(ctx, "/v1/responses", "gpt-5.4", responseFailedErrorBody(payload))
+	waitPromptFilterAuditIdle(t, db)
 
 	logs, err := db.ListPromptFilterLogs(ctx.Request.Context(), 10)
 	if err != nil {

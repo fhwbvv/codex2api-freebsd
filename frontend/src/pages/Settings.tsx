@@ -1068,6 +1068,12 @@ export default function Settings() {
     { label: t('settings.affinityModeOff'), value: 'off' },
     { label: t('settings.affinityModeStrict'), value: 'strict' },
   ]
+  const grokAffinityModeOptions = [
+    { label: t('settings.grokAffinityModeStrict'), value: 'strict' },
+    { label: t('settings.grokAffinityModeFollow'), value: 'follow' },
+    { label: t('settings.affinityModeBounded'), value: 'bounded' },
+    { label: t('settings.affinityModeOff'), value: 'off' },
+  ]
   const clientCompatOptions = [
     { label: t('settings.clientCompatPreserve'), value: 'preserve' },
     { label: t('settings.clientCompatAuto'), value: 'auto' },
@@ -1146,10 +1152,20 @@ export default function Settings() {
     codex_ws_hide_upstream_errors: true,
     codex_ws_silent_retry_enabled: true,
     codex_ws_silent_max_retries: 2,
+    codex_ws_size_router_enabled: true,
+    codex_ws_busy_acquire_max_wait_sec: 30,
+    codex_ws_busy_overflow_enabled: false,
+    codex_ws_busy_patience_sec: 2,
     codex_continue_thinking_enabled: false,
+    overflow_auto_compact_enabled: false,
+    codex_preflight_sse_passthrough_enabled: false,
     codex_continue_max_rounds: 8,
     scheduler_mode: 'round_robin',
     affinity_mode: 'bounded',
+    grok_affinity_mode: 'strict',
+    grok_probe_enabled: false,
+    grok_probe_interval_minutes: 30,
+    grok_max_rate_limit_retries: 0,
     max_retries: 2,
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
@@ -1195,6 +1211,7 @@ export default function Settings() {
     stream_flush_interval_ms: 20,
     first_token_mode: 'strict',
     first_token_timeout_seconds: 0,
+    first_token_excludes_ws_acquire: false,
     billing_tier_policy: 'actual',
     show_full_usage_numbers: false,
     public_key_usage_page_enabled: true,
@@ -2121,6 +2138,72 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
+          <SettingsCard title={t('settings.grokSettingsTitle')} description={t('settings.grokSettingsDesc')} icon={<Layers className="size-4" />}>
+            {/* 与「探测调度」一致：表单控件同宽网格，开关单独一行，避免 switch 卡片与 input 混排导致高低宽不一致。 */}
+            <div className="space-y-4">
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField label={t('settings.grokAffinityMode')} description={t('settings.grokAffinityModeDesc')}>
+                  <Select
+                    value={settingsForm.grok_affinity_mode || 'strict'}
+                    onValueChange={(value) => autoSaveStringField('grok_affinity_mode', value)}
+                    options={grokAffinityModeOptions}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.grokProbeInterval')}
+                  description={t('settings.grokProbeIntervalDesc')}
+                  suffix={t('settings.unit.min')}
+                >
+                  <DraftNumberInput
+                    min={5}
+                    max={1440}
+                    step={5}
+                    integer
+                    emptyValue={30}
+                    disabled={!settingsForm.grok_probe_enabled}
+                    value={settingsForm.grok_probe_interval_minutes ?? 30}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_probe_interval_minutes: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 5 ? 5 : value
+                      void autoSaveSettingsPatch({ grok_probe_interval_minutes: v })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.grokMaxRateLimitRetries')}
+                  description={t('settings.grokMaxRateLimitRetriesDesc')}
+                  suffix={t('settings.unit.times')}
+                >
+                  <DraftNumberInput
+                    min={0}
+                    max={20}
+                    step={1}
+                    integer
+                    emptyValue={0}
+                    value={settingsForm.grok_max_rate_limit_retries ?? 0}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_max_rate_limit_retries: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 0 ? 0 : value
+                      void autoSaveSettingsPatch({ grok_max_rate_limit_retries: v })
+                    }}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.grokProbeEnabled')} description={t('settings.grokProbeEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.grok_probe_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('grok_probe_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.globalAutoPauseTitle')} description={t('settings.globalAutoPauseDesc')} icon={<Activity className="size-4" />}>
             <div className="space-y-4">
               <div className={SETTINGS_FIELD_GRID_3}>
@@ -2278,6 +2361,18 @@ export default function Settings() {
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_silent_retry_enabled', checked)}
                   />
                 </SettingField>
+                <SettingField label={t('settings.codexWSSizeRouterEnabled')} description={t('settings.codexWSSizeRouterEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_size_router_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_size_router_enabled', checked)}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.codexWSBusyOverflowEnabled')} description={t('settings.codexWSBusyOverflowEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_busy_overflow_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_busy_overflow_enabled', checked)}
+                  />
+                </SettingField>
               </div>
 
               <div className={cn(SETTINGS_FIELD_GRID, 'border-t border-border/80 pt-4')}>
@@ -2322,6 +2417,44 @@ export default function Settings() {
                     }}
                   />
                 </SettingField>
+                <SettingField
+                  label={t('settings.codexWSBusyAcquireMaxWait')}
+                  description={t('settings.codexWSBusyAcquireMaxWaitDesc')}
+                  suffix={t('settings.unit.sec')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={300}
+                    value={settingsForm.codex_ws_busy_acquire_max_wait_sec}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_busy_acquire_max_wait_sec: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({
+                        codex_ws_busy_acquire_max_wait_sec: value,
+                      })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexWSBusyPatience')}
+                  description={t('settings.codexWSBusyPatienceDesc')}
+                  suffix={t('settings.unit.sec')}
+                  className={cn(!settingsForm.codex_ws_busy_overflow_enabled && 'opacity-60')}
+                >
+                  <DraftNumberInput
+                    min={0}
+                    max={300}
+                    disabled={!settingsForm.codex_ws_busy_overflow_enabled}
+                    value={settingsForm.codex_ws_busy_patience_sec}
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_busy_patience_sec: value }))}
+                    onValueCommit={(value) => {
+                      if (!settingsForm.codex_ws_busy_overflow_enabled) return
+                      void autoSaveSettingsPatch({
+                        codex_ws_busy_patience_sec: value,
+                      })
+                    }}
+                  />
+                </SettingField>
               </div>
             </div>
           </SettingsCard>
@@ -2357,6 +2490,28 @@ export default function Settings() {
                   />
                 </SettingField>
               </div>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.overflowAutoCompact')} description={t('settings.overflowAutoCompactDesc')} icon={<Layers className="size-4" />}>
+            <div className={SETTINGS_SWITCH_GRID}>
+              <SettingField label={t('settings.overflowAutoCompactEnabled')} description={t('settings.overflowAutoCompactEnabledDesc')} layout="switch">
+                <Switch
+                  checked={settingsForm.overflow_auto_compact_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField('overflow_auto_compact_enabled', checked)}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.codexPreflightSSEPassthrough')} description={t('settings.codexPreflightSSEPassthroughDesc')} icon={<Layers className="size-4" />}>
+            <div className={SETTINGS_SWITCH_GRID}>
+              <SettingField label={t('settings.codexPreflightSSEPassthroughEnabled')} description={t('settings.codexPreflightSSEPassthroughEnabledDesc')} layout="switch">
+                <Switch
+                  checked={settingsForm.codex_preflight_sse_passthrough_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField('codex_preflight_sse_passthrough_enabled', checked)}
+                />
+              </SettingField>
             </div>
           </SettingsCard>
 
@@ -2562,6 +2717,14 @@ export default function Settings() {
                     value={settingsForm.first_token_timeout_seconds}
                     emptyValue={0}
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, first_token_timeout_seconds: value }))}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.firstTokenExcludesWsAcquire')} description={t('settings.firstTokenExcludesWsAcquireDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.first_token_excludes_ws_acquire}
+                    onCheckedChange={(checked) => autoSaveBooleanField('first_token_excludes_ws_acquire', checked)}
                   />
                 </SettingField>
               </div>

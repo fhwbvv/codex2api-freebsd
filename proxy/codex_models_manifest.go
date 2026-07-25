@@ -22,9 +22,9 @@ import (
 // 上游失败时 fast-fail 返回错误、不伪造列表——Codex 客户端自身会回落本地缓存。
 func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 	apiKeyID := requestAPIKeyID(c)
-	// 清单端点只存在于 ChatGPT 后端,relay API-key 账号无从代答。
+	// 清单端点只存在于 ChatGPT 后端,relay/Grok 账号无从代答。
 	account := h.store.NextExcludingWithFilter(apiKeyID, nil, func(a *auth.Account) bool {
-		return !a.IsOpenAIResponsesAPI()
+		return !a.IsRelayStyle()
 	})
 	if account == nil {
 		api.SendError(c, api.ErrServiceUnavailable)
@@ -99,8 +99,8 @@ func (h *Handler) learnManifestModelsAsync(manifestBody []byte) {
 	}
 
 	body := append([]byte(nil), manifestBody...)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	h.db.RunBackgroundTask(func(parent context.Context) {
+		ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 		defer cancel()
 		added, err := LearnModelsFromManifest(ctx, h.db, body, time.Now().UTC())
 		if err != nil {
@@ -116,7 +116,7 @@ func (h *Handler) learnManifestModelsAsync(manifestBody []byte) {
 		if len(added) > 0 {
 			log.Printf("已从上游模型清单学习 %d 个新模型进注册表: %s", len(added), strings.Join(added, ", "))
 		}
-	}()
+	})
 }
 
 // CodexModelsManifestURL 是 ChatGPT 后端的 Codex 模型清单端点。

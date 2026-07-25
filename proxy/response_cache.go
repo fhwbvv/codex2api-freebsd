@@ -255,10 +255,7 @@ func inputHasToolCallContext(input gjson.Result) bool {
 func inputHasFunctionCallOutput(input gjson.Result) bool {
 	found := false
 	input.ForEach(func(_, v gjson.Result) bool {
-		switch v.Get("type").String() {
-		case "function_call_output", "tool_call_output", "local_shell_call_output",
-			"shell_call_output", "apply_patch_call_output",
-			"tool_search_call_output", "custom_tool_call_output", "mcp_tool_call_output":
+		if isCodexToolCallOutputType(v.Get("type").String()) {
 			found = true
 			return false
 		}
@@ -267,10 +264,34 @@ func inputHasFunctionCallOutput(input gjson.Result) bool {
 	return found
 }
 
+// isCodexToolCallOutputType 判断 item 类型是否属于工具调用输出项（*_call_output），
+// 与 isCodexToolCallContextType 的调用项集合一一对应。
+func isCodexToolCallOutputType(typ string) bool {
+	switch typ {
+	case "function_call_output",
+		"tool_call_output",
+		"local_shell_call_output",
+		"shell_call_output",
+		"apply_patch_call_output",
+		"tool_search_call_output",
+		"custom_tool_call_output",
+		"mcp_tool_call_output":
+		return true
+	default:
+		return false
+	}
+}
+
 // cacheCompletedResponse 从 response.completed 事件中提取 response.id 和 response.output，
 // 与当前请求的 expanded input 合并后存入 owner 命名空间的缓存。
 // 仅在响应包含需要 call_id 续链的 Codex 工具调用时才缓存，避免为普通对话浪费内存。
 func cacheCompletedResponse(owner string, expandedInputRaw []byte, completedData []byte) {
+	cacheCompletedResponseWithOutputItems(owner, expandedInputRaw, completedData, nil)
+}
+
+// cacheCompletedResponseWithOutputItems 在 response.completed.output 未携带工具调用时，
+// 使用流式 response.output_item.done 中已收集的 outputItems 作为兜底。
+func cacheCompletedResponseWithOutputItems(owner string, expandedInputRaw []byte, completedData []byte, outputItems []json.RawMessage) {
 	respID := gjson.GetBytes(completedData, "response.id").String()
 	if respID == "" {
 		return
@@ -279,19 +300,28 @@ func cacheCompletedResponse(owner string, expandedInputRaw []byte, completedData
 	// 仅在响应包含 Codex 工具调用时才缓存（普通对话无需 previous_response_id 展开）。
 	// image_generation_call / web_search_call 虽然也是 *_call 结尾，但不属于 call_id 工具续链体系。
 	output := gjson.GetBytes(completedData, "response.output")
-	if !output.IsArray() {
+	if !output.IsArray() && len(outputItems) == 0 {
 		return
 	}
-	hasToolCallContext := false
+	completedHasToolCallContext := false
 	output.ForEach(func(_, item gjson.Result) bool {
 		if isCodexToolCallContextType(item.Get("type").String()) {
-			hasToolCallContext = true
+			completedHasToolCallContext = true
 			return false
 		}
 		return true
 	})
-	if !hasToolCallContext {
-		return
+	if !completedHasToolCallContext {
+		hasToolCallContext := false
+		for _, raw := range outputItems {
+			if isCodexToolCallContextType(gjson.GetBytes(raw, "type").String()) {
+				hasToolCallContext = true
+				break
+			}
+		}
+		if !hasToolCallContext {
+			return
+		}
 	}
 
 	var items []json.RawMessage
@@ -315,6 +345,13 @@ func cacheCompletedResponse(owner string, expandedInputRaw []byte, completedData
 		}
 		return true
 	})
+	if !completedHasToolCallContext {
+		for _, raw := range outputItems {
+			if item, ok := replayableCachedOutputItem(gjson.ParseBytes(raw)); ok {
+				items = append(items, item)
+			}
+		}
+	}
 
 	if len(items) > 0 {
 		setResponseCache(owner, respID, items)

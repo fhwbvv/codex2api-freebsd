@@ -110,7 +110,7 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
 	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
 
-	got := summarizeDashboardAccounts(rows, []*auth.Account{
+	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{
 		activeFromStaleDB,
 		unauthorized,
 		disabled,
@@ -1090,6 +1090,188 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	}
 	if response.TransportRetryPolicy != "sticky" {
 		t.Fatalf("transport_retry_policy = %q, want sticky", response.TransportRetryPolicy)
+	}
+}
+
+func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	settings.PromptFilterAdvancedConfig = `{
+		"normalization":{"enabled":true,"future_decoder":"v2"},
+		"guard":{"mode":"shadow","future_guard":{"enabled":true}},
+		"future_root":{"revision":7}
+	}`
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	newAPISecret := strings.Repeat("s", 32)
+	if err := db.SetPromptFilterNewAPISecret(context.Background(), newAPISecret); err != nil {
+		t.Fatalf("seed NewAPI secret: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	getAdvanced := func() string {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil)
+		handler.GetSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var response settingsResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode GET response: %v", err)
+		}
+		return response.PromptFilterAdvancedConfig
+	}
+
+	assertUnknownAdvancedFields(t, getAdvanced())
+
+	patchBytes, err := json.Marshal(map[string]string{
+		"prompt_filter_advanced_config": `{"guard":{"mode":"enforce"}}`,
+	})
+	if err != nil {
+		t.Fatalf("marshal update: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", bytes.NewReader(patchBytes))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var updateResponse settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &updateResponse); err != nil {
+		t.Fatalf("decode PUT response: %v", err)
+	}
+	assertUnknownAdvancedFields(t, updateResponse.PromptFilterAdvancedConfig)
+	assertAdvancedGuardMode(t, updateResponse.PromptFilterAdvancedConfig, "enforce")
+	assertUnknownAdvancedFields(t, getAdvanced())
+	assertAdvancedGuardMode(t, getAdvanced(), "enforce")
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	assertUnknownAdvancedFields(t, persisted.PromptFilterAdvancedConfig)
+	assertAdvancedGuardMode(t, persisted.PromptFilterAdvancedConfig, "enforce")
+	if got := store.GetPromptFilterConfig().Advanced.Guard.Mode; got != "enforce" {
+		t.Fatalf("runtime guard.mode = %q, want enforce", got)
+	}
+	if got := store.GetPromptFilterConfig().Advanced.NewAPI.Secret; got != newAPISecret {
+		t.Fatalf("runtime NewAPI secret changed during advanced update")
+	}
+	if strings.Contains(updateResponse.PromptFilterAdvancedConfig, newAPISecret) {
+		t.Fatal("NewAPI secret leaked into prompt_filter_advanced_config")
+	}
+
+	// An unrelated partial update must not reserialize the typed runtime config
+	// and erase fields unknown to this binary.
+	unrelated := httptest.NewRecorder()
+	unrelatedCtx, _ := gin.CreateTestContext(unrelated)
+	unrelatedCtx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"site_name":"Raw Config Test"}`))
+	unrelatedCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(unrelatedCtx)
+	if unrelated.Code != http.StatusOK {
+		t.Fatalf("unrelated PUT status=%d body=%s", unrelated.Code, unrelated.Body.String())
+	}
+	persisted, err = db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings after unrelated update: %v", err)
+	}
+	assertUnknownAdvancedFields(t, persisted.PromptFilterAdvancedConfig)
+}
+
+func TestPromptFilterAdvancedSettingsRejectInvalidJSONWithoutReplacingLastValidState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	settings.PromptFilterAdvancedConfig = `{"guard":{"mode":"shadow"},"future_root":{"revision":9}}`
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	beforeRaw := store.GetPromptFilterAdvancedConfig()
+	beforeMode := store.GetPromptFilterConfig().Advanced.Guard.Mode
+	payload, err := json.Marshal(map[string]string{"prompt_filter_advanced_config": `{"guard":`})
+	if err != nil {
+		t.Fatalf("marshal invalid update: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", bytes.NewReader(payload))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := store.GetPromptFilterAdvancedConfig(); got != beforeRaw {
+		t.Fatalf("runtime raw config changed after invalid JSON\nbefore=%s\nafter=%s", beforeRaw, got)
+	}
+	if got := store.GetPromptFilterConfig().Advanced.Guard.Mode; got != beforeMode {
+		t.Fatalf("runtime guard.mode = %q, want unchanged %q", got, beforeMode)
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted.PromptFilterAdvancedConfig != settings.PromptFilterAdvancedConfig {
+		t.Fatalf("persisted raw config changed after invalid JSON\nbefore=%s\nafter=%s", settings.PromptFilterAdvancedConfig, persisted.PromptFilterAdvancedConfig)
+	}
+}
+
+func assertUnknownAdvancedFields(t *testing.T, raw string) {
+	t.Helper()
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &root); err != nil {
+		t.Fatalf("decode advanced config: %v raw=%s", err, raw)
+	}
+	if _, ok := root["future_root"]; !ok {
+		t.Fatalf("future_root missing from %s", raw)
+	}
+	var normalization map[string]json.RawMessage
+	if err := json.Unmarshal(root["normalization"], &normalization); err != nil {
+		t.Fatalf("decode normalization: %v", err)
+	}
+	if _, ok := normalization["future_decoder"]; !ok {
+		t.Fatalf("future_decoder missing from %s", root["normalization"])
+	}
+	var guard map[string]json.RawMessage
+	if err := json.Unmarshal(root["guard"], &guard); err != nil {
+		t.Fatalf("decode guard: %v", err)
+	}
+	if _, ok := guard["future_guard"]; !ok {
+		t.Fatalf("future_guard missing from %s", root["guard"])
+	}
+}
+
+func assertAdvancedGuardMode(t *testing.T, raw, want string) {
+	t.Helper()
+	var document struct {
+		Guard struct {
+			Mode string `json:"mode"`
+		} `json:"guard"`
+	}
+	if err := json.Unmarshal([]byte(raw), &document); err != nil {
+		t.Fatalf("decode advanced config: %v", err)
+	}
+	if document.Guard.Mode != want {
+		t.Fatalf("guard.mode = %q, want %q raw=%s", document.Guard.Mode, want, raw)
 	}
 }
 
@@ -2238,6 +2420,7 @@ func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
 		"refresh_token": "rt-active",
 		"email":         "restore@example.com",
 		"account_id":    "acc-restore",
+		"workspace_id":  "workspace-restore",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert active: %v", err)
@@ -2246,6 +2429,7 @@ func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
 		"refresh_token": "rt-deleted",
 		"email":         "Restore@Example.com",
 		"account_id":    "acc-restore",
+		"workspace_id":  "workspace-restore",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert deleted: %v", err)

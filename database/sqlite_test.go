@@ -26,6 +26,29 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLitePromptFilterColumnDefaultsRemainUpgradeCompatible(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) returned error: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.conn.ExecContext(context.Background(), `INSERT INTO system_settings (id) VALUES (1)`); err != nil {
+		t.Fatalf("insert default settings row: %v", err)
+	}
+	settings, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings returned error: %v", err)
+	}
+	if settings.PromptFilterEnabled || settings.PromptFilterMode != "monitor" || settings.PromptFilterStrictTerminalEnabled {
+		t.Fatalf("compatibility defaults = enabled:%t mode:%q strict_terminal:%t", settings.PromptFilterEnabled, settings.PromptFilterMode, settings.PromptFilterStrictTerminalEnabled)
+	}
+	if strings.TrimSpace(settings.PromptFilterAdvancedConfig) != "{}" {
+		t.Fatalf("compatibility advanced config = %q, want {}", settings.PromptFilterAdvancedConfig)
+	}
+}
+
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -192,15 +215,16 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 
 	ctx := context.Background()
 	id, err := db.InsertAccountWithCredentials(ctx, "identity", map[string]interface{}{
-		"refresh_token":      "rt-identity",
-		"email":              "User@Example.COM",
-		"chatgpt_account_id": "acc-identity",
+		"refresh_token":   "rt-identity",
+		"email":           "User@Example.COM",
+		"workspace_id":    "workspace-identity",
+		"allow_duplicate": "true",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
 	}
 
-	got, err := db.FindActiveAccountByOAuthIdentity(ctx, " user@example.com ", "acc-identity")
+	got, err := db.FindActiveAccountByOAuthIdentity(ctx, " user@example.com ", "workspace-identity")
 	if err != nil {
 		t.Fatalf("FindActiveAccountByOAuthIdentity 返回错误: %v", err)
 	}
@@ -211,12 +235,12 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 	otherID, err := db.InsertAccountWithCredentials(ctx, "identity-other", map[string]interface{}{
 		"refresh_token": "rt-identity-other",
 		"email":         "user@example.com",
-		"account_id":    "acc-identity",
+		"workspace_id":  "workspace-identity",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials other 返回错误: %v", err)
 	}
-	got, err = db.FindActiveAccountByOAuthIdentity(ctx, "user@example.com", "acc-identity", id)
+	got, err = db.FindActiveAccountByOAuthIdentity(ctx, "user@example.com", "workspace-identity", id)
 	if err != nil {
 		t.Fatalf("FindActiveAccountByOAuthIdentity with exclude 返回错误: %v", err)
 	}
@@ -230,17 +254,14 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 	if err := db.SoftDeleteAccount(ctx, otherID); err != nil {
 		t.Fatalf("SoftDeleteAccount other 返回错误: %v", err)
 	}
-	if _, err := db.FindActiveAccountByOAuthIdentity(ctx, "user@example.com", "acc-identity"); err == nil {
+	if _, err := db.FindActiveAccountByOAuthIdentity(ctx, "user@example.com", "workspace-identity"); err == nil {
 		t.Fatal("FindActiveAccountByOAuthIdentity 应该排除已删除账号")
 	} else if err != sql.ErrNoRows {
 		t.Fatalf("FindActiveAccountByOAuthIdentity err = %v, want sql.ErrNoRows", err)
 	}
 }
 
-// 个人账号 JWT 可能没有工作区 account_id，只有 user_id（user-...）；此外旧版
-// wham 回填曾把 user_id 写进 account_id 字段。身份匹配必须两个键都认，
-// 否则 AT 轮换后同一账号会被重复导入。
-func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
+func TestFindActiveAccountByOAuthIdentityIgnoresLegacyIDs(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
 	db, err := New("sqlite", dbPath)
@@ -252,7 +273,7 @@ func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
 	ctx := context.Background()
 
 	// 账号 A：credentials 里存的是 user_id 键
-	idA, err := db.InsertAccountWithCredentials(ctx, "uid-key", map[string]interface{}{
+	_, err = db.InsertAccountWithCredentials(ctx, "uid-key", map[string]interface{}{
 		"access_token": "at-uid-key",
 		"email":        "solo@example.com",
 		"user_id":      "user-abc123",
@@ -260,16 +281,12 @@ func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials A 返回错误: %v", err)
 	}
-	got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-abc123")
-	if err != nil {
-		t.Fatalf("match by user_id key 返回错误: %v", err)
-	}
-	if got != idA {
-		t.Fatalf("matched id = %d, want %d", got, idA)
+	if _, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-abc123"); err != sql.ErrNoRows {
+		t.Fatalf("user_id lookup err = %v, want sql.ErrNoRows", err)
 	}
 
 	// 账号 B：旧版 wham 回填把 user_id 污染进了 account_id 字段
-	idB, err := db.InsertAccountWithCredentials(ctx, "polluted", map[string]interface{}{
+	_, err = db.InsertAccountWithCredentials(ctx, "polluted", map[string]interface{}{
 		"access_token": "at-polluted",
 		"email":        "legacy@example.com",
 		"account_id":   "user-def456", // 实为 user_id
@@ -277,12 +294,8 @@ func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertAccountWithCredentials B 返回错误: %v", err)
 	}
-	got, err = db.FindActiveAccountByOAuthIdentity(ctx, "legacy@example.com", "user-def456")
-	if err != nil {
-		t.Fatalf("match polluted account_id 返回错误: %v", err)
-	}
-	if got != idB {
-		t.Fatalf("matched id = %d, want %d", got, idB)
+	if _, err := db.FindActiveAccountByOAuthIdentity(ctx, "legacy@example.com", "user-def456"); err != sql.ErrNoRows {
+		t.Fatalf("legacy account_id lookup err = %v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -352,11 +365,9 @@ func TestSQLiteDataMigrationV2DedupesByUserID(t *testing.T) {
 		t.Fatal("allow_duplicate 副本被迁移误删，应保留")
 	}
 
-	// 强制副本也不作为身份判重锚点：按身份查找应命中主账号而非副本
-	if got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-dup999"); err != nil {
-		t.Fatalf("FindActiveAccountByOAuthIdentity 返回错误: %v", err)
-	} else if got == forcedID {
-		t.Fatal("身份判重不应命中 allow_duplicate 副本")
+	// v3 动态判重不再把历史 user_id/account_id 当作 workspace_id。
+	if _, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-dup999"); err != sql.ErrNoRows {
+		t.Fatalf("FindActiveAccountByOAuthIdentity err = %v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -722,6 +733,55 @@ func TestSQLiteAccountsEnabledDefaultsAndCanToggle(t *testing.T) {
 	}
 }
 
+func TestSQLiteListActiveByChannel(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api-channel.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	codexID, err := db.InsertAccount(ctx, "codex-one", "rt-codex", "")
+	if err != nil {
+		t.Fatalf("InsertAccount codex 返回错误: %v", err)
+	}
+	grokID, err := db.InsertAccountWithUpstream(ctx, "grok-one", "xai", "oauth", map[string]interface{}{
+		"upstream_type":  "grok",
+		"refresh_token":  "rt-grok",
+		"access_token":   "at-grok",
+		"email":          "g@example.com",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithUpstream grok 返回错误: %v", err)
+	}
+
+	all, err := db.ListActiveByChannel(ctx, "")
+	if err != nil {
+		t.Fatalf("ListActiveByChannel(\"\") 返回错误: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("ListActiveByChannel(\"\") len = %d, want 2", len(all))
+	}
+
+	grokRows, err := db.ListActiveByChannel(ctx, UpstreamChannelGrok)
+	if err != nil {
+		t.Fatalf("ListActiveByChannel(grok) 返回错误: %v", err)
+	}
+	if len(grokRows) != 1 || grokRows[0].ID != grokID {
+		t.Fatalf("ListActiveByChannel(grok) = %+v, want id %d", grokRows, grokID)
+	}
+
+	codexRows, err := db.ListActiveByChannel(ctx, UpstreamChannelCodex)
+	if err != nil {
+		t.Fatalf("ListActiveByChannel(codex) 返回错误: %v", err)
+	}
+	if len(codexRows) != 1 || codexRows[0].ID != codexID {
+		t.Fatalf("ListActiveByChannel(codex) = %+v, want id %d", codexRows, codexID)
+	}
+}
+
 func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -765,7 +825,7 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 	}
 }
 
-func TestUsageLogModeErrorsSkipsSuccessfulLogs(t *testing.T) {
+func TestUsageLogModeErrorsSkipsSuccessfulLogsButChargesQuota(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
 	db, err := New("sqlite", dbPath)
@@ -776,11 +836,17 @@ func TestUsageLogModeErrorsSkipsSuccessfulLogs(t *testing.T) {
 	db.SetUsageLogConfig(UsageLogModeErrors, 10, 5)
 
 	ctx := context.Background()
+	apiKeyID, err := db.InsertAPIKey(ctx, "mode-errors", "sk-mode-errors-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
 	if err := db.InsertUsageLog(ctx, &UsageLogInput{
-		AccountID:  1,
-		Endpoint:   "/v1/responses",
-		Model:      "gpt-5.4",
-		StatusCode: 200,
+		AccountID:   1,
+		APIKeyID:    apiKeyID,
+		Endpoint:    "/v1/responses",
+		Model:       "gpt-5.4",
+		StatusCode:  200,
+		InputTokens: 1000,
 	}); err != nil {
 		t.Fatalf("InsertUsageLog success 返回错误: %v", err)
 	}
@@ -804,6 +870,15 @@ func TestUsageLogModeErrorsSkipsSuccessfulLogs(t *testing.T) {
 	}
 	if logs[0].StatusCode != 500 {
 		t.Fatalf("StatusCode = %d, want 500", logs[0].StatusCode)
+	}
+
+	want := calculateCost(1000, 0, 0, "gpt-5.4", "")
+	var quotaUsed, totalUsed float64
+	if err := db.conn.QueryRowContext(ctx, `SELECT quota_used, total_used FROM api_keys WHERE id = $1`, apiKeyID).Scan(&quotaUsed, &totalUsed); err != nil {
+		t.Fatalf("查询 API Key 用量返回错误: %v", err)
+	}
+	if math.Abs(quotaUsed-want) > 1e-12 || math.Abs(totalUsed-want) > 1e-12 {
+		t.Fatalf("API Key usage = quota %.12f total %.12f, want %.12f", quotaUsed, totalUsed, want)
 	}
 }
 
@@ -907,7 +982,7 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 		t.Fatalf("summary = %+v, want one 5xx/401/499/timeout/retry", summary)
 	}
 
-	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5)
+	charts, err := db.GetChartAggregation(ctx, filter.Start, filter.End, 5, "")
 	if err != nil {
 		t.Fatalf("GetChartAggregation 返回错误: %v", err)
 	}
@@ -930,7 +1005,7 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 	}
 }
 
-func TestUsageLogModeOffSkipsAllLogs(t *testing.T) {
+func TestUsageLogModeOffSkipsAllLogsButChargesQuota(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
 	db, err := New("sqlite", dbPath)
@@ -941,11 +1016,17 @@ func TestUsageLogModeOffSkipsAllLogs(t *testing.T) {
 	db.SetUsageLogConfig(UsageLogModeOff, 10, 5)
 
 	ctx := context.Background()
+	apiKeyID, err := db.InsertAPIKey(ctx, "mode-off", "sk-mode-off-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
 	if err := db.InsertUsageLog(ctx, &UsageLogInput{
-		AccountID:  1,
-		Endpoint:   "/v1/responses",
-		Model:      "gpt-5.4",
-		StatusCode: 500,
+		AccountID:   1,
+		APIKeyID:    apiKeyID,
+		Endpoint:    "/v1/responses",
+		Model:       "gpt-5.4",
+		StatusCode:  200,
+		InputTokens: 1000,
 	}); err != nil {
 		t.Fatalf("InsertUsageLog 返回错误: %v", err)
 	}
@@ -957,6 +1038,53 @@ func TestUsageLogModeOffSkipsAllLogs(t *testing.T) {
 	}
 	if len(logs) != 0 {
 		t.Fatalf("len(logs) = %d, want 0", len(logs))
+	}
+
+	want := calculateCost(1000, 0, 0, "gpt-5.4", "")
+	var quotaUsed, totalUsed float64
+	if err := db.conn.QueryRowContext(ctx, `SELECT quota_used, total_used FROM api_keys WHERE id = $1`, apiKeyID).Scan(&quotaUsed, &totalUsed); err != nil {
+		t.Fatalf("查询 API Key 用量返回错误: %v", err)
+	}
+	if math.Abs(quotaUsed-want) > 1e-12 || math.Abs(totalUsed-want) > 1e-12 {
+		t.Fatalf("API Key usage = quota %.12f total %.12f, want %.12f", quotaUsed, totalUsed, want)
+	}
+}
+
+func TestUsageLogModesPreserveCanceledQuotaExemption(t *testing.T) {
+	for _, mode := range []string{UsageLogModeErrors, UsageLogModeOff} {
+		t.Run(mode, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+			db, err := New("sqlite", dbPath)
+			if err != nil {
+				t.Fatalf("New(sqlite) 返回错误: %v", err)
+			}
+			defer db.Close()
+			db.SetUsageLogConfig(mode, 10, 5)
+
+			ctx := context.Background()
+			apiKeyID, err := db.InsertAPIKey(ctx, "mode-499-"+mode, "sk-mode-499-"+mode+"-1234567890")
+			if err != nil {
+				t.Fatalf("InsertAPIKey 返回错误: %v", err)
+			}
+			if err := db.InsertUsageLog(ctx, &UsageLogInput{
+				APIKeyID:    apiKeyID,
+				Endpoint:    "/v1/responses",
+				Model:       "gpt-5.4",
+				StatusCode:  499,
+				InputTokens: 1000,
+			}); err != nil {
+				t.Fatalf("InsertUsageLog 返回错误: %v", err)
+			}
+			db.flushLogs()
+
+			var quotaUsed, totalUsed float64
+			if err := db.conn.QueryRowContext(ctx, `SELECT quota_used, total_used FROM api_keys WHERE id = $1`, apiKeyID).Scan(&quotaUsed, &totalUsed); err != nil {
+				t.Fatalf("查询 API Key 用量返回错误: %v", err)
+			}
+			if quotaUsed != 0 || totalUsed != 0 {
+				t.Fatalf("API Key usage = quota %.12f total %.12f, want 0", quotaUsed, totalUsed)
+			}
+		})
 	}
 }
 
@@ -1107,6 +1235,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		StreamFlushIntervalMS:             20,
 		FirstTokenMode:                    "loose",
 		FirstTokenTimeoutSeconds:          17,
+		FirstTokenExcludesWsAcquire:       true,
 		BillingTierPolicy:                 "requested",
 		ImageStorageConfig:                "{}",
 		SchedulerMode:                     "round_robin",
@@ -1134,6 +1263,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.FirstTokenTimeoutSeconds != 17 {
 		t.Fatalf("FirstTokenTimeoutSeconds = %d, want 17", settings.FirstTokenTimeoutSeconds)
+	}
+	if !settings.FirstTokenExcludesWsAcquire {
+		t.Fatal("FirstTokenExcludesWsAcquire = false, want true")
 	}
 	if !settings.PromptFilterStrictTerminalEnabled {
 		t.Fatal("PromptFilterStrictTerminalEnabled = false, want true")
@@ -1227,6 +1359,21 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.PublicImageStudioPageEnabled {
 		t.Fatal("PublicImageStudioPageEnabled = true, want false")
+	}
+
+	settings.FirstTokenExcludesWsAcquire = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false FirstTokenExcludesWsAcquire 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false FirstTokenExcludesWsAcquire 返回错误: %v", err)
+	}
+	if settings.FirstTokenExcludesWsAcquire {
+		t.Fatal("FirstTokenExcludesWsAcquire = true, want false")
+	}
+	if settings.PromptFilterAdvancedConfig != `{"normalization":{"enabled":true}}` {
+		t.Fatalf("PromptFilterAdvancedConfig after FirstTokenExcludesWsAcquire update = %q", settings.PromptFilterAdvancedConfig)
 	}
 }
 
@@ -1780,7 +1927,7 @@ func TestUsageStatsIncludeBillingTotals(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -1879,7 +2026,7 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 	db.flushLogs()
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2111,7 +2258,7 @@ func TestUsageStatsBreakdownsRespectExplicitRange(t *testing.T) {
 		t.Fatalf("更新旧日志时间失败: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd)
+	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2187,7 +2334,7 @@ func TestUsageStatsBaselinePreservesCacheRateAndFirstTokenAfterClear(t *testing.
 		t.Fatalf("ClearUsageLogs 返回错误: %v", err)
 	}
 
-	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{})
+	stats, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
 	if err != nil {
 		t.Fatalf("GetUsageStats 返回错误: %v", err)
 	}
@@ -2882,6 +3029,72 @@ func TestFlushLogsRollsBackAndRequeuesWhenQuotaUpdateFails(t *testing.T) {
 	}
 }
 
+func TestFlushLogsRetriesQuotaOnlyBatchWithoutDoubleCharge(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	close(db.logStop)
+	db.logWg.Wait()
+	defer db.conn.Close()
+	db.SetUsageLogConfig(UsageLogModeOff, 10, 5)
+
+	ctx := context.Background()
+	apiKeyID, err := db.InsertAPIKey(ctx, "quota-only-retry", "sk-quota-only-retry-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey 返回错误: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `ALTER TABLE api_keys RENAME TO api_keys_broken`); err != nil {
+		t.Fatalf("rename api_keys 返回错误: %v", err)
+	}
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		APIKeyID:    apiKeyID,
+		Endpoint:    "/v1/responses",
+		Model:       "gpt-5.4",
+		StatusCode:  200,
+		InputTokens: 1000,
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+
+	db.flushLogs()
+	db.logMu.Lock()
+	if len(db.logBuf) != 1 {
+		db.logMu.Unlock()
+		t.Fatalf("len(logBuf) = %d, want 1", len(db.logBuf))
+	}
+	if db.logBuf[0].StoreUsageLog {
+		db.logMu.Unlock()
+		t.Fatal("quota-only event unexpectedly marked for usage log storage")
+	}
+	db.logMu.Unlock()
+
+	if _, err := db.conn.ExecContext(ctx, `ALTER TABLE api_keys_broken RENAME TO api_keys`); err != nil {
+		t.Fatalf("restore api_keys 返回错误: %v", err)
+	}
+	db.flushLogs()
+	db.flushLogs()
+
+	want := calculateCost(1000, 0, 0, "gpt-5.4", "")
+	var quotaUsed, totalUsed float64
+	if err := db.conn.QueryRowContext(ctx, `SELECT quota_used, total_used FROM api_keys WHERE id = $1`, apiKeyID).Scan(&quotaUsed, &totalUsed); err != nil {
+		t.Fatalf("查询 API Key 用量返回错误: %v", err)
+	}
+	if math.Abs(quotaUsed-want) > 1e-12 || math.Abs(totalUsed-want) > 1e-12 {
+		t.Fatalf("API Key usage = quota %.12f total %.12f, want exactly one charge %.12f", quotaUsed, totalUsed, want)
+	}
+
+	var count int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_logs`).Scan(&count); err != nil {
+		t.Fatalf("count usage_logs 返回错误: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("usage_logs count = %d, want 0", count)
+	}
+}
+
 func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -2894,14 +3107,22 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	ctx := context.Background()
 	if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
 		Source:          "local_filter",
-		Endpoint:        "/v1/responses",
+		Endpoint:        "/v1/messages",
+		Protocol:        "claude",
+		Provider:        "anthropic",
 		Model:           "gpt-5.4",
 		Action:          "allow",
 		Mode:            "block",
-		Score:           100,
+		Score:           70,
+		AuditScore:      100,
 		Threshold:       50,
+		PolicyProfile:   "strict",
+		ReasonCode:      "terminal_policy_match",
+		PrimaryOrigin:   "current_user",
+		StrikeEligible:  true,
 		MatchedPatterns: `[{"name":"credential_theft","weight":100}]`,
 		TextPreview:     "preview",
+		MatchContext:    "actual trigger excerpt",
 		ReviewModel:     "omni-moderation-latest",
 		ReviewFlagged:   false,
 		ReviewError:     "temporary failure",
@@ -2919,6 +3140,78 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	got := logs[0]
 	if got.ReviewModel != "omni-moderation-latest" || got.ReviewFlagged || got.ReviewError != "temporary failure" {
 		t.Fatalf("review metadata = %+v", got)
+	}
+	if got.Score != 70 || got.AuditScore != 100 || got.PolicyProfile != "strict" || got.ReasonCode != "terminal_policy_match" || got.PrimaryOrigin != "current_user" || !got.StrikeEligible {
+		t.Fatalf("guard metadata = %+v", got)
+	}
+	if got.Endpoint != "/v1/messages" || got.Protocol != "claude" || got.Provider != "anthropic" {
+		t.Fatalf("original request metadata = %+v", got)
+	}
+	if got.MatchContext != "actual trigger excerpt" {
+		t.Fatalf("match context = %q, want persisted trigger excerpt", got.MatchContext)
+	}
+
+	matched, matchTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Query: "trigger excerpt"})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(match context) 返回错误: %v", err)
+	}
+	if matchTotal != 1 || len(matched) != 1 || matched[0].MatchContext != "actual trigger excerpt" {
+		t.Fatalf("match context search total=%d logs=%+v", matchTotal, matched)
+	}
+
+	nearest, err := db.FindNearestPromptFilterLog(ctx, got.CreatedAt, "local_filter", "/v1/messages", 0, 5)
+	if err != nil {
+		t.Fatalf("FindNearestPromptFilterLog 返回错误: %v", err)
+	}
+	if nearest == nil || nearest.MatchContext != "actual trigger excerpt" {
+		t.Fatalf("nearest prompt filter log = %+v", nearest)
+	}
+}
+
+func TestSQLiteMigratesPromptFilterMatchContextColumn(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close sqlite 返回错误: %v", err)
+	}
+
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite 返回错误: %v", err)
+	}
+	if _, err := legacy.Exec(`ALTER TABLE prompt_filter_logs DROP COLUMN match_context`); err != nil {
+		legacy.Close()
+		t.Fatalf("remove match_context to simulate legacy schema: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy sqlite 返回错误: %v", err)
+	}
+
+	db, err = New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite legacy) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertPromptFilterLog(ctx, &PromptFilterLogInput{
+		Source:       "local_filter",
+		Endpoint:     "/v1/responses",
+		Action:       "allow",
+		Mode:         "monitor",
+		MatchContext: "migrated trigger excerpt",
+	}); err != nil {
+		t.Fatalf("InsertPromptFilterLog after migration 返回错误: %v", err)
+	}
+	logs, err := db.ListPromptFilterLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogs after migration 返回错误: %v", err)
+	}
+	if len(logs) != 1 || logs[0].MatchContext != "migrated trigger excerpt" {
+		t.Fatalf("migrated prompt filter logs = %+v", logs)
 	}
 }
 

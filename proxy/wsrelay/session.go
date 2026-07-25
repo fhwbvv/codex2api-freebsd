@@ -269,31 +269,44 @@ func (s *Session) StartHeartbeat(sendPing func() error) {
 		return
 	}
 	s.heartbeatTimer = time.AfterFunc(HeartbeatPingInterval, func() {
-		s.mu.RLock()
-		connected := s.Connected
-		s.mu.RUnlock()
-
-		if !connected {
-			return
-		}
-
-		// 发送 Ping
-		if err := sendPing(); err != nil {
-			s.Close()
-			return
-		}
-
-		// 检查 timer 是否仍存在（可能已被 StopHeartbeat 清除）
-		s.mu.Lock()
-		timer := s.heartbeatTimer
-		s.mu.Unlock()
-
-		// 安全重置计时器
-		if timer != nil {
-			timer.Reset(HeartbeatPingInterval)
-		}
+		s.heartbeatTick(sendPing)
 	})
 	s.mu.Unlock()
+}
+
+// heartbeatTick 心跳定时器的单次触发逻辑。
+func (s *Session) heartbeatTick(sendPing func() error) {
+	s.mu.RLock()
+	connected := s.Connected
+	s.mu.RUnlock()
+
+	if !connected {
+		return
+	}
+
+	// 发送 Ping
+	if err := sendPing(); err != nil {
+		// Ping 写失败只说明写路径故障，读路径可能仍在正常下发；有在途请求时
+		// 不能 Close（会把本会话全部 pending 同秒截断，issue #436），交给读路径
+		// 裁决：pump 读错误或 ReadMessage 超时会走各自的失败处理。连接本身已被
+		// SendHeartbeat 摘出池子，不会再有新请求进来；心跳链就此停止。
+		if s.PendingCount() > 0 {
+			s.StopHeartbeat()
+			return
+		}
+		s.Close()
+		return
+	}
+
+	// 检查 timer 是否仍存在（可能已被 StopHeartbeat 清除）
+	s.mu.Lock()
+	timer := s.heartbeatTimer
+	s.mu.Unlock()
+
+	// 安全重置计时器
+	if timer != nil {
+		timer.Reset(HeartbeatPingInterval)
+	}
 }
 
 // StopHeartbeat 停止心跳

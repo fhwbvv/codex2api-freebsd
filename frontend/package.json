@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --experimental-strip-types --test src/lib/*.test.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "audit:ci": "node scripts/audit-gate.mjs"
   },
   "dependencies": {
     "@lobehub/icons-static-svg": "^1.91.0",
@@ -21,7 +22,7 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-i18next": "^16.6.6",
-    "react-router-dom": "^7.17.0",
+    "react-router-dom": "^7.18.0",
     "recharts": "^3.8.0",
     "shiki": "^3.23.0",
     "tailwind-merge": "^3.5.0",

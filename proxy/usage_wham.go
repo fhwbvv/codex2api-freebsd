@@ -80,8 +80,11 @@ type WhamUsage struct {
 
 	// RateLimitResetCredits 是账号在 OpenAI 官方那边剩余的「主动重置次数」。
 	// available_count > 0 时可调用 wham/rate-limit-reset-credits/consume 立即重置额度。
+	// applicable_available_count 是当下「可应用」的张数：未触限时上游返回 0
+	// （券在有效期内但此刻不生效），触限后才 > 0。
 	RateLimitResetCredits *struct {
-		AvailableCount int `json:"available_count"`
+		AvailableCount           int `json:"available_count"`
+		ApplicableAvailableCount int `json:"applicable_available_count"`
 	} `json:"rate_limit_reset_credits,omitempty"`
 }
 
@@ -458,6 +461,17 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 	// 记录「主动重置次数」（OpenAI 官方剩余的手动重置额度次数）。
 	if usage.RateLimitResetCredits != nil {
 		account.SetRateLimitResetCredits(usage.RateLimitResetCredits.AvailableCount)
+		account.SetApplicableResetCredits(usage.RateLimitResetCredits.ApplicableAvailableCount)
+	}
+
+	// 记录 credits 积分余额快照（wham 的 credits 对象，零额度成本）。
+	if usage.Credits != nil {
+		account.SetCreditBalance(
+			usage.Credits.Balance,
+			usage.Credits.HasCredits,
+			usage.Credits.Unlimited,
+			usage.Credits.OverageLimitReached,
+		)
 	}
 
 	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow, usage.PlanType, observedAt)

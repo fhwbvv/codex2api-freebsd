@@ -59,6 +59,7 @@ function SheetContent({
   showCloseButton = true,
   onInteractOutside,
   onPointerDownOutside,
+  onFocusOutside,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   side?: "right" | "left"
@@ -88,6 +89,12 @@ function SheetContent({
         }}
         onPointerDownOutside={(event) => {
           onPointerDownOutside?.(event)
+          if (isInteractivePortalTarget(event.target)) {
+            event.preventDefault()
+          }
+        }}
+        onFocusOutside={(event) => {
+          onFocusOutside?.(event)
           if (isInteractivePortalTarget(event.target)) {
             event.preventDefault()
           }

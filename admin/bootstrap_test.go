@@ -1,6 +1,30 @@
 package admin
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/codex2api/security/promptfilter"
+)
+
+func TestDefaultBootstrapSettingsUseRecommendedPromptFilterPreset(t *testing.T) {
+	settings := defaultBootstrapSettings()
+	if settings.PromptFilterEnabled {
+		t.Fatal("fresh install must keep the prompt-filter master switch explicit")
+	}
+	if settings.PromptFilterMode != promptfilter.ModeBlock || !settings.PromptFilterStrictTerminalEnabled {
+		t.Fatalf("prompt filter bootstrap = mode:%q strict_terminal:%t", settings.PromptFilterMode, settings.PromptFilterStrictTerminalEnabled)
+	}
+	advanced, err := promptfilter.ParseAdvancedConfig(settings.PromptFilterAdvancedConfig)
+	if err != nil {
+		t.Fatalf("parse recommended advanced config: %v", err)
+	}
+	if !advanced.Normalization.Enabled || advanced.Normalization.MaxDecodeRuns != 2 {
+		t.Fatalf("recommended bootstrap normalization = %+v", advanced.Normalization)
+	}
+	if advanced.Output.Enabled || advanced.Sidecar.Enabled || advanced.Intelligence.Enabled {
+		t.Fatalf("latency-sensitive bootstrap layers must remain opt-in: %+v", advanced)
+	}
+}
 
 // issue #199: Docker 端口映射后宿主机访问的源 IP 是网桥地址(私网)而非 loopback，
 // 未配置 BOOTSTRAP_ALLOWED_CIDR 时必须默认放行私网来源，否则本地 Docker 部署

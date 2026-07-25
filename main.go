@@ -23,6 +23,7 @@ import (
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
 
@@ -61,105 +62,110 @@ func main() {
 	sysCtx, sysCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	settings, err := db.GetSystemSettings(sysCtx)
 	sysCancel()
+	recommendedPromptFilter := promptfilter.RecommendedConfig()
 
 	if err == nil && settings == nil {
 		// 初次运行，保存初始安全设置到数据库
 		log.Printf("初次运行，初始化系统默认设置...")
 		settings = &database.SystemSettings{
-			SiteName:                         database.DefaultSiteName,
-			MaxConcurrency:                   2,
-			GlobalRPM:                        0,
-			TestModel:                        "gpt-5.4",
-			TestContent:                      auth.DefaultTestContent,
-			TestConcurrency:                  50,
-			MaxRateLimitRetries:              1,
-			BackgroundRefreshIntervalMinutes: 2,
-			UsageProbeMaxAgeMinutes:          10,
-			UsageProbeConcurrency:            16,
-			RecoveryProbeIntervalMinutes:     30,
-			LazyMode:                         false,
-			ProxyURL:                         "",
-			PgMaxConns:                       50,
-			RedisPoolSize:                    30,
-			AutoCleanUnauthorized:            false,
-			AutoCleanRateLimited:             false,
-			PromptFilterMode:                 "monitor",
-			PromptFilterThreshold:            50,
-			PromptFilterStrictThreshold:      90,
-			PromptFilterLogMatches:           true,
-			PromptFilterMaxTextLength:        81920,
-			PromptFilterCustomPatterns:       "[]",
-			PromptFilterDisabledPatterns:     "[]",
-			ClientCompatMode:                 proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:               "0.118.0",
-			UsageLogMode:                     database.UsageLogModeFull,
-			UsageLogBatchSize:                200,
-			UsageLogFlushIntervalSeconds:     5,
-			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
-			StreamFlushIntervalMS:            20,
-			FirstTokenMode:                   proxy.FirstTokenModeStrict,
-			FirstTokenTimeoutSeconds:         0,
-			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
-			ImageStorageConfig:               "{}",
-			PublicKeyUsagePageEnabled:        true,
-			PublicImageStudioPageEnabled:     true,
-			CodexWSHideUpstreamErrors:        true,
-			CodexWSSilentRetryEnabled:        true,
-			CodexWSSilentMaxRetries:          2,
-			CodexContinueMaxRounds:           8,
-			AutoPause5hGuardBandPercent:      5,
-			AutoPause5hGuardConcurrency:      1,
-			SmartPacingMinConcurrency:        1,
-			SmartPacingWindows:               "5h,7d",
-			AutoResetCreditsBeforeExpiryMin:  60,
+			SiteName:                          database.DefaultSiteName,
+			MaxConcurrency:                    2,
+			GlobalRPM:                         0,
+			TestModel:                         "gpt-5.4",
+			TestContent:                       auth.DefaultTestContent,
+			TestConcurrency:                   50,
+			MaxRateLimitRetries:               1,
+			BackgroundRefreshIntervalMinutes:  2,
+			UsageProbeMaxAgeMinutes:           10,
+			UsageProbeConcurrency:             16,
+			RecoveryProbeIntervalMinutes:      30,
+			LazyMode:                          false,
+			ProxyURL:                          "",
+			PgMaxConns:                        50,
+			RedisPoolSize:                     30,
+			AutoCleanUnauthorized:             false,
+			AutoCleanRateLimited:              false,
+			PromptFilterMode:                  recommendedPromptFilter.Mode,
+			PromptFilterThreshold:             recommendedPromptFilter.Threshold,
+			PromptFilterStrictThreshold:       recommendedPromptFilter.StrictThreshold,
+			PromptFilterStrictTerminalEnabled: recommendedPromptFilter.StrictTerminalEnabled,
+			PromptFilterAdvancedConfig:        promptfilter.MarshalAdvancedConfig(recommendedPromptFilter.Advanced),
+			PromptFilterLogMatches:            true,
+			PromptFilterMaxTextLength:         81920,
+			PromptFilterCustomPatterns:        "[]",
+			PromptFilterDisabledPatterns:      "[]",
+			ClientCompatMode:                  proxy.ClientCompatModePreserve,
+			CodexMinCLIVersion:                "0.118.0",
+			UsageLogMode:                      database.UsageLogModeFull,
+			UsageLogBatchSize:                 200,
+			UsageLogFlushIntervalSeconds:      5,
+			StreamFlushPolicy:                 proxy.StreamFlushPolicyImmediate,
+			StreamFlushIntervalMS:             20,
+			FirstTokenMode:                    proxy.FirstTokenModeStrict,
+			FirstTokenTimeoutSeconds:          0,
+			BillingTierPolicy:                 proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
+			ImageStorageConfig:                "{}",
+			PublicKeyUsagePageEnabled:         true,
+			PublicImageStudioPageEnabled:      true,
+			CodexWSHideUpstreamErrors:         true,
+			CodexWSSilentRetryEnabled:         true,
+			CodexWSSilentMaxRetries:           2,
+			CodexContinueMaxRounds:            8,
+			AutoPause5hGuardBandPercent:       5,
+			AutoPause5hGuardConcurrency:       1,
+			SmartPacingMinConcurrency:         1,
+			SmartPacingWindows:                "5h,7d",
+			AutoResetCreditsBeforeExpiryMin:   60,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
 		log.Printf("警告: 读取系统设置失败: %v，将采用安全后备策略", err)
 		settings = &database.SystemSettings{
-			SiteName:                         database.DefaultSiteName,
-			MaxConcurrency:                   2,
-			GlobalRPM:                        0,
-			TestModel:                        "gpt-5.4",
-			TestContent:                      auth.DefaultTestContent,
-			TestConcurrency:                  50,
-			MaxRateLimitRetries:              1,
-			BackgroundRefreshIntervalMinutes: 2,
-			UsageProbeMaxAgeMinutes:          10,
-			UsageProbeConcurrency:            16,
-			RecoveryProbeIntervalMinutes:     30,
-			LazyMode:                         false,
-			PgMaxConns:                       50,
-			RedisPoolSize:                    30,
-			PromptFilterMode:                 "monitor",
-			PromptFilterThreshold:            50,
-			PromptFilterStrictThreshold:      90,
-			PromptFilterLogMatches:           true,
-			PromptFilterMaxTextLength:        81920,
-			PromptFilterCustomPatterns:       "[]",
-			PromptFilterDisabledPatterns:     "[]",
-			ClientCompatMode:                 proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:               "0.118.0",
-			UsageLogMode:                     database.UsageLogModeFull,
-			UsageLogBatchSize:                200,
-			UsageLogFlushIntervalSeconds:     5,
-			StreamFlushPolicy:                proxy.StreamFlushPolicyImmediate,
-			StreamFlushIntervalMS:            20,
-			FirstTokenMode:                   proxy.FirstTokenModeStrict,
-			FirstTokenTimeoutSeconds:         0,
-			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
-			ImageStorageConfig:               "{}",
-			PublicKeyUsagePageEnabled:        true,
-			PublicImageStudioPageEnabled:     true,
-			CodexWSHideUpstreamErrors:        true,
-			CodexWSSilentRetryEnabled:        true,
-			CodexWSSilentMaxRetries:          2,
-			CodexContinueMaxRounds:           8,
-			AutoPause5hGuardBandPercent:      5,
-			AutoPause5hGuardConcurrency:      1,
-			SmartPacingMinConcurrency:        1,
-			SmartPacingWindows:               "5h,7d",
-			AutoResetCreditsBeforeExpiryMin:  60,
+			SiteName:                          database.DefaultSiteName,
+			MaxConcurrency:                    2,
+			GlobalRPM:                         0,
+			TestModel:                         "gpt-5.4",
+			TestContent:                       auth.DefaultTestContent,
+			TestConcurrency:                   50,
+			MaxRateLimitRetries:               1,
+			BackgroundRefreshIntervalMinutes:  2,
+			UsageProbeMaxAgeMinutes:           10,
+			UsageProbeConcurrency:             16,
+			RecoveryProbeIntervalMinutes:      30,
+			LazyMode:                          false,
+			PgMaxConns:                        50,
+			RedisPoolSize:                     30,
+			PromptFilterMode:                  recommendedPromptFilter.Mode,
+			PromptFilterThreshold:             recommendedPromptFilter.Threshold,
+			PromptFilterStrictThreshold:       recommendedPromptFilter.StrictThreshold,
+			PromptFilterStrictTerminalEnabled: recommendedPromptFilter.StrictTerminalEnabled,
+			PromptFilterAdvancedConfig:        promptfilter.MarshalAdvancedConfig(recommendedPromptFilter.Advanced),
+			PromptFilterLogMatches:            true,
+			PromptFilterMaxTextLength:         81920,
+			PromptFilterCustomPatterns:        "[]",
+			PromptFilterDisabledPatterns:      "[]",
+			ClientCompatMode:                  proxy.ClientCompatModePreserve,
+			CodexMinCLIVersion:                "0.118.0",
+			UsageLogMode:                      database.UsageLogModeFull,
+			UsageLogBatchSize:                 200,
+			UsageLogFlushIntervalSeconds:      5,
+			StreamFlushPolicy:                 proxy.StreamFlushPolicyImmediate,
+			StreamFlushIntervalMS:             20,
+			FirstTokenMode:                    proxy.FirstTokenModeStrict,
+			FirstTokenTimeoutSeconds:          0,
+			BillingTierPolicy:                 proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
+			ImageStorageConfig:                "{}",
+			PublicKeyUsagePageEnabled:         true,
+			PublicImageStudioPageEnabled:      true,
+			CodexWSHideUpstreamErrors:         true,
+			CodexWSSilentRetryEnabled:         true,
+			CodexWSSilentMaxRetries:           2,
+			CodexContinueMaxRounds:            8,
+			AutoPause5hGuardBandPercent:       5,
+			AutoPause5hGuardConcurrency:       1,
+			SmartPacingMinConcurrency:         1,
+			SmartPacingWindows:                "5h,7d",
+			AutoResetCreditsBeforeExpiryMin:   60,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -273,6 +279,8 @@ func main() {
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
 	adminHandler.StartAutoResetCredits(backgroundCtx)
+	// Grok 账号状态定期探测（默认关，由 grok 系统设置开关/间隔控制）
+	adminHandler.StartGrokStatusProbe(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
@@ -309,6 +317,9 @@ func main() {
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
+
+	// 注册 Agent Identity task 确保函数（proxy 无 Store 引用，启动时注入）
+	proxy.EnsureCodexAgentIdentityTaskFunc = store.EnsureCodexAgentIdentityTask
 
 	// 上游 WS 空闲连接保活常驻任务（默认关闭：goroutine 常驻但仅在运行时开关开启时才发送 Ping）
 	wsKeepalive := wsrelay.NewKeepaliveTask(
@@ -491,8 +502,12 @@ func main() {
 	}
 	adminHandler.WaitAutoResetCredits()
 	wsKeepalive.Stop()
-	store.Stop()
 	wsrelay.ShutdownExecutor()
+	store.Stop()
+	// 所有请求入口和后台生产者停止后，再排空仍可能访问 Store、缓存或数据库的短任务。
+	if !db.DrainBackgroundTasks(2 * time.Second) {
+		log.Printf("部分后台任务未在关闭窗口内退出")
+	}
 	proxy.CloseErrorLogger()
 	log.Println("已关闭")
 }

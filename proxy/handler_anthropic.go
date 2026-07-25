@@ -11,11 +11,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ==================== Anthropic 错误格式 ====================
@@ -31,8 +31,11 @@ func sendAnthropicError(c *gin.Context, statusCode int, errType, message string)
 	})
 }
 
-// sendAnthropicStreamError 在流式模式中发送错误事件
-func sendAnthropicStreamError(c *gin.Context, errType, message string) {
+// writeAnthropicStreamErrorEvent 通过流写入器发送 Anthropic 协议的流内 error 事件。
+// 用于正文已下发、无法整段静默重试的上游失败：下游网关/客户端（Claude Code 等）
+// 能识别 error 事件并自行重试；伪造 stop_reason=end_turn 的干净收尾会让下游把
+// 截断/失败响应当成功，既无从感知也无从重试（issue #435）。
+func writeAnthropicStreamErrorEvent(w *streamFlushWriter, errType, message string) error {
 	payload, err := json.Marshal(gin.H{
 		"type": "error",
 		"error": gin.H{
@@ -43,10 +46,19 @@ func sendAnthropicStreamError(c *gin.Context, errType, message string) {
 	if err != nil {
 		payload = []byte(`{"type":"error","error":{"type":"api_error","message":"failed to encode stream error"}}`)
 	}
-	fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", payload)
-	if flusher, ok := c.Writer.(http.Flusher); ok {
-		flusher.Flush()
+	if err := w.WriteString(fmt.Sprintf("event: error\ndata: %s\n\n", payload)); err != nil {
+		return err
 	}
+	return w.Flush()
+}
+
+// rejectAnthropicMessagesRequest 入口校验拒绝：回 Anthropic 错误 JSON 并打一行控制台日志。
+// 这一阶段尚未选号，不产生 usage log；没有这行日志，"请求发不进来"在网关侧完全不可见
+// （issue #435：下游客户端请求被静默拒绝却无从排查）。
+func rejectAnthropicMessagesRequest(c *gin.Context, statusCode int, errType, message string) {
+	log.Printf("/v1/messages 入口拒绝 (status %d, %s): %s (ip=%s, ua=%q)",
+		statusCode, errType, message, c.ClientIP(), c.Request.UserAgent())
+	sendAnthropicError(c, statusCode, errType, message)
 }
 
 // mapHTTPStatusToAnthropicError 将 HTTP 状态码映射为 Anthropic 错误类型
@@ -71,6 +83,16 @@ func mapHTTPStatusToAnthropicError(statusCode int) string {
 	}
 }
 
+// applyMessagesModelMapping 对翻译后的 codexBody 套用全局模型映射与思考强度别名。
+// 别名注入会同时写入顶层 reasoning_effort（Chat 形态字段）与 reasoning.effort；
+// 本路径的 codexBody 已是 Responses 形态且不再经过 PrepareResponsesBody 净化，
+// 顶层字段原样发到上游会触发 400 Unsupported parameter（issue #412），在此剥离。
+func (h *Handler) applyMessagesModelMapping(codexBody []byte, supportedModels []string) []byte {
+	codexBody, _, _, _ = h.applyConfiguredModelMappingToBody(codexBody, supportedModels)
+	codexBody, _ = sjson.DeleteBytes(codexBody, "reasoning_effort")
+	return codexBody
+}
+
 // ==================== /v1/messages Handler ====================
 
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
@@ -78,35 +100,36 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
+		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 
 	if len(rawBody) == 0 {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
+		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
 
 	// 验证 JSON
 	if !gjson.ValidBytes(rawBody) {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Invalid JSON in request body")
+		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "Invalid JSON in request body")
 		return
 	}
 
 	// 检查请求体大小
 	if len(rawBody) > security.MaxRequestBodySize {
-		sendAnthropicError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "Request body too large")
+		rejectAnthropicMessagesRequest(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "Request body too large")
 		return
 	}
 
 	// 基本验证
 	model := gjson.GetBytes(rawBody, "model").String()
 	if model == "" {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
 	if !gjson.GetBytes(rawBody, "messages").Exists() {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "messages is required")
+		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "messages is required")
 		return
 	}
 	if h.inspectPromptFilterAnthropic(c, rawBody, "/v1/messages", model) {
@@ -122,7 +145,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+err.Error())
 		return
 	}
-	codexBody, _, _, _ = h.applyConfiguredModelMappingToBody(codexBody, h.supportedModelIDs(c.Request.Context()))
+	codexBody = h.applyMessagesModelMapping(codexBody, h.supportedModelIDs(c.Request.Context()))
 	effectiveModel := effectiveRequestModel(codexBody, model)
 	if isImageOnlyModel(effectiveModel) {
 		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))
@@ -143,6 +166,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 使仅接入中转的用户也能使用 Claude Code（issue #181）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
@@ -191,13 +215,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		if wsHTTPFallback.ForceHTTP() {
 			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
-		isRelayAccount := account.IsOpenAIResponsesAPI()
+		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
-			relayBaseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint = auth.OpenAIResponsesEndpoint(relayBaseURL, "/v1/responses")
+			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
 		}
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -223,7 +246,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			lastUpstreamCancel()
 		}
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
-		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, ruleIdentity)
+		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
+		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
+		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
 		var resp *http.Response
@@ -234,10 +259,10 @@ func (h *Handler) Messages(c *gin.Context) {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 			}
-			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
-			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, ruleIdentity)
+			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
 			resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
@@ -263,7 +288,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if retryable {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			if kind != "" && !(timedOut && shouldRetry) {
+			if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -309,7 +334,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -398,8 +423,14 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 
 			translator := newAnthropicStreamTranslator(originalModel)
-			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 			var pendingFirstTokenEvents bytes.Buffer
+			// contentStarted 用严格口径（isFirstTokenResult）跟踪"首个真实内容帧"，
+			// 专供流提交决策（缓冲/重试窗口/failed 抑制）使用；ttftRecorded 按
+			// first_token_mode 可能是 loose 口径，只用于首字统计。loose 模式会把
+			// output_item.added 等纯结构帧当"首字"，若拿它做流提交门，结构帧一到
+			// 就落盘 200，首包前静默重试窗口被过早关闭（issue #435）。
+			contentStarted := false
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
@@ -411,6 +442,9 @@ func (h *Handler) Messages(c *gin.Context) {
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
+				}
+				if !contentStarted && isFirstTokenResult(parsed) {
+					contentStarted = true
 				}
 
 				// 累计 delta 字符数
@@ -431,6 +465,30 @@ func (h *Handler) Messages(c *gin.Context) {
 					gotTerminal = true
 				}
 
+				// 首 token 前的 response.failed 不翻译进下游流（issue #412）：
+				// 可重试（5xx/429 等）时吞掉事件，交由循环外静默换号重试；
+				// 不可重试或重试耗尽时中止转发，循环外按真实错误码返回 JSON。
+				// 否则 handleFailed 会把失败翻译成 stop_reason=end_turn 的"正常空结束"，
+				// 下游网关会把它当成功计一条 0 token 请求且无从重试。
+				if shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, contentStarted, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+					pendingFirstTokenEvents.Reset()
+					return false
+				}
+				if shouldReturnHTTPErrorForResponseFailed(eventType, contentStarted, wroteAnyBody, writeErr != nil) {
+					pendingFirstTokenEvents.Reset()
+					return false
+				}
+				// 正文已下发后收到 response.failed：无法整段重试，且 handleFailed 会把失败
+				// 翻译成 stop_reason=end_turn 的干净收尾，下游把截断响应当成功、无从感知
+				// 与重试（issue #435）。按 Anthropic 协议改发流内 error 事件后中止转发。
+				if eventType == "response.failed" && wroteAnyBody && writeErr == nil {
+					failedOutcome := classifyResponseFailedOutcome(terminalFailurePayload)
+					if err := writeAnthropicStreamErrorEvent(streamWriter, mapHTTPStatusToAnthropicError(failedOutcome.logStatusCode), failedOutcome.failureMessage); err != nil {
+						writeErr = err
+					}
+					return false
+				}
+
 				// 翻译并写入
 				events := translator.translateEvent(data)
 				if len(events) > 0 {
@@ -439,7 +497,12 @@ func (h *Handler) Messages(c *gin.Context) {
 						payload.WriteString(anthropicEventToSSE(evt))
 					}
 					payloadString := payload.String()
-					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
+					// 首个真实内容帧之前的所有帧（结构帧 output_item.added /
+					// content_part.added 也算）一律先缓冲：一旦写出任何字节，首包前
+					// 静默换号重试窗口就永久关闭（issue #435）。内容帧到达（含思考
+					// delta，几乎紧跟结构帧，不违反 issue #207 的思考及时性）即整段
+					// flush，之后不再缓冲。
+					shouldDefer := !contentStarted && !gotTerminal
 					if shouldDefer {
 						pendingFirstTokenEvents.WriteString(payloadString)
 						if pendingFirstTokenEvents.Len() <= 1024*1024 {
@@ -460,22 +523,20 @@ func (h *Handler) Messages(c *gin.Context) {
 
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
-			if writeErr == nil {
+			// 仅在真的写过 body 时才做收尾 flush：flusher.Flush 会先提交 HTTP 200 header，
+			// 零写入时提前 flush 会让循环外按真实错误码返回的 JSON 失效（status 已定型为 200）。
+			if writeErr == nil && wroteAnyBody {
 				writeErr = streamWriter.Flush()
 			}
 
-			// 流结束后补齐事件
-			if writeErr == nil && !gotTerminal && ttftRecorded {
-				finalEvents := translator.finalize()
-				for _, evt := range finalEvents {
-					sse := anthropicEventToSSE(evt)
-					if err := streamWriter.WriteString(sse); err != nil {
-						writeErr = err
-						break
-					}
-				}
-				if writeErr == nil {
-					writeErr = streamWriter.Flush()
+			// 流结束但未收到终止事件（上游断流）：已写过 body 时无法整段重试，
+			// 也不能像旧逻辑那样伪造 stop_reason=end_turn 的干净收尾——下游会把
+			// 截断响应当成功，既无从感知也无从重试（issue #435）。按 Anthropic
+			// 协议发流内 error 事件，下游网关/客户端可识别并自行重试。
+			// 未写过 body 的断流不走这里：循环外静默换号重试或按真实错误码返回 JSON。
+			if writeErr == nil && !gotTerminal && wroteAnyBody && c.Request.Context().Err() == nil {
+				if err := writeAnthropicStreamErrorEvent(streamWriter, "overloaded_error", "Upstream stream interrupted before completion"); err != nil {
+					log.Printf("写入流内 error 事件失败 (/v1/messages): %v", err)
 				}
 			}
 		} else {
@@ -562,6 +623,17 @@ func (h *Handler) Messages(c *gin.Context) {
 			continue
 		}
 
+		if isStream && !wroteAnyBody && writeErr == nil && c.Request.Context().Err() == nil && outcome.logStatusCode != http.StatusOK {
+			// 流式：首包前上游失败、未向下游写过任何字节（收尾 flush 有 wroteAnyBody 守卫，
+			// 200 header 尚未提交）——按真实错误码返回 Anthropic 错误 JSON，而不是空 200 流，
+			// 让下游网关/客户端能感知失败并自行重试（issue #412）。
+			statusCode := outcome.logStatusCode
+			if statusCode < 400 || statusCode > 599 || statusCode == logStatusUpstreamStreamBreak {
+				statusCode = http.StatusBadGateway
+			}
+			c.Header("Content-Type", "application/json; charset=utf-8")
+			sendAnthropicError(c, statusCode, mapHTTPStatusToAnthropicError(statusCode), outcome.failureMessage)
+		}
 		if !isStream {
 			if anthropicResp != nil {
 				c.JSON(http.StatusOK, anthropicResp)

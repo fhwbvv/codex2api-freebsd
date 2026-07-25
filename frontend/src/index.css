@@ -1185,6 +1185,16 @@
   animation: image-studio-fade-in 0.35s ease-out 0.08s both;
 }
 
+/* 仪表盘/用量页渠道切换时的内容过渡（key 变化触发重播） */
+@keyframes channel-switch-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-channel-switch-in {
+  animation: channel-switch-in 0.3s ease-out both;
+}
+
 @keyframes image-studio-shake {
   0%, 100% { transform: translateX(0); }
   20% { transform: translateX(-3px); }

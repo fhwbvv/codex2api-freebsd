@@ -789,19 +789,47 @@ var imageIntentPositivePhrases = []string{
 // 两者都未表达真实生图意图（真实意图已被 rawResponsesBodyShouldForceHTTPForImageGeneration
 // 判定为强制 HTTP，不会走到这里）。移除后可防止模型自主调用图片工具产生大体积数据导致
 // WS 流卡死（issue #220）。
+//
+// 它是 stripResponsesImageGenerationCapabilities 的别名（后者是能力剥离的完整实现，
+// 额外覆盖 namespace image_gen 与 Responses Lite 内嵌声明）；WS 路径沿用此名保持语义。
 func stripResponsesImageGenerationTool(body []byte) []byte {
-	tools := gjson.GetBytes(body, "tools")
-	if tools.Exists() && tools.IsArray() {
-		kept := make([]interface{}, 0, len(tools.Array()))
-		removed := false
-		for _, tool := range tools.Array() {
-			if strings.TrimSpace(tool.Get("type").String()) == "image_generation" {
-				removed = true
-				continue
-			}
-			kept = append(kept, tool.Value())
+	return stripResponsesImageGenerationCapabilities(body)
+}
+
+// stripImageGenerationToolsFromArray 从工具数组里剔除图片能力声明：扁平的
+// {"type":"image_generation"} 与 namespace 形式 {"type":"namespace","name":"image_gen"}。
+// 返回保留下来的工具及是否发生过移除。
+func stripImageGenerationToolsFromArray(tools []gjson.Result) ([]interface{}, bool) {
+	kept := make([]interface{}, 0, len(tools))
+	removed := false
+	for _, tool := range tools {
+		toolType := strings.TrimSpace(tool.Get("type").String())
+		if toolType == "image_generation" {
+			removed = true
+			continue
 		}
-		if removed {
+		if toolType == "namespace" && strings.TrimSpace(tool.Get("name").String()) == "image_gen" {
+			removed = true
+			continue
+		}
+		kept = append(kept, tool.Value())
+	}
+	return kept, removed
+}
+
+// stripResponsesImageGenerationCapabilities 剥离请求体里的 Codex 图片工具能力声明，
+// 保留 shell/function/apply_patch/MCP/web search 等其他工具，把请求当作普通文本请求
+// 继续转发（issue #411 的 strip 策略；同时也是 WS 防大体积卡死路径的实现）。覆盖：
+//  1. 顶层 tools[] 移除 {"type":"image_generation"} 与 namespace {"name":"image_gen"}。
+//  2. Responses Lite 的 input[].additional_tools.tools[] 做同样过滤；若过滤后该载体
+//     工具列表为空则移除整个 additional_tools 项。
+//  3. 仅当 tool_choice 明确指向 image_generation / image_gen 时删除它；"auto" 及其他
+//     工具选择保持不变。
+//  4. 清理网关自己追加的图片桥接 instructions，保留用户自带的 instructions 内容。
+func stripResponsesImageGenerationCapabilities(body []byte) []byte {
+	// 1. 顶层 tools[]
+	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
+		if kept, removed := stripImageGenerationToolsFromArray(tools.Array()); removed {
 			if len(kept) == 0 {
 				body, _ = sjson.DeleteBytes(body, "tools")
 			} else {
@@ -809,20 +837,62 @@ func stripResponsesImageGenerationTool(body []byte) []byte {
 			}
 		}
 	}
-	choice := gjson.GetBytes(body, "tool_choice")
-	if choice.Exists() {
-		isImageChoice := false
-		if choice.Type == gjson.String {
-			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation")
-		} else {
-			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation")
+
+	// 2. Responses Lite: input[].additional_tools.tools[]
+	if input := gjson.GetBytes(body, "input"); input.Exists() && input.IsArray() {
+		items := input.Array()
+		keptItems := make([]interface{}, 0, len(items))
+		mutated := false
+		for _, item := range items {
+			if strings.TrimSpace(item.Get("type").String()) != "additional_tools" {
+				keptItems = append(keptItems, item.Value())
+				continue
+			}
+			nested := item.Get("tools")
+			if !nested.Exists() || !nested.IsArray() {
+				keptItems = append(keptItems, item.Value())
+				continue
+			}
+			keptTools, removed := stripImageGenerationToolsFromArray(nested.Array())
+			if !removed {
+				keptItems = append(keptItems, item.Value())
+				continue
+			}
+			mutated = true
+			if len(keptTools) == 0 {
+				// 载体工具全被剥离：移除整个 additional_tools 项。
+				continue
+			}
+			rebuilt, _ := sjson.SetBytes([]byte(item.Raw), "tools", keptTools)
+			var rebuiltVal interface{}
+			if err := json.Unmarshal(rebuilt, &rebuiltVal); err == nil {
+				keptItems = append(keptItems, rebuiltVal)
+			} else {
+				keptItems = append(keptItems, item.Value())
+			}
 		}
-		if isImageChoice {
+		if mutated {
+			body, _ = sjson.SetBytes(body, "input", keptItems)
+		}
+	}
+
+	// 3. tool_choice：仅删显式指向图片工具的选择
+	if choice := gjson.GetBytes(body, "tool_choice"); choice.Exists() {
+		var target string
+		if choice.Type == gjson.String {
+			target = strings.TrimSpace(choice.String())
+		} else {
+			target = strings.TrimSpace(choice.Get("type").String())
+			if target == "namespace" {
+				target = strings.TrimSpace(choice.Get("name").String())
+			}
+		}
+		if strings.EqualFold(target, "image_generation") || strings.EqualFold(target, "image_gen") {
 			body, _ = sjson.DeleteBytes(body, "tool_choice")
 		}
 	}
-	// 移除与图片工具配套注入的桥接 instructions（引导模型调用 image_generation
-	// 工具）；保留用户自带的 instructions 内容。
+
+	// 4. 桥接 instructions（网关注入的引导文案）
 	if instructions := gjson.GetBytes(body, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
 		cleaned := strings.ReplaceAll(instructions, "\n\n"+codexImageGenerationBridgeText, "")
 		cleaned = strings.ReplaceAll(cleaned, codexImageGenerationBridgeText, "")
@@ -937,6 +1007,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	if !json.Valid(rawBody) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
@@ -1022,11 +1093,16 @@ func (h *Handler) ImagesEdits(c *gin.Context) {
 }
 
 func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
+	if err := h.captureSignedMultipartIngress(c); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+		return
+	}
 	form, err := c.MultipartForm()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	defer func() { _ = form.RemoveAll() }()
 
 	prompt := strings.TrimSpace(c.PostForm("prompt"))
 	if prompt == "" {
@@ -1047,26 +1123,6 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if len(imageFiles) > MaxImageEditInputCount {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": fmt.Sprintf("Invalid request: too many input images (%d, max %d)", len(imageFiles), MaxImageEditInputCount), "type": "invalid_request_error"}})
 		return
-	}
-
-	images := make([]string, 0, len(imageFiles))
-	for _, fileHeader := range imageFiles {
-		dataURL, err := multipartFileToDataURL(fileHeader)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		images = append(images, dataURL)
-	}
-
-	var maskDataURL string
-	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
-		dataURL, err := multipartFileToDataURL(maskFiles[0])
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		maskDataURL = dataURL
 	}
 
 	imageModel := strings.TrimSpace(c.PostForm("model"))
@@ -1100,6 +1156,29 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
+
+	// Multipart parsing may have used bounded temporary storage before the
+	// prompt field was known, but image bytes must not be decoded or expanded to
+	// Base64 until the current-user prompt has passed the guard.
+	images := make([]string, 0, len(imageFiles))
+	for _, fileHeader := range imageFiles {
+		dataURL, err := multipartFileToDataURL(fileHeader)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		images = append(images, dataURL)
+	}
+
+	var maskDataURL string
+	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+		dataURL, err := multipartFileToDataURL(maskFiles[0])
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		maskDataURL = dataURL
+	}
 	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
 	if !ok {
 		return
@@ -1110,6 +1189,28 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
+}
+
+// captureSignedMultipartIngress preserves the exact wire body for NewAPI HMAC
+// verification, then restores it for net/http multipart parsing. It is only
+// enabled when signed NewAPI audit forwarding is configured, avoiding an
+// extra full-body copy for ordinary image uploads.
+func (h *Handler) captureSignedMultipartIngress(c *gin.Context) error {
+	if h == nil || h.store == nil || c == nil || c.Request == nil {
+		return nil
+	}
+	cfg := h.promptFilterConfigForRequest(c)
+	if !cfg.Advanced.NewAPI.Enabled || strings.TrimSpace(c.GetHeader("X-NewAPI-Signature")) == "" {
+		return nil
+	}
+	body, err := readRawRequestBody(c)
+	if err != nil {
+		return err
+	}
+	setIngressRequestBodyIfAbsent(c, body)
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	c.Request.ContentLength = int64(len(body))
+	return nil
 }
 
 func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string) []byte {
@@ -1139,6 +1240,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	if !json.Valid(rawBody) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
@@ -1336,7 +1438,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), false)
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if kind := classifyTransportFailure(reqErr); shouldPenalizeTransportKind(kind) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -1364,7 +1466,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
 				Endpoint:          inboundEndpoint,
@@ -1656,7 +1758,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
 	)
-	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 	var (
 		writeMu   sync.Mutex
 		closeOnce sync.Once

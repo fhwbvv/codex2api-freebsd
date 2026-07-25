@@ -12,17 +12,29 @@ var ErrOutputBlocked = errors.New("stream output blocked by prompt filter")
 
 type OutputScanner struct {
 	cfg          Config
+	engine       *Engine
 	pending      []byte
 	recordBuffer []byte
 	semantic     []byte
 }
 
 func NewOutputScanner(cfg Config) *OutputScanner {
-	cfg = NormalizeConfig(cfg)
 	if !cfg.Enabled || !cfg.Advanced.Output.Enabled {
 		return nil
 	}
-	return &OutputScanner{cfg: cfg}
+	cfg = NormalizeConfig(cfg)
+	return NewOutputScannerFromNormalizedConfig(cfg)
+}
+
+// NewOutputScannerFromNormalizedConfig constructs an output scanner from an
+// immutable runtime snapshot that has already passed NormalizeConfig. It keeps
+// streaming request paths from rebuilding the full guard configuration.
+func NewOutputScannerFromNormalizedConfig(cfg Config) *OutputScanner {
+	if !cfg.Enabled || !cfg.Advanced.Output.Enabled {
+		return nil
+	}
+	engine, _ := engineForConfig(cfg)
+	return &OutputScanner{cfg: cfg, engine: engine}
 }
 
 func (s *OutputScanner) Push(data []byte) ([]byte, error) {
@@ -32,12 +44,7 @@ func (s *OutputScanner) Push(data []byte) ([]byte, error) {
 	s.pending = append(s.pending, data...)
 	semantic, terminal := s.consumeRecords(data)
 	s.appendSemantic(semantic)
-	verdict := InspectText(string(s.semantic), s.cfg)
-	blocked := verdict.TerminalStrictHit
-	if !s.cfg.Advanced.Output.StrictOnly {
-		blocked = verdict.Action == ActionBlock
-	}
-	if blocked {
+	if (len(semantic) > 0 || terminal) && s.semanticBlocked() {
 		s.pending = nil
 		s.semantic = nil
 		s.recordBuffer = nil
@@ -64,19 +71,10 @@ func (s *OutputScanner) Flush() ([]byte, error) {
 	if s == nil {
 		return nil, nil
 	}
-	verdict := InspectText(string(s.semantic), s.cfg)
-	blocked := verdict.TerminalStrictHit
-	if !s.cfg.Advanced.Output.StrictOnly {
-		blocked = verdict.Action == ActionBlock
-	}
-	if blocked {
-		s.pending = nil
-		s.semantic = nil
-		s.recordBuffer = nil
-		return nil, ErrOutputBlocked
-	}
 	// Transport Flush is not a semantic end-of-stream. Keep the safety window
-	// until a terminal SSE event arrives so matches split across events remain detectable.
+	// until a terminal SSE event arrives so matches split across events remain
+	// detectable. Push already scanned every semantic state transition, so a
+	// transport-only flush must not rescan the unchanged window.
 	return nil, nil
 }
 
@@ -89,12 +87,7 @@ func (s *OutputScanner) Finalize() ([]byte, error) {
 		s.appendSemantic(semantic)
 		s.recordBuffer = nil
 	}
-	verdict := InspectText(string(s.semantic), s.cfg)
-	blocked := verdict.TerminalStrictHit
-	if !s.cfg.Advanced.Output.StrictOnly {
-		blocked = verdict.Action == ActionBlock
-	}
-	if blocked {
+	if s.semanticBlocked() {
 		s.pending = nil
 		s.semantic = nil
 		return nil, ErrOutputBlocked
@@ -103,6 +96,22 @@ func (s *OutputScanner) Finalize() ([]byte, error) {
 	s.pending = nil
 	s.semantic = nil
 	return out, nil
+}
+
+func (s *OutputScanner) semanticBlocked() bool {
+	if s == nil || len(s.semantic) == 0 {
+		return false
+	}
+	var verdict Verdict
+	if s.engine != nil {
+		verdict = s.engine.InspectText(string(s.semantic))
+	} else {
+		verdict = InspectText(string(s.semantic), s.cfg)
+	}
+	if !s.cfg.Advanced.Output.StrictOnly {
+		return verdict.Action == ActionBlock
+	}
+	return verdict.TerminalStrictHit
 }
 
 func (s *OutputScanner) appendSemantic(data []byte) {

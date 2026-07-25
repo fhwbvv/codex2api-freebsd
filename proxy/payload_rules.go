@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/codex2api/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -40,6 +41,9 @@ import (
 //	  "api_key_names": ["fast*"],                    // 下游 API Key 名称通配
 //	  "group_ids":     ["5"],                        // 该 Key 允许的账号组 ID（字符串化）通配
 //	  "group_names":   ["fast*"],                    // 该 Key 允许的账号组名通配
+//	  "account_group_ids":   ["5"],                  // 本次实际调度账号所属组 ID 通配
+//	  "account_group_names": ["plus*"],              // 本次实际调度账号所属组名通配
+//	  "account_plans":       ["plus"],               // 本次实际调度账号套餐通配
 //	  "match":         {"reasoning.effort": "medium"}, // JSON 路径等值
 //	  "not_match":     {"metadata.mode": "dev"},     // JSON 路径不等值
 //	  "exist":         ["tools.0"],                  // 路径必须存在
@@ -49,6 +53,13 @@ import (
 //
 // api_key_* / group_* 依赖请求身份（PayloadRuleIdentity）：无身份的内部/未鉴权路径下，
 // 凡配置了任一 key/组门的规则一律不匹配（fail-closed）。compact/relay 端点不套用本引擎。
+//
+// 注意 group_* 与 account_group_* 的语义区别（issue #410）：
+//   - group_*         匹配该 Key **允许使用**的账号组，与本次实际调度到哪个账号无关；
+//   - account_group_* / account_plans 匹配本次 attempt **实际选中账号**的组/套餐。
+//     重试换号后按新账号重新匹配。典型用途：pro Key 兜底到 plus 组账号时才覆写
+//     service_tier=fast，路由回 pro 账号则不覆写。
+//     账号身份未解析的路径（识别 AccountResolved）下，带 account_* 门的规则同样 fail-closed。
 //
 // 应用顺序：default → default_raw → override → override_raw → append → filter。
 
@@ -70,11 +81,16 @@ type PayloadRule struct {
 	Headers map[string]string `json:"headers,omitempty"`
 	// 身份门：均为通配列表，命中任一即通过；空=该维度不限。id 门按字符串化后的值通配。
 	// 依赖 PayloadRuleIdentity；无身份时凡配置了任一身份门的规则一律不匹配（fail-closed）。
-	APIKeyIDs   []string       `json:"api_key_ids,omitempty"`
-	APIKeyNames []string       `json:"api_key_names,omitempty"`
-	GroupIDs    []string       `json:"group_ids,omitempty"`
-	GroupNames  []string       `json:"group_names,omitempty"`
-	Match       map[string]any `json:"match,omitempty"`
+	APIKeyIDs   []string `json:"api_key_ids,omitempty"`
+	APIKeyNames []string `json:"api_key_names,omitempty"`
+	GroupIDs    []string `json:"group_ids,omitempty"`
+	GroupNames  []string `json:"group_names,omitempty"`
+	// 账号门：匹配本次实际调度选中账号的组/套餐（区别于上面按 Key 允许组匹配的
+	// group_*，见文件头注释）。账号身份未解析时 fail-closed 不匹配。
+	AccountGroupIDs   []string       `json:"account_group_ids,omitempty"`
+	AccountGroupNames []string       `json:"account_group_names,omitempty"`
+	AccountPlans      []string       `json:"account_plans,omitempty"`
+	Match             map[string]any `json:"match,omitempty"`
 	NotMatch    map[string]any `json:"not_match,omitempty"`
 	Exist       []string       `json:"exist,omitempty"`
 	NotExist    []string       `json:"not_exist,omitempty"`
@@ -83,13 +99,38 @@ type PayloadRule struct {
 	Params json.RawMessage `json:"params"`
 }
 
-// PayloadRuleIdentity 承载请求的下游身份，供 api_key_* / group_* 匹配门使用。
-// 由 handler 从鉴权 context 构造后经上游 context 传入（见 WithPayloadRuleIdentity）。
+// PayloadRuleIdentity 承载请求的下游身份，供 api_key_* / group_* / account_* 匹配门
+// 使用。由 handler 从鉴权 context 构造后经上游 context 传入（见 WithPayloadRuleIdentity）。
+// Account* 字段按 attempt 由 WithSelectedAccount 派生副本填充——重试换号后账号维度
+// 会变化，不能在共享实例上原地改。
 type PayloadRuleIdentity struct {
 	APIKeyID   int64
 	APIKeyName string
 	GroupIDs   []int64  // 该 Key 允许的账号组 ID（Key.AllowedGroupIDs）
 	GroupNames []string // 上述组 ID 解析出的组名
+
+	// 本次 attempt 实际调度选中账号的维度（issue #410）。
+	AccountResolved   bool // 账号信息是否已填充；false 时带 account_* 门的规则 fail-closed
+	AccountGroupIDs   []int64
+	AccountGroupNames []string
+	AccountPlan       string
+}
+
+// WithSelectedAccount 返回填充了实际调度账号维度的身份副本。原身份跨 attempt 共享，
+// 重试换号后账号信息不同，必须派生副本而非原地修改。id 为 nil（无鉴权身份）时保持
+// nil——与现有身份门的 fail-closed 语义一致。
+func (id *PayloadRuleIdentity) WithSelectedAccount(account *auth.Account, store *auth.Store) *PayloadRuleIdentity {
+	if id == nil || account == nil {
+		return id
+	}
+	derived := *id
+	derived.AccountResolved = true
+	derived.AccountGroupIDs = account.GroupIDSnapshot()
+	if store != nil {
+		derived.AccountGroupNames = store.ResolveGroupNames(derived.AccountGroupIDs)
+	}
+	derived.AccountPlan = account.GetPlanType()
+	return &derived
 }
 
 type payloadRuleIdentityKey struct{}
@@ -345,6 +386,15 @@ func anyWildcardMulti(patterns, values []string) bool {
 	return false
 }
 
+// formatInt64IDs 把 ID 列表字符串化，供 id 门通配匹配。
+func formatInt64IDs(ids []int64) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = strconv.FormatInt(id, 10)
+	}
+	return out
+}
+
 // payloadRuleMatches 判断规则的全部匹配门是否满足。identity 为请求身份（可为 nil）。
 func payloadRuleMatches(rule *PayloadRule, body []byte, model string, headers http.Header, identity *PayloadRuleIdentity) bool {
 	if !anyWildcard(rule.Models, model) {
@@ -367,15 +417,29 @@ func payloadRuleMatches(rule *PayloadRule, body []byte, model string, headers ht
 			return false
 		}
 		if len(rule.GroupIDs) > 0 {
-			ids := make([]string, len(identity.GroupIDs))
-			for i, id := range identity.GroupIDs {
-				ids[i] = strconv.FormatInt(id, 10)
-			}
-			if !anyWildcardMulti(rule.GroupIDs, ids) {
+			if !anyWildcardMulti(rule.GroupIDs, formatInt64IDs(identity.GroupIDs)) {
 				return false
 			}
 		}
 		if len(rule.GroupNames) > 0 && !anyWildcardMulti(rule.GroupNames, identity.GroupNames) {
+			return false
+		}
+	}
+	// 账号门：匹配本次实际调度选中账号的组/套餐。账号身份未解析（identity 为 nil
+	// 或 AccountResolved=false）时同样 fail-closed，不匹配。
+	if len(rule.AccountGroupIDs) > 0 || len(rule.AccountGroupNames) > 0 || len(rule.AccountPlans) > 0 {
+		if identity == nil || !identity.AccountResolved {
+			return false
+		}
+		if len(rule.AccountGroupIDs) > 0 {
+			if !anyWildcardMulti(rule.AccountGroupIDs, formatInt64IDs(identity.AccountGroupIDs)) {
+				return false
+			}
+		}
+		if len(rule.AccountGroupNames) > 0 && !anyWildcardMulti(rule.AccountGroupNames, identity.AccountGroupNames) {
+			return false
+		}
+		if len(rule.AccountPlans) > 0 && !anyWildcard(rule.AccountPlans, identity.AccountPlan) {
 			return false
 		}
 	}

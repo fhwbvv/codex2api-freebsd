@@ -5,10 +5,27 @@ import type {
   AccountUsageDetail,
   AddAccountRequest,
   AddATAccountRequest,
+  ImportAgentIdentityRequest,
+  ImportAgentIdentityResponse,
+  AgentIdentityBatchImportRequest,
+  AgentIdentityBatchImportResponse,
+  AgentIdentityImportItem,
   AddOpenAIResponsesAccountRequest,
+  AddGrokAccountRequest,
+  UpdateGrokAccountRequest,
+  FetchGrokModelsResponse,
+  GrokDeviceStartRequest,
+  GrokDeviceStartResponse,
+  GrokDevicePollRequest,
+  GrokDevicePollResponse,
+  GrokSSOImportRequest,
+  GrokSSOImportResponse,
+  GrokBatchImportRequest,
+  GrokBatchImportResponse,
   AdminErrorResponse,
   APIKeysResponse,
   APIKeyTokenStat,
+  APIKeyAccountStat,
   AccountsResponse,
   ChartAggregation,
   CreateAccountResponse,
@@ -385,17 +402,58 @@ export const api = {
   deletePortalImageAsset: (apiKey: string, id: number) =>
     requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
   getStats: () => request<StatsResponse>('/stats'),
-  getAccounts: () => request<AccountsResponse>('/accounts'),
+  // channel: 'codex' | 'grok' — server-side filter; omit for all accounts.
+  getAccounts: (params: { channel?: 'codex' | 'grok' } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.channel) searchParams.set('channel', params.channel)
+    const qs = searchParams.toString()
+    return request<AccountsResponse>(`/accounts${qs ? `?${qs}` : ''}`)
+  },
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
     request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
+  importCodexAgentIdentity: (data: ImportAgentIdentityRequest) =>
+    request<ImportAgentIdentityResponse>('/accounts/codex/agent-identity', { method: 'POST', body: JSON.stringify(data) }),
+  batchImportCodexAgentIdentity: (data: AgentIdentityBatchImportRequest) =>
+    request<AgentIdentityBatchImportResponse>('/accounts/codex/agent-identity/import', { method: 'POST', body: JSON.stringify(data) }),
   addOpenAIResponsesAccount: (data: AddOpenAIResponsesAccountRequest) =>
     request<CreateAccountResponse>('/accounts/openai-responses', { method: 'POST', body: JSON.stringify(data) }),
   fetchOpenAIResponsesModels: (data: FetchOpenAIResponsesModelsRequest) =>
     request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
   updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
+  addGrokAccount: (data: AddGrokAccountRequest) =>
+    request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
+  fetchGrokModels: (data: AddGrokAccountRequest) =>
+    request<FetchGrokModelsResponse>('/accounts/grok/models', { method: 'POST', body: JSON.stringify(data) }),
+  startGrokDeviceAuth: (data: GrokDeviceStartRequest = {}) =>
+    request<GrokDeviceStartResponse>('/accounts/grok/oauth/device/start', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  pollGrokDeviceAuth: (data: GrokDevicePollRequest) =>
+    request<GrokDevicePollResponse>('/accounts/grok/oauth/device/poll', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  importGrokSSO: (data: GrokSSOImportRequest) =>
+    request<GrokSSOImportResponse>('/accounts/grok/sso/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  batchImportGrokAccounts: (data: GrokBatchImportRequest) =>
+    request<GrokBatchImportResponse>('/accounts/grok/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  importGrokRefreshTokens: (data: GrokSSOImportRequest) =>
+    request<GrokSSOImportResponse>('/accounts/grok/refresh/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateGrokAccount: (id: number, data: UpdateGrokAccountRequest) =>
+    request<MessageResponse>(`/accounts/${id}/grok`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   updateAccountNote: (id: number, note: string) =>
@@ -425,6 +483,18 @@ export const api = {
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
+  // 设置 OAuth 账号的支持模型白名单;空数组表示清空(该账号可调度所有模型)。返回归一化后的白名单。
+  updateAccountModels: (id: number, models: string[]) =>
+    request<{ models: string[] }>(`/accounts/${id}/models`, { method: 'PATCH', body: JSON.stringify({ models }) }),
+  // 拉取该账号真实的上游模型清单(slug 列表,不落库),供白名单编辑器合并使用。
+  syncAccountModelsUpstream: (id: number) =>
+    request<{ models: string[] }>(`/accounts/${id}/models/sync-upstream`, { method: 'POST' }),
+  // 用账号自身凭据并发探测系统文本模型(已排除 image),返回确认可用的模型及每个模型的判定明细。只读不落库。
+  probeAccountModels: (id: number) =>
+    request<{
+      available: string[];
+      results: { model: string; outcome: string; detail?: string }[];
+    }>(`/accounts/${id}/models/probe`, { method: 'POST' }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
   createAccountGroup: (data: CreateAccountGroupRequest) =>
     request<{ id: number; message: string }>('/account-groups', { method: 'POST', body: JSON.stringify(data) }),
@@ -450,6 +520,10 @@ export const api = {
     request<InviteResponse>(`/accounts/${id}/invite`, { method: 'POST', body: JSON.stringify(data) }),
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchDeleteAccounts: (ids: number[]) =>
+    request<{ message: string; deleted: number; success: number; failed: number }>('/accounts/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchRefreshAccounts: (ids: number[]) =>
+    request<{ message: string; success: number; failed: number }>('/accounts/batch-refresh', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number, days?: number) => {
     const search = new URLSearchParams()
     if (typeof days === 'number') search.set('days', String(days))
@@ -517,10 +591,11 @@ export const api = {
     const search = buildOpsErrorSearchParams(params)
     return requestBlob(`/ops/errors/export?${search.toString()}`)
   },
-  getUsageStats: (params: { start?: string; end?: string } = {}) => {
+  getUsageStats: (params: { start?: string; end?: string; channel?: string } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start) searchParams.set('start', params.start)
     if (params.end) searchParams.set('end', params.end)
+    if (params.channel) searchParams.set('channel', params.channel)
     const qs = searchParams.toString()
     return request<UsageStats>(qs ? `/usage/stats?${qs}` : '/usage/stats')
   },
@@ -533,6 +608,15 @@ export const api = {
       qs ? `/usage/api-keys?${qs}` : '/usage/api-keys',
     )
   },
+  getAPIKeyAccountStats: (id: number, params: { start?: string; end?: string } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.start) searchParams.set('start', params.start)
+    if (params.end) searchParams.set('end', params.end)
+    const qs = searchParams.toString()
+    return request<{ items: APIKeyAccountStat[] }>(
+      qs ? `/usage/api-keys/${id}/accounts?${qs}` : `/usage/api-keys/${id}/accounts`,
+    )
+  },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start && params.end) {
@@ -543,7 +627,7 @@ export const api = {
     }
     return request<UsageLogsResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string }) => {
+  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string; channel?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
@@ -556,13 +640,15 @@ export const api = {
     if (params.accountId) searchParams.set('account_id', params.accountId)
     if (params.fast) searchParams.set('fast', params.fast)
     if (params.stream) searchParams.set('stream', params.stream)
+    if (params.channel) searchParams.set('channel', params.channel)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getChartData: (params: { start: string; end: string; bucketMinutes: number }) => {
+  getChartData: (params: { start: string; end: string; bucketMinutes: number; channel?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
     searchParams.set('bucket_minutes', String(params.bucketMinutes))
+    if (params.channel) searchParams.set('channel', params.channel)
     return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`)
   },
   getAccountEventTrend: (params: { start: string; end: string; bucketMinutes: number }) => {
@@ -730,6 +816,10 @@ export const api = {
     request<{ message: string; cleaned: number }>('/accounts/clean-rate-limited', { method: 'POST' }),
   cleanError: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-error', { method: 'POST' }),
+  cleanGrokBanned: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-banned', { method: 'POST' }),
+  cleanGrokError: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-error', { method: 'POST' }),
   exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[] }) => {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))

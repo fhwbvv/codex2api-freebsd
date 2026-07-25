@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codex2api/auth"
 	"github.com/tidwall/gjson"
 )
 
@@ -359,5 +360,136 @@ func TestWithPayloadRuleIdentityRoundTrip(t *testing.T) {
 	// 空 context 返回 nil
 	if PayloadRuleIdentityFromContext(context.Background()) != nil {
 		t.Fatalf("无身份 context 应返回 nil")
+	}
+}
+
+// ==================== 账号门（issue #410） ====================
+
+// TestPayloadRulesAccountGroupNameGate 复现 issue #410 的核心场景：Key 允许
+// [pro, plus] 两组时，规则只应在实际调度到 plus 组账号时生效。
+func TestPayloadRulesAccountGroupNameGate(t *testing.T) {
+	withPayloadRules(t, `{"override":[{"account_group_names":["plus"],"params":{"service_tier":"priority"}}]}`)
+
+	// Key 允许 plus 组，但实际调度到 pro 组账号 → 不改写（旧 group_names 门会误伤的场景）
+	proAccount := &PayloadRuleIdentity{
+		APIKeyID: 1, GroupNames: []string{"pro", "plus"},
+		AccountResolved: true, AccountGroupNames: []string{"pro"},
+	}
+	out := ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, proAccount)
+	if gjson.GetBytes(out, "service_tier").Exists() {
+		t.Fatalf("实际调度到 pro 组账号时不应改写: %s", out)
+	}
+
+	// 实际调度到 plus 组账号 → 改写
+	plusAccount := &PayloadRuleIdentity{
+		APIKeyID: 1, GroupNames: []string{"pro", "plus"},
+		AccountResolved: true, AccountGroupNames: []string{"plus"},
+	}
+	out = ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, plusAccount)
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+		t.Fatalf("service_tier = %q, want priority（实际调度到 plus 组）", got)
+	}
+
+	// 账号未解析（AccountResolved=false）→ fail-closed 不改写
+	unresolved := &PayloadRuleIdentity{APIKeyID: 1, GroupNames: []string{"plus"}}
+	out = ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, unresolved)
+	if gjson.GetBytes(out, "service_tier").Exists() {
+		t.Fatalf("账号未解析时带账号门的规则应 fail-closed")
+	}
+
+	// 无身份 → fail-closed
+	out = ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, nil)
+	if gjson.GetBytes(out, "service_tier").Exists() {
+		t.Fatalf("无身份时带账号门的规则应 fail-closed")
+	}
+}
+
+func TestPayloadRulesAccountGroupIDGate(t *testing.T) {
+	withPayloadRules(t, `{"override":[{"account_group_ids":["7"],"params":{"service_tier":"priority"}}]}`)
+	hit := &PayloadRuleIdentity{AccountResolved: true, AccountGroupIDs: []int64{3, 7}}
+	out := ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, hit)
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+		t.Fatalf("service_tier = %q, want priority（账号组 id 命中）", got)
+	}
+	miss := &PayloadRuleIdentity{AccountResolved: true, AccountGroupIDs: []int64{3, 4}}
+	out = ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, miss)
+	if gjson.GetBytes(out, "service_tier").Exists() {
+		t.Fatalf("账号组 id 不匹配时不应改写")
+	}
+}
+
+func TestPayloadRulesAccountPlanGate(t *testing.T) {
+	withPayloadRules(t, `{"override":[{"account_plans":["plus"],"params":{"service_tier":"priority"}}]}`)
+	plus := &PayloadRuleIdentity{AccountResolved: true, AccountPlan: "plus"}
+	out := ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, plus)
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+		t.Fatalf("service_tier = %q, want priority（plus 套餐命中）", got)
+	}
+	pro := &PayloadRuleIdentity{AccountResolved: true, AccountPlan: "pro"}
+	out = ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, pro)
+	if gjson.GetBytes(out, "service_tier").Exists() {
+		t.Fatalf("pro 套餐不应命中 plus 门")
+	}
+}
+
+func TestPayloadRulesAccountGateCombinesWithKeyGates(t *testing.T) {
+	// 账号门与 Key 身份门 AND：pro Key + 实际 plus 账号才改写
+	withPayloadRules(t, `{"override":[{"api_key_names":["pro*"],"account_group_names":["plus"],"params":{"service_tier":"priority"}}]}`)
+	both := &PayloadRuleIdentity{APIKeyName: "pro-main", AccountResolved: true, AccountGroupNames: []string{"plus"}}
+	out := ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, both)
+	if got := gjson.GetBytes(out, "service_tier").String(); got != "priority" {
+		t.Fatalf("service_tier = %q, want priority（key+账号门都命中）", got)
+	}
+	wrongKey := &PayloadRuleIdentity{APIKeyName: "other", AccountResolved: true, AccountGroupNames: []string{"plus"}}
+	out = ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, wrongKey)
+	if gjson.GetBytes(out, "service_tier").Exists() {
+		t.Fatalf("key 门不匹配时不应改写")
+	}
+}
+
+func TestWithSelectedAccount(t *testing.T) {
+	base := &PayloadRuleIdentity{APIKeyID: 9, APIKeyName: "pro-main", GroupNames: []string{"pro", "plus"}}
+	account := &auth.Account{DBID: 1, PlanType: "plus", GroupIDs: []int64{7}}
+
+	derived := base.WithSelectedAccount(account, nil)
+	if derived == base {
+		t.Fatalf("应返回副本而非原对象")
+	}
+	if !derived.AccountResolved {
+		t.Fatalf("AccountResolved 应为 true")
+	}
+	if derived.AccountPlan != "plus" {
+		t.Fatalf("AccountPlan = %q, want plus", derived.AccountPlan)
+	}
+	if len(derived.AccountGroupIDs) != 1 || derived.AccountGroupIDs[0] != 7 {
+		t.Fatalf("AccountGroupIDs = %v, want [7]", derived.AccountGroupIDs)
+	}
+	// Key 维度字段保留
+	if derived.APIKeyID != 9 || derived.APIKeyName != "pro-main" {
+		t.Fatalf("Key 身份字段应保留")
+	}
+	// 原对象不受影响
+	if base.AccountResolved || base.AccountPlan != "" {
+		t.Fatalf("原身份不应被修改")
+	}
+	// nil 身份保持 nil（fail-closed）；nil 账号原样返回
+	if (*PayloadRuleIdentity)(nil).WithSelectedAccount(account, nil) != nil {
+		t.Fatalf("nil 身份应保持 nil")
+	}
+	if base.WithSelectedAccount(nil, nil) != base {
+		t.Fatalf("nil 账号应原样返回")
+	}
+}
+
+// TestEffectiveRequestedServiceTierAccountGate 校验记账归因随账号门同步翻转。
+func TestEffectiveRequestedServiceTierAccountGate(t *testing.T) {
+	withPayloadRules(t, `{"override":[{"account_group_names":["plus"],"params":{"service_tier":"priority"}}]}`)
+	plus := &PayloadRuleIdentity{AccountResolved: true, AccountGroupNames: []string{"plus"}}
+	if got := EffectiveRequestedServiceTier([]byte(payloadTestBody), "gpt-5.6-sol", nil, plus); got != "priority" {
+		t.Fatalf("tier = %q, want priority（plus 账号归因）", got)
+	}
+	pro := &PayloadRuleIdentity{AccountResolved: true, AccountGroupNames: []string{"pro"}}
+	if got := EffectiveRequestedServiceTier([]byte(payloadTestBody), "gpt-5.6-sol", nil, pro); got != "" {
+		t.Fatalf("tier = %q, want \"\"（pro 账号不改写）", got)
 	}
 }

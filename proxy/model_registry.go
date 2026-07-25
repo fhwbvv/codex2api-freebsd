@@ -43,11 +43,14 @@ type ModelInfo struct {
 
 // ModelCatalog is the admin-facing model list plus registry metadata.
 type ModelCatalog struct {
-	Models       []string    `json:"models"`
-	Items        []ModelInfo `json:"items"`
-	LastSyncedAt *time.Time  `json:"last_synced_at,omitempty"`
-	SourceURL    string      `json:"source_url"`
-	Warning      string      `json:"warning,omitempty"`
+	Models []string    `json:"models"`
+	Items  []ModelInfo `json:"items"`
+	// GrokModels 是全部 Grok 账号声明模型的并集（由 admin 层填充），
+	// 供前端在渠道选 grok 时切换模型下拉选项；注册表本身仍只管 Codex 模型。
+	GrokModels   []string   `json:"grok_models,omitempty"`
+	LastSyncedAt *time.Time `json:"last_synced_at,omitempty"`
+	SourceURL    string     `json:"source_url"`
+	Warning      string     `json:"warning,omitempty"`
 }
 
 // ModelSyncResult is returned after a manual upstream sync.

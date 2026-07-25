@@ -57,6 +57,7 @@ function DialogContent({
   showCloseButton = true,
   onInteractOutside,
   onPointerDownOutside,
+  onFocusOutside,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
@@ -78,6 +79,14 @@ function DialogContent({
         }}
         onPointerDownOutside={(event) => {
           onPointerDownOutside?.(event)
+          if (isInteractivePortalTarget(event.target)) {
+            event.preventDefault()
+          }
+        }}
+        onFocusOutside={(event) => {
+          onFocusOutside?.(event)
+          // Portaled select menus (body) sit outside Dialog content; allow focus so
+          // inputs/options inside them remain usable while the modal is open.
           if (isInteractivePortalTarget(event.target)) {
             event.preventDefault()
           }

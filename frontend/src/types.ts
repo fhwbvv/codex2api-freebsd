@@ -9,7 +9,7 @@ export interface ToastState {
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
 export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
 
-export interface StatsResponse {
+export interface StatsChannelCounts {
   total: number
   available: number
   rate_limited: number
@@ -17,11 +17,59 @@ export interface StatsResponse {
   today_requests: number
 }
 
+export interface StatsResponse {
+  total: number
+  available: number
+  rate_limited: number
+  error: number
+  today_requests: number
+  // 按上游渠道(codex/grok)拆分的账号与今日请求计数
+  channels?: Record<string, StatsChannelCounts>
+}
+
 export interface AccountUsageWindow {
   requests: number
   tokens: number
   account_billed?: number
   user_billed?: number
+}
+
+export interface GrokProductUsage {
+  product: string
+  usage_percent?: number | null
+}
+
+// Grok billing 完整额度视图（后端 grok_billing_detail 凭据透出）。
+export interface GrokBillingDetail {
+  plan?: string
+  weekly_percent?: number | null
+  weekly_period_start?: string
+  weekly_period_end?: string
+  product_usage?: GrokProductUsage[]
+  on_demand_cap_cents?: number | null
+  on_demand_used_cents?: number | null
+  monthly_limit_cents?: number | null
+  monthly_used_cents?: number | null
+  monthly_percent?: number | null
+  monthly_period_start?: string
+  monthly_period_end?: string
+  updated_at?: string
+}
+
+export interface GrokRateLimitSnapshot {
+  limit_tokens?: number
+  remaining_tokens?: number
+  limit_requests?: number
+  remaining_requests?: number
+  updated_at?: string
+}
+
+// 免费额度耗尽时从上游 429 错误体解析的权威用量(滚动 24h 窗口)。
+export interface GrokFreeQuotaSnapshot {
+  used_tokens: number
+  limit_tokens: number
+  model?: string
+  exhausted_at: string
 }
 
 export interface AccountRow {
@@ -38,6 +86,13 @@ export interface AccountRow {
   access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
+  grok_api?: boolean
+  agent_identity?: boolean
+  grok_auth_kind?: string
+  grok_billing?: GrokBillingDetail
+  // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
+  grok_rate_limit?: GrokRateLimitSnapshot
+  grok_free_quota?: GrokFreeQuotaSnapshot
   base_url?: string
   models?: string[]
   model_mapping?: string
@@ -88,6 +143,11 @@ export interface AccountRow {
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   rate_limit_reset_credits?: number | null
+  applicable_reset_credits?: number | null
+  credits_balance?: string | null
+  credits_has_credits?: boolean | null
+  credits_unlimited?: boolean | null
+  credits_overage_limit_reached?: boolean | null
   auto_pause_5h_threshold?: number | null
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
@@ -213,6 +273,39 @@ export interface AddATAccountRequest {
   custom_headers?: Record<string, string> | null
 }
 
+// Codex Agent Identity auth.json 导入（auth_mode=agentIdentity，动态签名，不存 AT/RT）。
+export interface ImportAgentIdentityRequest {
+  name?: string
+  auth_json: string
+  proxy_url?: string
+}
+
+export interface ImportAgentIdentityResponse {
+  message: string
+  id: number
+  email?: string
+}
+
+// Agent Identity auth.json 文件批量导入(每项一个文件的原始 JSON 内容)。
+export interface AgentIdentityBatchImportRequest {
+  files: string[]
+  proxy_url?: string
+}
+
+export interface AgentIdentityImportItem {
+  email?: string
+  id?: number
+  ok: boolean
+  error?: string
+}
+
+export interface AgentIdentityBatchImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: AgentIdentityImportItem[]
+}
+
 export interface AddOpenAIResponsesAccountRequest {
   name?: string
   base_url: string
@@ -245,6 +338,99 @@ export interface FetchOpenAIResponsesModelsRequest {
 export interface FetchOpenAIResponsesModelsResponse {
   base_url: string
   models: string[]
+}
+
+export type GrokAuthKind = 'oauth' | 'api_key'
+
+export interface AddGrokAccountRequest {
+  name?: string
+  auth_kind: GrokAuthKind
+  auth_json?: string
+  api_key?: string
+  base_url?: string
+  models?: string[]
+  model_mapping?: string
+  proxy_url?: string
+}
+
+export type UpdateGrokAccountRequest = AddGrokAccountRequest
+
+export interface FetchGrokModelsResponse {
+  models: string[]
+}
+
+// Grok Device Code OAuth（与 CLIProxyAPI / Grok CLI 一致）。
+export interface GrokDeviceStartRequest {
+  proxy_url?: string
+  name?: string
+  base_url?: string
+  models?: string[]
+}
+
+export interface GrokDeviceStartResponse {
+  session_id: string
+  user_code: string
+  verification_uri?: string
+  verification_uri_complete?: string
+  verification_url: string
+  expires_in: number
+  interval: number
+}
+
+export interface GrokDevicePollRequest {
+  session_id: string
+  proxy_url?: string
+  name?: string
+}
+
+export interface GrokDevicePollResponse {
+  status: 'pending' | 'authorized' | string
+  slow_down?: boolean
+  interval?: number
+  user_code?: string
+  expires_at?: string
+  message?: string
+  id?: number
+  email?: string
+}
+
+// Grok Web SSO 批量导入：用 sso token 自动换成 Build(OAuth) 账号。
+export interface GrokSSOImportRequest {
+  tokens: string
+  base_url?: string
+  models?: string[]
+  proxy_url?: string
+}
+
+export interface GrokSSOImportItem {
+  name?: string
+  email?: string
+  id?: number
+  ok: boolean
+  error?: string
+}
+
+export interface GrokSSOImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: GrokSSOImportItem[]
+}
+
+// Grok 凭据文件批量导入（CPA.json / auth.json）：每项是一个文件的原始 JSON 内容。
+export interface GrokBatchImportRequest {
+  files: string[]
+  base_url?: string
+  models?: string[]
+  proxy_url?: string
+}
+
+// 结果结构与 SSO 导入一致，复用 GrokSSOImportItem。
+export interface GrokBatchImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: GrokSSOImportItem[]
 }
 
 export interface UpdateAccountSchedulerRequest {
@@ -330,6 +516,16 @@ export interface AccountUsageDayStat {
   user_billed: number
 }
 
+export interface AccountKeyStat {
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
+  requests: number
+  tokens: number
+  account_billed: number
+  user_billed: number
+}
+
 export interface AccountUsageDetail {
   period_days: number
   active_days: number
@@ -362,6 +558,7 @@ export interface AccountUsageDetail {
   highest_request_day?: AccountUsageDayStat
   history: AccountUsageDayStat[]
   models: AccountModelStat[]
+  by_api_key: AccountKeyStat[]
 }
 
 export interface MessageResponse {
@@ -623,10 +820,20 @@ export interface SystemSettings {
   codex_ws_hide_upstream_errors: boolean
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
+  codex_ws_size_router_enabled: boolean
+  codex_ws_busy_acquire_max_wait_sec: number
+  codex_ws_busy_overflow_enabled: boolean
+  codex_ws_busy_patience_sec: number
   codex_continue_thinking_enabled: boolean
+  overflow_auto_compact_enabled: boolean
+  codex_preflight_sse_passthrough_enabled: boolean
   codex_continue_max_rounds: number
   scheduler_mode: string
   affinity_mode?: string
+  grok_affinity_mode?: string
+  grok_probe_enabled?: boolean
+  grok_probe_interval_minutes?: number
+  grok_max_rate_limit_retries?: number
   max_retries: number
   max_rate_limit_retries: number
   retry_interval_ms: number
@@ -675,6 +882,7 @@ export interface SystemSettings {
   stream_flush_interval_ms: number
   first_token_mode: 'strict' | 'loose' | string
   first_token_timeout_seconds: number
+  first_token_excludes_ws_acquire: boolean
   billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
   public_key_usage_page_enabled: boolean
@@ -753,12 +961,20 @@ export interface PromptFilterLog {
   created_at: ISODateString
   source: string
   endpoint: string
+  protocol?: string
+  provider?: string
   model: string
   action: string
   mode: string
   score: number
+  audit_score?: number
   threshold: number
+  policy_profile?: string
+  reason_code?: string
+  primary_origin?: string
+  strike_eligible?: boolean
   matched_patterns: string
+  match_context?: string
   text_preview: string
   full_text: string
   api_key_id: number
@@ -785,6 +1001,154 @@ export interface PromptFilterTestResponse {
 export interface PromptFilterRulePatternTestResponse {
   matched: boolean
   error?: string
+}
+
+export type PromptGuardMode = 'inherit' | 'off' | 'shadow' | 'warn' | 'enforce'
+
+export type PromptGuardProfile = 'balanced' | 'strict' | 'research'
+
+export type PromptGuardProvider = 'openai' | 'anthropic' | 'xai' | 'unknown'
+
+export type PromptGuardRolloutFallbackMode = 'warn' | 'shadow'
+
+export interface PromptGuardRolloutConfig {
+  enabled: boolean
+  percent: number
+  fallback_mode: PromptGuardRolloutFallbackMode
+  newapi_user_allowlist: string[]
+  api_key_allowlist: string[]
+  protocols: string[]
+  providers: string[]
+}
+
+export interface PromptGuardPerformanceConfig {
+  async_shadow_auxiliary_enabled: boolean
+  exact_segment_cache_enabled: boolean
+  exact_segment_cache_entries: number
+  exact_segment_cache_ttl_seconds: number
+  max_segments: number
+  max_current_user_bytes: number
+  max_auxiliary_bytes: number
+  scan_chunk_bytes: number
+  scan_overlap_bytes: number
+  shadow_workers: number
+  shadow_queue_size: number
+  shadow_overflow_mode: 'drop'
+}
+
+export type PromptGuardLayer =
+  | 'current_user'
+  | 'history'
+  | 'system'
+  | 'developer'
+  | 'instructions'
+  | 'tool_output'
+  | 'tool_arguments'
+  | 'attachment_refs'
+  | 'session_context'
+  | 'attachment_content'
+
+export interface PromptGuardConfig {
+  mode: PromptGuardMode
+  default_profile: PromptGuardProfile
+  allow_trusted_overrides: boolean
+  provider_profiles: Partial<Record<PromptGuardProvider, PromptGuardProfile>>
+  layers: Record<PromptGuardLayer, { mode: PromptGuardMode }>
+  rollout: PromptGuardRolloutConfig
+  performance: PromptGuardPerformanceConfig
+}
+
+export type AdvancedConfigObject = Record<string, unknown>
+
+export interface AdvancedConfigDocument {
+  ok: boolean
+  value: AdvancedConfigObject | null
+  error: 'invalid_json' | 'root_not_object' | null
+}
+
+export interface AdvancedConfigPatch {
+  path: readonly string[]
+  value?: unknown
+  remove?: boolean
+}
+
+export interface AdvancedConfigPatchResult extends AdvancedConfigDocument {
+  serialized: string
+}
+
+function isAdvancedConfigObject(value: unknown): value is AdvancedConfigObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Parse the persisted advanced configuration without normalizing or rebuilding
+ * it. Callers can derive a typed view separately while retaining this original
+ * tree as the source of truth for compatible field-level updates.
+ */
+export function parseAdvancedConfigDocument(raw: string): AdvancedConfigDocument {
+  try {
+    const value = JSON.parse(raw || '{}') as unknown
+    if (!isAdvancedConfigObject(value)) {
+      return { ok: false, value: null, error: 'root_not_object' }
+    }
+    return { ok: true, value, error: null }
+  } catch {
+    return { ok: false, value: null, error: 'invalid_json' }
+  }
+}
+
+export function readAdvancedConfigPath(
+  value: AdvancedConfigObject | null,
+  path: readonly string[],
+): unknown {
+  let current: unknown = value
+  for (const key of path) {
+    if (!isAdvancedConfigObject(current)) return undefined
+    current = current[key]
+  }
+  return current
+}
+
+/**
+ * Apply only explicitly edited JSON paths to a freshly parsed document. This
+ * preserves unknown top-level and nested fields, including future enum values.
+ * Invalid JSON is returned untouched so the UI can block saving instead of
+ * silently replacing it with defaults.
+ */
+export function patchAdvancedConfigDocument(
+  raw: string,
+  patches: readonly AdvancedConfigPatch[],
+): AdvancedConfigPatchResult {
+  const parsed = parseAdvancedConfigDocument(raw)
+  if (!parsed.ok || !parsed.value) {
+    return { ...parsed, serialized: raw }
+  }
+
+  const root = parsed.value
+  for (const patch of patches) {
+    if (patch.path.length === 0) continue
+    let current = root
+    for (const key of patch.path.slice(0, -1)) {
+      const child = current[key]
+      if (isAdvancedConfigObject(child)) {
+        current = child
+      } else {
+        const next: AdvancedConfigObject = {}
+        current[key] = next
+        current = next
+      }
+    }
+    const leaf = patch.path[patch.path.length - 1]
+    if (patch.remove) delete current[leaf]
+    else current[leaf] = patch.value
+  }
+
+  return {
+    ok: true,
+    value: root,
+    error: null,
+    serialized: JSON.stringify(root),
+  }
 }
 
 export interface PromptFilterRule {
@@ -843,6 +1207,8 @@ export interface ModelInfo {
 
 export interface ModelsResponse {
   models: string[]
+  // Grok 渠道账号声明模型的并集;渠道选 grok 时模型下拉用这份
+  grok_models?: string[]
   items?: ModelInfo[]
   last_synced_at?: string
   source_url: string
@@ -959,9 +1325,35 @@ export interface APIKeyTokenStat {
   user_billed: number
 }
 
+// APIKeyAccountGroup 是上游账号分组的精简展示项（Token 用量明细用）。
+export interface APIKeyAccountGroup {
+  id: number
+  name: string
+  color: string
+}
+
+// APIKeyAccountStat 是 /usage/api-keys/:id/accounts 端点返回项：
+// 某个下游 Key 在时间区间内按上游账号拆分的用量（账号"按 Key 分解"的转置）。
+export interface APIKeyAccountStat {
+  account_id: number
+  account_name: string
+  account_email: string
+  groups?: APIKeyAccountGroup[]
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  total_tokens: number
+  error_count: number
+  account_billed: number
+  user_billed: number
+}
+
 export interface UsageLog {
   id: number
   account_id: number
+  // 上游渠道(codex/grok),写入时固化;历史行回填,可能为空
+  channel?: string
   client_ip: string
   client_user_agent: string
   upstream_user_agent: string
@@ -978,6 +1370,7 @@ export interface UsageLog {
   output_tokens: number
   reasoning_tokens: number
   first_token_ms: number
+  ws_acquire_ms?: number
   reasoning_effort: string
   inbound_endpoint: string
   upstream_endpoint: string
@@ -1087,6 +1480,9 @@ export interface APIKeyLimits {
   token_limit_7d?: number
   token_limit_30d?: number
   disable_image_generation?: boolean
+  /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
+  image_generation_policy?: "allow" | "strip" | "block"
+  upstream_channel?: "codex" | "grok"
 }
 
 export interface APIKeyWindowUsage {

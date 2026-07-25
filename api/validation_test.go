@@ -4,10 +4,48 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 )
+
+func TestValidateResponsesAPIRequestRejectsEmptyInputArray(t *testing.T) {
+	result := ValidateResponsesAPIRequest(
+		[]byte(`{"model":"gpt-5.4","input":[]}`),
+		[]string{"gpt-5.4"},
+	)
+	if result.Valid {
+		t.Fatal("expected empty input array to be invalid")
+	}
+	if len(result.Errors) != 1 || result.Errors[0].Code != "empty_input" {
+		t.Fatalf("expected empty_input, got %#v", result.Errors)
+	}
+}
+
+// BenchmarkValidateResponsesLargeInput 守护 issue #417：input 校验必须单遍 O(N)，
+// 不能退化回按下标随机访问的 O(N²)。
+func BenchmarkValidateResponsesLargeInput(b *testing.B) {
+	var sb strings.Builder
+	sb.WriteString(`{"model":"gpt-5.4","input":[`)
+	item := `{"type":"message","role":"user","content":[{"type":"input_text","text":"analyze this module carefully and summarize"}]}`
+	for i := 0; i < 8000; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(item)
+	}
+	sb.WriteString(`]}`)
+	body := []byte(sb.String())
+	models := []string{"gpt-5.4"}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for i := 0; i < b.N; i++ {
+		if r := ValidateResponsesAPIRequest(body, models); !r.Valid {
+			b.Fatalf("unexpected invalid: %#v", r.Errors)
+		}
+	}
+}
 
 func TestValidateResponsesAPIRequestRejectsUnsupportedModel(t *testing.T) {
 	result := ValidateResponsesAPIRequest(

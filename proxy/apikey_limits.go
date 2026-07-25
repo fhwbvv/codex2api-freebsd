@@ -102,8 +102,9 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
-	// 1b. 生图禁用 (本机校验:模型/端点/请求体意图,无 I/O)
-	if limits.DisableImageGeneration {
+	// 1b. 生图 block 策略 (本机校验:模型/端点/请求体意图,无 I/O)。
+	// strip 策略不在此短路——它在转发前改写请求体（见 stripResponsesImageGenerationCapabilities）。
+	if limits.ResolveImageGenerationPolicy() == database.ImageGenerationPolicyBlock {
 		if msg := checkAPIKeyImageGeneration(c, model); msg != "" {
 			return http.StatusForbidden, msg
 		}
@@ -178,6 +179,27 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	}
 
 	return 0, ""
+}
+
+// apiKeyImageGenerationPolicy 返回当前请求所属 API Key 的图片工具策略。
+// 无鉴权身份（内部路径）时返回 allow，不改写请求。
+func apiKeyImageGenerationPolicy(c *gin.Context) string {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return database.ImageGenerationPolicyAllow
+	}
+	return row.Limits.ResolveImageGenerationPolicy()
+}
+
+// applyImageGenerationStripPolicy 在 strip 策略下剥离请求体里的图片工具能力声明，
+// 把请求当作普通文本请求继续转发（issue #411）。应在请求体准备完成（含网关自动注入
+// 图片工具/桥接 instructions）之后调用，从而一并清理网关注入的能力声明。非 strip 策略
+// 原样返回。
+func applyImageGenerationStripPolicy(c *gin.Context, body []byte) []byte {
+	if apiKeyImageGenerationPolicy(c) != database.ImageGenerationPolicyStrip {
+		return body
+	}
+	return stripResponsesImageGenerationCapabilities(body)
 }
 
 // SendAPIKeyLimitError writes a standard /v1 API key limit error response.

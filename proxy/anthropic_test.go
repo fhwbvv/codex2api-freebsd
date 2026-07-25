@@ -15,7 +15,10 @@ func TestSendAnthropicStreamErrorEscapesJSON(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 
-	sendAnthropicStreamError(c, "api_error", "bad \"quote\"\\slash\nand control \x01")
+	writer := newStreamFlushWriter(c.Writer, nil)
+	if err := writeAnthropicStreamErrorEvent(writer, "api_error", "bad \"quote\"\\slash\nand control \x01"); err != nil {
+		t.Fatalf("writeAnthropicStreamErrorEvent: %v", err)
+	}
 
 	body := recorder.Body.String()
 	if !strings.HasPrefix(body, "event: error\ndata: ") || !strings.HasSuffix(body, "\n\n") {
@@ -769,4 +772,137 @@ func mustJSONString(s string) string {
 		panic(err)
 	}
 	return string(b)
+}
+
+func TestAnthropicThinkingSignatureRoundTrip_Output(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+
+	var all []anthropicStreamEvent
+	for _, ev := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"thinking hard"}`,
+		`{"type":"response.reasoning_summary_text.done"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"ENCRYPTED_BLOB"}}`,
+		`{"type":"response.output_text.delta","delta":"answer"}`,
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}`,
+	} {
+		all = append(all, tr.translateEvent([]byte(ev))...)
+	}
+
+	var sawSignature, signatureBeforeStop bool
+	for i, evt := range all {
+		if evt.Type == "content_block_delta" && evt.Delta != nil && evt.Delta.Type == "signature_delta" {
+			sawSignature = true
+			if evt.Delta.Signature != "ENCRYPTED_BLOB" {
+				t.Fatalf("signature = %q, want ENCRYPTED_BLOB", evt.Delta.Signature)
+			}
+			if i+1 < len(all) && all[i+1].Type != "content_block_stop" {
+				t.Fatalf("signature_delta 后应紧跟 content_block_stop, got %s", all[i+1].Type)
+			}
+			signatureBeforeStop = i+1 < len(all) && all[i+1].Type == "content_block_stop"
+		}
+	}
+	if !sawSignature {
+		t.Fatal("stream should emit signature_delta carrying encrypted_content")
+	}
+	if !signatureBeforeStop {
+		t.Fatal("signature_delta must precede the thinking content_block_stop")
+	}
+}
+
+func TestAnthropicThinkingSignatureRoundTrip_NoSignatureNoDelta(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+	var all []anthropicStreamEvent
+	for _, ev := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"t"}`,
+		`{"type":"response.reasoning_summary_text.done"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning"}}`,
+	} {
+		all = append(all, tr.translateEvent([]byte(ev))...)
+	}
+	for _, evt := range all {
+		if evt.Delta != nil && evt.Delta.Type == "signature_delta" {
+			t.Fatal("no encrypted_content → no signature_delta")
+		}
+	}
+	// thinking 块最终被 output_item.done 关闭
+	last := all[len(all)-1]
+	if last.Type != "content_block_stop" {
+		t.Fatalf("thinking block should close at output_item.done, last=%s", last.Type)
+	}
+}
+
+func TestAnthropicThinkingSignatureRoundTrip_Input(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[
+			{"role":"user","content":"question"},
+			{"role":"assistant","content":[
+				{"type":"thinking","thinking":"prior reasoning","signature":"ENCRYPTED_BLOB"},
+				{"type":"text","text":"prior answer"},
+				{"type":"thinking","thinking":"unsigned reasoning"}
+			]},
+			{"role":"user","content":"follow-up"}
+		]
+	}`)
+
+	got, _, err := TranslateAnthropicToCodexWithModels(raw, "", []string{"gpt-5.4"})
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+
+	items := gjson.GetBytes(got, "input").Array()
+	var reasoningCount int
+	for _, item := range items {
+		if item.Get("type").String() != "reasoning" {
+			continue
+		}
+		reasoningCount++
+		if enc := item.Get("encrypted_content").String(); enc != "ENCRYPTED_BLOB" {
+			t.Fatalf("encrypted_content = %q, want ENCRYPTED_BLOB", enc)
+		}
+		if txt := item.Get("summary.0.text").String(); txt != "prior reasoning" {
+			t.Fatalf("summary text = %q", txt)
+		}
+	}
+	if reasoningCount != 1 {
+		t.Fatalf("signed thinking → 1 reasoning item, unsigned skipped; got %d", reasoningCount)
+	}
+	// reasoning item 必须在 assistant message 之前（保持块序）
+	var seenReasoning bool
+	for _, item := range items {
+		switch item.Get("type").String() {
+		case "reasoning":
+			seenReasoning = true
+		case "message":
+			if item.Get("role").String() == "assistant" && !seenReasoning {
+				t.Fatal("reasoning item should precede the assistant message it belongs to")
+			}
+		}
+	}
+}
+
+func TestAnthropicAccumulator_SignatureInNonStreamResponse(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+	acc := newAnthropicResponseAccumulator("claude-sonnet-4-5")
+	for _, ev := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.output_item.added","item":{"type":"reasoning"}}`,
+		`{"type":"response.reasoning_summary_text.delta","delta":"thought"}`,
+		`{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"SIG"}}`,
+		`{"type":"response.output_text.delta","delta":"hi"}`,
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`,
+	} {
+		acc.apply(tr.translateEvent([]byte(ev)))
+	}
+	resp := acc.build(nil)
+	if len(resp.Content) < 2 {
+		t.Fatalf("want thinking+text blocks, got %d", len(resp.Content))
+	}
+	if resp.Content[0].Type != "thinking" || resp.Content[0].Signature != "SIG" {
+		t.Fatalf("thinking block should carry signature, got %+v", resp.Content[0])
+	}
 }

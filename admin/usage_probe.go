@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -30,6 +31,18 @@ var errWhamUnauthorized = errors.New("wham usage probe unauthorized")
 func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account) error {
 	if account == nil {
 		return nil
+	}
+
+	// Grok 账号绝不能走 ChatGPT wham / codex responses 探针——
+	// 否则会用错误的上游把有效 token 判成 unauthorized 并封禁。
+	if account.IsGrokAPI() {
+		return h.probeUsageViaGrokBilling(ctx, account)
+	}
+
+	// Agent Identity 无 AccessToken，wham（Bearer）用不了；直接用 /responses 最小探针
+	// （ExecuteRequest 会用 AgentAssertion 动态签名），从响应头同步用量快照。
+	if account.IsCodexAgentIdentity() {
+		return h.probeUsageViaResponses(ctx, account)
 	}
 
 	account.Mu().RLock()
@@ -133,6 +146,46 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 	return nil
 }
 
+// probeUsageViaGrokBilling 通过 cli-chat-proxy /v1/billing 拉取套餐与周/月额度。
+// 不走 wham，401 才视作凭据失效。
+func (h *Handler) probeUsageViaGrokBilling(ctx context.Context, account *auth.Account) error {
+	if account == nil {
+		return nil
+	}
+	// API Key 账号可能没有 AT；用 bearer（api_key 或 AT）探测。
+	baseURL, bearer := account.GrokCredentials()
+	_ = baseURL
+	if strings.TrimSpace(bearer) == "" {
+		// OAuth 无 AT 时先刷一次
+		if account.GrokAuthKind() == auth.GrokAuthKindOAuth {
+			if err := h.store.RefreshSingle(ctx, account.DBID); err != nil {
+				log.Printf("[账号 %d] Grok billing 探针前刷新失败: %v", account.DBID, err)
+			}
+		}
+	}
+
+	summary, err := proxy.FetchGrokBilling(ctx, account, h.store.ResolveProxyForAccount(account))
+	if err != nil {
+		errText := err.Error()
+		if strings.Contains(strings.ToLower(errText), "unauthorized") {
+			h.store.ReportRequestFailure(account, "client", 0)
+			h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized",
+				fmt.Sprintf("Grok billing 探针 401: %s", truncate(errText, 300)))
+			return nil
+		}
+		log.Printf("[账号 %d] Grok billing 探针失败: %v", account.DBID, err)
+		return err
+	}
+
+	credentials := proxy.ApplyGrokBilling(h.store, account, summary)
+	if h.db != nil && len(credentials) > 0 {
+		if err := h.db.UpdateCredentials(ctx, account.DBID, credentials); err != nil {
+			log.Printf("[账号 %d] Grok billing 写库失败: %v", account.DBID, err)
+		}
+	}
+	return nil
+}
+
 // probeUsageViaResponses 原有探针：发送最小 /responses 请求，
 // 通过响应头同步 Codex 用量状态。会真实消耗少量 token。
 func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Account) error {
@@ -171,7 +224,12 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 			return nil
 		}
 		if shouldMarkUsageProbeAccountError(resp.StatusCode, body) {
-			h.store.MarkError(account, fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+			errorMsg := fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
+			if resp.StatusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body) {
+				h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errorMsg)
+			} else {
+				h.store.MarkError(account, errorMsg)
+			}
 			return nil
 		}
 		if resp.StatusCode >= 500 {
@@ -186,7 +244,8 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 func shouldMarkUsageProbeAccountError(statusCode int, body []byte) bool {
 	switch statusCode {
 	case http.StatusPaymentRequired, http.StatusForbidden:
-		return proxy.IsDeactivatedWorkspaceError(body)
+		return proxy.IsDeactivatedWorkspaceError(body) ||
+			(statusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body))
 	default:
 		return false
 	}

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codex2api/security/promptfilter"
 	"github.com/tidwall/gjson"
 )
 
@@ -136,6 +137,33 @@ func TestWriteDeferredSSEDataFlushesLargeDeferredEventOnce(t *testing.T) {
 	}
 	if pending.Len() != 0 {
 		t.Fatalf("pending buffer not reset: %d", pending.Len())
+	}
+}
+
+func TestWriteDeferredSSEDataReportsActualOutputScannerDelivery(t *testing.T) {
+	cfg := promptfilter.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Advanced.Output.Enabled = true
+	cfg.Advanced.Output.BufferBytes = 512
+	cfg.Advanced.Output.OverlapBytes = 64
+	var buf bytes.Buffer
+	writer := &streamFlushWriter{writer: &buf, outputScanner: promptfilter.NewOutputScanner(cfg)}
+	var pending bytes.Buffer
+
+	wrote, err := writeDeferredSSEData(writer, &pending, []byte(`{"type":"response.output_text.delta","delta":"hi"}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrote || buf.Len() != 0 {
+		t.Fatalf("scanner-buffered event reported client delivery: wrote=%t bytes=%d", wrote, buf.Len())
+	}
+
+	wrote, err = writeDeferredSSEData(writer, &pending, []byte(`{"type":"response.completed"}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wrote || buf.Len() == 0 {
+		t.Fatalf("terminal scanner release was not reported: wrote=%t bytes=%d", wrote, buf.Len())
 	}
 }
 

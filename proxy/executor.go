@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -338,11 +339,56 @@ func prepareCodexResponsesLiteTransport(requestBody []byte, headers http.Header,
 	return requestBody, forwardHeaders
 }
 
+// normalizeCodexResponsesLiteBody 按上游对 Responses Lite 请求的强制约束净化请求体：
+// reasoning.context 必须为 all_turns、parallel_tool_calls 必须为 false，否则上游
+// 400 unsupported_value（WS/HTTP 均校验）。HTTP 上游还要求 tools 仅含 function/
+// custom/客户端执行的 tool search——网关自动注入的 hosted image_generation 工具
+// （及其桥接 instructions）会让整个请求被拒，须在发出前剥除；WS 上游接受该工具、
+// 生图桥接可用，不剥除以免功能回退。
+func normalizeCodexResponsesLiteBody(requestBody []byte, stripHostedTools bool) []byte {
+	requestBody, _ = sjson.SetBytes(requestBody, "parallel_tool_calls", false)
+	requestBody, _ = sjson.SetBytes(requestBody, "reasoning.context", "all_turns")
+	if !stripHostedTools {
+		return requestBody
+	}
+
+	if tools := gjson.GetBytes(requestBody, "tools"); tools.IsArray() {
+		kept := make([]json.RawMessage, 0, len(tools.Array()))
+		removed := false
+		for _, tool := range tools.Array() {
+			if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+				removed = true
+				continue
+			}
+			kept = append(kept, json.RawMessage(tool.Raw))
+		}
+		if removed {
+			if len(kept) == 0 {
+				requestBody, _ = sjson.DeleteBytes(requestBody, "tools")
+			} else if raw, err := json.Marshal(kept); err == nil {
+				requestBody, _ = sjson.SetRawBytes(requestBody, "tools", raw)
+			}
+			if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(requestBody, "tool_choice.type").String()), "image_generation") {
+				requestBody, _ = sjson.DeleteBytes(requestBody, "tool_choice")
+			}
+		}
+	}
+	if instructions := gjson.GetBytes(requestBody, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
+		requestBody, _ = sjson.SetBytes(requestBody, "instructions", removeCodexImageGenerationBridgeText(instructions))
+	}
+	return requestBody
+}
+
 // WebsocketExecuteFunc WebSocket 执行函数（由 wsrelay 包在 main.go 中注册，避免循环依赖）
 // poolRouteKey：本地连接池路由键（仅本地、永不发上游）。非空时 wsrelay 用它作 8 槽池的
 // baseKey，从而把"上游会话身份(每请求唯一)"与"连接复用(按 API Key 稳定)"解耦；空时沿用
 // headerSessionID 作 baseKey（显式会话 / per-api-key 模式的原有行为）。
 var WebsocketExecuteFunc func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error)
+
+// EnsureCodexAgentIdentityTaskFunc 由启动装配注册（store.EnsureCodexAgentIdentityTask），
+// 在构建 Agent Identity 请求前保证 task_id 就绪；forceRefresh=true 用于 401 task 失效重注册。
+// nil 时跳过（如嵌入式调用或初始化顺序问题）。
+var EnsureCodexAgentIdentityTaskFunc func(ctx context.Context, account *auth.Account, forceRefresh bool) error
 
 func IsolateCodexSessionID(apiKeyID int64, raw string) string {
 	raw = strings.TrimSpace(raw)
@@ -381,6 +427,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		ctx = context.Background()
 	}
 	resetUpstreamUserAgentAudit(ctx)
+	resetWsAcquireAudit(ctx)
 	responsesLite := codexResponsesLiteRequested(requestBody, headers)
 
 	// Payload 规则改写：在 WS/HTTP 分叉前统一应用，两条上游路径共享改写结果。
@@ -396,6 +443,11 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	wantWebsocket := CurrentRuntimeSettings().CodexForceWebsocket
 	if len(useWebsocket) > 0 {
 		wantWebsocket = useWebsocket[0]
+	}
+	// Agent Identity 账号强制走 HTTP：其鉴权是每请求动态签名的 AgentAssertion 头，
+	// 长连接 WS 的一次握手鉴权模型不适配，v1 统一走 HTTP。
+	if account.IsCodexAgentIdentity() {
+		wantWebsocket = false
 	}
 	poolRouteKey := ""
 	if wantWebsocket {
@@ -428,6 +480,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 	if wantWebsocket && WebsocketExecuteFunc != nil {
 		requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, true, responsesLite)
+		if responsesLite {
+			requestBody = normalizeCodexResponsesLiteBody(requestBody, false)
+		}
 		return WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	}
 	if wantWebsocket && WebsocketExecuteFunc == nil {
@@ -436,6 +491,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		log.Printf("[WS] 警告: 期望走 WebSocket 上游，但 WebsocketExecuteFunc 未注册，已回退到 HTTP (account %d)", account.ID())
 	}
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
+	if responsesLite {
+		requestBody = normalizeCodexResponsesLiteBody(requestBody, true)
+	}
 
 	account.Mu().RLock()
 	accessToken := account.AccessToken
@@ -447,7 +505,15 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		proxyURL = proxyOverride
 	}
 
-	if accessToken == "" {
+	isAgentIdentity := account.IsCodexAgentIdentity()
+	// Agent Identity 无 access_token，鉴权靠 AgentAssertion；请求前确保 task 已注册。
+	if isAgentIdentity {
+		if EnsureCodexAgentIdentityTaskFunc != nil {
+			if err := EnsureCodexAgentIdentityTaskFunc(ctx, account, false); err != nil {
+				return nil, ErrUpstream(0, "agent identity task 注册失败", err)
+			}
+		}
+	} else if accessToken == "" {
 		return nil, ErrNoAvailableAccount()
 	}
 
@@ -486,26 +552,47 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		client = getPooledClient(account, proxyURL)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
-	if err != nil {
-		return nil, ErrInternalError("创建请求失败", err)
-	}
-
-	// ==================== 请求头（伪装 Codex CLI） ====================
-	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
-
-	// Resin 反代：注入账号身份头
-	if IsResinEnabled() {
-		req.Header.Set("X-Resin-Account", ResinAccountID(account))
-	}
-	logCodexFingerprintDebug("http", account, proxyURL, req.Header)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+	send := func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
+		if err != nil {
+			return nil, ErrInternalError("创建请求失败", err)
 		}
-		return nil, ErrUpstream(0, "请求上游失败", err)
+
+		// ==================== 请求头（伪装 Codex CLI） ====================
+		applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
+
+		// Resin 反代：注入账号身份头
+		if IsResinEnabled() {
+			req.Header.Set("X-Resin-Account", ResinAccountID(account))
+		}
+		logCodexFingerprintDebug("http", account, proxyURL, req.Header)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if shouldRecyclePooledClient(err) {
+				recyclePooledClient(account, proxyURL)
+			}
+			return nil, ErrUpstream(0, "请求上游失败", err)
+		}
+		return resp, nil
+	}
+
+	resp, err := send()
+	if err != nil {
+		return nil, err
+	}
+
+	// Agent Identity：task 失效（401 invalid_task_id 等）时重注册并重试一次。
+	if isAgentIdentity && resp != nil && resp.StatusCode == http.StatusUnauthorized && EnsureCodexAgentIdentityTaskFunc != nil {
+		peeked, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		_ = resp.Body.Close()
+		if auth.IsAgentIdentityTaskInvalidResponse(resp.StatusCode, peeked) {
+			if regErr := EnsureCodexAgentIdentityTaskFunc(ctx, account, true); regErr == nil {
+				return send()
+			}
+		}
+		// 非 task 失效或重注册失败：把已读走的 body 还原后原样返回给上层错误处理。
+		resp.Body = io.NopCloser(bytes.NewReader(peeked))
 	}
 
 	return resp, nil
@@ -516,6 +603,7 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 		ctx = context.Background()
 	}
 	resetUpstreamUserAgentAudit(ctx)
+	resetWsAcquireAudit(ctx)
 	responsesLite := codexResponsesLiteRequested(requestBody, headers)
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 
@@ -655,6 +743,7 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 		ctx = context.Background()
 	}
 	resetUpstreamUserAgentAudit(ctx)
+	resetWsAcquireAudit(ctx)
 	responsesLite := codexResponsesLiteRequested(requestBody, headers)
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 
@@ -692,6 +781,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 		ctx = context.Background()
 	}
 	resetUpstreamUserAgentAudit(ctx)
+	resetWsAcquireAudit(ctx)
 	responsesLite := codexResponsesLiteRequested(requestBody, headers)
 
 	account.Mu().RLock()
@@ -911,7 +1001,14 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	userAgent, version, usedGeneratedHeaders := resolveCodexOutboundClientHeaders(account, apiKey, deviceCfg, downstreamHeaders)
 	req.Header.Set("User-Agent", userAgent)
 
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	// Agent Identity 账号用动态签名的 AgentAssertion 头替代 Bearer（task 已由调用方确保就绪）。
+	if account != nil && account.IsCodexAgentIdentity() {
+		if assertion, err := account.BuildCodexAgentAssertion(time.Now()); err == nil {
+			req.Header.Set("Authorization", assertion)
+		}
+	} else {
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Connection", "Keep-Alive")
@@ -1036,14 +1133,13 @@ func resolveDownstreamAffinityID(headers http.Header) string {
 
 func ResolveExplicitSessionID(headers http.Header, body []byte) string {
 	if headers != nil {
-		if v := strings.TrimSpace(headers.Get("Session_id")); v != "" {
-			return v
-		}
-		if v := strings.TrimSpace(headers.Get("Conversation_id")); v != "" {
-			return v
-		}
-		if v := strings.TrimSpace(headers.Get("Idempotency-Key")); v != "" {
-			return v
+		// 注意：Codex CLI 发的是连字符头 session-id / conversation-id（HTTP/2 全小写，
+		// 服务端规范化成 Session-Id / Conversation-Id），与旧的下划线写法 Session_id 不同，
+		// 两种都要认，否则取不到显式会话 id、affinity 只能退回内容种子。
+		for _, key := range []string{"Session-Id", "Session_id", "Conversation-Id", "Conversation_id", "Idempotency-Key"} {
+			if v := strings.TrimSpace(headers.Get(key)); v != "" {
+				return v
+			}
 		}
 	}
 	// 优先从 body 的 prompt_cache_key 提取

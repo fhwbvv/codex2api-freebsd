@@ -190,12 +190,193 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	}
 	for _, path := range []string{
 		"/v1/responses",
+		"/v1/realtime",
 		"/responses",
+		"/realtime",
 		"/backend-api/codex/responses",
 	} {
 		if !getRoutes[path] {
 			t.Fatalf("expected GET route %s to be registered; routes=%v", path, getRoutes)
 		}
+	}
+}
+
+func TestRealtimeWebSocketTranslatesTextConversationToResponses(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
+
+	bodyCh := make(chan []byte, 2)
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		bodyCh <- append([]byte(nil), requestBody...)
+		sse := `data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n" +
+			`data: {"type":"response.completed","response":{"id":"resp_realtime_1","output":[{"id":"msg_realtime_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(sse))}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-realtime"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/realtime?model=gpt-5.4"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial realtime websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial realtime websocket failed: %v", err)
+	}
+	defer conn.Close()
+	if resp == nil || resp.Header.Get(newAPIPolicyWebSocketCapabilityHeader) != newAPIPolicyWebSocketCapabilityV1 {
+		t.Fatalf("missing websocket policy event-id capability: response=%v", resp)
+	}
+	_, created, err := conn.ReadMessage()
+	if err != nil || gjson.GetBytes(created, "type").String() != "session.created" {
+		t.Fatalf("session created event = %s err=%v", created, err)
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"session.update","session":{"instructions":"Answer briefly."}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, ack, err := conn.ReadMessage()
+	if err != nil || gjson.GetBytes(ack, "type").String() != "session.updated" {
+		t.Fatalf("session ack = %s err=%v", ack, err)
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, ack, err = conn.ReadMessage()
+	if err != nil || gjson.GetBytes(ack, "type").String() != "conversation.item.created" {
+		t.Fatalf("item ack = %s err=%v", ack, err)
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"max_output_tokens":64},"__newapi_policy_event_id":"client-controlled"}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case gotBody := <-bodyCh:
+		if got := gjson.GetBytes(gotBody, "type").String(); got != "response.create" {
+			t.Fatalf("upstream type = %q body=%s", got, gotBody)
+		}
+		if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-5.4" {
+			t.Fatalf("upstream model = %q body=%s", got, gotBody)
+		}
+		if got := gjson.GetBytes(gotBody, "instructions").String(); got != "Answer briefly." {
+			t.Fatalf("upstream instructions = %q body=%s", got, gotBody)
+		}
+		if got := gjson.GetBytes(gotBody, "input.0.content.0.text").String(); got != "hello" {
+			t.Fatalf("upstream input text = %q body=%s", got, gotBody)
+		}
+		if gjson.GetBytes(gotBody, newAPIPolicyWebSocketEventField).Exists() {
+			t.Fatalf("reserved policy event id leaked upstream: %s", gotBody)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for translated realtime request")
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	_, event, err := conn.ReadMessage()
+	if err != nil || gjson.GetBytes(event, "type").String() != "response.output_text.delta" {
+		t.Fatalf("first response event = %s err=%v", event, err)
+	}
+	_, event, err = conn.ReadMessage()
+	if err != nil || gjson.GetBytes(event, "type").String() != "response.done" {
+		t.Fatalf("realtime terminal event = %s err=%v", event, err)
+	}
+	if got := gjson.GetBytes(event, "response.usage.total_tokens").Int(); got != 2 {
+		t.Fatalf("realtime terminal usage = %d body=%s", got, event)
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"again"}]}}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, ack, err = conn.ReadMessage()
+	if err != nil || gjson.GetBytes(ack, "type").String() != "conversation.item.created" {
+		t.Fatalf("second item ack = %s err=%v", ack, err)
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","response":{"max_output_tokens":64}}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case gotBody := <-bodyCh:
+		if gjson.GetBytes(gotBody, "previous_response_id").Exists() {
+			t.Fatalf("realtime history must not depend on upstream previous_response_id: %s", gotBody)
+		}
+		if count := gjson.GetBytes(gotBody, "input.#").Int(); count != 3 {
+			t.Fatalf("second realtime history count = %d body=%s", count, gotBody)
+		}
+		if got := gjson.GetBytes(gotBody, "input.0.content.0.text").String(); got != "hello" {
+			t.Fatalf("first user history = %q body=%s", got, gotBody)
+		}
+		if got := gjson.GetBytes(gotBody, "input.1.content.0.text").String(); got != "hi" {
+			t.Fatalf("assistant history = %q body=%s", got, gotBody)
+		}
+		if gjson.GetBytes(gotBody, "input.1.id").Exists() || gjson.GetBytes(gotBody, "input.1.status").Exists() {
+			t.Fatalf("assistant history retained server-owned fields: %s", gotBody)
+		}
+		if got := gjson.GetBytes(gotBody, "input.2.content.0.text").String(); got != "again" {
+			t.Fatalf("second realtime input = %q body=%s", got, gotBody)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second realtime request")
+	}
+}
+
+func TestRealtimeTextHistoryIsBoundedAndDropsServerOwnedFields(t *testing.T) {
+	state := &realtimeTextSession{}
+	for i := 0; i < realtimeTextHistoryMaxItems+10; i++ {
+		state.appendHistory(json.RawMessage(fmt.Sprintf(`{"id":"msg_%d","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"item-%d"}]}`, i, i)))
+	}
+	if len(state.History) != realtimeTextHistoryMaxItems {
+		t.Fatalf("history items = %d, want %d", len(state.History), realtimeTextHistoryMaxItems)
+	}
+	if state.historyBytes <= 0 || state.historyBytes > realtimeTextHistoryMaxBytes {
+		t.Fatalf("history bytes = %d", state.historyBytes)
+	}
+	if gjson.GetBytes(state.History[0], "id").Exists() || gjson.GetBytes(state.History[0], "status").Exists() {
+		t.Fatalf("server-owned fields remained: %s", state.History[0])
+	}
+	if got := gjson.GetBytes(state.History[0], "content.0.text").String(); got != "item-10" {
+		t.Fatalf("oldest retained item = %q, want item-10", got)
+	}
+}
+
+func TestRealtimeResponsesClientEventOnlyRenamesTerminalEvent(t *testing.T) {
+	completed := []byte(`{"type":"response.completed","response":{"id":"resp_1","usage":{"total_tokens":3}}}`)
+	got := realtimeResponsesClientEvent(completed)
+	if eventType := gjson.GetBytes(got, "type").String(); eventType != "response.done" {
+		t.Fatalf("terminal type = %q body=%s", eventType, got)
+	}
+	if id := gjson.GetBytes(got, "response.id").String(); id != "resp_1" {
+		t.Fatalf("response id = %q body=%s", id, got)
+	}
+	if usage := gjson.GetBytes(got, "response.usage.total_tokens").Int(); usage != 3 {
+		t.Fatalf("usage = %d body=%s", usage, got)
+	}
+
+	delta := []byte(`{"type":"response.output_text.delta","delta":"hi"}`)
+	if transformed := realtimeResponsesClientEvent(delta); string(transformed) != string(delta) {
+		t.Fatalf("non-terminal event changed: %s", transformed)
+	}
+}
+
+func TestNormalizeRealtimeTextClientEventRejectsAudioWithoutClosingTextSession(t *testing.T) {
+	state := &realtimeTextSession{Model: "gpt-5.4"}
+	ack, forward, apiErr := normalizeRealtimeTextClientEvent(state, []byte(`{"type":"input_audio_buffer.append","audio":"AAAA"}`))
+	if apiErr == nil || !strings.Contains(apiErr.Message, "text events only") {
+		t.Fatalf("audio event error = %#v", apiErr)
+	}
+	if len(ack) != 0 || len(forward) != 0 {
+		t.Fatalf("audio event produced ack=%s forward=%s", ack, forward)
+	}
+	if state.Model != "gpt-5.4" {
+		t.Fatalf("text session state was mutated: %+v", state)
 	}
 }
 
@@ -575,6 +756,27 @@ func TestResponsesWebSocketRetriesFirstTokenTimeoutBeforeRelay(t *testing.T) {
 	}
 }
 
+func TestEmitResponsesPhaseTimingsSetsHeaderAndSegments(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	base := time.Now().Add(-100 * time.Millisecond)
+	emitResponsesPhaseTimings(ctx, "gpt-5.6-sol", 300*1024,
+		base, base.Add(10*time.Millisecond), base.Add(30*time.Millisecond), base.Add(70*time.Millisecond))
+
+	header := recorder.Header().Get(responsesPhaseTimingHeader)
+	if header == "" {
+		t.Fatalf("%s header not set", responsesPhaseTimingHeader)
+	}
+	for _, segment := range []string{"read=10", "validate=20", "prepare=40", "schedule=", "body_kb=300"} {
+		if !strings.Contains(header, segment) {
+			t.Fatalf("timing header = %q, missing segment %q", header, segment)
+		}
+	}
+}
+
 func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -821,6 +1023,69 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	}
 	if got := atomic.LoadInt64(&secondary.TotalRequests); got != 0 {
 		t.Fatalf("secondary TotalRequests = %d, want no fallback redispatch", got)
+	}
+}
+
+func TestResponsesSkipsWebsocketWhenBodyReachesLearnedTooBigThreshold(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousSettings := CurrentRuntimeSettings()
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		ApplyRuntimeSettings(previousSettings)
+		resinCfg.Store(previousResin)
+		globalWSSizeRouter = websocketSizeRouter{}
+	})
+	nextSettings := previousSettings
+	nextSettings.CodexForceWebsocket = true
+	ApplyRuntimeSettings(nextSettings)
+
+	wsCalls := 0
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		wsCalls++
+		return nil, errors.New("websocket send error: websocket: close 1009 (message too big)")
+	}
+
+	httpCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpCalls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			`data: {"type":"response.output_text.delta","delta":"size-routed"}` + "\n\n" +
+				`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"service_tier":"default"}}` + "\n\n",
+		))
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"}
+	account.SetDispatchCountLimit(1)
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	// 预置学习状态:任何体积的请求都视为达到已知 1009 阈值
+	globalWSSizeRouter = websocketSizeRouter{minTooBig: 1, learnedAt: time.Now()}
+
+	body := []byte(`{"model":"gpt-5.4","input":"hello","stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "size-routed") {
+		t.Fatalf("status = %d, body = %q", recorder.Code, recorder.Body.String())
+	}
+	if wsCalls != 0 {
+		t.Fatalf("wsCalls = %d, want 0 (体积路由应完全跳过 WS)", wsCalls)
+	}
+	if httpCalls != 1 {
+		t.Fatalf("httpCalls = %d, want 1", httpCalls)
 	}
 }
 
@@ -2243,6 +2508,59 @@ func TestAppendMissingResponseImageOutputsAnnotatesExistingOutput(t *testing.T) 
 	}
 }
 
+func TestAccountFilterForModelRespectsAccountModelWhitelist(t *testing.T) {
+	filter := accountFilterForModel("gpt-5.6-sol")
+	if !filter(&auth.Account{PlanType: "plus"}) {
+		t.Fatal("空白名单账号应放行任意模型")
+	}
+	if !filter(&auth.Account{PlanType: "pro", Models: []string{"GPT-5.6-SOL", "gpt-5.3-codex"}}) {
+		t.Fatal("白名单命中（大小写不敏感）应放行")
+	}
+	restricted := &auth.Account{PlanType: "plus", Models: []string{"gpt-5.3-codex"}}
+	if filter(restricted) {
+		t.Fatal("白名单未包含请求模型时应拒绝")
+	}
+	if !accountFilterForModel("gpt-5.3-codex")(restricted) {
+		t.Fatal("白名单内模型应放行")
+	}
+	if !accountFilterForModel("")(restricted) {
+		t.Fatal("无模型信息的请求不应被白名单拦截")
+	}
+}
+
+func TestIsCodexModelUnsupportedError(t *testing.T) {
+	unsupported := []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.","type":"invalid_request_error"}}`)
+	if !isCodexModelUnsupportedError(unsupported) {
+		t.Fatal("应识别模型不支持错误")
+	}
+	if isCodexModelUnsupportedError([]byte(`{"error":{"message":"Invalid value for 'temperature'","type":"invalid_request_error"}}`)) {
+		t.Fatal("普通 invalid_request 不应命中")
+	}
+	if isCodexModelUnsupportedError(nil) {
+		t.Fatal("空 body 不应命中")
+	}
+
+	general, rate := 0, 0
+	if !shouldRetryHTTPStatus(http.StatusBadRequest, unsupported, &general, &rate, 2, 1) {
+		t.Fatal("模型不支持的 400 应可换号重试")
+	}
+	general, rate = 0, 0
+	if shouldRetryHTTPStatus(http.StatusBadRequest, []byte(`{"error":{"message":"bad request"}}`), &general, &rate, 2, 1) {
+		t.Fatal("普通 400 不应重试")
+	}
+}
+
+func TestResponseFailedModelUnsupportedRetryable(t *testing.T) {
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
+	if !responseFailedRetryable(payload) {
+		t.Fatal("模型不支持的 response.failed 应视为可换号重试")
+	}
+	plain := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"Invalid value for 'temperature'"}}}`)
+	if responseFailedRetryable(plain) {
+		t.Fatal("普通 invalid_request 的 response.failed 不应重试")
+	}
+}
+
 func TestAccountFilterForSparkAllowsNonFreeOrUnknownPlans(t *testing.T) {
 	filter := accountFilterForModel("gpt-5.3-codex-spark")
 	if filter == nil {
@@ -2352,13 +2670,13 @@ func TestClassify429Header7dUsesAccountCooldown(t *testing.T) {
 func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
 	generalRetries := 0
 	rateLimitRetries := 0
-	if !shouldRetryHTTPStatus(http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusTooManyRequests, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("first 429 should consume rate-limit retry budget")
 	}
-	if shouldRetryHTTPStatus(http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+	if shouldRetryHTTPStatus(http.StatusTooManyRequests, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("second 429 should be blocked by rate-limit retry budget")
 	}
-	if !shouldRetryHTTPStatus(http.StatusServiceUnavailable, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusServiceUnavailable, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("503 should still use general retry budget")
 	}
 	if generalRetries != 1 || rateLimitRetries != 1 {
@@ -2389,6 +2707,43 @@ func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	account.Mu().RUnlock()
 	if !strings.Contains(errorMsg, "deactivated_workspace") {
 		t.Fatalf("ErrorMsg = %q, want deactivated_workspace", errorMsg)
+	}
+}
+
+// TestAgentRuntimeDeleted403MarksAccountBanned 验证代理请求会将 runtime 已删除的账号标记为封禁。
+func TestAgentRuntimeDeleted403MarksAccountBanned(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 42, AccessToken: "at", Status: auth.StatusReady, HealthTier: auth.HealthTierHealthy}
+	handler := &Handler{store: store}
+	body := []byte(`{"error":{"message":"Agent runtime has been deleted.","type":null,"code":"biscuit_baker_service_agent_error_status","param":null},"status":403}`)
+
+	if !IsAgentRuntimeDeletedError(body) {
+		t.Fatal("expected deleted Agent runtime body to be detected")
+	}
+	if IsAgentRuntimeDeletedError([]byte(`{"error":{"message":"Agent runtime has been deleted.","code":"permission_denied"}}`)) {
+		t.Fatal("unrelated error code must not be detected as deleted Agent runtime")
+	}
+	if got := upstreamErrorKind(http.StatusForbidden, body, codex429Decision{}); got != "agent_runtime_deleted" {
+		t.Fatalf("upstreamErrorKind = %q, want agent_runtime_deleted", got)
+	}
+
+	handler.applyCooldownForModel(account, http.StatusForbidden, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+	if !account.IsBanned() {
+		t.Fatal("account should be in banned health tier")
+	}
+	_, cooldownUntil := account.GetCooldownSnapshot()
+	if remaining := time.Until(cooldownUntil); remaining < 23*time.Hour+59*time.Minute || remaining > 24*time.Hour {
+		t.Fatalf("cooldown remaining = %s, want approximately 24h", remaining)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "Agent runtime has been deleted") {
+		t.Fatalf("ErrorMsg = %q, want deleted runtime message", errorMsg)
 	}
 }
 
@@ -2603,13 +2958,13 @@ func TestShouldRetryHTTPStatus403(t *testing.T) {
 	}
 	generalRetries := 0
 	rateLimitRetries := 0
-	if !shouldRetryHTTPStatus(http.StatusForbidden, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusForbidden, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("首个 403（未达上限）应可重试")
 	}
-	if !shouldRetryHTTPStatus(http.StatusForbidden, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatus(http.StatusForbidden, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("第二个 403（仍未达上限）应可重试")
 	}
-	if shouldRetryHTTPStatus(http.StatusForbidden, &generalRetries, &rateLimitRetries, 2, 1) {
+	if shouldRetryHTTPStatus(http.StatusForbidden, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("达到 general 重试上限后 403 不应再重试")
 	}
 	if generalRetries != 2 {
@@ -3335,6 +3690,76 @@ func TestAuthMiddlewareSetsAPIKeyContext(t *testing.T) {
 	}
 	if payload.Raw != key {
 		t.Fatalf("raw = %q, want %q", payload.Raw, key)
+	}
+}
+
+func TestAuthMiddlewareAcceptsOpenAIWebSocketSubprotocolAPIKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New returned error: %v", err)
+	}
+	defer db.Close()
+
+	key := "sk-test-ws-auth-1234567890"
+	id, err := db.InsertAPIKey(context.Background(), "NewAPI WS", key)
+	if err != nil {
+		t.Fatalf("InsertAPIKey returned error: %v", err)
+	}
+
+	handler := NewHandler(nil, db, nil, nil)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/v1/responses", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"id": c.MustGet(contextAPIKeyID), "raw": c.MustGet("apiKey")})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/responses?model=gpt-5.6-sol", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key."+key+", openai-beta.realtime-v1")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "id").Int(); got != id {
+		t.Fatalf("api key id = %d, want %d", got, id)
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "raw").String(); got != key {
+		t.Fatalf("raw key = %q, want configured websocket key", got)
+	}
+}
+
+func TestAuthMiddlewareDoesNotAcceptWebSocketSubprotocolOnOrdinaryHTTP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New returned error: %v", err)
+	}
+	defer db.Close()
+	key := "sk-test-ws-http-reject-1234567890"
+	if _, err := db.InsertAPIKey(context.Background(), "HTTP Reject", key); err != nil {
+		t.Fatalf("InsertAPIKey returned error: %v", err)
+	}
+
+	handler := NewHandler(nil, db, nil, nil)
+	router := gin.New()
+	router.Use(handler.authMiddleware())
+	router.GET("/ok", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+
+	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+	req.Header.Set("Sec-WebSocket-Protocol", "realtime, openai-insecure-api-key."+key)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
 	}
 }
 

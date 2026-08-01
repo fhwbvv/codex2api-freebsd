@@ -84,7 +84,7 @@ func StartGrokDeviceFlow(ctx context.Context, proxyURL string) (*GrokDeviceCodeR
 		return nil, err
 	}
 	form := url.Values{
-		"client_id": {GrokDefaultOAuthClientID},
+		"client_id": {EffectiveGrokOAuthClientID()},
 		"scope":     {GrokDefaultOAuthScope},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, discovery.DeviceAuthorizationEndpoint, strings.NewReader(form.Encode()))
@@ -121,11 +121,11 @@ func StartGrokDeviceFlow(ctx context.Context, proxyURL string) (*GrokDeviceCodeR
 
 // GrokDevicePollResult 是一次 device token 轮询结果。
 type GrokDevicePollResult struct {
-	Pending      bool // authorization_pending / slow_down
-	SlowDown     bool
-	Token        *GrokTokenData
-	Email        string
-	Subject      string
+	Pending       bool // authorization_pending / slow_down
+	SlowDown      bool
+	Token         *GrokTokenData
+	Email         string
+	Subject       string
 	TokenEndpoint string
 }
 
@@ -146,7 +146,7 @@ func PollGrokDeviceToken(ctx context.Context, deviceCode, tokenEndpoint, proxyUR
 	form := url.Values{
 		"grant_type":  {GrokDeviceCodeGrantType},
 		"device_code": {deviceCode},
-		"client_id":   {GrokDefaultOAuthClientID},
+		"client_id":   {EffectiveGrokOAuthClientID()},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -221,6 +221,7 @@ func PollGrokDeviceToken(ctx context.Context, deviceCode, tokenEndpoint, proxyUR
 			AccessToken:  payload.AccessToken,
 			RefreshToken: payload.RefreshToken,
 			IDToken:      payload.IDToken,
+			PlanType:     GrokPlanTypeFromAccessToken(payload.AccessToken),
 			ExpiresAt:    expiresAt,
 		},
 		Email:         email,

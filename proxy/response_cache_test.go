@@ -1,20 +1,15 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
-	"time"
 
 	"github.com/codex2api/cache"
 	"github.com/tidwall/gjson"
 )
 
 func resetResponseCacheForTest() {
-	respCache.mu.Lock()
-	respCache.store = make(map[string]*responseCacheEntry)
-	respCache.runtimeCache = nil
-	respCache.mu.Unlock()
+	resetResponseCacheStateForTest(defaultResponseCacheConfig())
 }
 
 func TestCacheCompletedResponseCachesCodexNativeToolCalls(t *testing.T) {
@@ -129,21 +124,18 @@ func TestExpandPreviousResponseCachesShellAndApplyPatchCalls(t *testing.T) {
 
 func TestExpandPreviousResponseUsesRuntimeCacheAfterLocalMiss(t *testing.T) {
 	resetResponseCacheForTest()
-	tc := cache.NewMemory(10)
+	tc := newRecordingResponseContextBackend(true)
 	SetResponseContextCache(tc)
 	t.Cleanup(func() {
 		SetResponseContextCache(nil)
-		_ = tc.Close()
+		_ = tc.TokenCache.Close()
 	})
 
-	ctx := context.Background()
 	items := []json.RawMessage{
 		json.RawMessage(`{"type":"message","role":"user","content":"run mcp tool"}`),
 		json.RawMessage(`{"type":"mcp_tool_call","call_id":"call_mcp","name":"read","arguments":"{}"}`),
 	}
-	if err := tc.SetResponseContext(ctx, responseCacheStoreKey("key:1", "resp_remote"), items, time.Minute); err != nil {
-		t.Fatalf("SetResponseContext: %v", err)
-	}
+	tc.bounded = cache.ResponseContextReadResult{Status: cache.ResponseContextReadFound, Items: items}
 
 	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_remote","input":[{"type":"mcp_tool_call_output","call_id":"call_mcp","output":"ok"}]}`)
 	got, prevID := expandPreviousResponse(body, "key:1")

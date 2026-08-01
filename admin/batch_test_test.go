@@ -61,6 +61,62 @@ func TestShouldMarkBatchTestAccountError(t *testing.T) {
 	}
 }
 
+func TestBatchOperationHTTPStatus(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		status  string
+		message string
+		want    int
+	}{
+		{name: "success", status: "success", message: "测试通过", want: http.StatusOK},
+		{name: "upstream chinese", status: "failed", message: "上游返回 402: workspace deactivated", want: http.StatusPaymentRequired},
+		{name: "http prefix", status: "failed", message: "HTTP 500: upstream failed", want: http.StatusInternalServerError},
+		{name: "embedded status", status: "failed", message: "token endpoint returned status 401", want: http.StatusUnauthorized},
+		{name: "status code", status: "failed", message: "token endpoint returned status code 403", want: http.StatusForbidden},
+		{name: "status equals", status: "failed", message: "OAuth refresh failed (status=429)", want: http.StatusTooManyRequests},
+		{name: "application error", status: "failed", message: "response.failed: model unavailable", want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := batchOperationHTTPStatus(tt.status, tt.message); got != tt.want {
+				t.Fatalf("batchOperationHTTPStatus(%q, %q) = %d, want %d", tt.status, tt.message, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEmitBatchTestProgressIncludesStructuredResult(t *testing.T) {
+	var completed, success, failed, banned, rateLimited int64
+	atomic.StoreInt64(&failed, 1)
+	atomic.StoreInt64(&rateLimited, 1)
+
+	var got batchOperationEvent
+	handler := &Handler{}
+	handler.emitBatchTestProgress(
+		func(event batchOperationEvent) {
+			got = event
+		},
+		42,
+		3,
+		&completed,
+		&success,
+		&failed,
+		&banned,
+		&rateLimited,
+		"rate_limited",
+		"上游返回 429: 账号触发限流",
+	)
+
+	if got.Type != "progress" || got.Action != "batch_test" {
+		t.Fatalf("event type/action = %q/%q, want progress/batch_test", got.Type, got.Action)
+	}
+	if got.AccountID != 42 || got.Status != "rate_limited" || got.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("event account/status/http = %d/%q/%d, want 42/rate_limited/429", got.AccountID, got.Status, got.HTTPStatus)
+	}
+	if got.Current != 1 || got.Total != 3 || got.Failed != 1 || got.RateLimited != 1 {
+		t.Fatalf("event counters = current:%d total:%d failed:%d rate_limited:%d", got.Current, got.Total, got.Failed, got.RateLimited)
+	}
+}
+
 func TestResolveBatchTestAccountsDefaultsToAllAccounts(t *testing.T) {
 	store := auth.NewStore(nil, nil, nil)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token-1", Status: auth.StatusReady})

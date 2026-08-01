@@ -199,6 +199,24 @@ func BenchmarkStreamFlushWriterWriteSSEData(b *testing.B) {
 	}
 }
 
+func BenchmarkReadSSEStream(b *testing.B) {
+	var input bytes.Buffer
+	for i := 0; i < 1024; i++ {
+		input.WriteString("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+	}
+	input.WriteString("data: [DONE]\n\n")
+	payload := input.Bytes()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ReadSSEStream(bytes.NewReader(payload), func([]byte) bool { return true }); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkStreamTranslatorTranslateParsed(b *testing.B) {
 	event := []byte(`{"type":"response.output_text.delta","delta":"hello"}`)
 	parsed := gjson.ParseBytes(event)

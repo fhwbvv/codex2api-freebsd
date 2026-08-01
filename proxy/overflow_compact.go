@@ -64,9 +64,16 @@ func overflowCompactSummaryInputBytes() int {
 
 // autoCompactOverflowEnabled 判断当前请求是否开启超窗自动压缩：
 // 全局实验性开关（系统设置 overflow_auto_compact_enabled）或 per-key
-// limits.auto_compact_overflow 任一开启即生效。
-// 内部调用（无鉴权 Key 上下文）恒为 false，天然阻断摘要调用自身的压缩递归。
+// limits.auto_compact_overflow 任一开启即生效。内部摘要调用通过显式上下文标记
+// 阻断递归，不能再依赖“没有 Key 身份”这一偶然副作用。
 func autoCompactOverflowEnabled(c *gin.Context) bool {
+	if c != nil {
+		if disabled, exists := c.Get(contextDisableOverflowAutoCompact); exists {
+			if value, ok := disabled.(bool); ok && value {
+				return false
+			}
+		}
+	}
 	row := apiKeyRowFromContext(c)
 	if row == nil {
 		return false
@@ -135,6 +142,21 @@ func isContextLengthExceededFailedPayload(payload []byte) bool {
 // 压缩为一条 developer 摘要消息，保留尾部最近轮次原文。返回压缩后的 body。
 // 无法压缩（input 太短 / 结构不符合预期）时返回 ok=false，调用方透传原错误。
 func (h *Handler) compactOverflowResponsesBody(ctx context.Context, codexBody []byte) ([]byte, bool) {
+	return h.compactOverflowResponsesBodyWithAttribution(ctx, codexBody, nil)
+}
+
+// compactOverflowResponsesBodyForRequest preserves the authenticated parent
+// identity for the model-generated summary while leaving the generic helper
+// anonymous for administrative callers and focused unit tests.
+func (h *Handler) compactOverflowResponsesBodyForRequest(c *gin.Context, codexBody []byte) ([]byte, bool) {
+	if c == nil || c.Request == nil {
+		return h.compactOverflowResponsesBody(context.Background(), codexBody)
+	}
+	attribution := internalResponseAttributionFromRequest(c, internalReasonOverflowCompact)
+	return h.compactOverflowResponsesBodyWithAttribution(c.Request.Context(), codexBody, attribution)
+}
+
+func (h *Handler) compactOverflowResponsesBodyWithAttribution(ctx context.Context, codexBody []byte, attribution *internalResponseAttribution) ([]byte, bool) {
 	var body map[string]any
 	if err := json.Unmarshal(codexBody, &body); err != nil {
 		return nil, false
@@ -175,7 +197,7 @@ func (h *Handler) compactOverflowResponsesBody(ctx context.Context, codexBody []
 	head := inputItems[headStart:cut]
 	tail := inputItems[cut:]
 
-	summaryText := h.summarizeOverflowItems(ctx, firstNonEmptyAnyString(body["model"]), head)
+	summaryText := h.summarizeOverflowItems(ctx, firstNonEmptyAnyString(body["model"]), head, attribution)
 	var replacement string
 	if summaryText != "" {
 		replacement = overflowCompactSummaryPrefix + summaryText
@@ -210,7 +232,7 @@ func (h *Handler) compactOverflowResponsesBody(ctx context.Context, codexBody []
 
 // summarizeOverflowItems 用内部 Responses 调用把旧轮次转写摘要成一段文本。
 // 失败返回空串（调用方退化为省略标记）。
-func (h *Handler) summarizeOverflowItems(ctx context.Context, model string, items []any) string {
+func (h *Handler) summarizeOverflowItems(ctx context.Context, model string, items []any, attribution *internalResponseAttribution) string {
 	transcript := flattenOverflowItemsTranscript(items, overflowCompactSummaryInputBytes())
 	if strings.TrimSpace(transcript) == "" || strings.TrimSpace(model) == "" {
 		return ""
@@ -239,7 +261,7 @@ func (h *Handler) summarizeOverflowItems(ctx context.Context, model string, item
 
 	callCtx, cancel := context.WithTimeout(ctx, overflowCompactSummaryTimeout)
 	defer cancel()
-	status, respBody := h.ExecuteInternalResponse(callCtx, reqBody)
+	status, respBody := h.executeInternalResponseWithAttribution(callCtx, reqBody, attribution)
 	if status != 200 {
 		log.Printf("超窗自动压缩: 摘要调用失败 (status %d), 退化为省略标记", status)
 		return ""

@@ -239,6 +239,8 @@ func (h *Handler) runtimeUsageLogStatus() runtimeUsageLogResponse {
 		FlushIntervalSeconds: stats.FlushIntervalSeconds,
 		BufferLength:         stats.BufferLength,
 		BufferCapacity:       stats.BufferCapacity,
+		BufferLimit:          stats.BufferLimit,
+		DroppedTotal:         stats.DroppedTotal,
 	}
 }
 

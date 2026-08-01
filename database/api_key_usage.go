@@ -14,19 +14,98 @@ type APIKeyWindowUsage struct {
 	Requests   int64   `json:"requests"`
 	Tokens     int64   `json:"tokens"`
 	UserBilled float64 `json:"user_billed"`
+	// OldestAt 是窗口内最早一笔用量的时间,窗口内无用量时为空。滑动窗口下
+	// OldestAt+窗口长度 即额度开始回落的时刻,供自助用量页展示(issue #460)。
+	OldestAt *time.Time `json:"oldest_at,omitempty"`
+}
+
+// StartOfDay 返回 t 所在自然日的零点(保留 t 的时区)。自然日限额与
+// key-usage 展示共用,保证判定与展示的日界一致。
+func StartOfDay(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
 }
 
 // GetAPIKeyWindowUsage 聚合指定 API Key 在 [now-window, now] 时间窗口内的使用情况。
 // 用于 API Key 级别的滑动窗口限额校验(rpm/rpd/cost_5h/cost_7d/token_5h/token_7d)。
-// 索引 idx_usage_logs_api_key_created_at 让该查询在数据量大时仍 O(log n)。
+// 手动额度重置只截断 5h/7d 窗口，RPM/RPD/30d 与自然日窗口保持原有口径。
 func (db *DB) GetAPIKeyWindowUsage(ctx context.Context, apiKeyID int64, window time.Duration) (*APIKeyWindowUsage, error) {
-	if apiKeyID <= 0 || window <= 0 {
+	if window <= 0 {
 		return &APIKeyWindowUsage{}, nil
 	}
-	since := time.Now().Add(-window)
+	return db.getAPIKeyUsageSince(ctx, apiKeyID, time.Now().Add(-window), isResettableAPIKeyWindow(window))
+}
+
+func isResettableAPIKeyWindow(window time.Duration) bool {
+	return window == 5*time.Hour || window == 7*24*time.Hour
+}
+
+// GetAPIKeyUsageSince 聚合指定 API Key 自 since 起的使用情况。自然日限额
+// (issue #460)以当天零点为 since 复用同一条查询。
+// 索引 idx_usage_logs_api_key_created_at 让该查询在数据量大时仍 O(log n)。
+func (db *DB) GetAPIKeyUsageSince(ctx context.Context, apiKeyID int64, since time.Time) (*APIKeyWindowUsage, error) {
+	return db.getAPIKeyUsageSince(ctx, apiKeyID, since, false)
+}
+
+func (db *DB) getAPIKeyUsageSince(ctx context.Context, apiKeyID int64, since time.Time, honorReset bool) (*APIKeyWindowUsage, error) {
+	if apiKeyID <= 0 || since.IsZero() {
+		return &APIKeyWindowUsage{}, nil
+	}
 	usage := &APIKeyWindowUsage{}
 	query := `
 		SELECT
+			COUNT(*),
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(user_billed), 0),
+			MIN(created_at)
+		FROM usage_logs
+		WHERE api_key_id = $1
+		  AND created_at >= $2
+		  AND status_code <> 499
+	`
+	if honorReset {
+		query = `
+			SELECT
+				COUNT(*),
+				COALESCE(SUM(u.total_tokens), 0),
+				COALESCE(SUM(u.user_billed), 0),
+				MIN(u.created_at)
+			FROM usage_logs u
+			JOIN api_keys k ON k.id = u.api_key_id
+			WHERE u.api_key_id = $1
+			  AND u.created_at >= $2
+			  AND (k.last_reset_at IS NULL OR u.created_at >= k.last_reset_at)
+			  AND u.status_code <> 499
+		`
+	}
+	var oldestRaw interface{}
+	err := db.conn.QueryRowContext(ctx, query, apiKeyID, db.timeArg(since)).Scan(
+		&usage.Requests, &usage.Tokens, &usage.UserBilled, &oldestRaw,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if oldest, err := parseDBTimeValue(oldestRaw); err == nil && !oldest.IsZero() {
+		usage.OldestAt = &oldest
+	}
+	return usage, nil
+}
+
+// GetAPIKeyAccountWindowUsage 聚合指定 API Key 在窗口内**按账号拆分**的使用情况,
+// 供 scope 维度限额(issue #439)判定。一次查询即可覆盖该 Key 的全部 scope 条目:
+// 分组维度在调用方按账号当前所属分组折算,因此分组成员变动即时生效,无需在
+// usage_logs 里冗余 group_id。
+//
+// 复用索引 idx_usage_logs_api_key_created_at,扫描量与同窗口的 Key 级 cost 聚合同级。
+// 已从账号池删除的账号仍会出现在返回值里,但调用方无法把它折算到分组——这部分历史
+// 用量在分组维度上会被忽略(账号维度仍准确)。
+func (db *DB) GetAPIKeyAccountWindowUsage(ctx context.Context, apiKeyID int64, window time.Duration) (map[int64]APIKeyWindowUsage, error) {
+	if apiKeyID <= 0 || window <= 0 {
+		return map[int64]APIKeyWindowUsage{}, nil
+	}
+	since := time.Now().Add(-window)
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT
+			COALESCE(account_id, 0),
 			COUNT(*),
 			COALESCE(SUM(total_tokens), 0),
 			COALESCE(SUM(user_billed), 0)
@@ -34,14 +113,89 @@ func (db *DB) GetAPIKeyWindowUsage(ctx context.Context, apiKeyID int64, window t
 		WHERE api_key_id = $1
 		  AND created_at >= $2
 		  AND status_code <> 499
-	`
-	err := db.conn.QueryRowContext(ctx, query, apiKeyID, db.timeArg(since)).Scan(
-		&usage.Requests, &usage.Tokens, &usage.UserBilled,
-	)
+		GROUP BY account_id
+	`, apiKeyID, db.timeArg(since))
 	if err != nil {
 		return nil, err
 	}
-	return usage, nil
+	defer rows.Close()
+
+	out := make(map[int64]APIKeyWindowUsage)
+	for rows.Next() {
+		var accountID int64
+		var usage APIKeyWindowUsage
+		if err := rows.Scan(&accountID, &usage.Requests, &usage.Tokens, &usage.UserBilled); err != nil {
+			return nil, err
+		}
+		if accountID <= 0 {
+			continue
+		}
+		out[accountID] = usage
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetAPIKeysAccountWindowUsage 是 GetAPIKeyAccountWindowUsage 的批量版本:一次查询拿到
+// 多个 API Key 在同一窗口内、按账号拆分的用量,供列表页展示 scope 预算进度(issue #439)。
+// apiKeyIDs 为空时返回空表(刻意不退化成全表聚合,避免列表页误触发大查询)。
+func (db *DB) GetAPIKeysAccountWindowUsage(ctx context.Context, apiKeyIDs []int64, window time.Duration) (map[int64]map[int64]APIKeyWindowUsage, error) {
+	out := make(map[int64]map[int64]APIKeyWindowUsage)
+	if len(apiKeyIDs) == 0 || window <= 0 {
+		return out, nil
+	}
+	placeholders := make([]string, 0, len(apiKeyIDs))
+	args := make([]interface{}, 0, len(apiKeyIDs)+1)
+	for i, id := range apiKeyIDs {
+		if db.isSQLite() {
+			placeholders = append(placeholders, "?")
+		} else {
+			placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
+		}
+		args = append(args, id)
+	}
+	sincePlaceholder := "?"
+	if !db.isSQLite() {
+		sincePlaceholder = fmt.Sprintf("$%d", len(apiKeyIDs)+1)
+	}
+	args = append(args, db.timeArg(time.Now().Add(-window)))
+
+	query := fmt.Sprintf(`
+		SELECT
+			api_key_id,
+			COALESCE(account_id, 0),
+			COUNT(*),
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(user_billed), 0)
+		FROM usage_logs
+		WHERE api_key_id IN (%s)
+		  AND created_at >= %s
+		  AND status_code <> 499
+		GROUP BY api_key_id, account_id
+	`, strings.Join(placeholders, ","), sincePlaceholder)
+
+	rows, err := db.conn.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var apiKeyID, accountID int64
+		var usage APIKeyWindowUsage
+		if err := rows.Scan(&apiKeyID, &accountID, &usage.Requests, &usage.Tokens, &usage.UserBilled); err != nil {
+			return nil, err
+		}
+		if apiKeyID <= 0 || accountID <= 0 {
+			continue
+		}
+		if out[apiKeyID] == nil {
+			out[apiKeyID] = make(map[int64]APIKeyWindowUsage)
+		}
+		out[apiKeyID][accountID] = usage
+	}
+	return out, rows.Err()
 }
 
 // APIKeyTokenStat 是 API Key 在某时间区间内的 token 使用排行项。
@@ -355,7 +509,19 @@ func (db *DB) GetAllAPIKeysWindowCost(ctx context.Context, window time.Duration)
 	if window <= 0 {
 		return make(map[int64]float64), nil
 	}
-	since := time.Now().Add(-window)
+	return db.getAllAPIKeysCostSince(ctx, time.Now().Add(-window), isResettableAPIKeyWindow(window))
+}
+
+// GetAllAPIKeysCostSince 批量聚合所有 API Key 自 since 起的 user_billed。
+// 自然日限额(issue #460)以当天零点为 since 复用该查询。
+func (db *DB) GetAllAPIKeysCostSince(ctx context.Context, since time.Time) (map[int64]float64, error) {
+	return db.getAllAPIKeysCostSince(ctx, since, false)
+}
+
+func (db *DB) getAllAPIKeysCostSince(ctx context.Context, since time.Time, honorReset bool) (map[int64]float64, error) {
+	if since.IsZero() {
+		return make(map[int64]float64), nil
+	}
 	query := `
 		SELECT api_key_id, COALESCE(SUM(user_billed), 0)
 		FROM usage_logs
@@ -364,6 +530,18 @@ func (db *DB) GetAllAPIKeysWindowCost(ctx context.Context, window time.Duration)
 		  AND status_code <> 499
 		GROUP BY api_key_id
 	`
+	if honorReset {
+		query = `
+			SELECT u.api_key_id, COALESCE(SUM(u.user_billed), 0)
+			FROM usage_logs u
+			JOIN api_keys k ON k.id = u.api_key_id
+			WHERE u.api_key_id > 0
+			  AND u.created_at >= $1
+			  AND (k.last_reset_at IS NULL OR u.created_at >= k.last_reset_at)
+			  AND u.status_code <> 499
+			GROUP BY u.api_key_id
+		`
+	}
 	rows, err := db.conn.QueryContext(ctx, query, db.timeArg(since))
 	if err != nil {
 		return nil, err
@@ -412,10 +590,23 @@ type APIKeySelfUsageSummary struct {
 	TPM             int64   `json:"tpm"`
 }
 
+// APIKeySelfUsageWindow 是自助页的窗口条目:原始聚合之上附带窗口语义与重置/回落
+// 时刻(issue #460),由服务端计算,前端不做本地推算。
+type APIKeySelfUsageWindow struct {
+	APIKeyWindowUsage
+	// WindowKind: fixed=自然日固定窗口,到 ResetAt 全额清零;
+	// sliding=滑动窗口,没有单一重置时刻,DecayAt 是最早一笔用量滚出窗口、
+	// 额度开始回落的时间(窗口内无用量时为空)。
+	WindowKind string     `json:"window_kind"`
+	ResetAt    *time.Time `json:"reset_at,omitempty"`
+	DecayAt    *time.Time `json:"decay_at,omitempty"`
+}
+
 type APIKeySelfUsageWindows struct {
-	Last5h  APIKeyWindowUsage `json:"last_5h"`
-	Last7d  APIKeyWindowUsage `json:"last_7d"`
-	Last30d APIKeyWindowUsage `json:"last_30d"`
+	Today   APIKeySelfUsageWindow `json:"today"`
+	Last5h  APIKeySelfUsageWindow `json:"last_5h"`
+	Last7d  APIKeySelfUsageWindow `json:"last_7d"`
+	Last30d APIKeySelfUsageWindow `json:"last_30d"`
 }
 
 type APIKeySelfUsageBreakdown struct {
@@ -430,33 +621,34 @@ type APIKeySelfUsageBreakdown struct {
 }
 
 type APIKeySelfUsageLog struct {
-	ID                int64     `json:"id"`
-	Endpoint          string    `json:"endpoint"`
-	Model             string    `json:"model"`
-	EffectiveModel    string    `json:"effective_model"`
-	StatusCode        int       `json:"status_code"`
-	DurationMS        int       `json:"duration_ms"`
-	FirstTokenMS      int       `json:"first_token_ms"`
-	InputTokens       int       `json:"input_tokens"`
-	OutputTokens      int       `json:"output_tokens"`
-	CachedTokens      int       `json:"cached_tokens"`
-	TotalTokens       int       `json:"total_tokens"`
-	UserBilled        float64   `json:"user_billed"`
-	InputCost         float64   `json:"input_cost"`
-	OutputCost        float64   `json:"output_cost"`
-	CacheReadCost     float64   `json:"cache_read_cost"`
-	TotalCost         float64   `json:"total_cost"`
-	InputPrice        float64   `json:"input_price_per_mtoken"`
-	OutputPrice       float64   `json:"output_price_per_mtoken"`
-	CacheReadPrice    float64   `json:"cache_read_price_per_mtoken"`
-	RateMultiplier    float64   `json:"rate_multiplier"`
-	LongContext       bool      `json:"long_context"`
-	ServiceTier       string    `json:"service_tier"`
-	Stream            bool      `json:"stream"`
-	Compact           bool      `json:"compact"`
-	ViaWebsocket      bool      `json:"via_websocket"`
-	UpstreamErrorKind string    `json:"upstream_error_kind"`
-	CreatedAt         time.Time `json:"created_at"`
+	ID                   int64     `json:"id"`
+	Endpoint             string    `json:"endpoint"`
+	Model                string    `json:"model"`
+	EffectiveModel       string    `json:"effective_model"`
+	StatusCode           int       `json:"status_code"`
+	DurationMS           int       `json:"duration_ms"`
+	FirstTokenMS         int       `json:"first_token_ms"`
+	InputTokens          int       `json:"input_tokens"`
+	OutputTokens         int       `json:"output_tokens"`
+	CachedTokens         int       `json:"cached_tokens"`
+	TotalTokens          int       `json:"total_tokens"`
+	UserBilled           float64   `json:"user_billed"`
+	InputCost            float64   `json:"input_cost"`
+	OutputCost           float64   `json:"output_cost"`
+	CacheReadCost        float64   `json:"cache_read_cost"`
+	TotalCost            float64   `json:"total_cost"`
+	InputPrice           float64   `json:"input_price_per_mtoken"`
+	OutputPrice          float64   `json:"output_price_per_mtoken"`
+	CacheReadPrice       float64   `json:"cache_read_price_per_mtoken"`
+	RateMultiplier       float64   `json:"rate_multiplier"`
+	LongContext          bool      `json:"long_context"`
+	ServiceTier          string    `json:"service_tier"`
+	Stream               bool      `json:"stream"`
+	Compact              bool      `json:"compact"`
+	HasCompactionHistory bool      `json:"has_compaction_history"`
+	ViaWebsocket         bool      `json:"via_websocket"`
+	UpstreamErrorKind    string    `json:"upstream_error_kind"`
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 // populateBillingBreakdown 复用与管理端一致的计费拆解逻辑，按 effective_model + 计费档位
@@ -509,13 +701,16 @@ func (db *DB) GetAPIKeySelfUsageReport(ctx context.Context, apiKeyID int64, rang
 	if report.Summary, err = db.getAPIKeySelfUsageSummary(ctx, apiKeyID, rangeStart, rangeEnd); err != nil {
 		return nil, err
 	}
-	if report.Windows.Last5h, err = db.getAPIKeyWindowUsageValue(ctx, apiKeyID, 5*time.Hour); err != nil {
+	if report.Windows.Today, err = db.getAPIKeySelfDailyWindow(ctx, apiKeyID); err != nil {
 		return nil, err
 	}
-	if report.Windows.Last7d, err = db.getAPIKeyWindowUsageValue(ctx, apiKeyID, 7*24*time.Hour); err != nil {
+	if report.Windows.Last5h, err = db.getAPIKeySelfSlidingWindow(ctx, apiKeyID, 5*time.Hour); err != nil {
 		return nil, err
 	}
-	if report.Windows.Last30d, err = db.getAPIKeyWindowUsageValue(ctx, apiKeyID, 30*24*time.Hour); err != nil {
+	if report.Windows.Last7d, err = db.getAPIKeySelfSlidingWindow(ctx, apiKeyID, 7*24*time.Hour); err != nil {
+		return nil, err
+	}
+	if report.Windows.Last30d, err = db.getAPIKeySelfSlidingWindow(ctx, apiKeyID, 30*24*time.Hour); err != nil {
 		return nil, err
 	}
 	if report.Models, err = db.listAPIKeySelfUsageBreakdown(ctx, apiKeyID, rangeStart, rangeEnd, "model", 8); err != nil {
@@ -544,12 +739,36 @@ func normalizeAPIKeySelfRecentLogPagination(page, pageSize int) (int, int) {
 	return page, pageSize
 }
 
-func (db *DB) getAPIKeyWindowUsageValue(ctx context.Context, apiKeyID int64, window time.Duration) (APIKeyWindowUsage, error) {
+// 窗口语义取值(APIKeySelfUsageWindow.WindowKind)。
+const (
+	usageWindowKindFixed   = "fixed"
+	usageWindowKindSliding = "sliding"
+)
+
+func (db *DB) getAPIKeySelfSlidingWindow(ctx context.Context, apiKeyID int64, window time.Duration) (APIKeySelfUsageWindow, error) {
+	out := APIKeySelfUsageWindow{WindowKind: usageWindowKindSliding}
 	usage, err := db.GetAPIKeyWindowUsage(ctx, apiKeyID, window)
 	if err != nil || usage == nil {
-		return APIKeyWindowUsage{}, err
+		return out, err
 	}
-	return *usage, nil
+	out.APIKeyWindowUsage = *usage
+	if usage.OldestAt != nil {
+		decay := usage.OldestAt.Add(window)
+		out.DecayAt = &decay
+	}
+	return out, nil
+}
+
+func (db *DB) getAPIKeySelfDailyWindow(ctx context.Context, apiKeyID int64) (APIKeySelfUsageWindow, error) {
+	dayStart := StartOfDay(time.Now())
+	resetAt := dayStart.AddDate(0, 0, 1)
+	out := APIKeySelfUsageWindow{WindowKind: usageWindowKindFixed, ResetAt: &resetAt}
+	usage, err := db.GetAPIKeyUsageSince(ctx, apiKeyID, dayStart)
+	if err != nil || usage == nil {
+		return out, err
+	}
+	out.APIKeyWindowUsage = *usage
+	return out, nil
 }
 
 func (db *DB) apiKeySelfUsageWhere(apiKeyID int64, rangeStart, rangeEnd time.Time) (string, []interface{}) {
@@ -698,6 +917,7 @@ func (db *DB) listAPIKeySelfRecentLogs(ctx context.Context, apiKeyID int64, rang
 			COALESCE(NULLIF(billing_service_tier, ''), NULLIF(actual_service_tier, ''), NULLIF(service_tier, ''), ''),
 			COALESCE(stream, false),
 			COALESCE(compact, false),
+			COALESCE(has_compaction_history, false),
 			COALESCE(via_websocket, false),
 			COALESCE(upstream_error_kind, ''),
 			created_at
@@ -731,6 +951,7 @@ func (db *DB) listAPIKeySelfRecentLogs(ctx context.Context, apiKeyID int64, rang
 			&item.ServiceTier,
 			&item.Stream,
 			&item.Compact,
+			&item.HasCompactionHistory,
 			&item.ViaWebsocket,
 			&item.UpstreamErrorKind,
 			&createdAtRaw,

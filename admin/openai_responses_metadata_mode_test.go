@@ -25,7 +25,7 @@ func TestOpenAIResponsesCodexClientMetadataModeLifecycle(t *testing.T) {
 		Name:                    "responses-relay",
 		BaseURL:                 "https://relay.example.com",
 		APIKey:                  "relay-token",
-		Models:                  []string{"gpt-5.5"},
+		Models:                  []string{"openrouter/gpt-5:free"},
 		CodexClientMetadataMode: &mode,
 	}, handler.AddOpenAIResponsesAccount)
 	if addRecorder.Code != http.StatusOK {
@@ -59,7 +59,7 @@ func TestOpenAIResponsesCodexClientMetadataModeLifecycle(t *testing.T) {
 	preserveRecorder := invokeOpenAIResponsesJSONHandler(t, http.MethodPut, updatePath, params, addOpenAIResponsesAccountReq{
 		Name:    "responses-relay",
 		BaseURL: "https://relay.example.com",
-		Models:  []string{"gpt-5.5"},
+		Models:  []string{"openrouter/gpt-5:free"},
 	}, handler.UpdateOpenAIResponsesAccount)
 	if preserveRecorder.Code != http.StatusOK {
 		t.Fatalf("preserve update status = %d, want %d: %s", preserveRecorder.Code, http.StatusOK, preserveRecorder.Body.String())
@@ -70,7 +70,7 @@ func TestOpenAIResponsesCodexClientMetadataModeLifecycle(t *testing.T) {
 	offRecorder := invokeOpenAIResponsesJSONHandler(t, http.MethodPut, updatePath, params, addOpenAIResponsesAccountReq{
 		Name:                    "responses-relay",
 		BaseURL:                 "https://relay.example.com",
-		Models:                  []string{"gpt-5.5"},
+		Models:                  []string{"openrouter/gpt-5:free"},
 		CodexClientMetadataMode: &mode,
 	}, handler.UpdateOpenAIResponsesAccount)
 	if offRecorder.Code != http.StatusOK {

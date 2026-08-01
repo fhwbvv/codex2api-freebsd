@@ -11,6 +11,17 @@ import type { HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '..
 import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
+import { buildWritableSettingsPayload } from '../lib/settingsPayload'
+import {
+  MIB,
+  buildResponseCacheBudgetPatch,
+  bytesToMiB,
+  mergeResponseCacheGeneration,
+  mibToBytes,
+  validateResponseCacheBudget,
+  type ResponseCacheBudgetMiB,
+  type ResponseCacheBudgetValidationError,
+} from '../lib/responseCacheMetrics'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -55,7 +66,6 @@ import {
   Image as ImageIcon,
   Layers,
   Link2,
-  Loader2,
   Palette,
   RefreshCw,
   Save,
@@ -67,6 +77,7 @@ import {
   X,
 } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
+import ChannelLogo from '../components/ChannelLogo'
 
 type ModelPanelKey = 'registry' | 'anthropic' | 'codex' | 'reasoning'
 
@@ -94,6 +105,14 @@ const REASONING_EFFORT_OPTIONS = ['none', 'minimal', 'low', 'medium', 'high', 'x
 }))
 const AUTO_SAVE_STATUS_RESET_MS = 1800
 const AUTO_SAVE_TOAST_MS = 2000
+const DEFAULT_RESPONSE_CACHE_TOTAL_BYTES = 64 * MIB
+const DEFAULT_RESPONSE_CACHE_ENTRY_BYTES = 8 * MIB
+const DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES = 64 * MIB
+const RESPONSE_CACHE_BUDGET_KEYS = [
+  'response_cache_local_max_bytes',
+  'response_cache_local_max_entry_bytes',
+  'response_cache_reconstruct_max_bytes',
+] as const satisfies ReadonlyArray<keyof SystemSettings>
 const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   raw_user_agent: '',
   client_name: 'codex-tui',
@@ -154,6 +173,45 @@ const getSettingsPatchValues = (settings: SystemSettings, keys: Array<keyof Syst
     patch[key] = settings[key]
   }
   return patch as Partial<SystemSettings>
+}
+
+const normalizeResponseCacheSettings = (settings: SystemSettings): SystemSettings => ({
+  ...settings,
+  response_cache_local_max_bytes: Number.isFinite(settings.response_cache_local_max_bytes)
+    ? settings.response_cache_local_max_bytes
+    : DEFAULT_RESPONSE_CACHE_TOTAL_BYTES,
+  response_cache_local_max_entry_bytes: Number.isFinite(settings.response_cache_local_max_entry_bytes)
+    ? settings.response_cache_local_max_entry_bytes
+    : DEFAULT_RESPONSE_CACHE_ENTRY_BYTES,
+  response_cache_reconstruct_max_bytes: Number.isFinite(settings.response_cache_reconstruct_max_bytes)
+    ? settings.response_cache_reconstruct_max_bytes
+    : DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+  response_cache_config_generation: Number.isFinite(settings.response_cache_config_generation)
+    ? settings.response_cache_config_generation
+    : 0,
+})
+
+const responseCacheBudgetFromSettings = (settings: SystemSettings): ResponseCacheBudgetMiB => ({
+  totalMiB: bytesToMiB(settings.response_cache_local_max_bytes),
+  entryMiB: bytesToMiB(settings.response_cache_local_max_entry_bytes),
+  reconstructMiB: bytesToMiB(settings.response_cache_reconstruct_max_bytes),
+})
+
+const isResponseCacheBudgetKey = (key: keyof SystemSettings) =>
+  RESPONSE_CACHE_BUDGET_KEYS.some((candidate) => candidate === key)
+
+const responseCacheBudgetFieldPatch = (
+  field: keyof ResponseCacheBudgetMiB,
+  value: number,
+): Partial<SystemSettings> => {
+  switch (field) {
+    case 'totalMiB':
+      return { response_cache_local_max_bytes: mibToBytes(value) }
+    case 'entryMiB':
+      return { response_cache_local_max_entry_bytes: mibToBytes(value) }
+    case 'reconstructMiB':
+      return { response_cache_reconstruct_max_bytes: mibToBytes(value) }
+  }
 }
 
 const parseReasoningEffortModelEntries = (value: string): ReasoningEffortModelEntry[] => {
@@ -1101,10 +1159,11 @@ export default function Settings() {
     { label: t('settings.imageStorageS3'), value: 's3' },
   ]
   const normalizeLazySettingsForm = useCallback((settings: SystemSettings): SystemSettings => {
+    const cacheNormalized = normalizeResponseCacheSettings(settings)
     const normalized = {
-      ...settings,
-      billing_tier_policy: normalizeBillingTierPolicyValue(settings.billing_tier_policy),
-      first_token_mode: normalizeFirstTokenModeValue(settings.first_token_mode),
+      ...cacheNormalized,
+      billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
+      first_token_mode: normalizeFirstTokenModeValue(cacheNormalized.first_token_mode),
     }
     if (!normalized.lazy_mode) {
       return normalized
@@ -1147,6 +1206,7 @@ export default function Settings() {
     auto_reset_credits_enabled: false,
     auto_reset_credits_before_expiry_min: 60,
     codex_force_websocket: false,
+    codex_ws_weak_network_mode: false,
     codex_ws_keepalive_enabled: false,
     codex_ws_keepalive_interval_sec: 60,
     codex_ws_hide_upstream_errors: true,
@@ -1160,12 +1220,14 @@ export default function Settings() {
     overflow_auto_compact_enabled: false,
     codex_preflight_sse_passthrough_enabled: false,
     codex_continue_max_rounds: 8,
+    utls_shutdown_timeout_minutes: 30,
     scheduler_mode: 'round_robin',
     affinity_mode: 'bounded',
     grok_affinity_mode: 'strict',
     grok_probe_enabled: false,
     grok_probe_interval_minutes: 30,
     grok_max_rate_limit_retries: 0,
+    grok_oauth_client_id: '',
     max_retries: 2,
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
@@ -1175,6 +1237,10 @@ export default function Settings() {
     database_label: 'PostgreSQL',
     cache_driver: 'redis',
     cache_label: 'Redis',
+    response_cache_local_max_bytes: DEFAULT_RESPONSE_CACHE_TOTAL_BYTES,
+    response_cache_local_max_entry_bytes: DEFAULT_RESPONSE_CACHE_ENTRY_BYTES,
+    response_cache_reconstruct_max_bytes: DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+    response_cache_config_generation: 0,
     model_mapping: '{}',
     codex_model_mapping: '{}',
     payload_rules: '{}',
@@ -1200,7 +1266,7 @@ export default function Settings() {
     prompt_filter_review_timeout_seconds: 10,
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
-    codex_min_cli_version: '0.118.0',
+    codex_min_cli_version: '0.144.1',
     codex_cli_version_sync_enabled: true,
     codex_cli_version_sync_interval_hours: 12,
     codex_user_agent_config: '{}',
@@ -1235,9 +1301,13 @@ export default function Settings() {
     ignore_usage_limit_status: false,
   })
   const lazyModeActive = settingsForm.lazy_mode
+  const responseCacheBudget = responseCacheBudgetFromSettings(settingsForm)
   const [savingSettings, setSavingSettings] = useState(false)
   const [autoSaveStatus, setAutoSaveStatus] = useState<AutoSaveStatus>('idle')
-  const [autoSaveError, setAutoSaveError] = useState('')
+  const [responseCacheValidationError, setResponseCacheValidationError] = useState<ResponseCacheBudgetValidationError | null>(null)
+  const responseCacheValidationMessage = responseCacheValidationError
+    ? t(`settings.responseCache.validation.${responseCacheValidationError}`)
+    : ''
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
@@ -1253,7 +1323,7 @@ export default function Settings() {
   const settingsFormRef = useRef(settingsForm)
   const autoSavePendingCountRef = useRef(0)
   const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
-  const autoSaveStatusTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
+  const autoSaveStatusTimerRef = useRef<number | null>(null)
   const { toast, showToast } = useToast()
 
   useEffect(() => {
@@ -1324,7 +1394,6 @@ export default function Settings() {
       window.clearTimeout(autoSaveStatusTimerRef.current)
       autoSaveStatusTimerRef.current = null
     }
-    setAutoSaveError('')
     setAutoSaveStatus('saving')
 
     try {
@@ -1333,10 +1402,24 @@ export default function Settings() {
         const fieldKey = String(key)
         return autoSaveFieldVersionsRef.current[fieldKey] === requestedVersions[fieldKey]
       })
-      if (mergeKeys.length > 0) {
+      const currentSettings = settingsFormRef.current
+      const responseCacheRequest = patchKeys.some(isResponseCacheBudgetKey)
+      const mergedResponseCacheGeneration = responseCacheRequest
+        ? mergeResponseCacheGeneration(
+            currentSettings.response_cache_config_generation,
+            updated.response_cache_config_generation,
+          )
+        : currentSettings.response_cache_config_generation
+      if (
+        mergeKeys.length > 0
+        || mergedResponseCacheGeneration !== currentSettings.response_cache_config_generation
+      ) {
         commitSettingsForm({
-          ...settingsFormRef.current,
+          ...currentSettings,
           ...getSettingsPatchValues(updated, mergeKeys),
+          ...(responseCacheRequest
+            ? { response_cache_config_generation: mergedResponseCacheGeneration }
+            : {}),
         })
       }
       const autoSaveSuccessMessage = updated.expired_cleaned && updated.expired_cleaned > 0
@@ -1356,7 +1439,6 @@ export default function Settings() {
         })
       }
       const message = getErrorMessage(error)
-      setAutoSaveError(message)
       showToast(`${t('settings.autoSaveFailed')}: ${message}`, 'error')
       finishAutoSaveRequest('error')
     }
@@ -1375,6 +1457,38 @@ export default function Settings() {
       [field]: value,
     } as Partial<SystemSettings>)
   }, [autoSaveSettingsPatch])
+
+  const updateResponseCacheBudget = (
+    field: keyof ResponseCacheBudgetMiB,
+    value: number,
+  ) => {
+    const next = {
+      ...responseCacheBudgetFromSettings(settingsFormRef.current),
+      [field]: value,
+    }
+    setResponseCacheValidationError(validateResponseCacheBudget(next))
+    commitSettingsForm({
+      ...settingsFormRef.current,
+      ...responseCacheBudgetFieldPatch(field, value),
+    })
+  }
+
+  const commitResponseCacheBudget = (
+    field: keyof ResponseCacheBudgetMiB,
+    value: number,
+  ) => {
+    const next = {
+      ...responseCacheBudgetFromSettings(settingsFormRef.current),
+      [field]: value,
+    }
+    const validationError = validateResponseCacheBudget(next)
+    setResponseCacheValidationError(validationError)
+    if (validationError) {
+      showToast(t(`settings.responseCache.validation.${validationError}`), 'error')
+      return
+    }
+    void autoSaveSettingsPatch(buildResponseCacheBudgetPatch(next))
+  }
 
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
@@ -1411,10 +1525,19 @@ export default function Settings() {
   })
 
   const handleSaveSettings = async () => {
+    const normalized = normalizeLazySettingsForm(settingsForm)
+    const validationError = validateResponseCacheBudget(responseCacheBudgetFromSettings(normalized))
+    setResponseCacheValidationError(validationError)
+    if (validationError) {
+      showToast(t(`settings.responseCache.validation.${validationError}`), 'error')
+      return
+    }
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-      const updated = await api.updateSettings(normalizeLazySettingsForm(settingsForm))
+      const updated = await api.updateSettings(
+        buildWritableSettingsPayload(normalized),
+      )
       commitSettingsForm(updated)
       const branding = {
         site_name: updated.site_name,
@@ -1594,31 +1717,6 @@ export default function Settings() {
   const showConnectionPool = isExternalDatabase || isExternalCache
   const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
   const saveButtonLabel = savingSettings ? t('common.saving') : t('settings.saveSettings')
-  const autoSaveStatusMeta = autoSaveStatus === 'idle' ? null : (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1 font-medium',
-        autoSaveStatus === 'saving' && 'text-muted-foreground',
-        autoSaveStatus === 'saved' && 'text-emerald-600 dark:text-emerald-400',
-        autoSaveStatus === 'error' && 'text-destructive',
-      )}
-      title={autoSaveStatus === 'error' ? autoSaveError : undefined}
-    >
-      <span
-        className={cn(
-          'size-1.5 rounded-full',
-          autoSaveStatus === 'saving' && 'animate-pulse bg-muted-foreground',
-          autoSaveStatus === 'saved' && 'bg-emerald-500',
-          autoSaveStatus === 'error' && 'bg-destructive',
-        )}
-      />
-      {autoSaveStatus === 'saving'
-        ? t('settings.autoSaving')
-        : autoSaveStatus === 'saved'
-          ? t('settings.autoSaved')
-          : t('settings.autoSaveFailed')}
-    </span>
-  )
   const siteLogoPreview = sanitizeBrandingLogo(settingsForm.site_logo) || DEFAULT_SITE_LOGO
   const backgroundImagePreview = sanitizeBrandingImage(settingsForm.background_image)
   const backgroundIsVideo = isBrandingVideo(backgroundImagePreview)
@@ -1703,6 +1801,7 @@ export default function Settings() {
       [
         { id: 'settings-overview', label: t('settings.nav.overview'), icon: <Activity className="size-4" /> },
         { id: 'settings-traffic', label: t('settings.nav.traffic'), icon: <Gauge className="size-4" /> },
+        { id: 'settings-grok', label: t('settings.nav.grok'), icon: <ChannelLogo channel="grok" size={16} /> },
         { id: 'settings-runtime', label: t('settings.nav.runtime'), icon: <Wrench className="size-4" /> },
         { id: 'settings-storage', label: t('settings.nav.storage'), icon: <ImageIcon className="size-4" /> },
         { id: 'settings-appearance', label: t('settings.nav.appearance'), icon: <Palette className="size-4" /> },
@@ -1848,20 +1947,11 @@ export default function Settings() {
               )
             })}
           </nav>
-          {autoSaveStatusMeta ? (
-            <div className="hidden shrink-0 items-center gap-1.5 rounded-full border border-border/80 bg-card/95 px-3 py-2 text-xs shadow-sm backdrop-blur-xl sm:inline-flex">
-              {autoSaveStatus === 'saving' ? (
-                <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-              ) : null}
-              {autoSaveStatusMeta}
-            </div>
-          ) : null}
         </div>
 
         <PageHeader
           title={t('settings.title')}
           description={t('settings.description')}
-          actionMeta={autoSaveStatusMeta}
           actions={renderSaveButton('shrink-0')}
         />
 
@@ -1909,7 +1999,6 @@ export default function Settings() {
                 <SettingField label={t('settings.maxConcurrency')} description={t('settings.maxConcurrencyRange')} suffix={t('settings.unit.concurrency')}>
                   <DraftNumberInput
                     min={1}
-                    max={50}
                     value={settingsForm.max_concurrency}
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, max_concurrency: value }))}
                   />
@@ -2138,72 +2227,6 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
-          <SettingsCard title={t('settings.grokSettingsTitle')} description={t('settings.grokSettingsDesc')} icon={<Layers className="size-4" />}>
-            {/* 与「探测调度」一致：表单控件同宽网格，开关单独一行，避免 switch 卡片与 input 混排导致高低宽不一致。 */}
-            <div className="space-y-4">
-              <div className={SETTINGS_FIELD_GRID_3}>
-                <SettingField label={t('settings.grokAffinityMode')} description={t('settings.grokAffinityModeDesc')}>
-                  <Select
-                    value={settingsForm.grok_affinity_mode || 'strict'}
-                    onValueChange={(value) => autoSaveStringField('grok_affinity_mode', value)}
-                    options={grokAffinityModeOptions}
-                  />
-                </SettingField>
-                <SettingField
-                  label={t('settings.grokProbeInterval')}
-                  description={t('settings.grokProbeIntervalDesc')}
-                  suffix={t('settings.unit.min')}
-                >
-                  <DraftNumberInput
-                    min={5}
-                    max={1440}
-                    step={5}
-                    integer
-                    emptyValue={30}
-                    disabled={!settingsForm.grok_probe_enabled}
-                    value={settingsForm.grok_probe_interval_minutes ?? 30}
-                    onValueChange={(value) => {
-                      setSettingsForm(f => ({ ...f, grok_probe_interval_minutes: value }))
-                    }}
-                    onValueCommit={(value) => {
-                      const v = value < 5 ? 5 : value
-                      void autoSaveSettingsPatch({ grok_probe_interval_minutes: v })
-                    }}
-                  />
-                </SettingField>
-                <SettingField
-                  label={t('settings.grokMaxRateLimitRetries')}
-                  description={t('settings.grokMaxRateLimitRetriesDesc')}
-                  suffix={t('settings.unit.times')}
-                >
-                  <DraftNumberInput
-                    min={0}
-                    max={20}
-                    step={1}
-                    integer
-                    emptyValue={0}
-                    value={settingsForm.grok_max_rate_limit_retries ?? 0}
-                    onValueChange={(value) => {
-                      setSettingsForm(f => ({ ...f, grok_max_rate_limit_retries: value }))
-                    }}
-                    onValueCommit={(value) => {
-                      const v = value < 0 ? 0 : value
-                      void autoSaveSettingsPatch({ grok_max_rate_limit_retries: v })
-                    }}
-                  />
-                </SettingField>
-              </div>
-              <div className={SETTINGS_SWITCH_GRID}>
-                <SettingField label={t('settings.grokProbeEnabled')} description={t('settings.grokProbeEnabledDesc')} layout="switch">
-                  <Switch
-                    checked={settingsForm.grok_probe_enabled}
-                    onCheckedChange={(checked) => autoSaveBooleanField('grok_probe_enabled', checked)}
-                  />
-                </SettingField>
-              </div>
-            </div>
-          </SettingsCard>
-
           <SettingsCard title={t('settings.globalAutoPauseTitle')} description={t('settings.globalAutoPauseDesc')} icon={<Activity className="size-4" />}>
             <div className="space-y-4">
               <div className={SETTINGS_FIELD_GRID_3}>
@@ -2333,7 +2356,169 @@ export default function Settings() {
 
           </SettingsSection>
 
+          <SettingsSection id="settings-grok" title={t('settings.nav.grok')} description={t('settings.nav.grokDesc')}>
+          <SettingsCard title={t('settings.grokSettingsTitle')} description={t('settings.grokSettingsDesc')} icon={<ChannelLogo channel="grok" size={16} />}>
+            {/* 与「探测调度」一致：表单控件同宽网格，开关单独一行，避免 switch 卡片与 input 混排导致高低宽不一致。 */}
+            <div className="space-y-4">
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField label={t('settings.grokAffinityMode')} description={t('settings.grokAffinityModeDesc')}>
+                  <Select
+                    value={settingsForm.grok_affinity_mode || 'strict'}
+                    onValueChange={(value) => autoSaveStringField('grok_affinity_mode', value)}
+                    options={grokAffinityModeOptions}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.grokProbeInterval')}
+                  description={t('settings.grokProbeIntervalDesc')}
+                  suffix={t('settings.unit.min')}
+                >
+                  <DraftNumberInput
+                    min={5}
+                    max={1440}
+                    step={5}
+                    integer
+                    emptyValue={30}
+                    disabled={!settingsForm.grok_probe_enabled}
+                    value={settingsForm.grok_probe_interval_minutes ?? 30}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_probe_interval_minutes: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 5 ? 5 : value
+                      void autoSaveSettingsPatch({ grok_probe_interval_minutes: v })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.grokMaxRateLimitRetries')}
+                  description={t('settings.grokMaxRateLimitRetriesDesc')}
+                  suffix={t('settings.unit.times')}
+                >
+                  <DraftNumberInput
+                    min={0}
+                    max={20}
+                    step={1}
+                    integer
+                    emptyValue={0}
+                    value={settingsForm.grok_max_rate_limit_retries ?? 0}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_max_rate_limit_retries: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 0 ? 0 : value
+                      void autoSaveSettingsPatch({ grok_max_rate_limit_retries: v })
+                    }}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.grokProbeEnabled')} description={t('settings.grokProbeEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.grok_probe_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('grok_probe_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_FIELD_GRID_3}>
+                {/* client_id 同时可由环境变量 GROK_OAUTH_CLIENT_ID 指定，且环境变量优先级更高；
+                    被覆盖时这里禁用输入并说明当前生效值，避免用户以为改了却不起作用。 */}
+                <SettingField
+                  className="sm:col-span-2 xl:col-span-3"
+                  label={t('settings.grokOAuthClientId')}
+                  description={
+                    settingsForm.grok_oauth_client_id_env_override
+                      ? t('settings.grokOAuthClientIdEnvOverride', {
+                          value: settingsForm.grok_oauth_client_id_effective || '',
+                        })
+                      : t('settings.grokOAuthClientIdDesc')
+                  }
+                >
+                  <Input
+                    value={settingsForm.grok_oauth_client_id ?? ''}
+                    disabled={settingsForm.grok_oauth_client_id_env_override}
+                    placeholder={t('settings.grokOAuthClientIdPlaceholder')}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setSettingsForm(f => ({ ...f, grok_oauth_client_id: e.target.value }))
+                    }
+                    onBlur={(e) => autoSaveStringField('grok_oauth_client_id', e.currentTarget.value.trim())}
+                  />
+                </SettingField>
+              </div>
+            </div>
+          </SettingsCard>
+          </SettingsSection>
+
           <SettingsSection id="settings-runtime" title={t('settings.nav.runtime')} description={t('settings.nav.runtimeDesc')}>
+          <SettingsCard
+            title={t('settings.responseCache.title')}
+            description={t('settings.responseCache.description')}
+            icon={<Database className="size-4" />}
+            badge={
+              <Badge variant="outline" className="text-[11px] tabular-nums">
+                {settingsForm.response_cache_config_generation > 0
+                  ? t('settings.responseCache.generation', { value: settingsForm.response_cache_config_generation })
+                  : t('settings.responseCache.generationPending')}
+              </Badge>
+            }
+          >
+            <div className="space-y-4">
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField
+                  label={t('settings.responseCache.total')}
+                  description={t('settings.responseCache.totalDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.totalMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('totalMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('totalMiB', value)}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.responseCache.entry')}
+                  description={t('settings.responseCache.entryDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.entryMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('entryMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('entryMiB', value)}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.responseCache.reconstruct')}
+                  description={t('settings.responseCache.reconstructDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.reconstructMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('reconstructMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('reconstructMiB', value)}
+                  />
+                </SettingField>
+              </div>
+              {responseCacheValidationMessage ? (
+                <p role="alert" className="text-xs font-medium text-destructive">
+                  {responseCacheValidationMessage}
+                </p>
+              ) : null}
+              <div className="rounded-lg border border-primary/15 bg-primary/5 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
+                <p>{t('settings.responseCache.l1Note')}</p>
+                <p className="mt-1.5">{t('settings.responseCache.memoryNote')}</p>
+              </div>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.codexWebsocket')} description={t('settings.codexWebsocketDesc')} icon={<Wifi className="size-4" />}>
             <div className="space-y-4">
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -2343,9 +2528,16 @@ export default function Settings() {
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_force_websocket', checked)}
                   />
                 </SettingField>
+                <SettingField label={t('settings.codexWSWeakNetworkMode')} description={t('settings.codexWSWeakNetworkModeDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_weak_network_mode}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_weak_network_mode', checked)}
+                  />
+                </SettingField>
                 <SettingField label={t('settings.codexWSKeepaliveEnabled')} description={t('settings.codexWSKeepaliveEnabledDesc')} layout="switch">
                   <Switch
                     checked={settingsForm.codex_ws_keepalive_enabled}
+                    disabled={settingsForm.codex_ws_weak_network_mode}
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_keepalive_enabled', checked)}
                   />
                 </SettingField>
@@ -2380,16 +2572,16 @@ export default function Settings() {
                   label={t('settings.codexWSKeepaliveInterval')}
                   description={t('settings.codexWSKeepaliveIntervalDesc')}
                   suffix={t('settings.unit.sec')}
-                  className={cn(!settingsForm.codex_ws_keepalive_enabled && 'opacity-60')}
+                  className={cn((!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode) && 'opacity-60')}
                 >
                   <DraftNumberInput
                     min={10}
                     max={600}
-                    disabled={!settingsForm.codex_ws_keepalive_enabled}
+                    disabled={!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode}
                     value={settingsForm.codex_ws_keepalive_interval_sec}
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_keepalive_interval_sec: value }))}
                     onValueCommit={(value) => {
-                      if (!settingsForm.codex_ws_keepalive_enabled) return
+                      if (!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode) return
                       void autoSaveSettingsPatch({
                         codex_ws_keepalive_interval_sec: value,
                       })
@@ -2594,6 +2786,25 @@ export default function Settings() {
                     </div>
                   </div>
                 </div>
+                <SettingField label={t('settings.utlsShutdownTimeout')} description={t('settings.utlsShutdownTimeoutDesc')}>
+                  <div className="relative">
+                    <DraftNumberInput
+                      min={1}
+                      max={240}
+                      className="pr-12 tabular-nums"
+                      value={settingsForm.utls_shutdown_timeout_minutes}
+                      onValueChange={(value) => setSettingsForm(f => ({ ...f, utls_shutdown_timeout_minutes: value }))}
+                      onValueCommit={(value) => {
+                        void autoSaveSettingsPatch({
+                          utls_shutdown_timeout_minutes: value,
+                        })
+                      }}
+                    />
+                    <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-medium text-muted-foreground">
+                      {t('settings.unit.min')}
+                    </span>
+                  </div>
+                </SettingField>
                 <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUserAgentRaw')} description={t('settings.codexUserAgentRawDesc')}>
                   <Input
                     className="font-mono text-xs"
@@ -2668,7 +2879,7 @@ export default function Settings() {
                 <SettingField label={t('settings.usageLogBatchSize')} description={t('settings.usageLogBatchSizeDesc')}>
                   <DraftNumberInput
                     min={1}
-                    max={10000}
+                    max={1000}
                     value={settingsForm.usage_log_batch_size}
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, usage_log_batch_size: value }))}
                   />

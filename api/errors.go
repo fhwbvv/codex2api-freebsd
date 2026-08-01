@@ -15,26 +15,27 @@ type ErrorCode string
 // Standard error codes following OpenAI API conventions
 const (
 	// Authentication errors
-	ErrCodeMissingAPIKey    ErrorCode = "missing_api_key"
-	ErrCodeInvalidAPIKey    ErrorCode = "invalid_api_key"
+	ErrCodeMissingAPIKey     ErrorCode = "missing_api_key"
+	ErrCodeInvalidAPIKey     ErrorCode = "invalid_api_key"
 	ErrCodeInsufficientScope ErrorCode = "insufficient_scope"
-	ErrCodeInvalidAuth      ErrorCode = "invalid_auth"
+	ErrCodeInvalidAuth       ErrorCode = "invalid_auth"
 
 	// Request errors
-	ErrCodeInvalidRequest     ErrorCode = "invalid_request"
-	ErrCodeInvalidParameter   ErrorCode = "invalid_parameter"
-	ErrCodeMissingField       ErrorCode = "missing_field"
-	ErrCodeInvalidFieldType   ErrorCode = "invalid_field_type"
-	ErrCodeInvalidFieldFormat ErrorCode = "invalid_field_format"
-	ErrCodeContextLengthExceeded ErrorCode = "context_length_exceeded"
-	ErrCodeUnsupportedModel   ErrorCode = "unsupported_model"
-	ErrCodeRateLimitReached   ErrorCode = "rate_limit_reached"
+	ErrCodeInvalidRequest             ErrorCode = "invalid_request"
+	ErrCodeInvalidParameter           ErrorCode = "invalid_parameter"
+	ErrCodeMissingField               ErrorCode = "missing_field"
+	ErrCodeInvalidFieldType           ErrorCode = "invalid_field_type"
+	ErrCodeInvalidFieldFormat         ErrorCode = "invalid_field_format"
+	ErrCodeContextLengthExceeded      ErrorCode = "context_length_exceeded"
+	ErrCodeResponseContextUnavailable ErrorCode = "response_context_unavailable"
+	ErrCodeUnsupportedModel           ErrorCode = "unsupported_model"
+	ErrCodeRateLimitReached           ErrorCode = "rate_limit_reached"
 
 	// Server errors
-	ErrCodeServerError     ErrorCode = "server_error"
+	ErrCodeServerError        ErrorCode = "server_error"
 	ErrCodeServiceUnavailable ErrorCode = "service_unavailable"
-	ErrCodeUpstreamError   ErrorCode = "upstream_error"
-	ErrCodeUpstreamTimeout ErrorCode = "upstream_timeout"
+	ErrCodeUpstreamError      ErrorCode = "upstream_error"
+	ErrCodeUpstreamTimeout    ErrorCode = "upstream_timeout"
 
 	// Resource errors
 	ErrCodeResourceNotFound ErrorCode = "resource_not_found"
@@ -125,6 +126,8 @@ func HTTPStatusCode(code ErrorCode) int {
 	case ErrCodeResourceNotFound:
 		return http.StatusNotFound
 	case ErrCodeResourceConflict:
+		return http.StatusConflict
+	case ErrCodeResponseContextUnavailable:
 		return http.StatusConflict
 	case ErrCodeInvalidRequest, ErrCodeInvalidParameter, ErrCodeMissingField, ErrCodeInvalidFieldType,
 		ErrCodeInvalidFieldFormat, ErrCodeContextLengthExceeded, ErrCodeUnsupportedModel:

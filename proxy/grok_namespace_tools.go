@@ -38,6 +38,13 @@ func grokNsStringField(m map[string]any, key string) string {
 	return s
 }
 
+// grokDisambiguatedAlias 处理极少见的别名撞名：不同 (namespace, name) 展平出同一个
+// 扁平名时追加短哈希区分。
+func grokDisambiguatedAlias(alias, namespace, name string) string {
+	sum := sha256.Sum256([]byte(namespace + "\x00" + name))
+	return alias + "__" + hex.EncodeToString(sum[:])[:8]
+}
+
 // grokWebSearchTypes 是 Codex 会声明、但 Grok 上游归一为 "web_search" 的搜索工具变体。
 var grokWebSearchTypes = map[string]struct{}{
 	"web_search":                    {},
@@ -119,16 +126,6 @@ func rebuildGrokHistoryItem(item map[string]any, register func(namespace, name s
 //
 // 同步改写 tool_choice 与 input[] 历史引用。无相关内容时原样返回、映射 nil（零开销快速路径）。
 func normalizeGrokUpstreamTools(body []byte) ([]byte, map[string]grokNsIdentity) {
-	// 触发条件：tools 里有 namespace/web_search，或 input[] 有需要按原生字段重建的历史项
-	// （function_call/reasoning 等携带 Codex 扩展字段会让 Grok 严格反序列化 422）。
-	needsWork := bytes.Contains(body, []byte(`"namespace"`)) ||
-		bytes.Contains(body, []byte(`"web_search`)) ||
-		bytes.Contains(body, []byte(`"function_call`)) ||
-		bytes.Contains(body, []byte(`"reasoning"`)) ||
-		bytes.Contains(body, []byte(`_call"`))
-	if !needsWork {
-		return body, nil
-	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return body, nil
@@ -141,9 +138,7 @@ func normalizeGrokUpstreamTools(body []byte) ([]byte, map[string]grokNsIdentity)
 	register := func(namespace, name string) string {
 		alias := grokNamespaceAliasName(namespace, name)
 		if existing, ok := aliases[alias]; ok && (existing.Namespace != namespace || existing.Name != name) {
-			// 极少见：不同 (ns,name) 撞出同一别名，追加短哈希消歧。
-			sum := sha256.Sum256([]byte(namespace + "\x00" + name))
-			alias = alias + "__" + hex.EncodeToString(sum[:])[:8]
+			alias = grokDisambiguatedAlias(alias, namespace, name)
 		}
 		aliases[alias] = grokNsIdentity{Namespace: namespace, Name: name}
 		return alias

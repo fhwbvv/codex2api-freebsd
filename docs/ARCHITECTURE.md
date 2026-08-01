@@ -452,6 +452,10 @@ CREATE TABLE system_settings (
     proxy_url VARCHAR(500),
     pg_max_conns INTEGER DEFAULT 50,
     redis_pool_size INTEGER DEFAULT 30,
+    response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864,
+    response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608,
+    response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
+    response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
     auto_clean_unauthorized BOOLEAN DEFAULT FALSE,
     auto_clean_rate_limited BOOLEAN DEFAULT FALSE,
     admin_secret VARCHAR(255)
@@ -512,6 +516,38 @@ type CacheTTL struct {
     AccessToken  time.Duration = 30 * time.Minute
 }
 ```
+
+#### Responses 上下文缓存
+
+`previous_response_id` 连续请求使用一层每进程独立的有界 L1。完成响应时先按完整 call/output 组保留尾部最多 200 个 raw item，再写入 L1；默认总量 64 MiB、单条准入 8 MiB、最多 2,000 条、绝对 TTL 10 分钟。LRU 同时受条数和逻辑字节预算约束，命中不会延长绝对 TTL。
+
+```text
+完成响应
+   │
+   ├─ pair-safe 尾部裁剪（最多 200 items）
+   │
+   ├─ 本进程 L1（64 MiB total / 8 MiB entry / 2,000 entries / 10m）
+   │
+   └─ Redis 共享 response context（仅 Redis 模式）
+
+previous_response_id 连续请求
+   │
+   ├─ L1 命中 ───────────────────────────────▶ 重建上下文
+   │
+   └─ L1 未命中
+       ├─ Redis 有界读取 → 规范化 → 重建上限校验
+       │    ├─ 符合 L1 准入 → 服务请求并提升到 L1
+       │    └─ 超 L1、未超重建上限 → 仅服务本次请求，不提升
+       └─ Memory 模式 → 无共享 response context 后备
+```
+
+三个数据库预算分别控制 L1 总量、L1 单条准入和共享后端重建上限。只有预算实际变化的事务提交才分配递增 generation，并立即应用到写入实例；同值或空更新不递增。其他实例每 5 秒读取一次，单次最多等待 3 秒，只应用更新的 generation。读取失败时保留最后一次有效配置，并记录同步错误供运维页展示。
+
+Memory 模式只有 L1。已知超限/淘汰，或依赖的必需上下文缺失/过期且没有 relay 后备时，Responses/Compact 连续请求可返回 HTTP `409 response_context_unavailable`。Redis 值损坏或超过重建上限且没有 relay 后备时同样返回 409；共享后端传输故障且请求确实依赖该上下文时可返回 HTTP `503`。Redis 中未超过重建上限的上下文不会仅因超过 L1 准入预算而失败。
+
+客户端原生 Responses WebSocket 入口不执行本地 response-cache 查找，保留 `previous_response_id` 交给上游。上述预算和 409/503 语义适用于本地重建的 HTTP Responses/Compact 路径。
+
+`GET /api/admin/ops/overview` 的 `response_cache` 从一个锁内快照返回 effective/applied generation、当前/上限/高水位/最大观测条目的逻辑字节，以及本地/远程命中与未命中、过期、条数/字节淘汰、超限旁路、Memory 超限拒绝和最终 409 计数。这里的字节是保留 JSON payload 长度之和，不包含 Go 对象、LRU、allocator 或容器开销，不是 RSS 硬上限。进程内存需要结合 Linux/Docker RSS、Go `HeapAlloc` / `HeapInuse` / `HeapReleased` 和 `NumGC` 判断。
 
 ---
 

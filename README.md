@@ -291,6 +291,22 @@ Examples include `MaxConcurrency`, `GlobalRPM`, `TestModel`, `TestContent`, `Tes
 
 Default settings are written automatically on first startup.
 
+#### Response Context Cache
+
+Locally reconstructed HTTP Responses continuations that use `previous_response_id` are protected by a bounded, per-process L1 cache. Its defaults are 64 MiB of logical retained JSON payload, 8 MiB per admitted entry, 2,000 entries, a 10-minute absolute TTL, and at most 200 raw items per entry.
+
+The Settings page exposes three persisted integer-MiB budgets:
+
+| Budget | Default | Allowed Range |
+| --- | --- | --- |
+| Local L1 total | 64 MiB | 8-4096 MiB |
+| Local L1 entry admission | 8 MiB | 1-256 MiB and no greater than the total |
+| Backend reconstruction | 64 MiB | 8-512 MiB |
+
+With Redis, a shared context that is within the reconstruction limit but above the L1 admission budget can still serve the request; it is not promoted into the local cache. Memory mode has no shared response-context fallback, so a dependent continuation whose context was oversized or evicted can return HTTP `409 response_context_unavailable`. A dependent continuation can return HTTP `503` when its shared backend is temporarily unavailable and no eligible relay fallback can preserve `previous_response_id`.
+
+Each successful budget change receives a read-only generation and is polled by every instance every five seconds. Operations shows effective/applied generations, synchronization state, logical cache bytes and counters, process memory, Go heap fields, and GC count. Logical cache bytes do not include Go/container overhead and are not an RSS or process-memory hard limit. During a rolling upgrade, a newer frontend tolerates an older backend that omits the new settings or Operations fields.
+
 ### API Keys and Admin Secret
 
 - Public API keys come from the database API Keys table. If no key is configured, `/v1/*` skips API key authentication.
@@ -413,9 +429,9 @@ Open `/admin/` in a browser.
 | Image Studio portal (non-admin) | `/image-studio` | Standalone studio for teammates using their own API key; toggle on the API Keys page |
 | Prompt Filter | `/admin/prompt-filter/overview` | Rules, hit logs, testing, and handling mode configuration |
 | Usage | `/admin/usage` | Request logs, metric cards, charts, log cleanup |
-| Operations | `/admin/ops` | Runtime monitoring and system overview |
+| Operations | `/admin/ops` | Runtime overview, response-context logical cache metrics, process memory, Go heap, and GC |
 | Scheduler Board | `/admin/ops/scheduler` | Scheduler health, penalties, and score breakdown |
-| Settings | `/admin/settings` | Runtime parameters and admin secret settings |
+| Settings | `/admin/settings` | Runtime parameters, response-context cache budgets, and admin secret settings |
 | Usage Guide | `/admin/docs` | Codex CLI and Claude Code integration examples |
 | API Reference | `/admin/api-reference` | OpenAI-style endpoints and admin API reference |
 

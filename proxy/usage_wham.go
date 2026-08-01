@@ -168,12 +168,15 @@ func QueryWhamUsage(ctx context.Context, account *auth.Account, proxyURL string)
 // X-Resin-Account 并复用按账号隔离的 Resin 连接池；否则回退网关同款
 // transport（支持 uTLS Chrome 指纹），让 wham 请求与 /responses 走一致的
 // TLS 指纹，降低被 Cloudflare 拦截的概率。
+//
+// 直连分支必须用池化 Client：wham 探针是后台周期任务，每次新建一次性
+// uTLS transport 会持续泄漏 HTTP/2 连接与 goroutine（issue #446）。
 func whamHTTPClient(req *http.Request, account *auth.Account, resinClient *http.Client, viaResin bool, proxyURL string) *http.Client {
 	if viaResin {
 		req.Header.Set("X-Resin-Account", ResinAccountID(account))
 		return resinClient
 	}
-	return &http.Client{Transport: newCodexTransport(proxyURL)}
+	return getCodexMaintenanceClient(account, proxyURL)
 }
 
 func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL, url string) (*WhamUsage, *http.Response, error) {

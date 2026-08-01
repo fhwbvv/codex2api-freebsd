@@ -1955,6 +1955,56 @@ func newOpenAIResponsesRelayStore(upstreamURL string) *auth.Store {
 	return store
 }
 
+func TestResponsesAcceptsCustomOpenAIResponsesModelID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const customModel = "openrouter/gpt-5:free"
+	var seenPath, seenAuth string
+	var seenBody []byte
+	upstream := newOpenAIResponsesSSEUpstream(&seenPath, &seenAuth, &seenBody)
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{customModel},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"openrouter/gpt-5:free","input":"hello","stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
+	}
+	if seenAuth != "Bearer sk-direct" {
+		t.Fatalf("Authorization = %q, want Bearer sk-direct", seenAuth)
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != customModel {
+		t.Fatalf("upstream model = %q, want %q; body=%s", model, customModel, seenBody)
+	}
+	if !strings.Contains(recorder.Body.String(), `"type":"response.completed"`) {
+		t.Fatalf("downstream stream missing response.completed; body=%s", recorder.Body.String())
+	}
+}
+
 func newOpenAIResponsesRelayStoreWithModelMapping(upstreamURL string) *auth.Store {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:      2,
@@ -2194,6 +2244,9 @@ func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 		if input.Compact {
 			t.Fatal("Compact = true, want false for durable compaction history item")
 		}
+		if !input.HasCompactionHistory {
+			t.Fatal("HasCompactionHistory = false, want true for durable compaction history item")
+		}
 	})
 
 	t.Run("durable context compaction history item", func(t *testing.T) {
@@ -2209,6 +2262,9 @@ func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 
 		if input.Compact {
 			t.Fatal("Compact = true, want false for durable context_compaction history item")
+		}
+		if !input.HasCompactionHistory {
+			t.Fatal("HasCompactionHistory = false, want true for durable context_compaction history item")
 		}
 	})
 
@@ -2247,6 +2303,65 @@ func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 		}
 	})
 
+	t.Run("compaction trigger and history coexist", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		ctx.Set("raw_body", []byte(`{
+			"model":"gpt-5.6-sol",
+			"input":[
+				{"type":"compaction_trigger"},
+				{"type":"compaction","encrypted_content":"opaque-history"}
+			]
+		}`))
+		input := &database.UsageLogInput{Endpoint: "/v1/responses"}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if !input.Compact || !input.HasCompactionHistory {
+			t.Fatalf("got Compact=%v HasCompactionHistory=%v, want true/true", input.Compact, input.HasCompactionHistory)
+		}
+	})
+
+	t.Run("explicit compact endpoint and history coexist", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+		ctx.Set("raw_body", []byte(`{
+			"model":"gpt-5.6-sol",
+			"input":{"type":"context_compaction","id":"cmp_123"}
+		}`))
+		input := &database.UsageLogInput{
+			Endpoint:         "/v1/responses/compact",
+			InboundEndpoint:  "/v1/responses/compact",
+			UpstreamEndpoint: "/v1/responses/compact",
+		}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if !input.Compact || !input.HasCompactionHistory {
+			t.Fatalf("got Compact=%v HasCompactionHistory=%v, want true/true", input.Compact, input.HasCompactionHistory)
+		}
+	})
+
+	t.Run("rewritten upstream compact endpoint does not create an inbound signal", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		ctx.Set("raw_body", []byte(`{"model":"gpt-5.6-sol","input":"hello"}`))
+		input := &database.UsageLogInput{
+			Endpoint:         "/v1/responses",
+			InboundEndpoint:  "/v1/responses",
+			UpstreamEndpoint: "/v1/responses/compact",
+		}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if input.Compact || input.HasCompactionHistory {
+			t.Fatalf("got Compact=%v HasCompactionHistory=%v, want false/false", input.Compact, input.HasCompactionHistory)
+		}
+	})
+
 	t.Run("nested compaction trigger in tool output", func(t *testing.T) {
 		recorder := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(recorder)
@@ -2267,6 +2382,9 @@ func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 		if input.Compact {
 			t.Fatal("Compact = true, want false for nested compaction_trigger in tool output")
 		}
+		if input.HasCompactionHistory {
+			t.Fatal("HasCompactionHistory = true, want false for nested tool output")
+		}
 	})
 
 	t.Run("normal responses request", func(t *testing.T) {
@@ -2279,6 +2397,137 @@ func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 
 		if input.Compact {
 			t.Fatal("Compact = true, want false for normal responses input")
+		}
+		if input.HasCompactionHistory {
+			t.Fatal("HasCompactionHistory = true, want false for normal responses input")
+		}
+	})
+
+	t.Run("metadata only manual compact", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		ctx.Set("raw_body", []byte(`{
+			"model":"gpt-5.6-sol",
+			"input":[{"type":"message","role":"user","content":"summarize"}],
+			"client_metadata":{
+				"x-codex-turn-metadata":"{\"request_kind\":\"compaction\",\"thread_source\":\"user\"}"
+			}
+		}`))
+		input := &database.UsageLogInput{Endpoint: "/v1/responses"}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if !input.Compact {
+			t.Fatal("Compact = false, want true for metadata-only manual compact")
+		}
+		if input.HasCompactionHistory {
+			t.Fatal("HasCompactionHistory = true, want false without a direct history item")
+		}
+	})
+
+	t.Run("http turn metadata header", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		ctx.Request.Header.Set("X-Codex-Turn-Metadata", `{"request_kind":"compaction","trigger":"manual"}`)
+		ctx.Set("raw_body", []byte(`{"model":"gpt-5.6-sol","input":"summarize"}`))
+		input := &database.UsageLogInput{Endpoint: "/v1/responses"}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if !input.Compact {
+			t.Fatal("Compact = false, want true for HTTP turn metadata header")
+		}
+	})
+
+	t.Run("metadata compaction and history", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		ctx.Set("raw_body", []byte(`{
+			"model":"gpt-5.6-sol",
+			"input":[{"type":"compaction","encrypted_content":"opaque-history"}],
+			"client_metadata":{"x-codex-turn-metadata":"{\"request_kind\":\"compaction\"}"}
+		}`))
+		input := &database.UsageLogInput{Endpoint: "/v1/responses"}
+
+		populateCompactUsageMetaFromRequest(ctx, input)
+
+		if !input.Compact || !input.HasCompactionHistory {
+			t.Fatalf("got Compact=%v HasCompactionHistory=%v, want true/true", input.Compact, input.HasCompactionHistory)
+		}
+	})
+
+	t.Run("malformed and unknown metadata fail closed", func(t *testing.T) {
+		tests := []struct {
+			name string
+			body string
+		}{
+			{
+				name: "malformed JSON string",
+				body: `{"model":"gpt-5.6-sol","input":"hello","client_metadata":{"x-codex-turn-metadata":"{"}}`,
+			},
+			{
+				name: "non string metadata",
+				body: `{"model":"gpt-5.6-sol","input":"hello","client_metadata":{"x-codex-turn-metadata":{"request_kind":"compaction"}}}`,
+			},
+			{
+				name: "unknown request kind",
+				body: `{"model":"gpt-5.6-sol","input":"hello","client_metadata":{"x-codex-turn-metadata":"{\"request_kind\":\"turn\"}"}}`,
+			},
+			{
+				name: "nested tool output",
+				body: `{"model":"gpt-5.6-sol","input":[{"type":"function_call_output","output":{"client_metadata":{"x-codex-turn-metadata":"{\"request_kind\":\"compaction\"}"}}}]}`,
+			},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				ctx, _ := gin.CreateTestContext(recorder)
+				ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				ctx.Set("raw_body", []byte(test.body))
+				input := &database.UsageLogInput{Endpoint: "/v1/responses"}
+
+				populateCompactUsageMetaFromRequest(ctx, input)
+
+				if input.Compact || input.HasCompactionHistory {
+					t.Fatalf("got Compact=%v HasCompactionHistory=%v, want false/false", input.Compact, input.HasCompactionHistory)
+				}
+			})
+		}
+	})
+
+	t.Run("cached websocket frame state is replaced", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+
+		cacheRequestCompactionMeta(ctx, requestBodyCompactionMeta([]byte(`{
+			"model":"gpt-5.6-sol",
+			"client_metadata":{"x-codex-turn-metadata":"{\"request_kind\":\"compaction\"}"}
+		}`)))
+		first := &database.UsageLogInput{Endpoint: "/v1/responses"}
+		populateCompactUsageMetaFromRequest(ctx, first)
+		if !first.Compact {
+			t.Fatal("first frame Compact = false, want true")
+		}
+
+		cacheRequestCompactionMeta(ctx, requestBodyCompactionMeta([]byte(`{"model":"gpt-5.6-sol","input":"next"}`)))
+		second := &database.UsageLogInput{Endpoint: "/v1/responses"}
+		populateCompactUsageMetaFromRequest(ctx, second)
+		if second.Compact || second.HasCompactionHistory {
+			t.Fatalf("second frame leaked prior state: Compact=%v HasCompactionHistory=%v", second.Compact, second.HasCompactionHistory)
+		}
+
+		cacheRequestCompactionMeta(ctx, requestBodyCompactionMeta([]byte(`{
+			"model":"gpt-5.6-sol",
+			"client_metadata":{"x-codex-turn-metadata":"{"}
+		}`)))
+		third := &database.UsageLogInput{Endpoint: "/v1/responses"}
+		populateCompactUsageMetaFromRequest(ctx, third)
+		if third.Compact || third.HasCompactionHistory {
+			t.Fatalf("malformed third frame leaked prior state: Compact=%v HasCompactionHistory=%v", third.Compact, third.HasCompactionHistory)
 		}
 	})
 }
@@ -3903,6 +4152,88 @@ func TestSessionAffinityKeySeparatesDifferentAPIKeys(t *testing.T) {
 	}
 }
 
+func TestApplyAffinityGroupRoutingSplitsByRequestFingerprint(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{
+		AllowedGroupIDs: []int64{10},
+		Limits: database.APIKeyLimits{
+			NoAffinityGroupIDs: []int64{20},
+		},
+	})
+	primary := &auth.Account{DBID: 1, GroupIDs: []int64{10}}
+	split := &auth.Account{DBID: 2, GroupIDs: []int64{20}}
+
+	withoutAffinity := applyAffinityGroupRouting(c, requestSessionIdentity{}, nil)
+	if withoutAffinity(primary) || !withoutAffinity(split) {
+		t.Fatal("request without affinity header must use only the split groups")
+	}
+
+	withFingerprint := applyAffinityGroupRouting(c, requestSessionIdentity{hasRequestFingerprint: true}, nil)
+	if !withFingerprint(primary) || withFingerprint(split) {
+		t.Fatal("fingerprinted request must keep using the original groups")
+	}
+}
+
+func TestApplyAffinityGroupRoutingDisabledKeepsExistingFilter(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{AllowedGroupIDs: []int64{10}})
+	want := auth.AccountFilter(func(account *auth.Account) bool { return account != nil && account.DBID == 1 })
+	if got := applyAffinityGroupRouting(c, requestSessionIdentity{}, want); got(&auth.Account{DBID: 1}) != true || got(&auth.Account{DBID: 2}) != false {
+		t.Fatal("disabled split routing must preserve the existing account filter")
+	}
+}
+
+// TestApplyAffinityGroupRoutingExcludesSplitGroupsWhenNoAllowedGroups 覆盖最常见的配置：
+// Key 不限分组。此时带指纹的请求必须避开分流组，否则分流组照样接真 Codex 流量，隔离等于没做。
+func TestApplyAffinityGroupRoutingExcludesSplitGroupsWhenNoAllowedGroups(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{
+		Limits: database.APIKeyLimits{NoAffinityGroupIDs: []int64{20}},
+	})
+	split := &auth.Account{DBID: 1, GroupIDs: []int64{20}}
+	other := &auth.Account{DBID: 2, GroupIDs: []int64{30}}
+	ungrouped := &auth.Account{DBID: 3}
+
+	withFingerprint := applyAffinityGroupRouting(c, requestSessionIdentity{hasRequestFingerprint: true}, nil)
+	if withFingerprint(split) {
+		t.Fatal("fingerprinted request must not land on a split group account")
+	}
+	if !withFingerprint(other) || !withFingerprint(ungrouped) {
+		t.Fatal("fingerprinted request must keep every non-split account available")
+	}
+
+	withoutFingerprint := applyAffinityGroupRouting(c, requestSessionIdentity{}, nil)
+	if !withoutFingerprint(split) || withoutFingerprint(other) || withoutFingerprint(ungrouped) {
+		t.Fatal("request without a fingerprint must use only the split groups")
+	}
+}
+
+// TestApplyAffinityGroupRoutingKeepsInnerFilter 分组门必须叠加在既有 filter 之上，
+// 不能把模型/冷却/预算这些闸门盖掉。
+func TestApplyAffinityGroupRoutingKeepsInnerFilter(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Set(contextAPIKeyRow, &database.APIKeyRow{
+		Limits: database.APIKeyLimits{NoAffinityGroupIDs: []int64{20}},
+	})
+	inner := auth.AccountFilter(func(account *auth.Account) bool { return account != nil && account.DBID == 1 })
+
+	split := applyAffinityGroupRouting(c, requestSessionIdentity{}, inner)
+	if !split(&auth.Account{DBID: 1, GroupIDs: []int64{20}}) {
+		t.Fatal("split routing dropped an account the inner filter accepts")
+	}
+	if split(&auth.Account{DBID: 2, GroupIDs: []int64{20}}) {
+		t.Fatal("split routing must not bypass the inner filter")
+	}
+
+	fingerprinted := applyAffinityGroupRouting(c, requestSessionIdentity{hasRequestFingerprint: true}, inner)
+	if !fingerprinted(&auth.Account{DBID: 1, GroupIDs: []int64{30}}) {
+		t.Fatal("exclusion routing dropped an account the inner filter accepts")
+	}
+	if fingerprinted(&auth.Account{DBID: 2, GroupIDs: []int64{30}}) {
+		t.Fatal("exclusion routing must not bypass the inner filter")
+	}
+}
+
 // TestResponsesWebSocketStripsInjectedImageTool verifies that a plain
 // conversation request — which PrepareResponsesWebSocketBody auto-injects an
 // image_generation tool into — has that tool stripped before going to the
@@ -4253,6 +4584,73 @@ func TestResponses_CompactionHistoryNotPromotedOnRelayOnlyPool(t *testing.T) {
 	}
 	if seenPath != "/v1/responses" {
 		t.Fatalf("upstream path = %q, want /v1/responses for durable compaction history", seenPath)
+	}
+}
+
+// A metadata-only manual /compact turn is an observability signal, not the
+// protocol compaction_trigger control. It must remain on the normal Responses
+// route even for a non-streaming relay-only pool.
+func TestResponses_MetadataCompactionNotPromotedOnRelayOnlyPool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_metadata_compaction",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-4.1-direct",
+		"stream":false,
+		"input":[{"type":"message","role":"user","content":"summarize"}],
+		"client_metadata":{
+			"x-codex-turn-metadata":"{\"request_kind\":\"compaction\",\"thread_source\":\"user\"}"
+		}
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses for metadata-only compaction", seenPath)
+	}
+	meta, ok := cachedRequestCompactionMeta(ctx)
+	if !ok {
+		t.Fatal("request compaction metadata was not cached")
+	}
+	if meta.ProtocolTriggered || !meta.UsageTriggered {
+		t.Fatalf("cached meta = %+v, want protocol=false usage=true", meta)
 	}
 }
 

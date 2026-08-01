@@ -135,7 +135,8 @@ export default function RuntimeStatus() {
                   [t('runtime.enabled'), status.usage_log.enabled ? t('common.enabled') : t('common.disabled')],
                   [t('runtime.batchSize'), formatNumber(status.usage_log.batch_size)],
                   [t('runtime.flushInterval'), t('runtime.seconds', { count: status.usage_log.flush_interval_seconds })],
-                  [t('runtime.buffer'), `${status.usage_log.buffer_length} / ${status.usage_log.buffer_capacity || '-'}`],
+                  [t('runtime.buffer'), `${status.usage_log.buffer_length} / ${status.usage_log.buffer_limit || status.usage_log.buffer_capacity || '-'}`],
+                  [t('runtime.usageLogDropped'), formatNumber(status.usage_log.dropped_total ?? 0)],
                 ]}
               />
 

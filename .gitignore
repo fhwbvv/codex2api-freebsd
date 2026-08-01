@@ -36,7 +36,7 @@ scripts
 
 # Logs
 logs/
-AGMENT.md
+AGENTS.md
 CLIProxyAPI/
 sub2api/
 new-api/
@@ -44,4 +44,5 @@ CPA-Manager-Plus/
 grok2api/
 grokcli2api-go/
 .gstack/
+.superpowers/
 CLAUDE.md

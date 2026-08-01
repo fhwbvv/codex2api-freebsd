@@ -29,6 +29,12 @@ type utlsAuthRoundTripper struct {
 	dialer      xproxy.Dialer
 }
 
+const (
+	utlsAuthReadIdleTimeout = 15 * time.Second
+	utlsAuthPingTimeout     = 15 * time.Second
+	utlsAuthIdleConnTimeout = 90 * time.Second
+)
+
 func newUTLSAuthTransport(proxyURL string) http.RoundTripper {
 	var dialer xproxy.Dialer = xproxy.Direct
 	if proxyURL != "" {
@@ -108,7 +114,14 @@ func (t *utlsAuthRoundTripper) createConnection(host, addr string) (*http2.Clien
 		return nil, fmt.Errorf("TLS 握手失败: %w", err)
 	}
 
-	tr := &http2.Transport{}
+	// 认证 transport 自管 HTTP/2 连接，不经过 net/http 的连接池。三项超时
+	// 必须直接配置在 http2.Transport 上：否则健康空闲连接不会安装回收计时器，
+	// readLoop、socket 与缓冲区会一直驻留。
+	tr := &http2.Transport{
+		ReadIdleTimeout: utlsAuthReadIdleTimeout,
+		PingTimeout:     utlsAuthPingTimeout,
+		IdleConnTimeout: utlsAuthIdleConnTimeout,
+	}
 	h2Conn, err := tr.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
@@ -145,14 +158,19 @@ func (t *utlsAuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, err
 }
 
 func (t *utlsAuthRoundTripper) CloseIdleConnections() {
+	var idle []*http2.ClientConn
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	for host, conn := range t.connections {
-		if !conn.CanTakeNewRequest() {
-			conn.Close()
+		state := conn.State()
+		if state.StreamsActive == 0 && state.StreamsReserved == 0 && state.StreamsPending == 0 {
 			delete(t.connections, host)
+			idle = append(idle, conn)
 		}
+	}
+	t.mu.Unlock()
+
+	for _, conn := range idle {
+		_ = conn.Close()
 	}
 }
 
@@ -294,9 +312,10 @@ func evictExpiredUTLSAuthClients() {
 	cutoff := time.Now().Add(-utlsAuthClientPoolTTL).UnixNano()
 	utlsAuthClientPool.Range(func(key, value any) bool {
 		entry := value.(*utlsAuthPoolEntry)
-		if entry.lastUsed.Load() < cutoff {
-			utlsAuthClientPool.Delete(key)
+		if entry.lastUsed.Load() < cutoff && utlsAuthClientPool.CompareAndDelete(key, value) {
 			if ut, ok := entry.client.Transport.(*utlsAuthRoundTripper); ok {
+				// 只关闭无在途 stream 的连接，避免清理与刚开始的认证请求
+				// 竞态时误杀请求；漏过的连接由 IdleConnTimeout 最终回收。
 				ut.CloseIdleConnections()
 			}
 		}

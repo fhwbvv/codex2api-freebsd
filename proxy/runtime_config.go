@@ -34,7 +34,7 @@ const (
 	RequestIsolationModePerAPIKey = "per-api-key"
 
 	defaultClientCompatMode       = ClientCompatModePreserve
-	defaultCodexMinCLIVersion     = "0.118.0"
+	defaultCodexMinCLIVersion     = "0.144.1"
 	defaultStreamFlushPolicy      = StreamFlushPolicyImmediate
 	defaultStreamFlushIntervalMS  = 20
 	minStreamFlushIntervalMS      = 1
@@ -58,15 +58,18 @@ const (
 )
 
 type RuntimeSettings struct {
-	ClientCompatMode       string
-	CodexMinCLIVersion     string
-	CodexUserAgentConfig   string
-	StreamFlushPolicy      string
-	StreamFlushIntervalMS  int
-	FirstTokenMode         string
-	FirstTokenTimeoutSec   int
-	BillingTierPolicy      string
-	CodexForceWebsocket    bool // 强制 Codex 上游走 WebSocket（默认 false）
+	ClientCompatMode      string
+	CodexMinCLIVersion    string
+	CodexUserAgentConfig  string
+	StreamFlushPolicy     string
+	StreamFlushIntervalMS int
+	FirstTokenMode        string
+	FirstTokenTimeoutSec  int
+	BillingTierPolicy     string
+	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
+	// CodexWSWeakNetworkMode 对 VPN/住宅代理等不稳定链路采用保守复用：
+	// 缩短空闲/最大寿命、每次复用都做真实 Ping/Pong，并暂停空闲保活（默认 false）。
+	CodexWSWeakNetworkMode bool
 	CodexWSHideErrors      bool // 隐藏 Codex WS 上游原始错误（默认 true）
 	CodexWSSilentRetry     bool // 首包前 Codex WS 上游错误静默换号重试（默认 true）
 	CodexWSSilentRetries   int  // Codex WS 静默换号最大重试次数（默认 2）
@@ -102,6 +105,15 @@ type RuntimeSettings struct {
 	AutoResetCreditsEnabled bool
 	// AutoResetCreditsBeforeExpiryMin 是进入自动消费窗口的提前分钟数（默认 60）。
 	AutoResetCreditsBeforeExpiryMin int
+	// UTLSShutdownTimeoutMin 是 uTLS（CODEX_TRANSPORT_MODE=utls_chrome）连接被摘出
+	// 连接池后，等待其上在途 stream 收尾的上限（分钟，默认 30，范围 1-240）。
+	// 超时则强制关闭，保证异常挂死的 stream 不会把连接永久留住（issue #446）。
+	UTLSShutdownTimeoutMin int
+}
+
+// UTLSShutdownTimeout 返回 uTLS 连接优雅关闭的等待上限。
+func (s RuntimeSettings) UTLSShutdownTimeout() time.Duration {
+	return time.Duration(database.NormalizeUTLSShutdownTimeoutMinutes(s.UTLSShutdownTimeoutMin)) * time.Minute
 }
 
 // IsolateRequestsByDefault 返回是否对无显式会话的请求默认按每请求隔离上游身份。
@@ -140,6 +152,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexCLIVersionSyncEnabled:       true,
 		CodexCLIVersionSyncIntervalHours: 12,
 		AutoResetCreditsBeforeExpiryMin:  60,
+		UTLSShutdownTimeoutMin:           database.NormalizeUTLSShutdownTimeoutMinutes(0),
 	}
 }
 
@@ -260,6 +273,7 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 		settings.CodexContinueMaxRounds = maxCodexContinueMaxRounds
 	}
 	settings.AutoResetCreditsBeforeExpiryMin = database.NormalizeAutoResetCreditsBeforeExpiryMinutes(settings.AutoResetCreditsBeforeExpiryMin)
+	settings.UTLSShutdownTimeoutMin = database.NormalizeUTLSShutdownTimeoutMinutes(settings.UTLSShutdownTimeoutMin)
 	return settings
 }
 
@@ -278,6 +292,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
 		next.BillingTierPolicy = settings.BillingTierPolicy
 		next.CodexForceWebsocket = settings.CodexForceWebsocket
+		next.CodexWSWeakNetworkMode = settings.CodexWSWeakNetworkMode
 		next.CodexWSHideErrors = settings.CodexWSHideUpstreamErrors
 		next.CodexWSSilentRetry = settings.CodexWSSilentRetryEnabled
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
@@ -295,6 +310,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexCLIVersionSyncIntervalHours = settings.CodexCLIVersionSyncIntervalHours
 		next.AutoResetCreditsEnabled = settings.AutoResetCreditsEnabled
 		next.AutoResetCreditsBeforeExpiryMin = settings.AutoResetCreditsBeforeExpiryMin
+		next.UTLSShutdownTimeoutMin = settings.UTLSShutdownTimeoutMinutes
 		// Payload 重写规则不进 RuntimeSettings（编译后独立存放），此处顺带完成启动种子。
 		if err := SetPayloadRulesJSON(settings.PayloadRules); err != nil {
 			log.Printf("payload_rules 配置解析失败，已忽略: %v", err)

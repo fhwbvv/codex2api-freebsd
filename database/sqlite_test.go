@@ -47,6 +47,9 @@ func TestSQLitePromptFilterColumnDefaultsRemainUpgradeCompatible(t *testing.T) {
 	if strings.TrimSpace(settings.PromptFilterAdvancedConfig) != "{}" {
 		t.Fatalf("compatibility advanced config = %q, want {}", settings.PromptFilterAdvancedConfig)
 	}
+	if settings.CodexMinCLIVersion != "0.144.1" {
+		t.Fatalf("fresh SQLite minimum Codex CLI version = %q, want 0.144.1", settings.CodexMinCLIVersion)
+	}
 }
 
 func TestSQLiteAPIKeyLookupAndCount(t *testing.T) {
@@ -748,10 +751,10 @@ func TestSQLiteListActiveByChannel(t *testing.T) {
 		t.Fatalf("InsertAccount codex 返回错误: %v", err)
 	}
 	grokID, err := db.InsertAccountWithUpstream(ctx, "grok-one", "xai", "oauth", map[string]interface{}{
-		"upstream_type":  "grok",
-		"refresh_token":  "rt-grok",
-		"access_token":   "at-grok",
-		"email":          "g@example.com",
+		"upstream_type": "grok",
+		"refresh_token": "rt-grok",
+		"access_token":  "at-grok",
+		"email":         "g@example.com",
 	}, "")
 	if err != nil {
 		t.Fatalf("InsertAccountWithUpstream grok 返回错误: %v", err)
@@ -797,7 +800,7 @@ func TestSQLiteUsageLogsHasAPIKeyColumns(t *testing.T) {
 		t.Fatalf("sqliteTableColumns 返回错误: %v", err)
 	}
 
-	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "client_user_agent", "upstream_user_agent", "user_agent_overridden", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
+	for _, name := range []string{"api_key_id", "api_key_name", "api_key_masked", "client_ip", "client_user_agent", "upstream_user_agent", "user_agent_overridden", "internal_reason", "parent_request_id", "image_count", "image_width", "image_height", "image_bytes", "image_format", "image_size", "effective_model", "compact", "has_compaction_history", "account_billed", "user_billed", "is_retry_attempt", "attempt_index", "upstream_error_kind", "error_message"} {
 		if _, ok := columns[name]; !ok {
 			t.Fatalf("usage_logs 缺少列 %q", name)
 		}
@@ -1692,6 +1695,52 @@ func TestUsageLogsPersistUserAgentAudit(t *testing.T) {
 	}
 	if !logs[0].UserAgentOverridden {
 		t.Fatal("UserAgentOverridden = false, want true")
+	}
+}
+
+func TestUsageLogsPersistAttributedInternalRequest(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:       7,
+		Endpoint:        "/v1/responses",
+		Model:           "gpt-5.4",
+		StatusCode:      200,
+		InputTokens:     1_000_000,
+		TotalTokens:     1_000_000,
+		APIKeyID:        42,
+		APIKeyName:      "team-key",
+		APIKeyMasked:    "sk-...test",
+		InternalReason:  "overflow_compact_summary",
+		ParentRequestID: "req-parent-42",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	logs, err := db.ListRecentUsageLogs(ctx, 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs) = %d, want 1", len(logs))
+	}
+	if logs[0].APIKeyID != 42 || logs[0].InternalReason != "overflow_compact_summary" || logs[0].ParentRequestID != "req-parent-42" {
+		t.Fatalf("internal usage attribution = %+v", logs[0])
+	}
+
+	usage, err := db.GetAPIKeyWindowUsage(ctx, 42, time.Hour)
+	if err != nil {
+		t.Fatalf("GetAPIKeyWindowUsage 返回错误: %v", err)
+	}
+	if usage.Requests != 1 || usage.Tokens != 1_000_000 || usage.UserBilled <= 0 {
+		t.Fatalf("attributed internal usage aggregate = %+v", usage)
 	}
 }
 
@@ -2799,7 +2848,7 @@ func TestGetAccountUsageStatsAggregatesRecentAccountSummary(t *testing.T) {
 	insertUsage(7, "old-model", 200, 9000, 9000, 0, 0, 0, 5000, 9.99, 9.99, todayStart.AddDate(0, 0, -40))
 	insertUsage(7, "cancelled", 499, 8000, 8000, 0, 0, 0, 5000, 8.88, 8.88, todayStart.Add(2*time.Hour))
 	insertUsage(8, "other-account", 200, 7000, 7000, 0, 0, 0, 5000, 7.77, 7.77, todayStart.Add(2*time.Hour))
-	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 500, stream = 1 WHERE account_id = 7 AND total_tokens = 1000`); err != nil {
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 500, stream = 1, has_compaction_history = 1 WHERE account_id = 7 AND total_tokens = 1000`); err != nil {
 		t.Fatalf("update first usage quality fields: %v", err)
 	}
 	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 1500, compact = 1 WHERE account_id = 7 AND total_tokens = 2000`); err != nil {
@@ -3271,5 +3320,102 @@ func TestSQLiteSystemSettingsContinueThinkingRoundtrip(t *testing.T) {
 	}
 	if clamped.CodexContinueMaxRounds != 32 {
 		t.Errorf("越界轮数应归一到 32, got %d", clamped.CodexContinueMaxRounds)
+	}
+}
+
+// TestSQLiteSystemSettingsUTLSShutdownTimeoutRoundtrip 验证 uTLS 优雅关闭上限
+// （issue #446）能在 SQLite 上完成 播种默认 → 写入 → 读回 → 越界夹取 的全链路。
+func TestSQLiteSystemSettingsUTLSShutdownTimeoutRoundtrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// 全新库播种：未显式指定该字段时必须落到默认 30 分钟，而不是 0
+	//（0 会让在途流式请求被立即截断）。
+	seed := &SystemSettings{
+		MaxConcurrency:  2,
+		TestConcurrency: 1,
+		TestModel:       "gpt-5.4",
+	}
+	if err := db.UpdateSystemSettings(ctx, seed); err != nil {
+		t.Fatalf("UpdateSystemSettings(seed): %v", err)
+	}
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got.UTLSShutdownTimeoutMinutes != 30 {
+		t.Fatalf("默认 utls_shutdown_timeout_minutes = %d, want 30", got.UTLSShutdownTimeoutMinutes)
+	}
+
+	// 写入合法值后读回。
+	got.UTLSShutdownTimeoutMinutes = 7
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(7): %v", err)
+	}
+	after, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(after): %v", err)
+	}
+	if after.UTLSShutdownTimeoutMinutes != 7 {
+		t.Fatalf("往返后 = %d, want 7", after.UTLSShutdownTimeoutMinutes)
+	}
+
+	// 越界值必须在持久化时被夹到上界。
+	after.UTLSShutdownTimeoutMinutes = 100000
+	if err := db.UpdateSystemSettings(ctx, after); err != nil {
+		t.Fatalf("UpdateSystemSettings(越界): %v", err)
+	}
+	clamped, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(clamped): %v", err)
+	}
+	if clamped.UTLSShutdownTimeoutMinutes != 240 {
+		t.Fatalf("越界值应夹到 240, got %d", clamped.UTLSShutdownTimeoutMinutes)
+	}
+}
+
+func TestSQLiteSystemSettingsWeakNetworkModeRoundtrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		CodexWSWeakNetworkMode: true,
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings(true): %v", err)
+	}
+
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(true): %v", err)
+	}
+	if got == nil || !got.CodexWSWeakNetworkMode {
+		t.Fatalf("codex_ws_weak_network_mode = %v, want true", got != nil && got.CodexWSWeakNetworkMode)
+	}
+
+	got.CodexWSWeakNetworkMode = false
+	if err := db.UpdateSystemSettings(ctx, got); err != nil {
+		t.Fatalf("UpdateSystemSettings(false): %v", err)
+	}
+	after, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings(false): %v", err)
+	}
+	if after.CodexWSWeakNetworkMode {
+		t.Fatal("codex_ws_weak_network_mode = true after disabling, want false")
 	}
 }

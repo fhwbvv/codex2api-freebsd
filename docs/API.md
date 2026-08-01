@@ -203,6 +203,8 @@ data: [DONE]
 | include              | array        | 否   | 包含的额外字段                                                                                     |
 | previous_response_id | string       | 否   | 上一响应 ID，用于上下文连续                                                                        |
 
+`previous_response_id` 的上下文先查当前进程的有界 L1。已认证请求按 API Key ID 隔离；未配置任何 API Key、显式启用 `CODEX_ALLOW_ANONYMOUS=true` 后放行的请求共用 `anon` 命名空间。Redis 模式在 L1 未命中时可从共享后端重建；后端值未超过重建上限但超过 L1 准入预算时仍可服务本次请求，只是不提升到 L1。Memory 模式没有共享 response context 后备，依赖上下文被判定为超限、已淘汰或缺失时可能返回 HTTP `409 response_context_unavailable`。共享后端暂时不可用且请求依赖该上下文时可能返回 HTTP `503 service_unavailable`。如果账号池存在可用的 relay-style 后备，网关可保留原始 `previous_response_id` 继续转发，而不是立即返回上述错误。客户端原生 Responses WebSocket 入口不执行这次本地查找，会保留 `previous_response_id` 交给上游。
+
 **响应示例:**
 
 ```json
@@ -468,7 +470,7 @@ data: [DONE]
 | 参数                      | 类型           | 必填 | 说明                                                                                                       |
 | ------------------------- | -------------- | ---- | ---------------------------------------------------------------------------------------------------------- |
 | score_bias_override       | integer/null   | 否   | 总加权分覆盖值，范围 `-200..200`，`null` 表示恢复套餐默认                                                  |
-| base_concurrency_override | integer/null   | 否   | 基础并发覆盖值，范围 `1..50`，`null` 表示恢复全局默认                                                      |
+| base_concurrency_override | integer/null   | 否   | 基础并发覆盖值，`≥1` 无上限，`null` 表示恢复全局默认                                                      |
 | skip_warm_tier            | boolean/null   | 否   | 是否跳过 warm 层级；`null` 等同 `false`，字段省略时保持原值                                                |
 | allowed_api_key_ids       | integer[]/null | 否   | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
 
@@ -544,7 +546,7 @@ data: [DONE]
 | 字段 | 类型 | 范围/语义 |
 |------|------|-----------|
 | `score_bias_override` | integer/null | `-200..200`；`null` 恢复套餐默认分数偏置 |
-| `base_concurrency_override` | integer/null | `1..50`；`null` 恢复分组或全局继承值 |
+| `base_concurrency_override` | integer/null | `≥1` 无上限；`null` 恢复分组或全局继承值 |
 | `scheduler_priority` | integer/null | `-100..100`；`null` 恢复默认优先级 `0` |
 | `tags` | string[] | 替换账号标签；空数组清空 |
 | `group_ids` | integer[] | 替换账号分组；空数组清空 |
@@ -1208,7 +1210,7 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
 }
 ```
 
-`base_concurrency_override` 的有效范围为 `1..50`。创建时省略或传 `null` 表示不设置分组覆盖；PATCH 时传 `null` 会清除已有值并恢复继承。该值只决定基础并发，健康档位、用量保护和智能配速仍可能继续下调实际并发。
+`base_concurrency_override` 最小为 `1`，无上限。创建时省略或传 `null` 表示不设置分组覆盖；PATCH 时传 `null` 会清除已有值并恢复继承。该值只决定基础并发，健康档位、用量保护和智能配速仍可能继续下调实际并发。
 
 **响应:**
 
@@ -1269,6 +1271,10 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "database_label": "PostgreSQL",
   "cache_driver": "redis",
   "cache_label": "Redis",
+  "response_cache_local_max_bytes": 67108864,
+  "response_cache_local_max_entry_bytes": 8388608,
+  "response_cache_reconstruct_max_bytes": 67108864,
+  "response_cache_config_generation": 1,
   "admin_secret": "",
   "admin_auth_source": "env"
 }
@@ -1294,11 +1300,25 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "scheduler_mode": "remaining_quota",
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 500,
-  "transport_retry_policy": "sticky"
+  "transport_retry_policy": "sticky",
+  "response_cache_local_max_bytes": 134217728,
+  "response_cache_local_max_entry_bytes": 8388608,
+  "response_cache_reconstruct_max_bytes": 134217728
 }
 ```
 
 **响应:** 更新后的完整设置对象
+
+Responses 上下文缓存字段使用原始字节数：
+
+| 字段 | 类型 | 默认值 | 有效范围 |
+| --- | --- | --- | --- |
+| `response_cache_local_max_bytes` | integer | 67,108,864（64 MiB） | 8 MiB-4 GiB |
+| `response_cache_local_max_entry_bytes` | integer | 8,388,608（8 MiB） | 1-256 MiB，且不能超过本地总量 |
+| `response_cache_reconstruct_max_bytes` | integer | 67,108,864（64 MiB） | 8-512 MiB |
+| `response_cache_config_generation` | integer | 1 | 只读；任何显式写入，包括 `null`，都返回 HTTP 400 |
+
+PUT 可只提交其中一部分可写预算，服务端会在数据库事务中与当前值合并并校验。管理台使用整数 MiB 输入，并把三个可写字段作为一次原子更新发送。成功修改后 generation 递增；本实例立即应用，其他实例每 5 秒同步。
 
 ### 代理池管理
 
@@ -1316,9 +1336,11 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
       "url": "http://proxy1.example.com:8080",
       "label": "US Proxy",
       "enabled": true,
-      "last_tested_at": "2024-01-01T12:00:00Z",
-      "last_test_result": "ok",
-      "latency_ms": 150
+      "created_at": "2024-01-01T12:00:00Z",
+      "test_ip": "1.2.3.4",
+      "test_location": "United States·California·Los Angeles",
+      "test_latency_ms": 150,
+      "test_status": "success"
     }
   ]
 }
@@ -1377,23 +1399,28 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 
 #### POST /api/admin/proxies/test
 
-测试代理连通性。
+测试代理连通性。传入 `id` 时会持久化 `test_status`；可归因于代理的失败状态（包括代理端 TCP 建立失败/超时、HTTPS/SOCKS 协商失败/超时和 HTTP `407` 代理认证失败）为 `error`，成功复测后恢复为 `success`。调用方取消、已连上代理后的传输错误、SOCKS 代理开始连接目标站点后的不可达或超时、探测服务返回 429/5xx 或无效响应时，响应中的 `conclusive` 为 `false`，原测试状态保持不变。
 
 **请求:**
 
 ```json
 {
   "url": "http://proxy.example.com:8080",
-  "id": 1, // 可选，用于持久化测试结果
+  "id": 1,
   "lang": "zh-CN"
 }
 ```
+
+`id` 可选；省略时仅测试，不持久化结果。
+
+传入 `id` 时，服务端先读取该 ID 当前保存的 URL，仅在其与请求 URL 一致时发起测试；写入结果时再次进行 ID + 原始 URL 比较，测试期间 URL 被修改会返回 HTTP `409`，避免旧结果覆盖新配置。首尾空白只在拨号时去除，兼容历史数据中的非规范 URL。
 
 **响应:**
 
 ```json
 {
   "success": true,
+  "conclusive": true,
   "ip": "1.2.3.4",
   "country": "United States",
   "region": "California",
@@ -1401,6 +1428,41 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "isp": "Example ISP",
   "latency_ms": 150,
   "location": "United States·California·Los Angeles"
+}
+```
+
+#### POST /api/admin/proxies/test-all
+
+由服务端以最多 4 路并发测试指定代理，并通过 SSE 逐项返回进度。请求只传代理 ID，服务端使用数据库中的当前 URL；全部测试结果保存完成后只重载一次运行时代理池。代理池刷新由后台收尾路径执行，不依赖客户端持续读取 SSE。
+
+**请求:**
+
+```json
+{
+  "ids": [1, 2, 3],
+  "lang": "zh-CN"
+}
+```
+
+`ids` 必填、必须为正整数，单次最多 100 个；空数组、未知请求字段、超限请求均返回 HTTP `400`。管理后台在代理超过 100 个时会自动拆成多个顺序批次。同一服务实例同一时间只运行一个批量代理测试，已有任务运行时返回 HTTP `409`。SSE `progress` 事件示例：
+
+```text
+data: {"type":"progress","proxy_id":1,"current":1,"total":3,"success":1,"result":{"success":true,"conclusive":true,"ip":"1.2.3.4","latency_ms":150}}
+```
+
+流结束时发送 `complete` 事件；如果数据库结果已经保存但运行时代理池刷新失败，事件的 `error` 字段会说明该异常。客户端断开会取消尚未完成的探测；已经落库的结果仍会触发一次代理池刷新。
+
+#### POST /api/admin/proxies/clean-error
+
+固定本次操作开始时 `test_status=error` 的代理集合，删除这些代理，并清空实际引用它们的账号绑定。清理期间新变为 `error` 的代理留到下一次清理。提交后会立即从当前进程的运行时代理池剔除实际删除的 URL；若数据库快照重载失败，接口返回 HTTP `500` 和已完成的 `cleaned` / `unbound` 数量，但不会把已删除代理重新投入调度。
+
+**响应:**
+
+```json
+{
+  "message": "已清理 2 个错误代理并解绑 3 个账号",
+  "cleaned": 2,
+  "unbound": 3
 }
 ```
 
@@ -1427,7 +1489,44 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "memory": {
     "percent": 60.2,
     "used_bytes": 6442450944,
-    "total_bytes": 10737418240
+    "total_bytes": 10737418240,
+    "process_bytes": 268435456,
+    "heap_alloc_bytes": 100663296,
+    "heap_inuse_bytes": 117440512,
+    "heap_released_bytes": 33554432,
+    "num_gc": 421
+  },
+  "response_cache": {
+    "effective_config": {
+      "generation": 3,
+      "local_max_bytes": 67108864,
+      "local_max_entry_bytes": 8388608,
+      "reconstruct_max_bytes": 67108864
+    },
+    "applied_config": {
+      "generation": 3,
+      "local_max_bytes": 67108864,
+      "local_max_entry_bytes": 8388608,
+      "reconstruct_max_bytes": 67108864
+    },
+    "entries": 120,
+    "max_entries": 2000,
+    "current_bytes": 33554432,
+    "max_bytes": 67108864,
+    "high_water_bytes": 50331648,
+    "largest_entry_bytes": 7340032,
+    "local_hits": 920,
+    "local_misses": 80,
+    "remote_hits": 60,
+    "remote_misses": 20,
+    "expirations": 12,
+    "count_evictions": 2,
+    "byte_evictions": 8,
+    "oversize_bypasses": 4,
+    "oversize_rejections": 0,
+    "known_unavailable_errors": 1,
+    "last_config_sync_at": "2024-01-01T11:59:58Z",
+    "last_config_sync_error": ""
   },
   "runtime": {
     "goroutines": 50,
@@ -1469,6 +1568,12 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   }
 }
 ```
+
+`response_cache.current_bytes`、`max_bytes`、`high_water_bytes` 和 `largest_entry_bytes` 都是 JSON payload 的逻辑字节，不是 RSS。`local_*` 统计 L1 查找；`remote_*` 统计共享后端的有效命中和明确未命中；`oversize_bypasses` 表示共享后端命中可服务但未提升到 L1；`oversize_rejections` 只统计 Memory 模式因字节预算无法保留的写入；`known_unavailable_errors` 只统计最终发出的上下文不可用 HTTP 409。
+
+`memory.process_bytes` 在 Linux/Docker 使用进程 RSS，非 Linux 无法读取 `/proc` 时回退到 Go `Sys`；`heap_alloc_bytes`、`heap_inuse_bytes`、`heap_released_bytes` 和 `num_gc` 来自同一次 Go runtime 采样。缓存逻辑预算不包含 Go 对象或 allocator 开销，不能当作进程内存硬上限。
+
+滚动升级时，旧后端响应可能不包含 `response_cache` 或新的 heap/GC 字段；新版管理前端会显示兼容等待状态或隐藏缺失的 heap 行。
 
 ### 模型管理
 
@@ -1754,11 +1859,12 @@ curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
 | 401    | 认证失败                 |
 | 403    | 权限不足                 |
 | 404    | 资源不存在               |
+| 409    | 资源冲突或上一响应上下文不可用 |
 | 429    | 请求过于频繁（限流）     |
 | 499    | 客户端断开连接           |
 | 500    | 服务器内部错误           |
 | 502    | 网关错误（上游服务异常） |
-| 503    | 服务不可用（账号池耗尽） |
+| 503    | 服务不可用（账号池耗尽或依赖的共享上下文后端暂时故障） |
 | 598    | 上游流中断               |
 
 ### 错误响应格式
@@ -1786,6 +1892,31 @@ curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
 | no_available_account             | 当前无可调度账号 | 稍后重试、启用账号或补充可用账号 |
 | account_pool_usage_limit_reached | 账号池额度耗尽   | 等待冷却或添加新账号             |
 | rate_limit_exceeded              | 限流触发         | 降低请求频率                     |
+| response_context_unavailable     | `previous_response_id` 所需上下文不可用 | 重新发送完整上下文或开始新的响应链 |
+| service_unavailable              | 依赖的共享上下文后端暂时不可用 | 退避后重试并检查 Redis 状态 |
+
+### Responses 上下文不可用
+
+在没有可用 relay fallback 时，以下情况会返回 HTTP 409：
+
+- Memory 模式命中已知超限/淘汰，或依赖的必需上下文普通缺失/已经过期。
+- Redis 模式读取到损坏的值，或逻辑上下文超过重建上限。
+
+```json
+{
+  "error": {
+    "code": "response_context_unavailable",
+    "message": "Previous response context is unavailable",
+    "type": "invalid_request_error",
+    "details": {
+      "field": "previous_response_id",
+      "message": "local_context_evicted"
+    }
+  }
+}
+```
+
+同一 `previous_response_id` 已确定不可用时，不要无条件重试；应重新发送完整必需上下文、开始新的响应链，或为后续请求调整缓存预算。若只是共享后端传输故障，依赖上下文的请求返回 HTTP 503、错误码为 `service_unavailable`，适合退避后重试并检查 Redis。
 
 ---
 

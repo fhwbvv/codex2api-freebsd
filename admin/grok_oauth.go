@@ -289,7 +289,7 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 	if in.Token == nil {
 		return 0, "", fmt.Errorf("token 为空")
 	}
-	clientID := auth.GrokDefaultOAuthClientID
+	clientID := auth.EffectiveGrokOAuthClientID()
 	subject := strings.TrimSpace(in.Subject)
 	if subject == "" {
 		subject = auth.GrokSubjectFromAccessToken(in.Token.AccessToken)
@@ -298,19 +298,23 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 	if email == "" {
 		email = subject
 	}
+	planType := strings.TrimSpace(in.Token.PlanType)
+	if planType == "" {
+		planType = auth.GrokPlanTypeFromAccessToken(in.Token.AccessToken)
+	}
 
 	credentials := map[string]interface{}{
 		"upstream_type": auth.UpstreamGrok,
-		// OAuth（device/sso/refresh）导入的是 grok.com 订阅账号，默认按免费档展示；
-		// billing 探针成功后会纠正为 SuperGrok / SuperGrok Heavy。旧值 "api" 混淆了
-		// "接入方式"与"订阅档位"，会让免费账号长期错显为 api。
-		"plan_type":           "free",
+		// access_token 的 tier claim 是套餐权威来源；缺失/无效 tier 保持空白。
 		"refresh_token":       in.Token.RefreshToken,
 		"access_token":        in.Token.AccessToken,
 		"expires_at":          in.Token.ExpiresAt.Format(time.RFC3339),
 		"grok_client_id":      clientID,
 		"grok_oidc_issuer":    auth.GrokDefaultOIDCIssuer,
 		"grok_token_endpoint": strings.TrimSpace(in.TokenEndpoint),
+	}
+	if planType != "" {
+		credentials["plan_type"] = planType
 	}
 	if in.Token.IDToken != "" {
 		credentials["id_token"] = in.Token.IDToken
@@ -355,7 +359,7 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 		BaseURL:           baseURL,
 		Models:            in.Models,
 		Email:             email,
-		PlanType:          "free",
+		PlanType:          planType,
 		GrokClientID:      clientID,
 		GrokOIDCIssuer:    auth.GrokDefaultOIDCIssuer,
 		GrokTokenEndpoint: strings.TrimSpace(in.TokenEndpoint),

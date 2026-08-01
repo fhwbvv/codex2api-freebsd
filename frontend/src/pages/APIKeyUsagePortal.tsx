@@ -30,6 +30,7 @@ import {
 import { api } from '../api'
 import { DEFAULT_SITE_LOGO, useBranding } from '../branding'
 import Pagination from '../components/Pagination'
+import CompactionBadges from '../components/CompactionBadges'
 import { useTheme } from '../hooks/useTheme'
 import { usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import type {
@@ -658,10 +659,11 @@ function QuotaCard({ data, quotaPercent }: { data: PublicAPIKeyUsageResponse; qu
 function WindowUsageCard({ limits, windows }: { limits: APIKeyLimits; windows: PublicAPIKeyUsageResponse['usage']['windows'] }) {
   const { t } = useTranslation()
   const rows = [
+    { label: t('keyUsage.windowToday'), usage: windows.today, costLimit: limits.cost_limit_daily ?? 0, tokenLimit: limits.token_limit_daily ?? 0 },
     { label: '5h', usage: windows.last_5h, costLimit: limits.cost_limit_5h ?? 0, tokenLimit: limits.token_limit_5h ?? 0 },
     { label: '7d', usage: windows.last_7d, costLimit: limits.cost_limit_7d ?? 0, tokenLimit: limits.token_limit_7d ?? 0 },
     { label: '30d', usage: windows.last_30d, costLimit: limits.cost_limit_30d ?? 0, tokenLimit: limits.token_limit_30d ?? 0 },
-  ]
+  ].filter((row) => row.usage)
   return (
     <PanelShell>
       <PanelHeader accent="cyan" icon={<Clock3 />} title={t('keyUsage.windows')} />
@@ -687,8 +689,46 @@ function WindowRow({ label, usage, costLimit, tokenLimit }: { label: string; usa
         <UsageLimitBar label="USD" used={formatUSD(usage.user_billed)} limit={costLimit > 0 ? formatUSD(costLimit) : '-'} percent={costPct} />
         <UsageLimitBar label="Tok" used={formatCompact(usage.tokens)} limit={tokenLimit > 0 ? formatCompact(tokenLimit) : '-'} percent={tokenPct} />
       </div>
+      <WindowResetHint usage={usage} />
     </div>
   )
+}
+
+// WindowResetHint 展示服务端下发的窗口重置/回落时刻(issue #460):
+// fixed(自然日)窗口有确定的清零时刻;sliding 窗口没有单一重置点,
+// 只有最早一笔用量滚出窗口、额度开始回落的时间。
+function WindowResetHint({ usage }: { usage: PublicAPIKeyWindowUsage }) {
+  const { t } = useTranslation()
+  if (usage.window_kind === 'fixed' && usage.reset_at) {
+    return (
+      <div className="mt-2 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>{t('keyUsage.resetsAt', { time: formatBeijingTime(usage.reset_at) })}</span>
+        <span className="tabular-nums">{t('keyUsage.resetRemaining', { duration: formatDurationUntil(usage.reset_at) })}</span>
+      </div>
+    )
+  }
+  if (usage.window_kind === 'sliding') {
+    return (
+      <div className="mt-2 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>{t('keyUsage.slidingWindow')}</span>
+        {usage.decay_at ? <span className="tabular-nums">{t('keyUsage.decayAt', { time: formatBeijingTime(usage.decay_at) })}</span> : null}
+      </div>
+    )
+  }
+  return null
+}
+
+// formatDurationUntil 计算距目标时刻的剩余时长(向上取整到分钟)。
+function formatDurationUntil(dateStr: string): string {
+  const diff = new Date(dateStr).getTime() - Date.now()
+  if (!Number.isFinite(diff) || diff <= 0) return '0m'
+  const totalMinutes = Math.ceil(diff / 60000)
+  const days = Math.floor(totalMinutes / 1440)
+  const hours = Math.floor((totalMinutes % 1440) / 60)
+  const minutes = totalMinutes % 60
+  if (days > 0) return `${days}d ${hours}h`
+  if (hours > 0) return `${hours}h ${minutes}m`
+  return `${minutes}m`
 }
 
 function LimitsCard({ limits }: { limits: APIKeyLimits }) {
@@ -700,9 +740,11 @@ function LimitsCard({ limits }: { limits: APIKeyLimits }) {
     [t('apiKeys.limits.cost5h'), limits.cost_limit_5h ? formatUSD(limits.cost_limit_5h) : ''],
     [t('apiKeys.limits.cost7d'), limits.cost_limit_7d ? formatUSD(limits.cost_limit_7d) : ''],
     [t('apiKeys.limits.cost30d'), limits.cost_limit_30d ? formatUSD(limits.cost_limit_30d) : ''],
+    [t('apiKeys.limits.costDaily'), limits.cost_limit_daily ? formatUSD(limits.cost_limit_daily) : ''],
     [t('apiKeys.limits.tokens5h'), limits.token_limit_5h ? formatCompact(limits.token_limit_5h) : ''],
     [t('apiKeys.limits.tokens7d'), limits.token_limit_7d ? formatCompact(limits.token_limit_7d) : ''],
     [t('apiKeys.limits.tokens30d'), limits.token_limit_30d ? formatCompact(limits.token_limit_30d) : ''],
+    [t('apiKeys.limits.tokensDaily'), limits.token_limit_daily ? formatCompact(limits.token_limit_daily) : ''],
   ]
   const visible = items.filter(([, value]) => value !== undefined && value !== '' && value !== 0)
   const hasModels = (limits.model_allow?.length ?? 0) > 0 || (limits.model_deny?.length ?? 0) > 0
@@ -976,9 +1018,10 @@ function RecentLogsTable({
                       >
                         {log.stream ? 'stream' : 'sync'}
                       </Badge>
-                      {log.compact ? (
-                        <Badge variant="outline" className="gap-0.5 border-transparent bg-teal-500/12 text-[11px] font-semibold text-teal-700 dark:bg-teal-500/20 dark:text-teal-300"><Box className="size-3" />{t('usage.compactRequest')}</Badge>
-                      ) : null}
+                      <CompactionBadges
+                        compact={log.compact}
+                        hasCompactionHistory={log.has_compaction_history}
+                      />
                     </div>
                   </TableCell>
                   <TableCell className="text-right">

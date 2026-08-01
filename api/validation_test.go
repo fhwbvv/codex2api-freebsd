@@ -256,6 +256,7 @@ func TestHTTPStatusCodeForCommonAPIErrors(t *testing.T) {
 	}{
 		{name: "auth", code: ErrCodeInvalidAPIKey, want: http.StatusUnauthorized},
 		{name: "rate limit", code: ErrCodeRateLimitReached, want: http.StatusTooManyRequests},
+		{name: "response context unavailable", code: ErrCodeResponseContextUnavailable, want: http.StatusConflict},
 		{name: "unsupported model", code: ErrCodeUnsupportedModel, want: http.StatusBadRequest},
 		{name: "upstream timeout", code: ErrCodeUpstreamTimeout, want: http.StatusInternalServerError},
 	}

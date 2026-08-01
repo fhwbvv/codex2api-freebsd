@@ -8,6 +8,7 @@ import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import ChannelFilter, { useUsageChannel } from '../components/ChannelFilter'
 import ChannelLogo from '../components/ChannelLogo'
+import CompactionBadges from '../components/CompactionBadges'
 import ModelLogo from '../components/ModelLogo'
 import Modal from '../components/Modal'
 import StateShell from '../components/StateShell'
@@ -31,7 +32,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -75,6 +76,30 @@ function ReasoningEffortBadge({ effort }: { effort: string }) {
   )
 }
 
+function InternalRequestBadge({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const reason = log.internal_reason?.trim()
+  if (!reason) return null
+
+  const label = reason === 'overflow_compact_summary'
+    ? t('usage.internalOverflowSummary')
+    : t('usage.internalRequest')
+  const title = log.parent_request_id?.trim()
+    ? t('usage.internalRequestParentTooltip', { parentRequestId: log.parent_request_id.trim() })
+    : t('usage.internalRequestTooltip')
+
+  return (
+    <Badge
+      variant="outline"
+      className="gap-0.5 whitespace-nowrap border-transparent bg-fuchsia-500/12 text-[11px] font-semibold text-fuchsia-700 dark:bg-fuchsia-500/20 dark:text-fuchsia-300"
+      title={title}
+    >
+      <Brain className="size-3" />
+      {label}
+    </Badge>
+  )
+}
+
 function getStatusBadgeClassName(statusCode: number): string {
   if (statusCode === 200) {
     return 'border-transparent bg-emerald-500/14 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300'
@@ -96,6 +121,7 @@ function getStatusBadgeClassName(statusCode: number): string {
 
 type UsagePresetRangeKey = 'today' | TimeRangeKey
 const USAGE_TIME_RANGE_OPTIONS: UsagePresetRangeKey[] = ['today', '1h', '6h', '24h', '7d', '30d']
+type UsageTypeFilter = '' | 'stream' | 'sync' | 'compact' | 'history'
 
 // 本页面局部的"自定义"区间标记。不污染全局 TimeRangeKey 类型 (Dashboard 等仍只识别预设档)。
 type UsageTimeRangeKey = UsagePresetRangeKey | 'custom'
@@ -1223,7 +1249,7 @@ function EmptyPanel({ accent, icon, text }: { accent: PanelAccentKey; icon: Reac
   )
 }
 
-type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'userAgent' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'wsAcquire' | 'tokensPerSec' | 'duration' | 'time'
+type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'userAgent' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'wsAcquire' | 'tokensPerSec' | 'timing' | 'time'
 
 const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string }> = [
   { key: 'status', labelKey: 'usage.tableStatus' },
@@ -1235,12 +1261,11 @@ const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string 
   { key: 'endpoint', labelKey: 'usage.tableEndpoint' },
   { key: 'type', labelKey: 'usage.tableType' },
   { key: 'token', labelKey: 'usage.tableToken' },
-  { key: 'cost', labelKey: 'usage.tableCost' },
   { key: 'cached', labelKey: 'usage.tableCached' },
-  { key: 'firstToken', labelKey: 'usage.tableFirstToken' },
   { key: 'wsAcquire', labelKey: 'usage.tableWsAcquire' },
+  { key: 'timing', labelKey: 'usage.tableTiming' },
   { key: 'tokensPerSec', labelKey: 'usage.tableTokensPerSec' },
-  { key: 'duration', labelKey: 'usage.tableDuration' },
+  { key: 'cost', labelKey: 'usage.tableCost' },
   { key: 'time', labelKey: 'usage.tableTime' },
 ]
 
@@ -1257,11 +1282,11 @@ const DEFAULT_USAGE_VISIBLE_COLUMNS: Record<UsageTableColumn, boolean> = {
   token: true,
   cost: true,
   cached: true,
-  firstToken: true,
   // 取得连接耗时属于深挖排障信息，默认隐藏，需在列设置中手动开启
   wsAcquire: false,
   tokensPerSec: true,
-  duration: true,
+  // 首字 + 总耗时聚合为「用时」一列
+  timing: true,
   time: true,
 }
 
@@ -1314,6 +1339,127 @@ function TokensPerSecCell({ log }: { log: UsageLog }) {
   )
 }
 
+function formatLatencyMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '-'
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
+  return `${Math.round(ms)}ms`
+}
+
+type TimingTone = 'good' | 'warn' | 'bad' | 'muted'
+
+function firstTokenTone(ms: number): TimingTone {
+  if (ms <= 0) return 'muted'
+  if (ms > 5000) return 'bad'
+  if (ms > 2000) return 'warn'
+  return 'good'
+}
+
+function durationTone(ms: number): TimingTone {
+  if (ms <= 0) return 'muted'
+  if (ms > 30000) return 'bad'
+  if (ms > 10000) return 'warn'
+  return 'good'
+}
+
+/** 数值色阶：在各自胶囊内单独表意快慢。 */
+const TIMING_VALUE_TONE: Record<TimingTone, string> = {
+  good: 'text-emerald-700 dark:text-emerald-300',
+  warn: 'text-amber-700 dark:text-amber-300',
+  bad: 'text-red-600 dark:text-red-400',
+  muted: 'text-muted-foreground',
+}
+
+/**
+ * 首字 / 耗时 用固定身份色胶囊区分（蓝 vs 紫），
+ * 扫表时即使数值色相同也能立刻分辨是哪一项。
+ */
+const TIMING_PILL_SHELL = {
+  first:
+    'bg-sky-500/12 ring-1 ring-inset ring-sky-500/25 dark:bg-sky-500/16 dark:ring-sky-400/30',
+  duration:
+    'bg-violet-500/12 ring-1 ring-inset ring-violet-500/25 dark:bg-violet-500/16 dark:ring-violet-400/30',
+  muted: 'bg-muted/60 ring-1 ring-inset ring-border',
+} as const
+
+const TIMING_PILL_LABEL = {
+  first: 'text-sky-700/85 dark:text-sky-300/90',
+  duration: 'text-violet-700/85 dark:text-violet-300/90',
+  muted: 'text-muted-foreground',
+} as const
+
+function TimingPill({
+  kind,
+  label,
+  valueMs,
+  tone,
+}: {
+  kind: 'first' | 'duration'
+  label: string
+  valueMs: number
+  tone: TimingTone
+}) {
+  const display = valueMs > 0 ? formatLatencyMs(valueMs) : '-'
+  const shell = tone === 'muted' ? TIMING_PILL_SHELL.muted : TIMING_PILL_SHELL[kind]
+  const labelClass = tone === 'muted' ? TIMING_PILL_LABEL.muted : TIMING_PILL_LABEL[kind]
+
+  return (
+    <span
+      className={cn(
+        'inline-flex h-5 items-center gap-0.5 rounded-full px-1.5 whitespace-nowrap',
+        shell,
+      )}
+    >
+      <span className={cn('text-[10px] font-semibold leading-none tracking-tight', labelClass)}>
+        {label}
+      </span>
+      <span
+        className={cn(
+          'font-mono text-[11px] font-bold tabular-nums leading-none',
+          TIMING_VALUE_TONE[tone],
+        )}
+      >
+        {display}
+      </span>
+    </span>
+  )
+}
+
+/** 首字 + 总耗时聚合列：横向双色胶囊，避免把整行撑高。 */
+function TimingCell({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const firstMs = log.first_token_ms || 0
+  const durationMs = log.duration_ms || 0
+  if (firstMs <= 0 && durationMs <= 0) {
+    return <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
+  }
+
+  const firstLabel = firstMs > 0 ? formatLatencyMs(firstMs) : '-'
+  const durationLabel = durationMs > 0 ? formatLatencyMs(durationMs) : '-'
+  const title = [
+    firstMs > 0 ? `${t('usage.timingFirst')}: ${firstLabel}` : null,
+    durationMs > 0 ? `${t('usage.timingDuration')}: ${durationLabel}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
+  return (
+    <div className="inline-flex items-center gap-1" title={title || undefined}>
+      <TimingPill
+        kind="first"
+        label={t('usage.timingFirst')}
+        valueMs={firstMs}
+        tone={firstTokenTone(firstMs)}
+      />
+      <TimingPill
+        kind="duration"
+        label={t('usage.timingDuration')}
+        valueMs={durationMs}
+        tone={durationTone(durationMs)}
+      />
+    </div>
+  )
+}
+
 function getInitialUsageVisibleColumns(): Record<UsageTableColumn, boolean> {
   try {
     const stored = localStorage.getItem(USAGE_VISIBLE_COLUMNS_KEY)
@@ -1323,6 +1469,12 @@ function getInitialUsageVisibleColumns(): Record<UsageTableColumn, boolean> {
         const defaults: Record<UsageTableColumn, boolean> = { ...DEFAULT_USAGE_VISIBLE_COLUMNS }
         for (const key of Object.keys(defaults) as UsageTableColumn[]) {
           if (key in parsed) defaults[key] = Boolean(parsed[key])
+        }
+        // 兼容旧版独立「首字 / 总耗时」列：任一开启则聚合列开启
+        if (!('timing' in parsed)) {
+          const oldFirst = 'firstToken' in parsed ? Boolean(parsed.firstToken) : true
+          const oldDuration = 'duration' in parsed ? Boolean(parsed.duration) : true
+          defaults.timing = oldFirst || oldDuration
         }
         return defaults
       }
@@ -1410,7 +1562,7 @@ export default function Usage() {
   const [filterApiKeyId, setFilterApiKeyId] = useState('')
   const [filterAccountId, setFilterAccountId] = useState(getInitialUsageAccountID)
   const [filterFast, setFilterFast] = useState('')
-  const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
+  const [filterType, setFilterType] = useState<UsageTypeFilter>('')
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [grokModelOptions, setGrokModelOptions] = useState<string[]>([])
@@ -1475,7 +1627,9 @@ export default function Usage() {
         apiKeyId: filterApiKeyId || undefined,
         accountId: filterAccountId || undefined,
         fast: filterFast || undefined,
-        stream: filterStream || undefined,
+        stream: filterType === 'stream' ? 'true' : filterType === 'sync' ? 'false' : undefined,
+        compact: filterType === 'compact' ? 'true' : undefined,
+        hasCompactionHistory: filterType === 'history' ? 'true' : undefined,
         channel: channel || undefined,
       })
       setLogs(res.logs ?? [])
@@ -1485,7 +1639,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream, channel])
+  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterType, channel])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -1586,7 +1740,7 @@ export default function Usage() {
   const avgDurationMs = stats?.avg_duration_ms ?? 0
   const successRequests = rangeRequests - Math.round(rangeRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
-  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterAccountId || filterStream || filterFast)
+  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterAccountId || filterType || filterFast)
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -1802,8 +1956,22 @@ export default function Usage() {
                   />
                 )}
               </div>
-              <div className="flex shrink-0 items-center gap-3">
+              <div className="flex shrink-0 items-center gap-2">
                 <span className="whitespace-nowrap text-xs text-muted-foreground">{logsLoading ? t('common.loading') : t('usage.recordsCount', { count: logsTotal })}</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={logsLoading}
+                  title={t('common.refresh')}
+                  aria-label={t('common.refresh')}
+                  onClick={() => {
+                    void reloadSilently()
+                    void loadLogs()
+                  }}
+                >
+                  <RefreshCw className={cn('size-3.5', logsLoading && 'animate-spin')} />
+                  {t('common.refresh')}
+                </Button>
                 <Button
                   variant="destructive"
                   size="sm"
@@ -1904,15 +2072,17 @@ export default function Usage() {
 
               {/* 类型下拉 */}
               <Select
-                className="w-28 shrink-0"
+                className="w-40 shrink-0"
                 compact
-                value={filterStream}
-                onValueChange={(v) => { setFilterStream(v as '' | 'true' | 'false'); setPage(1) }}
+                value={filterType}
+                onValueChange={(v) => { setFilterType(v as UsageTypeFilter); setPage(1) }}
                 placeholder={t('usage.allTypes')}
                 options={[
                   { label: t('usage.allTypes'), value: '' },
-                  { label: 'Stream', value: 'true' },
-                  { label: 'Sync', value: 'false' },
+                  { label: 'Stream', value: 'stream' },
+                  { label: 'Sync', value: 'sync' },
+                  { label: t('usage.compactionTrigger'), value: 'compact' },
+                  { label: t('usage.compactionHistory'), value: 'history' },
                 ]}
               />
 
@@ -1940,7 +2110,7 @@ export default function Usage() {
                     setFilterModel(''); setFilterEndpoint('')
                     setFilterApiKeyId('')
                     setFilterAccountId('')
-                    setFilterStream(''); setFilterFast('')
+                    setFilterType(''); setFilterFast('')
                     setPage(1)
                   }}
                   className="h-8 shrink-0 px-2.5 rounded-lg border border-border bg-background text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors inline-flex items-center gap-1 whitespace-nowrap"
@@ -1970,14 +2140,6 @@ export default function Usage() {
               <TooltipProvider>
               <div className="grid gap-3 lg:hidden">
                 {logs.map((log: UsageLog) => {
-                  const durationLabel = log.duration_ms > 1000
-                    ? `${(log.duration_ms / 1000).toFixed(1)}s`
-                    : `${log.duration_ms}ms`
-                  const firstTokenLabel = log.first_token_ms > 0
-                    ? (log.first_token_ms > 1000
-                      ? `${(log.first_token_ms / 1000).toFixed(1)}s`
-                      : `${log.first_token_ms}ms`)
-                    : null
                   return (
                     <div
                       key={log.id}
@@ -2021,6 +2183,11 @@ export default function Usage() {
                           >
                             {log.stream ? 'stream' : 'sync'}
                           </Badge>
+                          <CompactionBadges
+                            compact={log.compact}
+                            hasCompactionHistory={log.has_compaction_history}
+                          />
+                          <InternalRequestBadge log={log} />
                         </div>
                         <div className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
                           {formatBeijingTime(log.created_at)}
@@ -2057,29 +2224,14 @@ export default function Usage() {
                           </div>
                         </div>
                         <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCost')}</div>
-                          <div className="mt-1">
-                            <UsageCostCell log={log} />
+                          <div
+                            className="text-[11px] font-semibold text-muted-foreground"
+                            title={t('usage.tableTimingHint')}
+                          >
+                            {t('usage.tableTiming')}
                           </div>
-                        </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableDuration')}</div>
-                          <div className={`mt-1 font-mono tabular-nums ${log.duration_ms > 30000 ? 'text-red-500' : log.duration_ms > 10000 ? 'text-amber-500' : 'text-foreground'}`}>
-                            {durationLabel}
-                          </div>
-                        </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableFirstToken')}</div>
-                          <div className={`mt-1 font-mono tabular-nums ${
-                            !firstTokenLabel
-                              ? 'text-muted-foreground'
-                              : log.first_token_ms > 5000
-                                ? 'text-red-500'
-                                : log.first_token_ms > 2000
-                                  ? 'text-amber-500'
-                                  : 'text-emerald-500'
-                          }`}>
-                            {firstTokenLabel || '-'}
+                          <div className="mt-1.5">
+                            <TimingCell log={log} />
                           </div>
                         </div>
                         <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
@@ -2093,6 +2245,12 @@ export default function Usage() {
                             <TokensPerSecCell log={log} />
                           </div>
                         </div>
+                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCost')}</div>
+                          <div className="mt-1">
+                            <UsageCostCell log={log} />
+                          </div>
+                        </div>
                       </div>
                     </div>
                   )
@@ -2100,8 +2258,8 @@ export default function Usage() {
               </div>
               </TooltipProvider>
 
-              {/* Desktop table */}
-              <div className="data-table-shell hidden lg:block">
+              {/* Desktop table — denser py so multi-badge columns don't leave empty vertical air */}
+              <div className="data-table-shell usage-logs-table hidden lg:block">
                 <TooltipProvider>
                 <Table>
                   <TableHeader>
@@ -2115,10 +2273,18 @@ export default function Usage() {
                       {visibleColumns.endpoint && <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>}
                       {visibleColumns.type && <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>}
                       {visibleColumns.token && <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>}
-                      {visibleColumns.cost && <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>}
                       {visibleColumns.cached && <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>}
-                      {visibleColumns.firstToken && <TableHead className={usageTableHeadClass}><span title={t('usage.tableFirstTokenHint')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableFirstToken')}</span></TableHead>}
                       {visibleColumns.wsAcquire && <TableHead className={usageTableHeadClass}><span title={t('usage.wsAcquireTooltip')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableWsAcquire')}</span></TableHead>}
+                      {visibleColumns.timing && (
+                        <TableHead className={usageTableHeadClass}>
+                          <span
+                            title={t('usage.tableTimingHint')}
+                            className="cursor-help underline decoration-dotted underline-offset-2"
+                          >
+                            {t('usage.tableTiming')}
+                          </span>
+                        </TableHead>
+                      )}
                       {visibleColumns.tokensPerSec && (
                         <TableHead className={usageTableHeadClass}>
                           <span
@@ -2129,7 +2295,7 @@ export default function Usage() {
                           </span>
                         </TableHead>
                       )}
-                      {visibleColumns.duration && <TableHead className={usageTableHeadClass}>{t('usage.tableDuration')}</TableHead>}
+                      {visibleColumns.cost && <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>}
                       {visibleColumns.time && <TableHead className={usageTableHeadClass}>{t('usage.tableTime')}</TableHead>}
                     </TableRow>
                   </TableHeader>
@@ -2234,16 +2400,11 @@ export default function Usage() {
                             >
                               {log.stream ? 'stream' : 'sync'}
                             </Badge>
-                            {log.compact && (
-                              <Badge
-                                variant="outline"
-                                className="text-[11px] font-semibold gap-0.5 border-transparent bg-teal-500/12 text-teal-700 dark:bg-teal-500/20 dark:text-teal-300"
-                                title={t('usage.compactRequestTooltip')}
-                              >
-                                <Box className="size-3" />
-                                {t('usage.compactRequest')}
-                              </Badge>
-                            )}
+                            <CompactionBadges
+                              compact={log.compact}
+                              hasCompactionHistory={log.has_compaction_history}
+                            />
+                            <InternalRequestBadge log={log} />
                           </div>
                         </TableCell>}
                         {visibleColumns.token && <TableCell>
@@ -2263,9 +2424,6 @@ export default function Usage() {
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
                         </TableCell>}
-                        {visibleColumns.cost && <TableCell>
-                          <UsageCostCell log={log} />
-                        </TableCell>}
                         {visibleColumns.cached && <TableCell>
                           {log.cached_tokens > 0 ? (
                             <Badge variant="outline" className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
@@ -2275,13 +2433,6 @@ export default function Usage() {
                           ) : (
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
-                        </TableCell>}
-                        {visibleColumns.firstToken && <TableCell>
-                          {log.first_token_ms > 0 ? (
-                            <span className={`${usageTableMonoClass} ${log.first_token_ms > 5000 ? 'text-red-500' : log.first_token_ms > 2000 ? 'text-amber-500' : 'text-emerald-500'}`}>
-                              {log.first_token_ms > 1000 ? `${(log.first_token_ms / 1000).toFixed(1)}s` : `${log.first_token_ms}ms`}
-                            </span>
-                          ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
                         </TableCell>}
                         {visibleColumns.wsAcquire && <TableCell>
                           {(log.ws_acquire_ms ?? 0) > 0 ? (
@@ -2293,15 +2444,18 @@ export default function Usage() {
                             </span>
                           ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
                         </TableCell>}
+                        {visibleColumns.timing && (
+                          <TableCell>
+                            <TimingCell log={log} />
+                          </TableCell>
+                        )}
                         {visibleColumns.tokensPerSec && (
                           <TableCell>
                             <TokensPerSecCell log={log} />
                           </TableCell>
                         )}
-                        {visibleColumns.duration && <TableCell>
-                          <span className={`${usageTableMonoClass} ${log.duration_ms > 30000 ? 'text-red-500' : log.duration_ms > 10000 ? 'text-amber-500' : 'text-muted-foreground'}`}>
-                            {log.duration_ms > 1000 ? `${(log.duration_ms / 1000).toFixed(1)}s` : `${log.duration_ms}ms`}
-                          </span>
+                        {visibleColumns.cost && <TableCell>
+                          <UsageCostCell log={log} />
                         </TableCell>}
                         {visibleColumns.time && <TableCell className={`${usageTableMonoClass} text-muted-foreground whitespace-nowrap`}>
                           {formatBeijingTime(log.created_at)}

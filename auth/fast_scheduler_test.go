@@ -1108,3 +1108,27 @@ func TestStoreAPIKeyPlanFilterMatchesProLiteDistinctly(t *testing.T) {
 		t.Fatal("pro account should NOT be allowed by prolite-only filter")
 	}
 }
+
+func TestStoreAPIKeyAllowsConfiguredNoAffinityGroups(t *testing.T) {
+	primary := newFastSchedulerTestAccount(1, HealthTierHealthy, 120, 1)
+	primary.GroupIDs = []int64{10}
+	split := newFastSchedulerTestAccount(2, HealthTierHealthy, 110, 1)
+	split.GroupIDs = []int64{20}
+	other := newFastSchedulerTestAccount(3, HealthTierHealthy, 100, 1)
+	other.GroupIDs = []int64{30}
+
+	store := &Store{accounts: []*Account{primary, split, other}, maxConcurrency: 1}
+	store.rebuildAccountIndex()
+	store.SetAPIKeyAllowedGroups(1, []int64{10})
+	store.SetAPIKeyNoAffinityGroups(1, []int64{20})
+
+	if !store.APIKeyAllowsAccount(1, primary) {
+		t.Fatal("original group should remain authorized")
+	}
+	if !store.APIKeyAllowsAccount(1, split) {
+		t.Fatal("configured no-affinity group should be authorized for request-level routing")
+	}
+	if store.APIKeyAllowsAccount(1, other) {
+		t.Fatal("unconfigured group should remain unauthorized")
+	}
+}

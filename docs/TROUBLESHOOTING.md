@@ -8,6 +8,7 @@
 - [数据库问题](#数据库问题)
 - [账号池问题](#账号池问题)
 - [API 请求问题](#api-请求问题)
+  - [Responses 上下文连续请求](#症状-409-response_context_unavailable)
 - [性能问题](#性能问题)
 - [网络/代理问题](#网络代理问题)
 - [日志分析](#日志分析)
@@ -271,6 +272,54 @@ curl -s -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/accounts |
 2. 清理冷却状态的账号
 3. 等待冷却结束
 
+### 症状: 409 response_context_unavailable
+
+该错误表示 `previous_response_id` 所需上下文已经确定无法在当前路径重建。常见原因包括 Memory 模式下单条上下文超过 L1 准入预算、依赖上下文已被条数/字节 LRU 淘汰、必需上下文普通缺失或已经过期，或 Redis 值损坏、超过重建上限。
+
+```bash
+# 查看当前预算、逻辑占用、淘汰和不可用计数
+curl -s -H "X-Admin-Key: your-secret" \
+  http://localhost:8080/api/admin/ops/overview |
+  jq '.response_cache | {
+    effective_config,
+    applied_config,
+    entries,
+    max_entries,
+    current_bytes,
+    max_bytes,
+    count_evictions,
+    byte_evictions,
+    oversize_bypasses,
+    oversize_rejections,
+    known_unavailable_errors,
+    last_config_sync_at,
+    last_config_sync_error
+  }'
+```
+
+**处理建议:**
+
+1. 不要对同一个已确定不可用的 `previous_response_id` 做无条件重试；重新发送完整必需上下文或开始新的响应链。
+2. Memory 模式重点查看 `oversize_rejections`、`count_evictions` 和 `byte_evictions`。可在设置页调整本地总量/单条准入，但总量不是 RSS 硬上限。
+3. Redis 模式重点查看 `last_config_sync_error`、Redis 健康状态和 `reconstruct_max_bytes`。共享值在重建上限内但超过 L1 准入时会计入 `oversize_bypasses`，仍能服务请求，不需要仅为该计数扩大 L1。
+
+### 症状: previous response context backend 返回 503
+
+当请求确实依赖上一响应的工具调用上下文，而共享 response-context 后端暂时不可用且没有可用 relay 后备时，会返回 HTTP 503、错误码 `service_unavailable`。
+
+```bash
+curl -s -H "X-Admin-Key: your-secret" \
+  http://localhost:8080/api/admin/ops/overview |
+  jq '{redis: .redis, response_cache: {
+    remote_hits: .response_cache.remote_hits,
+    remote_misses: .response_cache.remote_misses,
+    last_config_sync_at: .response_cache.last_config_sync_at,
+    last_config_sync_error: .response_cache.last_config_sync_error
+  }}'
+```
+
+先检查 Redis 网络、TLS、认证和连接池，再按退避策略重试。后端传输错误不会计入 `remote_misses`，因为它不是明确的缓存未命中。
+
 ---
 
 ## 性能问题
@@ -313,17 +362,24 @@ FAST_SCHEDULER_ENABLED=true
 **排查:**
 
 ```bash
-# 查看内存使用
+# 查看容器内存
 docker stats codex2api --no-stream
+
+# 对照进程 RSS、Go heap/GC 和 response-context 逻辑字节
+curl -s -H "X-Admin-Key: your-secret" \
+  http://localhost:8080/api/admin/ops/overview |
+  jq '{memory: .memory, response_cache: .response_cache}'
 
 # 查看 Go 内存分析（如启用 pprof）
 curl http://localhost:8080/debug/pprof/heap > heap.prof
 ```
 
+`response_cache.current_bytes`、`high_water_bytes` 和 `largest_entry_bytes` 是 JSON payload 的逻辑字节，不包含 Go 对象、切片、LRU、allocator 或容器开销，不能与 RSS 直接相加，也不能作为进程内存硬上限。Linux/Docker 的 `memory.process_bytes` 是进程 RSS；非 Linux 回退为 Go `Sys`。结合 `heap_alloc_bytes`、`heap_inuse_bytes`、`heap_released_bytes` 和 `num_gc` 判断堆增长与回收情况。
+
 **优化:**
 
 1. 限制日志保留时间
-2. 调整缓存过期时间
+2. 如果 L1 逻辑占用和高水位持续接近上限，可在设置页降低 `response_cache_local_max_bytes`；降低后会立即淘汰超出新预算的条目，并可能增加 Memory 模式的 409
 3. 减少并发连接数
 
 ---
@@ -493,7 +549,7 @@ echo "Redis: $cache_status"
 echo ""
 
 echo "[5/6] 系统资源..."
-curl -sf -H "X-Admin-Key: $ADMIN_KEY" "$BASE_URL/api/admin/ops/overview" 2>/dev/null | jq '{cpu: .cpu, memory: .memory}'
+curl -sf -H "X-Admin-Key: $ADMIN_KEY" "$BASE_URL/api/admin/ops/overview" 2>/dev/null | jq '{cpu: .cpu, memory: .memory, response_cache: .response_cache}'
 echo ""
 
 echo "[6/6] 最近错误..."

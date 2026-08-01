@@ -149,17 +149,16 @@ func (wc *WsConnection) recentInboundWithin(window time.Duration) bool {
 // IsExpired 检查连接是否过期
 func (wc *WsConnection) IsExpired() bool {
 	lastUsed := time.Unix(0, wc.lastUsed.Load())
-	return time.Since(lastUsed) > IdleTimeout
+	return time.Since(lastUsed) > connectionIdleTimeout()
 }
 
-// IsOverAge 检查连接是否超过最大寿命（MaxConnLifetime）。到龄连接不能再接新请求：
-// 上游按连接建立时间计 60 分钟寿命，撞线后 response.create 一律报错，但 Ping
-// 探活仍成功，必须按年龄主动识别。
+// IsOverAge 检查连接是否超过当前模式的最大寿命。到龄连接不能再接新请求：
+// 默认模式提前规避上游 60 分钟硬限制；弱网模式使用更短窗口主动轮换。
 func (wc *WsConnection) IsOverAge() bool {
 	if wc.createdAt == 0 {
 		return false
 	}
-	return time.Since(time.Unix(0, wc.createdAt)) > MaxConnLifetime
+	return time.Since(time.Unix(0, wc.createdAt)) > connectionMaxLifetime()
 }
 
 // IsConnected 检查是否已连接
@@ -334,7 +333,7 @@ func (m *Manager) cleanupLoop() {
 // evictExpired 清理过期连接和会话（含到龄且空闲的连接，主动轮转避免撞上游寿命上限）。
 // 有在途请求的连接/会话一律跳过：IsExpired 只看 lastUsed/LastActiveAt，上游长思考
 // 或 pong 丢失时会把活跃对象误判为空闲，直接 Close 会把在途流同秒批量截断
-// （issue #436）；等在途收尾（PendingRequestTimeout 兜底）后下一轮再清。
+// （issue #436）；等在途收尾（读路径业务帧静默上限 ActiveReadMaxTurnSilence 兜底）后下一轮再清。
 func (m *Manager) evictExpired() {
 	m.connections.Range(func(key, value any) bool {
 		wc := value.(*WsConnection)
@@ -1017,7 +1016,7 @@ func (m *Manager) probe(wc *WsConnection) bool {
 	if fn != nil {
 		return fn(wc)
 	}
-	if wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
+	if !weakNetworkModeEnabled() && wc != nil && wc.IsConnected() && wc.recentInboundWithin(probeRecencyWindow) && wc.readPumpReusable() {
 		return true
 	}
 	return probeConnection(wc)

@@ -142,6 +142,7 @@ func TestApplyRuntimeSettingsFromSystemCodexWebSocketRetrySettings(t *testing.T)
 		CodexWSHideUpstreamErrors: true,
 		CodexWSSilentRetryEnabled: true,
 		CodexWSSilentMaxRetries:   42,
+		CodexWSWeakNetworkMode:    true,
 	})
 
 	if !settings.CodexWSHideErrors {
@@ -152,6 +153,9 @@ func TestApplyRuntimeSettingsFromSystemCodexWebSocketRetrySettings(t *testing.T)
 	}
 	if settings.CodexWSSilentRetries != 10 {
 		t.Fatalf("CodexWSSilentRetries = %d, want 10", settings.CodexWSSilentRetries)
+	}
+	if !settings.CodexWSWeakNetworkMode {
+		t.Fatal("CodexWSWeakNetworkMode = false, want true")
 	}
 }
 

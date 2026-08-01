@@ -10,10 +10,12 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 // UpstreamGrok 标记 Grok CLI 上游账号（upstream_type 凭据字段取值）。
@@ -43,7 +45,64 @@ const (
 	GrokDefaultOAuthClientID    = "b1a00492-073a-47ea-816f-4c329264a828"
 	GrokDefaultOAuthScope       = "openid profile email offline_access grok-cli:access api:access"
 	GrokDefaultOAuthRedirectURI = "http://127.0.0.1:56121/callback"
+
+	// EnvGrokOAuthClientID 沿用既有 grokEnv 覆盖约定（类比 proxy 包的 GROK_CLIENT_VERSION / GROK_CLIENT_IDENTIFIER）：
+	// 留空回退到 GrokDefaultOAuthClientID，默认行为零变化。服务于多 client_id 部署、灰度对照与端点测试。
+	EnvGrokOAuthClientID = "GROK_OAUTH_CLIENT_ID"
 )
+
+// EffectiveGrokOAuthClientID 返回生效的 OAuth client_id，优先级从高到低：
+// 环境变量 GROK_OAUTH_CLIENT_ID > 系统设置 grok_config.oauth_client_id > 内置的官方
+// Grok CLI 公开 id。环境变量压在系统设置之上：它属于部署级配置，数据库里的值被误改
+// 或前端配错时仍能从部署侧兜住，且不需要进后台就能改回来。
+func EffectiveGrokOAuthClientID() string {
+	if v := GrokOAuthClientIDFromEnv(); v != "" {
+		return v
+	}
+	if v := ConfiguredGrokOAuthClientID(); v != "" {
+		return v
+	}
+	return GrokDefaultOAuthClientID
+}
+
+// GrokOAuthClientIDFromEnv 返回环境变量里配的 client_id（去空格后为空表示未设）。
+// 管理端用它告诉用户「系统设置里的值当前被环境变量盖掉了」。
+func GrokOAuthClientIDFromEnv() string {
+	return strings.TrimSpace(os.Getenv(EnvGrokOAuthClientID))
+}
+
+// configuredGrokOAuthClientID 是系统设置里配的 client_id，随设置热更新。
+var configuredGrokOAuthClientID atomic.Value // string
+
+// SetConfiguredGrokOAuthClientID 热更新系统设置里的 client_id（空 = 回落到内置默认）。
+func SetConfiguredGrokOAuthClientID(clientID string) {
+	configuredGrokOAuthClientID.Store(NormalizeGrokOAuthClientID(clientID))
+}
+
+// ConfiguredGrokOAuthClientID 返回系统设置里配的 client_id，未配置时为空。
+func ConfiguredGrokOAuthClientID() string {
+	v, _ := configuredGrokOAuthClientID.Load().(string)
+	return v
+}
+
+// GrokOAuthClientIDMaxLen 是 client_id 的长度上限。官方 id 是 36 字符的 UUID，
+// 留出余量即可；这个值会进授权 URL 与 token 表单，不接受超长/带空白的输入。
+const GrokOAuthClientIDMaxLen = 128
+
+// NormalizeGrokOAuthClientID 归一化 client_id：去首尾空白，含空白或控制字符、
+// 超长的一律视为未配置（返回空 = 回落到上一级）。
+func NormalizeGrokOAuthClientID(clientID string) string {
+	v := strings.TrimSpace(clientID)
+	if v == "" || len(v) > GrokOAuthClientIDMaxLen {
+		return ""
+	}
+	for _, r := range v {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return ""
+		}
+	}
+	return v
+}
 
 func (a *Account) isGrokAPILocked() bool {
 	if a == nil {
@@ -124,7 +183,8 @@ func (a *Account) GrokCredentials() (baseURL, bearer string) {
 }
 
 // GrokRateLimitSnapshot 是 Grok 上游逐请求返回的配额余量（x-ratelimit-* 响应头）。
-// 仅运行时保存，重启后由下一次请求恢复。
+// 内存实时更新;由 store 后台循环按分钟批量落库(grok_rate_limit 凭据),重启后恢复,
+// 账号列表的用量进度条不再因容器重启清零。
 type GrokRateLimitSnapshot struct {
 	LimitTokens       int64     `json:"limit_tokens,omitempty"`
 	RemainingTokens   int64     `json:"remaining_tokens,omitempty"`
@@ -135,6 +195,12 @@ type GrokRateLimitSnapshot struct {
 
 // SetGrokRateLimitSnapshot 更新配额余量快照（时间倒流的旧观测被忽略）。
 func (a *Account) SetGrokRateLimitSnapshot(snap GrokRateLimitSnapshot) {
+	a.setGrokRateLimitSnapshot(snap, true)
+}
+
+// setGrokRateLimitSnapshot 的 markDirty=false 供启动恢复用:恢复的值本来就来自
+// 库里,不需要再触发一轮落库。
+func (a *Account) setGrokRateLimitSnapshot(snap GrokRateLimitSnapshot, markDirty bool) {
 	if a == nil {
 		return
 	}
@@ -145,6 +211,24 @@ func (a *Account) SetGrokRateLimitSnapshot(snap GrokRateLimitSnapshot) {
 	}
 	copied := snap
 	a.grokRateLimit = &copied
+	if markDirty {
+		a.grokRateLimitDirty = true
+	}
+}
+
+// TakeGrokRateLimitSnapshotIfDirty 返回自上次持久化后有更新的快照并清除脏位;
+// 无更新时 ok=false。供 store 的分钟级批量落库循环调用。
+func (a *Account) TakeGrokRateLimitSnapshotIfDirty() (GrokRateLimitSnapshot, bool) {
+	if a == nil {
+		return GrokRateLimitSnapshot{}, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.grokRateLimitDirty || a.grokRateLimit == nil {
+		return GrokRateLimitSnapshot{}, false
+	}
+	a.grokRateLimitDirty = false
+	return *a.grokRateLimit, true
 }
 
 // GetGrokRateLimitSnapshot 返回配额余量快照；无观测时 ok=false。
@@ -158,6 +242,26 @@ func (a *Account) GetGrokRateLimitSnapshot() (GrokRateLimitSnapshot, bool) {
 		return GrokRateLimitSnapshot{}, false
 	}
 	return *a.grokRateLimit, true
+}
+
+// SetGrokContextWindow 记录上游 x-grok-context-window 的观测值（非正数忽略）。
+func (a *Account) SetGrokContextWindow(window int64) {
+	if a == nil || window <= 0 {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.grokContextWindow = window
+}
+
+// GetGrokContextWindow 返回上下文窗口观测值；未观测到时返回 0。
+func (a *Account) GetGrokContextWindow() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.grokContextWindow
 }
 
 // GrokFreeQuotaSnapshot 是免费额度耗尽时从上游 429 错误体解析出的权威用量
@@ -273,6 +377,7 @@ type GrokImportedCredential struct {
 	AccessToken   string
 	RefreshToken  string
 	APIKey        string
+	PlanType      string
 	ClientID      string
 	TokenEndpoint string
 	OIDCIssuer    string
@@ -361,6 +466,7 @@ func parseGrokCredentialNode(scope string, node map[string]any) (*GrokImportedCr
 	cred := &GrokImportedCredential{
 		AccessToken:   access,
 		RefreshToken:  refresh,
+		PlanType:      GrokPlanTypeFromAccessToken(access),
 		ClientID:      grokFirstString(node, "client_id", "clientId", "oidc_client_id", "oidcClientId"),
 		TokenEndpoint: grokFirstString(node, "token_endpoint", "tokenEndpoint"),
 		OIDCIssuer:    strings.TrimRight(grokFirstString(node, "oidc_issuer", "oidcIssuer", "issuer"), "/"),
@@ -482,6 +588,7 @@ type GrokTokenData struct {
 	AccessToken  string
 	RefreshToken string // 上游轮换时非空
 	IDToken      string
+	PlanType     string
 	ExpiresAt    time.Time
 }
 
@@ -509,7 +616,7 @@ func BuildGrokAuthorizationURL(params GrokAuthURLParams) (string, error) {
 	}
 	clientID := strings.TrimSpace(params.ClientID)
 	if clientID == "" {
-		clientID = GrokDefaultOAuthClientID
+		clientID = EffectiveGrokOAuthClientID()
 	}
 	scope := strings.TrimSpace(params.Scope)
 	if scope == "" {
@@ -600,7 +707,7 @@ func ExchangeGrokAuthorizationCode(ctx context.Context, params GrokExchangeCodeP
 	}
 	clientID := strings.TrimSpace(params.ClientID)
 	if clientID == "" {
-		clientID = GrokDefaultOAuthClientID
+		clientID = EffectiveGrokOAuthClientID()
 	}
 	redirectURI := strings.TrimSpace(params.RedirectURI)
 	if redirectURI == "" {
@@ -687,6 +794,7 @@ func ExchangeGrokAuthorizationCode(ctx context.Context, params GrokExchangeCodeP
 		AccessToken:  payload.AccessToken,
 		RefreshToken: payload.RefreshToken,
 		IDToken:      payload.IDToken,
+		PlanType:     GrokPlanTypeFromAccessToken(payload.AccessToken),
 		ExpiresAt:    expiresAt,
 	}, nil
 }
@@ -817,7 +925,7 @@ func RefreshGrokAccessToken(ctx context.Context, params GrokRefreshParams) (*Gro
 	}
 	if strings.TrimSpace(params.ClientID) == "" {
 		// 浏览器授权链路默认使用 Grok CLI 公开 client_id
-		params.ClientID = GrokDefaultOAuthClientID
+		params.ClientID = EffectiveGrokOAuthClientID()
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -898,6 +1006,7 @@ func RefreshGrokAccessToken(ctx context.Context, params GrokRefreshParams) (*Gro
 		AccessToken:  payload.AccessToken,
 		RefreshToken: payload.RefreshToken,
 		IDToken:      payload.IDToken,
+		PlanType:     GrokPlanTypeFromAccessToken(payload.AccessToken),
 		ExpiresAt:    expiresAt,
 	}, nil
 }
@@ -938,6 +1047,9 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 			if !forceRefresh && waitErr == nil && token != "" {
 				acc.mu.Lock()
 				acc.AccessToken = token
+				if planType := GrokPlanTypeFromAccessToken(token); planType != "" {
+					acc.PlanType = planType
+				}
 				if expiresAt := grokAccessTokenExpiry(token); !expiresAt.IsZero() {
 					acc.ExpiresAt = expiresAt
 				} else {
@@ -985,6 +1097,9 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 
 	acc.mu.Lock()
 	acc.AccessToken = td.AccessToken
+	if td.PlanType != "" {
+		acc.PlanType = td.PlanType
+	}
 	if td.RefreshToken != "" {
 		acc.RefreshToken = td.RefreshToken
 	}
@@ -1016,6 +1131,9 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 		credentials := map[string]interface{}{
 			"access_token": td.AccessToken,
 			"expires_at":   td.ExpiresAt.Format(time.RFC3339),
+		}
+		if td.PlanType != "" {
+			credentials["plan_type"] = td.PlanType
 		}
 		if td.RefreshToken != "" {
 			credentials["refresh_token"] = td.RefreshToken

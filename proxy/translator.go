@@ -1778,6 +1778,7 @@ type responsesBodyPrepareOptions struct {
 	forceStoreFalse            bool
 	expandPreviousResponse     bool
 	preservePreviousResponseID bool
+	cachedResponseItems        []json.RawMessage
 	// cacheOwner 是 previous_response_id 展开时使用的缓存归属命名空间
 	//（见 responseCacheOwner）。owner 不匹配的缓存按未命中处理，防跨用户注入。
 	cacheOwner string
@@ -1793,11 +1794,40 @@ func PrepareResponsesBody(rawBody []byte) ([]byte, string) {
 // PrepareResponsesBodyForOwner 同 PrepareResponsesBody，但 previous_response_id
 // 展开限定在 owner 的缓存命名空间内（owner 见 responseCacheOwner）。
 func PrepareResponsesBodyForOwner(rawBody []byte, owner string) ([]byte, string) {
-	return prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
+	prepared := prepareResponsesBodyForOwnerDetailed(rawBody, owner)
+	return prepared.Body, prepared.ExpandedInputRaw
+}
+
+type responsesBodyPreparation struct {
+	Body                 []byte
+	ExpandedInputRaw     string
+	PreviousResponseID   string
+	CacheLookup          responseCacheLookupResult
+	RequiresLocalContext bool
+	Bypassed             bool
+}
+
+func prepareResponsesBodyForOwnerDetailed(rawBody []byte, owner string) responsesBodyPreparation {
+	prevID := gjson.GetBytes(rawBody, "previous_response_id").String()
+	preparation := responsesBodyPreparation{PreviousResponseID: prevID}
+	if prevID != "" {
+		currentInput := gjson.GetBytes(rawBody, "input")
+		if currentInput.IsArray() && inputHasToolCallContext(currentInput) {
+			preparation.Bypassed = true
+		} else {
+			preparation.RequiresLocalContext = currentInput.IsArray() && inputHasFunctionCallOutput(currentInput)
+			preparation.CacheLookup = getResponseCacheResult(owner, prevID)
+		}
+	}
+	preparedBody, expandedInputRaw := prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
 		forceStoreFalse:        true,
-		expandPreviousResponse: true,
+		expandPreviousResponse: false,
 		cacheOwner:             owner,
+		cachedResponseItems:    preparation.CacheLookup.Items,
 	})
+	preparation.Body = preparedBody
+	preparation.ExpandedInputRaw = expandedInputRaw
+	return preparation
 }
 
 // PrepareResponsesWebSocketBody keeps upstream response storage linkage for
@@ -1960,8 +1990,12 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 
 	// 6. 展开 previous_response_id（限定在请求归属的缓存命名空间，防跨用户注入）
 	prevID, _ := body["previous_response_id"].(string)
-	if opts.expandPreviousResponse && prevID != "" {
-		if cached := getResponseCache(opts.cacheOwner, prevID); cached != nil {
+	if prevID != "" {
+		cached := opts.cachedResponseItems
+		if opts.expandPreviousResponse && cached == nil {
+			cached = getResponseCache(opts.cacheOwner, prevID)
+		}
+		if cached != nil {
 			var cachedItems []any
 			for _, item := range cached {
 				var v any
@@ -2080,15 +2114,20 @@ func PrepareCompactResponsesBody(rawBody []byte) ([]byte, string) {
 // PrepareCompactResponsesBodyForOwner 同 PrepareCompactResponsesBody，但
 // previous_response_id 展开限定在 owner 的缓存命名空间内。
 func PrepareCompactResponsesBodyForOwner(rawBody []byte, owner string) ([]byte, string) {
-	body, expandedInputRaw := PrepareResponsesBodyForOwner(rawBody, owner)
-	body, _ = sjson.DeleteBytes(body, "include")
-	body, _ = sjson.DeleteBytes(body, "store")
-	body, _ = sjson.DeleteBytes(body, "stream")
+	prepared := prepareCompactResponsesBodyForOwnerDetailed(rawBody, owner)
+	return prepared.Body, prepared.ExpandedInputRaw
+}
+
+func prepareCompactResponsesBodyForOwnerDetailed(rawBody []byte, owner string) responsesBodyPreparation {
+	prepared := prepareResponsesBodyForOwnerDetailed(rawBody, owner)
+	prepared.Body, _ = sjson.DeleteBytes(prepared.Body, "include")
+	prepared.Body, _ = sjson.DeleteBytes(prepared.Body, "store")
+	prepared.Body, _ = sjson.DeleteBytes(prepared.Body, "stream")
 	// 普通 /responses 请求携带的客户端指纹元数据,compact 端点不认识该参数
 	// (Unknown parameter: 'client_metadata')——body-signal 压缩提升会把普通
 	// 请求形状的 body 送进本函数,须在此剥除。
-	body, _ = sjson.DeleteBytes(body, "client_metadata")
-	return body, expandedInputRaw
+	prepared.Body, _ = sjson.DeleteBytes(prepared.Body, "client_metadata")
+	return prepared
 }
 
 // PrepareOpenAIResponsesCompactBody 为中转（OpenAI Responses API）账号准备
@@ -3071,12 +3110,18 @@ func newToolCallDeltaChunk(id, model string, created int64, tcIndex int, argsDel
 	return b
 }
 
-// newFinalChunk 构建最终流式块（含 finish_reason 和可选 usage）
+// newFinalChunk 构建最终流式块（含 finish_reason 和可选 usage）。
+//
+// delta 必须显式带上空对象:OpenAI 官方终结块形如
+// {"index":0,"delta":{},"finish_reason":"stop"},严格反序列化的客户端
+// (Rust/serde 系)把 delta 当必填字段,缺失会直接报
+// "missing field `delta`" 并让整轮对话失败。
 func newFinalChunk(id, model string, created int64, finishReason string, usage *UsageInfo) []byte {
 	chunk := openAIStreamChunk{
 		ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 		Choices: []streamChoice{{
 			Index:        0,
+			Delta:        &streamDelta{},
 			FinishReason: &finishReason,
 		}},
 		Usage: usage,

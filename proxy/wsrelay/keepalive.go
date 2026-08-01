@@ -14,6 +14,7 @@ import (
 //   - 不主动建立新连接、不发送任何 response.create 业务帧，因此不消耗账号额度；
 //   - 目的：避免空闲连接被上游/中间网络断开，下次复用时省去 TLS+握手冷启动，
 //     更接近官方 Codex CLI 的“长连接 + 低首字延迟”体验。
+//   - 弱网模式会暂停本保活，让连接按较短空闲窗口主动轮换。
 //
 // 当保活开关关闭时，KeepaliveTask 根本不会启动 goroutine，对现有系统零影响。
 
@@ -23,7 +24,7 @@ import (
 // 返回 (pinged, failed)：成功 Ping 数 与 失败数（失败的空闲连接会被 SendHeartbeat
 // 关闭并移除；快照后恰好被请求取走的连接只摘池，不关 socket，见 issue #436）。
 func (m *Manager) PingIdleConnections() (pinged int, failed int) {
-	if m == nil {
+	if m == nil || weakNetworkModeEnabled() {
 		return 0, 0
 	}
 	// 实际发送 Ping 的函数，可被测试替换（keepalivePingFunc 为 nil 时用默认 SendHeartbeat）。

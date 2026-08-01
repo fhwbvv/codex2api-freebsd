@@ -31,8 +31,10 @@ var (
 	grokClientIdentifier = grokEnv("GROK_CLIENT_IDENTIFIER", "grok-pager")
 	grokClientMode       = grokEnv("GROK_CLIENT_MODE", "interactive")
 	grokTokenAuth        = grokEnv("GROK_TOKEN_AUTH", "xai-grok-cli")
-	// x-compaction-at：CLI 声明的客户端侧压缩阈值（上游 context window 500k，CLI 报 400k）。
-	grokCompactionAt = grokEnv("GROK_COMPACTION_AT", "400000")
+	// x-compaction-at：CLI 声明的客户端侧压缩阈值。默认值对应实抓的
+	// context window 500k × 80%；环境变量非空时作为逃生阀直接覆盖推导结果。
+	grokCompactionAtOverride = strings.TrimSpace(os.Getenv("GROK_COMPACTION_AT"))
+	grokCompactionAtDefault  = "400000"
 )
 
 func grokEnv(key, fallback string) string {
@@ -40,6 +42,25 @@ func grokEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// grokCompactionThresholdPercent 是客户端压缩阈值占上下文窗口的比例。
+// 与上游 /v1/models 返回的 auto_compact_threshold_percent 一致：实抓的
+// context_window=500000、阈值 80%，官方 CLI 正是据此发出 x-compaction-at: 400000。
+const grokCompactionThresholdPercent = 80
+
+// grokCompactionAtForAccount 决定发给上游的 x-compaction-at。
+// 优先级：环境变量显式覆盖 > 按账号观测到的上下文窗口推导 > 默认值。
+// 观测值来自上游响应头，因此首个请求必然走默认值；观测到的窗口与默认假设一致时
+// 推导结果也与默认值相同，即行为不变、仅在上游改窗口后自动跟上。
+func grokCompactionAtForAccount(account *auth.Account) string {
+	if grokCompactionAtOverride != "" {
+		return grokCompactionAtOverride
+	}
+	if window := account.GetGrokContextWindow(); window > 0 {
+		return strconv.FormatInt(window*grokCompactionThresholdPercent/100, 10)
+	}
+	return grokCompactionAtDefault
 }
 
 // grokUserAgentOS 返回 UA 里的平台名。官方 CLI 用 "macos" 而非 Go 的 "darwin"。
@@ -83,8 +104,8 @@ func applyGrokRequestHeaders(req *http.Request, account *auth.Account, bearer st
 	req.Header.Set("x-grok-client-version", grokClientVersion)
 	req.Header.Set("x-grok-client-identifier", grokClientIdentifier)
 	req.Header.Set("x-grok-client-mode", grokClientMode)
-	if grokCompactionAt != "" {
-		req.Header.Set("x-compaction-at", grokCompactionAt)
+	if compactionAt := grokCompactionAtForAccount(account); compactionAt != "" {
+		req.Header.Set("x-compaction-at", compactionAt)
 	}
 	if !isAPIKey {
 		req.Header.Set("x-xai-token-auth", grokTokenAuth)
@@ -138,16 +159,16 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 		proxyURL = proxyOverride
 	}
 
-	// Grok 上游不接受 Codex 的 namespace 分组工具与 web_search 控制字段，投递前归一化：
-	// namespace 展平成子 function 并记录别名（响应流里再反解回 {name, namespace}），
-	// web_search 降级为最小形态。
-	requestBody, nsAliases := normalizeGrokUpstreamTools(requestBody)
-	// Grok 上游不认识 Codex 专属字段，投递前剥离。
-	requestBody = sanitizeGrokRequestBody(requestBody)
+	// 投递前一次性归一化：namespace 分组工具展平成子 function 并记录别名（响应流里再
+	// 反解回 {name, namespace}）、web_search 降级为最小形态、历史项按 Grok 原生契约重建、
+	// Codex 专属字段剥离、思考强度钳制，顺带算出轮次序号与模型名。
+	preflight := prepareGrokUpstreamBody(requestBody)
+	requestBody = preflight.Body
+	nsAliases := preflight.Aliases
 
 	endpoint := grokResponsesEndpoint(baseURL)
-	turnIdx := grokTurnIndex(requestBody)
-	model := gjson.GetBytes(requestBody, "model").String()
+	turnIdx := preflight.TurnIndex
+	model := preflight.Model
 
 	send := func(body []byte) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -193,7 +214,7 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 			resp.Body = io.NopCloser(bytes.NewReader(errBody))
 		}
 	}
-	recordGrokRateLimitHeaders(account, resp.Header)
+	recordGrokUpstreamObservations(account, resp.Header)
 	// 请求侧展平过 namespace 工具时，把上游响应里的扁平函数名反解回 {name, namespace}。
 	if len(nsAliases) > 0 && resp.Body != nil {
 		streaming := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream")
@@ -204,6 +225,32 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 		}
 	}
 	return resp, nil
+}
+
+// recordGrokUpstreamObservations 采集上游逐请求返回的运行时观测：配额余量头
+// （x-ratelimit-*）与上下文窗口（x-grok-context-window）。两者互不依赖，
+// 缺一个不影响另一个。
+func recordGrokUpstreamObservations(account *auth.Account, header http.Header) {
+	if account == nil || header == nil {
+		return
+	}
+	recordGrokRateLimitHeaders(account, header)
+	if window := parseGrokPositiveHeader(header, "x-grok-context-window"); window > 0 {
+		account.SetGrokContextWindow(window)
+	}
+}
+
+// parseGrokPositiveHeader 解析正整数响应头；缺失或非法返回 0。
+func parseGrokPositiveHeader(header http.Header, key string) int64 {
+	raw := strings.TrimSpace(header.Get(key))
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
 }
 
 // recordGrokRateLimitHeaders 采集上游逐请求返回的配额余量头（x-ratelimit-*），
@@ -252,6 +299,28 @@ func sanitizeGrokRequestBody(body []byte) []byte {
 		}
 	}
 	body = clampGrokReasoningEffort(body)
+	body = dropGrokToolChoiceWithoutTools(body)
+	return body
+}
+
+// dropGrokToolChoiceWithoutTools 在没有工具声明时撤掉残留的 tool_choice。Grok 上游对
+// "设了 tool_choice 但 tools 为空" 硬校验（400 invalid-argument "A tool_choice was set on
+// the request but no tools were specified."），Codex/ChatGPT 上游则容忍，因此只在 Grok 侧归一。
+// 两种来源都要兜住：客户端压缩轮自带 tools:[] + tool_choice:"auto"（issue #450），以及归一化
+// 把工具全剥空后残留的选择（如 external_web_access:false 丢弃唯一的 web_search 工具）。
+// 没有工具时 tool_choice 本就无意义，删除对语义无损。
+func dropGrokToolChoiceWithoutTools(body []byte) []byte {
+	if !gjson.GetBytes(body, "tool_choice").Exists() {
+		return body
+	}
+	// 仅在 tools 缺失或为空数组时动手：非数组形态属于畸形请求，保持原样交给上游报错。
+	tools := gjson.GetBytes(body, "tools")
+	if tools.Exists() && (!tools.IsArray() || len(tools.Array()) > 0) {
+		return body
+	}
+	if updated, err := sjson.DeleteBytes(body, "tool_choice"); err == nil {
+		return updated
+	}
 	return body
 }
 
@@ -311,7 +380,9 @@ func relayUpstreamEndpointForAccount(account *auth.Account) string {
 // FetchGrokModelIDs 用凭据探测 Grok 上游模型目录（GET /models），返回可用模型 ID
 // 列表（过滤 hidden；API Key 凭据只保留 supported_in_api 的模型）。
 // 条目兼容字符串与对象两种形态、data/models 两种容器（与 Grok CLI 目录响应一致）。
-func FetchGrokModelIDs(ctx context.Context, account *auth.Account) ([]string, error) {
+// proxyURL 由调用方解析(建议 store.ResolveProxyForAccount,与主请求路径同一套
+// 三级回退),避免未绑定代理的账号在探测时直连同一出口 IP。
+func FetchGrokModelIDs(ctx context.Context, account *auth.Account, proxyURL string) ([]string, error) {
 	baseURL, bearer := account.GrokCredentials()
 	if baseURL == "" || bearer == "" {
 		return nil, fmt.Errorf("grok 账号缺少可用凭据")
@@ -326,7 +397,7 @@ func FetchGrokModelIDs(ctx context.Context, account *auth.Account) ([]string, er
 	applyGrokRequestHeaders(req, account, bearer, nil)
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := getPooledClient(account, account.GetProxyURL()).Do(req)
+	resp, err := getPooledClient(account, proxyURL).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求 Grok 模型列表失败: %w", err)
 	}
@@ -387,11 +458,30 @@ func FetchGrokModelIDs(ctx context.Context, account *auth.Account) ([]string, er
 
 // ==================== 错误分类与冷却映射 ====================
 
-// DefaultGrokModelIDs 是 Grok 账号未声明 models 白名单时的默认可用文本模型集，
-// 用于把 grok-4.5 等注册进 /v1/models（与 Grok CLI 常见目录对齐）。账号显式声明
-// models 后以其白名单为准，不再补默认集。
-func DefaultGrokModelIDs() []string {
+// Grok 账号未声明 models 白名单时的默认可用文本模型集，用于注册进 /v1/models
+// 与放行调度。账号显式声明 models 后以其白名单为准，不再补默认集。
+//
+// 两条通道的目录并不相同，必须分开取：
+//   - OAuth 走 cli-chat-proxy，目录由 CLI 通道决定。实测 supergrok_heavy 与 free
+//     两种套餐的 GET /v1/models 都只返回 grok-4.5，不含 grok-3 / grok-2。
+//   - API Key 走 xAI 公开 API，目录更宽。
+//
+// 默认集只是探测不到时的兜底：账号导入或连通性测试跑过 FetchGrokModelIDs 后，
+// 应以探到的真实目录为准。
+func grokOAuthDefaultModelIDs() []string {
+	return []string{"grok-4.5"}
+}
+
+func grokAPIKeyDefaultModelIDs() []string {
 	return []string{"grok-4.5", "grok-4", "grok-3-fast", "grok-3", "grok-2"}
+}
+
+// DefaultGrokModelIDsForAccount 按账号的凭据类型返回默认可用文本模型集。
+func DefaultGrokModelIDsForAccount(account *auth.Account) []string {
+	if account != nil && account.GrokAuthKind() == auth.GrokAuthKindAPIKey {
+		return grokAPIKeyDefaultModelIDs()
+	}
+	return grokOAuthDefaultModelIDs()
 }
 
 // IsGrokFreeQuotaExhaustedError 识别免费额度耗尽（模型级，Grok 上游滚动 24h 窗口）。

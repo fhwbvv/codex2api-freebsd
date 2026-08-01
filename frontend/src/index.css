@@ -986,6 +986,19 @@
     background: color-mix(in oklab, var(--color-muted) 58%, transparent);
   }
 
+  /* 使用记录表：内容多为单行徽章/数字，收紧行高避免上下留白偏大 */
+  .usage-logs-table [data-slot="table-head"],
+  .usage-logs-table thead th {
+    height: 2rem;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+
+  .usage-logs-table [data-slot="table-cell"] {
+    padding-top: 0.375rem;
+    padding-bottom: 0.375rem;
+  }
+
   [data-slot="card"] {
     @apply rounded-xl shadow-sm transition-[border-color,box-shadow,transform,background-color] duration-200;
   }

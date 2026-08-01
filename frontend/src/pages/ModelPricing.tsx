@@ -129,9 +129,20 @@ function modelVersionParts(model: string): number[] {
   return matches.map((m) => Number(m)).filter((n) => Number.isFinite(n))
 }
 
-/** 比较模型名：置顶 sol/terra/luna，其余版本号高的在前；同版本再按字典序。 */
+/**
+ * 模型家族分组：Codex(gpt-*) 在前、Grok 在后。两家版本号各走各的（grok-4.5 与
+ * gpt-5.4 直接比数字没有意义），先按家族分块，块内再比版本。
+ */
+function modelFamilyRank(model: string): number {
+  return model.trim().toLowerCase().startsWith('grok') ? 1 : 0
+}
+
+/** 比较模型名：Codex 在前 Grok 在后，块内置顶 sol/terra/luna，其余版本号高的在前；同版本再按字典序。 */
 function compareModelsNewestFirst(a: string, b: string): number {
   if (a === b) return 0
+  const fa = modelFamilyRank(a)
+  const fb = modelFamilyRank(b)
+  if (fa !== fb) return fa - fb
   const ra = modelPreferredRank(a)
   const rb = modelPreferredRank(b)
   if (ra >= 0 || rb >= 0) {

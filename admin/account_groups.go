@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -87,7 +88,8 @@ func parseAccountGroupBaseConcurrencyOverride(raw json.RawMessage) (database.Opt
 	if strings.HasPrefix(trimmed, `"`) {
 		return database.OptionalNullInt64{}, errors.New("base_concurrency_override 必须是整数或 null")
 	}
-	return parseOptionalIntegerField(raw, "base_concurrency_override", 1, 50)
+	// 最小 1，无上限（与全局 max_concurrency / 账号级覆盖一致）
+	return parseOptionalIntegerField(raw, "base_concurrency_override", 1, math.MaxInt64)
 }
 
 func (h *Handler) CreateAccountGroup(c *gin.Context) {

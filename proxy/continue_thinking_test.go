@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/tidwall/gjson"
 )
@@ -642,5 +644,99 @@ func TestFoldClientGoneStopsContinuation(t *testing.T) {
 	), f)
 	if res.StopReason != continueStopClientGone {
 		t.Fatalf("StopReason = %q, want client_gone", res.StopReason)
+	}
+}
+
+// --- 隐藏轮下游保活 (issue #458) --------------------------------------------
+
+// keepaliveFold 构造带保活回调的折叠:openRound 延迟 openDelay 模拟慢续想轮。
+func keepaliveFold(t *testing.T, counter *atomic.Int32, keepaliveRet func() bool, openDelay time.Duration, round2 *http.Response) *continueFold {
+	t.Helper()
+	return &continueFold{
+		baseBody:  []byte(testBaseBody),
+		maxRounds: 8,
+		forward:   func([]byte) bool { return true },
+		observe:   func([]byte) {},
+		openRound: func([]byte) (*http.Response, error) {
+			time.Sleep(openDelay)
+			return round2, nil
+		},
+		clientGone:        func() bool { return false },
+		keepalive:         func() bool { counter.Add(1); return keepaliveRet() },
+		keepaliveInterval: 10 * time.Millisecond,
+	}
+}
+
+func fingerprintFirstRound() *http.Response {
+	return sseResponse(
+		evCreated(),
+		evReasoningAdded(1, 0),
+		evReasoningDone(2, 0, "enc-a"),
+		evCompleted(3, 100, 516, 516), // 516 命中指纹 → 进入隐藏续想
+	)
+}
+
+func cleanSecondRound() *http.Response {
+	return sseResponse(
+		evReasoningAdded(1, 0),
+		evReasoningDone(2, 0, "enc-b"),
+		evCompleted(3, 120, 900, 400),
+	)
+}
+
+func TestFoldKeepaliveFiresDuringHiddenRoundAndStopsAfterFold(t *testing.T) {
+	var counter atomic.Int32
+	f := keepaliveFold(t, &counter, func() bool { return true }, 80*time.Millisecond, cleanSecondRound())
+
+	res := runContinueThinkingFold(fingerprintFirstRound(), f)
+	if res.StopReason != continueStopClean || res.RoundsRun != 2 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	after := counter.Load()
+	if after < 1 {
+		t.Fatalf("openRound 延迟 80ms、间隔 10ms,保活至少应触发 1 次, got %d", after)
+	}
+
+	// fold 返回时 defer 已同步 join 保活 goroutine:之后不允许再有回调。
+	time.Sleep(50 * time.Millisecond)
+	if got := counter.Load(); got != after {
+		t.Fatalf("fold 返回后保活仍在触发: %d -> %d", after, got)
+	}
+}
+
+func TestFoldKeepaliveNotStartedOnCleanSingleRound(t *testing.T) {
+	var counter atomic.Int32
+	f := keepaliveFold(t, &counter, func() bool { return true }, 0, nil)
+	f.openRound = func([]byte) (*http.Response, error) {
+		t.Fatal("未命中指纹不应开续想轮")
+		return nil, nil
+	}
+
+	res := runContinueThinkingFold(sseResponse(
+		evCreated(),
+		evReasoningAdded(1, 0),
+		evReasoningDone(2, 0, "enc-a"),
+		evCompleted(3, 100, 600, 400), // 400 不命中指纹
+	), f)
+	if res.StopReason != continueStopClean || res.RoundsRun != 1 {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := counter.Load(); got != 0 {
+		t.Fatalf("单轮干净结束不进隐藏轮,保活不应触发, got %d", got)
+	}
+}
+
+func TestFoldKeepaliveStopsWhenCallbackReportsDeadClient(t *testing.T) {
+	var counter atomic.Int32
+	f := keepaliveFold(t, &counter, func() bool { return false }, 100*time.Millisecond, cleanSecondRound())
+
+	res := runContinueThinkingFold(fingerprintFirstRound(), f)
+	if res.StopReason != continueStopClean {
+		t.Fatalf("unexpected result: %+v", res)
+	}
+	// 回调首次返回 false 即停表:openRound 100ms 里 10ms 间隔本可触发 ~10 次。
+	if got := counter.Load(); got != 1 {
+		t.Fatalf("回调返回 false 后保活应立即停止, got %d 次", got)
 	}
 }

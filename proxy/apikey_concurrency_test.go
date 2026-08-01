@@ -123,6 +123,29 @@ func TestAcquireAPIKeyConcurrencyUsesPerHandlerLimiter(t *testing.T) {
 	}
 }
 
+func TestAcquireAPIKeyConcurrencyInheritedByInternalChild(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{}
+	row := &database.APIKeyRow{ID: 7, Limits: database.APIKeyLimits{MaxConcurrency: 1}}
+
+	parent, _ := testAPIKeyConcurrencyContext(row)
+	releaseParent, ok := handler.acquireAPIKeyConcurrency(parent)
+	if !ok || releaseParent == nil {
+		t.Fatalf("parent acquire ok=%v releaseNil=%v, want acquired", ok, releaseParent == nil)
+	}
+	defer releaseParent()
+
+	child, recorder := testAPIKeyConcurrencyContext(row)
+	child.Set(contextAPIKeyConcurrencyInherited, true)
+	releaseChild, ok := handler.acquireAPIKeyConcurrency(child)
+	if !ok || releaseChild != nil {
+		t.Fatalf("inherited child acquire ok=%v releaseNil=%v, want bypass", ok, releaseChild == nil)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("inherited child status = %d, want untouched 200", recorder.Code)
+	}
+}
+
 func testAPIKeyConcurrencyContext(row *database.APIKeyRow) (*gin.Context, *httptest.ResponseRecorder) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)

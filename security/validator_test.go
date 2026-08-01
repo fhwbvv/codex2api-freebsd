@@ -140,8 +140,14 @@ func TestValidateModelName(t *testing.T) {
 	}{
 		{"gpt-5.4", false},
 		{"gpt-5-codex", false},
+		{"openrouter/gpt-5:free", false},
+		{"claude@20250728", false},
+		{"provider/model+preview", false},
+		{"自定义模型/预览版", false},
 		{"", false},                      // empty is allowed
-		{strings.Repeat("a", 101), true}, // too long
+		{strings.Repeat("a", 256), true}, // too long
+		{"bad model", true},              // whitespace is not allowed
+		{"bad\nmodel", true},             // control characters are not allowed
 		{"model<script>", true},          // invalid chars
 	}
 

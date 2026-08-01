@@ -449,3 +449,53 @@ func (tc *MemoryTokenCache) DeleteRuntime(ctx context.Context, namespace string,
 	tc.mu.Unlock()
 	return nil
 }
+
+// IncrRuntimeCounters 在单锁内累加计数器。计数器以 JSON 对象存在 runtime 表里，
+// 语义与 Redis 的 HINCRBYFLOAT 一致，但只对本进程可见。
+func (tc *MemoryTokenCache) IncrRuntimeCounters(ctx context.Context, namespace string, key string, deltas map[string]float64, ttl time.Duration) error {
+	mapKey := runtimeMapKey(namespace, key)
+	if mapKey == "" || len(deltas) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	counters := make(map[string]float64)
+	if entry, ok := tc.runtime[mapKey]; ok {
+		if entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt) {
+			_ = json.Unmarshal(entry.value, &counters)
+		}
+	}
+	for field, delta := range deltas {
+		if delta == 0 {
+			continue
+		}
+		counters[field] += delta
+	}
+	encoded, err := json.Marshal(counters)
+	if err != nil {
+		return err
+	}
+	tc.runtime[mapKey] = memoryRuntimeEntry{
+		value:     encoded,
+		expiresAt: time.Now().Add(ttl),
+	}
+	return nil
+}
+
+func (tc *MemoryTokenCache) GetRuntimeCounters(ctx context.Context, namespace string, key string) (map[string]float64, error) {
+	raw, ok, err := tc.GetRuntime(ctx, namespace, key)
+	if err != nil || !ok || len(raw) == 0 {
+		return nil, err
+	}
+	counters := make(map[string]float64)
+	if err := json.Unmarshal(raw, &counters); err != nil {
+		return nil, nil
+	}
+	return counters, nil
+}
+
+// SharedAcrossInstances 报告进程内内存缓存不跨实例共享。
+func (tc *MemoryTokenCache) SharedAcrossInstances() bool { return false }

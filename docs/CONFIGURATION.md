@@ -129,11 +129,32 @@ Codex2API 采用三层配置架构：
 
 系统设置存储在数据库的 `SystemSettings` 表中，可通过管理后台 `/admin/settings` 实时修改。
 
+### Responses 上下文缓存
+
+Responses 连续请求会按 `previous_response_id` 重建上下文。每个 Codex2API 进程都有一层有界 L1 缓存，三个字节预算保存在数据库中；管理台用整数 MiB 展示和修改，管理 API 使用原始字节数。
+
+| 管理 API 字段 | 默认值 | 设置页范围 | 说明 |
+|------|------|------|------|
+| `response_cache_local_max_bytes` | 67,108,864 bytes（64 MiB） | 整数 8-4096 MiB | 单个进程 L1 可保留的逻辑 JSON payload 总量 |
+| `response_cache_local_max_entry_bytes` | 8,388,608 bytes（8 MiB） | 整数 1-256 MiB | 单条上下文进入 L1 的上限，且不能超过本地总量 |
+| `response_cache_reconstruct_max_bytes` | 67,108,864 bytes（64 MiB） | 整数 8-512 MiB | 从共享后端读取并重建一条上下文时允许的逻辑 payload 上限 |
+| `response_cache_config_generation` | 1 | 只读 | 配置发生实际变化时递增；客户端不能写入 |
+
+设置页会把三个预算作为一个原子更新发送。管理 API 也支持只提交部分预算，服务端会在数据库事务中与当前值合并并校验，提交成功后才应用到本实例。固定边界不随这三个设置变化：最多 2,000 条、10 分钟绝对 TTL、每条最多 200 个 raw item。降低预算会立即收缩本地 L1，并可能淘汰已有上下文。
+
+Redis 模式会把 response context 保存到共享后端。后端值在重建上限内但超过 L1 单条或总量准入预算时，仍可服务当前请求，但不会提升到本地 L1。Memory 模式只保留本进程 L1，不存在第二份共享 response context；已知超限/淘汰，或依赖的必需上下文缺失/过期时，可能导致 HTTP `409 response_context_unavailable`。Redis 值损坏或超过重建上限且无法走 relay 后备时也可能返回 409。共享后端暂时不可用时，依赖该上下文且无法走 relay 后备的请求可能返回 HTTP `503`。
+
+只有预算实际变化时才会分配并递增 generation；同值更新或空更新不会递增。当前实例在数据库提交后立即应用，其他实例每 5 秒轮询一次，只应用更新的 generation；单次读取最多等待 3 秒。同步失败时保留最后一次有效配置，并在运维页显示错误，后续轮询成功后自动恢复。
+
+这些预算只控制本地重建的 HTTP Responses/Compact 上下文。客户端原生 Responses WebSocket 入口不查询本地 response cache，会保留 `previous_response_id` 交给上游处理。
+
+这里的“字节”是保留 `json.RawMessage` 长度之和，不包含 map、切片、LRU、Go 堆或容器开销，因此不是 RSS 或进程内存硬上限。滚动升级时，新前端对旧后端缺失的设置使用 64/8/64 MiB 展示默认值、generation `0`；旧后端缺少 response-cache 运维对象时，前端显示兼容等待状态而不会崩溃。
+
 ### 调度配置
 
 | 字段 | 类型 | 默认值 | 范围 | 说明 |
 |------|------|--------|------|------|
-| `MaxConcurrency` | int | 2 | 1-50 | 单账号最大并发请求数 |
+| `MaxConcurrency` | int | 2 | ≥1（无上限） | 单账号最大并发请求数 |
 | `GlobalRPM` | int | 0 | 0-∞ | 全局每分钟请求限制，0 表示不限 |
 | `MaxRetries` | int | 3 | 0-10 | 请求失败最大重试次数 |
 | `MaxRateLimitRetries` | int | 2 | 0-10 | 遇到 429 限流时的最大额外重试次数 |
@@ -175,7 +196,7 @@ Codex2API 采用三层配置架构：
 | `credit_enabled` | bool | false | 标记账号为信用计费模式 |
 | `credit_skip_usage_window` | bool | false | 跳过 7 天/5 小时用量窗口惩罚（适用于信用账号） |
 | `score_bias_override` | int/null | null | 手工覆盖调度权重分，`null` 跟随套餐默认 |
-| `base_concurrency_override` | int/null | null | 手工覆盖基础并发值，`null` 时先继承所属分组的最小有效值，再回退到全局默认 |
+| `base_concurrency_override` | int/null | null | 手工覆盖基础并发值（`≥1` 无上限）；`null` 时先继承所属分组的最小有效值，再回退到全局默认 |
 | `scheduler_priority` | int/null | null | 严格调度优先级（`-100..100`）；`null` 恢复默认值 `0` |
 | `skip_warm_tier` | bool | false | 跳过 warm 层级；仅把 warm 提升为 healthy，不覆盖 risky/banned |
 
@@ -183,7 +204,7 @@ Codex2API 采用三层配置架构：
 
 ### 分组级基础并发
 
-账号分组可设置 `base_concurrency_override`（`1..50`，`null` 表示不覆盖）。基础并发按“账号显式覆盖 > 所属分组中最小的有效值 > 全局 `max_concurrency`”解析；最终动态并发仍会受健康档位、用量保护和智能配速限制。
+账号分组可设置 `base_concurrency_override`（`≥1`，无上限，`null` 表示不覆盖）。基础并发按“账号显式覆盖 > 所属分组中最小的有效值 > 全局 `max_concurrency`”解析；最终动态并发仍会受健康档位、用量保护和智能配速限制。
 
 ### WebSocket 连接池与 1009 降级
 
@@ -391,7 +412,7 @@ curl -H "X-Admin-Key: your-secret" http://localhost:8080/api/admin/ops/overview
 
 ### Q: 如何查看当前生效的配置？
 
-**A:** 通过管理后台 `/admin/settings` 页面，可查看所有系统设置及配置来源（env/database）。
+**A:** 通过管理后台 `/admin/settings` 页面可查看系统设置及配置来源（env/database）。Responses 上下文缓存的本实例 effective/applied generation、最近同步时间和同步错误可在 `/admin/ops` 查看。
 
 ### Q: 配置错误导致无法启动怎么办？
 

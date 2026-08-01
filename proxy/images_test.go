@@ -401,7 +401,7 @@ func TestNextImageAccountPrefersPlusOrHigherPlan(t *testing.T) {
 	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "plus-token", PlanType: "plus"})
 	handler := &Handler{store: store}
 
-	account, _ := handler.nextImageAccount(0, nil, "")
+	account, _ := handler.nextImageAccount(nil, 0, nil, "", requestSessionIdentity{})
 	if account == nil {
 		t.Fatal("nextImageAccount returned nil")
 	}
@@ -417,7 +417,7 @@ func TestNextImageAccountFallsBackToFreeWhenNoPaidAccountAvailable(t *testing.T)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "free-token", PlanType: "free"})
 	handler := &Handler{store: store}
 
-	account, _ := handler.nextImageAccount(0, nil, "")
+	account, _ := handler.nextImageAccount(nil, 0, nil, "", requestSessionIdentity{})
 	if account == nil {
 		t.Fatal("nextImageAccount returned nil")
 	}
@@ -730,5 +730,40 @@ func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: image_generation.completed\n") {
 		t.Fatalf("stream body missing completed event: %q", body)
+	}
+}
+
+// TestNextImageAccountHonorsNoAffinitySplit 生图也要守分流：无指纹的生图请求只能落到
+// 分流组，带指纹的必须避开分流组——否则 store 层放宽了授权，生图流量会两个方向都走反。
+func TestNextImageAccountHonorsNoAffinitySplit(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "primary-token", PlanType: "plus", GroupIDs: []int64{10}})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "split-token", PlanType: "plus", GroupIDs: []int64{20}})
+	handler := &Handler{store: store}
+
+	newContext := func() *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Set(contextAPIKeyRow, &database.APIKeyRow{
+			Limits: database.APIKeyLimits{NoAffinityGroupIDs: []int64{20}},
+		})
+		return c
+	}
+
+	noFingerprint, _ := handler.nextImageAccount(newContext(), 0, nil, "", requestSessionIdentity{})
+	if noFingerprint == nil {
+		t.Fatal("nextImageAccount returned nil for a request without a fingerprint")
+	}
+	defer store.Release(noFingerprint)
+	if noFingerprint.DBID != 2 {
+		t.Fatalf("request without a fingerprint picked account %d, want the split account 2", noFingerprint.DBID)
+	}
+
+	fingerprinted, _ := handler.nextImageAccount(newContext(), 0, nil, "", requestSessionIdentity{hasRequestFingerprint: true})
+	if fingerprinted == nil {
+		t.Fatal("nextImageAccount returned nil for a fingerprinted request")
+	}
+	defer store.Release(fingerprinted)
+	if fingerprinted.DBID != 1 {
+		t.Fatalf("fingerprinted request picked account %d, want the non-split account 1", fingerprinted.DBID)
 	}
 }

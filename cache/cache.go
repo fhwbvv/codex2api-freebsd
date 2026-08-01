@@ -19,6 +19,32 @@ type SessionAffinityBinding struct {
 	ProxyURL  string `json:"proxy_url,omitempty"`
 }
 
+// ResponseContextReadStatus classifies a bounded shared-backend lookup without
+// changing the TokenCache compatibility interface.
+type ResponseContextReadStatus uint8
+
+const (
+	ResponseContextReadMiss ResponseContextReadStatus = iota
+	ResponseContextReadFound
+	ResponseContextReadTooLarge
+	ResponseContextReadCorrupt
+)
+
+// ResponseContextReadResult is returned by optional bounded response-context
+// readers. Transport failures remain ordinary errors.
+type ResponseContextReadResult struct {
+	Status ResponseContextReadStatus
+	Items  []json.RawMessage
+}
+
+// BoundedResponseContextReader is an additive capability for shared backends.
+// Implementations may reject oversized wire values before deserialization.
+// TokenCache implementations that do not provide it remain supported through
+// GetResponseContext followed by a logical-size check in the proxy.
+type BoundedResponseContextReader interface {
+	GetResponseContextBounded(ctx context.Context, responseID string, maxWireBytes int64) (ResponseContextReadResult, error)
+}
+
 // TokenCache 统一的 token 缓存、刷新锁与短期运行态缓存接口。
 type TokenCache interface {
 	Driver() string
@@ -44,4 +70,13 @@ type TokenCache interface {
 	SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error
 	GetRuntime(ctx context.Context, namespace string, key string) (json.RawMessage, bool, error)
 	DeleteRuntime(ctx context.Context, namespace string, key string) error
+	// IncrRuntimeCounters 原子累加一组浮点计数器（同一 key 下的多个字段），并刷新过期时间。
+	// Redis 驱动落成一次 pipeline 的 HINCRBYFLOAT，用于跨实例共享短窗口增量；
+	// 内存驱动在单锁内完成，语义一致但只对本进程可见。
+	IncrRuntimeCounters(ctx context.Context, namespace string, key string, deltas map[string]float64, ttl time.Duration) error
+	// GetRuntimeCounters 读取 IncrRuntimeCounters 写入的全部字段。key 不存在时返回 nil。
+	GetRuntimeCounters(ctx context.Context, namespace string, key string) (map[string]float64, error)
+	// SharedAcrossInstances 表示运行态缓存是否跨实例共享（Redis 为 true，进程内内存为 false）。
+	// 调用方据此决定是否值得为跨实例一致性付额外的往返开销。
+	SharedAcrossInstances() bool
 }

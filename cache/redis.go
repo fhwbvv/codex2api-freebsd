@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -424,7 +425,11 @@ func (tc *redisTokenCache) SetResponseContext(ctx context.Context, responseID st
 	if ttl <= 0 {
 		ttl = 10 * time.Minute
 	}
-	record := redisResponseContextRecord{Items: items}
+	normalizedItems, err := NormalizeResponseContextItems(items)
+	if err != nil {
+		return err
+	}
+	record := redisResponseContextRecord{Items: normalizedItems}
 	payload, err := json.Marshal(record)
 	if err != nil {
 		return err
@@ -452,7 +457,48 @@ func (tc *redisTokenCache) GetResponseContext(ctx context.Context, responseID st
 	for i, item := range record.Items {
 		items[i] = append(json.RawMessage(nil), item...)
 	}
-	return items, nil
+	normalizedItems, err := NormalizeResponseContextItems(items)
+	if err != nil {
+		return nil, err
+	}
+	return normalizedItems, nil
+}
+
+// GetResponseContextBounded reads at most maxWireBytes+1 bytes so an oversized
+// Redis value can be rejected before the complete value is fetched or decoded.
+func (tc *redisTokenCache) GetResponseContextBounded(ctx context.Context, responseID string, maxWireBytes int64) (ResponseContextReadResult, error) {
+	responseID = strings.TrimSpace(responseID)
+	if responseID == "" {
+		return ResponseContextReadResult{Status: ResponseContextReadMiss}, nil
+	}
+	if maxWireBytes < 0 {
+		maxWireBytes = 0
+	}
+	val, err := tc.client.GetRange(ctx, responseContextKey(responseID), 0, maxWireBytes).Bytes()
+	if err == redis.Nil {
+		return ResponseContextReadResult{Status: ResponseContextReadMiss}, nil
+	}
+	if err != nil {
+		return ResponseContextReadResult{}, err
+	}
+	if len(val) == 0 {
+		return ResponseContextReadResult{Status: ResponseContextReadMiss}, nil
+	}
+	if int64(len(val)) > maxWireBytes {
+		return ResponseContextReadResult{Status: ResponseContextReadTooLarge}, nil
+	}
+	var record redisResponseContextRecord
+	if err := json.Unmarshal(val, &record); err != nil {
+		return ResponseContextReadResult{Status: ResponseContextReadCorrupt}, nil
+	}
+	if len(record.Items) == 0 {
+		return ResponseContextReadResult{Status: ResponseContextReadMiss}, nil
+	}
+	normalizedItems, err := NormalizeResponseContextItems(record.Items)
+	if err != nil {
+		return ResponseContextReadResult{Status: ResponseContextReadCorrupt}, nil
+	}
+	return ResponseContextReadResult{Status: ResponseContextReadFound, Items: normalizedItems}, nil
 }
 
 func (tc *redisTokenCache) SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error {
@@ -488,3 +534,54 @@ func (tc *redisTokenCache) DeleteRuntime(ctx context.Context, namespace string, 
 	}
 	return tc.client.Del(ctx, runtimeValueKey(namespace, key)).Err()
 }
+
+func (tc *redisTokenCache) IncrRuntimeCounters(ctx context.Context, namespace string, key string, deltas map[string]float64, ttl time.Duration) error {
+	key = strings.TrimSpace(key)
+	if key == "" || len(deltas) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	hashKey := runtimeValueKey(namespace, key)
+	_, err := tc.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for field, delta := range deltas {
+			if delta == 0 {
+				continue
+			}
+			pipe.HIncrByFloat(ctx, hashKey, field, delta)
+		}
+		pipe.Expire(ctx, hashKey, ttl)
+		return nil
+	})
+	return err
+}
+
+func (tc *redisTokenCache) GetRuntimeCounters(ctx context.Context, namespace string, key string) (map[string]float64, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, nil
+	}
+	raw, err := tc.client.HGetAll(ctx, runtimeValueKey(namespace, key)).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]float64, len(raw))
+	for field, value := range raw {
+		parsed, convErr := strconv.ParseFloat(value, 64)
+		if convErr != nil {
+			continue
+		}
+		out[field] = parsed
+	}
+	return out, nil
+}
+
+// SharedAcrossInstances 报告 Redis 运行态缓存跨实例共享。
+func (tc *redisTokenCache) SharedAcrossInstances() bool { return true }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
@@ -122,6 +123,38 @@ func sortModelKeysNewestFirst(keys []string) {
 	})
 }
 
+// grokBillingModelIDs 返回定价页要展示的 Grok 模型：各 Grok 账号声明白名单的并集，
+// 外加默认集（只要存在未声明白名单的 Grok 账号——这类账号按默认集对外放行）。
+// 没有 Grok 账号时返回空，纯 Codex 部署的定价页不受影响。
+func (h *Handler) grokBillingModelIDs() []string {
+	if h == nil || h.store == nil {
+		return nil
+	}
+	ids := h.grokChannelModels()
+	// 默认集按凭据类型不同（OAuth 走 CLI 通道、API Key 走公开 API），
+	// 两种通道各取一次，不能见到第一个未声明账号就收工。
+	oauthCovered, apiKeyCovered := false, false
+	for _, account := range h.store.Accounts() {
+		if !account.IsGrokAPI() || len(account.GrokModels()) > 0 {
+			continue
+		}
+		isAPIKey := account.GrokAuthKind() == auth.GrokAuthKindAPIKey
+		if (isAPIKey && apiKeyCovered) || (!isAPIKey && oauthCovered) {
+			continue
+		}
+		if isAPIKey {
+			apiKeyCovered = true
+		} else {
+			oauthCovered = true
+		}
+		ids = append(ids, proxy.DefaultGrokModelIDsForAccount(account)...)
+		if oauthCovered && apiKeyCovered {
+			break
+		}
+	}
+	return ids
+}
+
 // modelPricingRow 是定价管理页每个规范模型的一行：当前生效价 + 来源。
 type modelPricingRow struct {
 	Model   string                        `json:"model"`
@@ -135,20 +168,32 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 
 	// 取当前对外暴露的模型，映射到规范定价键去重（退役模型自然被排除）。
 	seen := map[string]struct{}{}
-	keys := make([]string, 0, 16)
-	for _, id := range proxy.SupportedModelIDs(ctx, h.db) {
-		key := database.CanonicalBillingModelKey(id)
-		if key == "" || strings.Contains(key, "(") { // 跳过思考强度别名
-			continue
+	collect := func(ids []string) []string {
+		out := make([]string, 0, len(ids))
+		for _, id := range ids {
+			key := database.CanonicalBillingModelKey(id)
+			if key == "" || strings.Contains(key, "(") { // 跳过思考强度别名
+				continue
+			}
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, key)
 		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		keys = append(keys, key)
+		return out
 	}
+
+	keys := collect(proxy.SupportedModelIDs(ctx, h.db))
+	// Grok 模型不在 Codex 注册表里，但同样对外暴露、同样按 token 计费，
+	// 单独并进来，否则定价页看不到 grok-4.5 这类模型。
+	grokKeys := collect(h.grokBillingModelIDs())
+
 	// 新版本在前（gpt-5.6 > gpt-5.5 > gpt-5.4 …），避免字典序把旧模型顶到列表顶部。
+	// Grok 单独排序并整体排在 Codex 之后，避免两家版本号交叉穿插。
 	sortModelKeysNewestFirst(keys)
+	sortModelKeysNewestFirst(grokKeys)
+	keys = append(keys, grokKeys...)
 
 	rows := make([]modelPricingRow, 0, len(keys))
 	for _, key := range keys {

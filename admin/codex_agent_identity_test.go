@@ -104,12 +104,15 @@ func TestParseAgentIdentityAuthJSON_WrapperMissingFieldsReportsFieldError(t *tes
 
 func TestImportAgentIdentityTokensRejectsMissingRequiredFields(t *testing.T) {
 	handler := &Handler{}
-	success, duplicate, failed := handler.importAgentIdentityTokens(context.Background(), []importToken{{
+	success, duplicate, failed, createdIDs := handler.importAgentIdentityTokens(context.Background(), []importToken{{
 		agentRuntimeID:  "agent-runtime-1",
 		agentPrivateKey: newTestAgentPrivateKey(t),
 	}}, "", false)
 	if success != 0 || duplicate != 0 || failed != 1 {
 		t.Fatalf("counts = success:%d duplicate:%d failed:%d, want 0/0/1", success, duplicate, failed)
+	}
+	if len(createdIDs) != 0 {
+		t.Fatalf("createdIDs = %v, want none when nothing was created", createdIDs)
 	}
 }
 

@@ -86,6 +86,13 @@ func (h *Handler) AcquireAPIKeyConcurrency(c *gin.Context) (func(), bool) {
 }
 
 func (h *Handler) acquireAPIKeyConcurrency(c *gin.Context) (func(), bool) {
+	if c != nil {
+		if inherited, exists := c.Get(contextAPIKeyConcurrencyInherited); exists {
+			if value, ok := inherited.(bool); ok && value {
+				return nil, true
+			}
+		}
+	}
 	row := apiKeyRowFromContext(c)
 	if row == nil || row.ID <= 0 || row.Limits.MaxConcurrency <= 0 {
 		return nil, true

@@ -105,10 +105,27 @@ func evictExpiredClients() {
 		entry := value.(*poolEntry)
 		if entry.lastUsed.Load() < cutoff {
 			clientPool.Delete(key)
-			entry.client.CloseIdleConnections()
+			releaseEvictedClient(entry.client)
 		}
 		return true
 	})
+}
+
+// releaseEvictedClient 彻底释放一个已从连接池逐出、后续不会再被取用的 Client。
+//
+// 普通 transport 用 CloseIdleConnections 即可（剩下的在途请求结束后由
+// IdleConnTimeout 回收）。但 uTLS transport 自管连接池，此处需要连带在途连接
+// 一起摘掉（在途 stream 走优雅关闭）：否则 entry 一旦从 map 删除，就再没有
+// 任何人持有该 transport，它名下的连接会泄漏到进程结束（issue #446）。
+func releaseEvictedClient(client *http.Client) {
+	if client == nil {
+		return
+	}
+	if rt, ok := client.Transport.(*utlsRoundTripper); ok {
+		rt.CloseAllConnections()
+		return
+	}
+	client.CloseIdleConnections()
 }
 
 const (
@@ -145,7 +162,7 @@ func shouldRecyclePooledClient(err error) bool {
 func recyclePooledClient(account *auth.Account, proxyURL string) {
 	key := clientPoolKey(account, proxyURL, codexTransportModeFromEnv())
 	if v, ok := clientPool.LoadAndDelete(key); ok {
-		v.(*poolEntry).client.CloseIdleConnections()
+		releaseEvictedClient(v.(*poolEntry).client)
 	}
 }
 
@@ -1062,9 +1079,11 @@ const downstreamAffinityHeader = "X-Codex2API-Affinity-Key"
 // dedicated downstream affinity header may only replace affinityID; it must
 // never change upstreamSeed or become an explicit upstream session.
 type requestSessionIdentity struct {
-	affinityID         string
-	upstreamSeed       string
-	explicitUpstreamID string
+	affinityID            string
+	upstreamSeed          string
+	explicitUpstreamID    string
+	hasDownstreamAffinity bool
+	hasRequestFingerprint bool
 }
 
 // ResolveSessionID 从下游请求提取或生成 session ID
@@ -1087,6 +1106,7 @@ func ResolveSessionID(headers http.Header, body []byte) string {
 }
 
 func resolveRequestSessionIdentity(headers http.Header, body []byte) requestSessionIdentity {
+	hasEngineFingerprint := EvaluateEngineFingerprint(headers, body, nil)
 	explicitID := ResolveExplicitSessionID(headers, body)
 	upstreamSeed := explicitID
 	if upstreamSeed == "" {
@@ -1111,11 +1131,19 @@ func resolveRequestSessionIdentity(headers http.Header, body []byte) requestSess
 	affinityID := upstreamSeed
 	if localAffinityID := resolveDownstreamAffinityID(headers); localAffinityID != "" {
 		affinityID = localAffinityID
+		return requestSessionIdentity{
+			affinityID:            affinityID,
+			upstreamSeed:          upstreamSeed,
+			explicitUpstreamID:    explicitID,
+			hasDownstreamAffinity: true,
+			hasRequestFingerprint: true,
+		}
 	}
 	return requestSessionIdentity{
-		affinityID:         affinityID,
-		upstreamSeed:       upstreamSeed,
-		explicitUpstreamID: explicitID,
+		affinityID:            affinityID,
+		upstreamSeed:          upstreamSeed,
+		explicitUpstreamID:    explicitID,
+		hasRequestFingerprint: hasEngineFingerprint,
 	}
 }
 
@@ -1201,12 +1229,21 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 			return true
 		}
 
-		data := bytes.Join(dataLines, []byte("\n"))
-		dataLines = dataLines[:0]
-		if bytes.Equal(data, []byte("[DONE]")) {
-			return false
+		// 绝大多数上游事件只有一条 data: 行，直接交给 callback，避免
+		// bytes.Join 为每个 token 事件再复制一遍 payload。多行 SSE 才合并。
+		data := dataLines[0]
+		if len(dataLines) > 1 {
+			data = bytes.Join(dataLines, []byte("\n"))
 		}
-		return callback(data)
+		isDone := bytes.Equal(data, []byte("[DONE]"))
+		keepReading := !isDone && callback(data)
+		// 清掉 backing array 中的切片引用，避免最后一个大事件一直被
+		// dataLines 的容量槽位持有到整条流结束。
+		for i := range dataLines {
+			dataLines[i] = nil
+		}
+		dataLines = dataLines[:0]
+		return keepReading
 	}
 
 	for {
@@ -1214,15 +1251,19 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 		if n > 0 {
 			lineBuf = append(lineBuf, buf[:n]...)
 
-			// 按行处理
+			// 按行处理。用偏移量扫描，最后一次性把未完成行搬到缓冲区头部；
+			// 不能反复 lineBuf = lineBuf[idx+1:]，否则每消费一行都会缩短 cap，
+			// 下一次 64KB Read 几乎必然重新分配，池化缓冲区形同失效。
+			consumed := 0
 			for {
-				idx := bytes.IndexByte(lineBuf, '\n')
+				idx := bytes.IndexByte(lineBuf[consumed:], '\n')
 				if idx < 0 {
 					break
 				}
 
-				line := bytes.TrimRight(lineBuf[:idx], "\r")
-				lineBuf = lineBuf[idx+1:]
+				lineEnd := consumed + idx
+				line := bytes.TrimRight(lineBuf[consumed:lineEnd], "\r")
+				consumed = lineEnd + 1
 
 				if len(line) == 0 {
 					if !emitEvent() {
@@ -1246,11 +1287,9 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 				}
 			}
 
-			// 缩容：已消费数据超过一半时，将剩余数据移到头部释放前端内存
-			if len(lineBuf) > 0 && cap(lineBuf) > 4096 && len(lineBuf) < cap(lineBuf)/4 {
-				compact := make([]byte, len(lineBuf), cap(lineBuf)/2)
-				copy(compact, lineBuf)
-				lineBuf = compact
+			if consumed > 0 {
+				remaining := copy(lineBuf, lineBuf[consumed:])
+				lineBuf = lineBuf[:remaining]
 			}
 		}
 

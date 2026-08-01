@@ -129,7 +129,6 @@ func TestAccountGroupBaseConcurrencyOverrideAPIThreeState(t *testing.T) {
 
 	for _, body := range []string{
 		`{"base_concurrency_override":0}`,
-		`{"base_concurrency_override":51}`,
 		`{"base_concurrency_override":"2"}`,
 	} {
 		recorder = patch(body)
@@ -137,8 +136,21 @@ func TestAccountGroupBaseConcurrencyOverrideAPIThreeState(t *testing.T) {
 			t.Fatalf("invalid patch %s status = %d, want %d: %s", body, recorder.Code, http.StatusBadRequest, recorder.Body.String())
 		}
 	}
+	// 51 曾是上限，现已放开：应成功写入
+	recorder = patch(`{"base_concurrency_override":51}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("patch 51 status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := account.GetBaseConcurrencyEffective(); got != 51 {
+		t.Fatalf("runtime effective after high-value patch = %d, want 51", got)
+	}
+	// 恢复到 2，后续断言依赖该值
+	recorder = patch(`{"base_concurrency_override":2}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("patch restore 2 status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
 	if got := account.GetBaseConcurrencyEffective(); got != 2 {
-		t.Fatalf("runtime effective after rejected patches = %d, want 2", got)
+		t.Fatalf("runtime effective after restore = %d, want 2", got)
 	}
 
 	listRecorder := invokeAccountGroupHandler(t, http.MethodGet, "/api/admin/account-groups", nil, "", handler.ListAccountGroups)
@@ -181,13 +193,18 @@ func TestCreateAccountGroupRejectsInvalidBaseConcurrencyOverride(t *testing.T) {
 	handler := &Handler{db: newTestAdminDB(t)}
 	for _, body := range []string{
 		`{"name":"zero","base_concurrency_override":0}`,
-		`{"name":"large","base_concurrency_override":51}`,
 		`{"name":"fraction","base_concurrency_override":1.5}`,
 	} {
 		recorder := invokeAccountGroupHandler(t, http.MethodPost, "/api/admin/account-groups", nil, body, handler.CreateAccountGroup)
 		if recorder.Code != http.StatusBadRequest {
 			t.Fatalf("body %s status = %d, want %d: %s", body, recorder.Code, http.StatusBadRequest, recorder.Body.String())
 		}
+	}
+	// 无上限：>50 应允许
+	recorder := invokeAccountGroupHandler(t, http.MethodPost, "/api/admin/account-groups", nil,
+		`{"name":"large","base_concurrency_override":51}`, handler.CreateAccountGroup)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("create with 51 status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 }
 

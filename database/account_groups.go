@@ -190,6 +190,9 @@ func (db *DB) DeleteAccountGroup(ctx context.Context, id int64, force ...bool) e
 	if err := pruneDeletedGroupFromAPIKeyScopes(ctx, tx, db.isSQLite(), id); err != nil {
 		return err
 	}
+	if err := pruneDeletedScopeFromAPIKeyLimits(ctx, tx, db.isSQLite(), APIKeyScopeTypeGroup, id); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, "DELETE FROM account_groups WHERE id = "+ph, id)
 	if err != nil {
 		return err
@@ -250,6 +253,57 @@ func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite b
 	return nil
 }
 
+// pruneDeletedScopeFromAPIKeyLimits 清理指向已删除分组 / 账号的 scope 维度限额
+// (api_keys.limits.scope_limits)。与 allowed_group_ids 的处理不同,这里即使清空也无副作用:
+// 少一条限额只会让该 Key 恢复不限,不会把它变成能访问更多账号。
+func pruneDeletedScopeFromAPIKeyLimits(ctx context.Context, tx *sql.Tx, sqlite bool, scopeType string, scopeID int64) error {
+	if scopeID <= 0 {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(limits, '{}') FROM api_keys`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	type update struct {
+		id     int64
+		limits APIKeyLimits
+	}
+	updates := make([]update, 0)
+	for rows.Next() {
+		var id int64
+		var raw interface{}
+		if err := rows.Scan(&id, &raw); err != nil {
+			return err
+		}
+		limits := decodeAPIKeyLimits(raw)
+		if len(limits.ScopeLimits) == 0 {
+			continue
+		}
+		pruned, changed := PruneAPIKeyScopeLimitsForScope(limits.ScopeLimits, scopeType, scopeID)
+		if !changed {
+			continue
+		}
+		limits.ScopeLimits = pruned
+		updates = append(updates, update{id: id, limits: limits})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	query := `UPDATE api_keys SET limits = $1::jsonb WHERE id = $2`
+	if sqlite {
+		query = `UPDATE api_keys SET limits = ? WHERE id = ?`
+	}
+	for _, item := range updates {
+		if _, err := tx.ExecContext(ctx, query, encodeAPIKeyLimits(item.limits), item.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func removeInt64(slice []int64, target int64) []int64 {
 	out := make([]int64, 0, len(slice))
 	for _, v := range slice {
@@ -296,6 +350,27 @@ func (db *DB) SetAccountGroups(ctx context.Context, accountID int64, groupIDs []
 		if _, err := tx.ExecContext(ctx, insertQ, accountID, gid); err != nil {
 			return err
 		}
+	}
+	return tx.Commit()
+}
+
+// BatchSetAccountGroups 在单个事务里把一批账号的分组归属整体替换成 groupIDs。
+// 导入时给「本次新建的账号」统一绑定分组用它，比逐个 SetAccountGroups 少 N 次事务。
+// accountIDs 或 groupIDs 为空时直接返回（空分组表示"不绑"，不是"清空"，
+// 因为导入路径不该顺手抹掉别处刚设好的归属）。
+func (db *DB) BatchSetAccountGroups(ctx context.Context, accountIDs []int64, groupIDs []int64) error {
+	accountIDs = normalizeIDSlice(accountIDs)
+	groupIDs = normalizeIDSlice(groupIDs)
+	if len(accountIDs) == 0 || len(groupIDs) == 0 {
+		return nil
+	}
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := db.batchReplaceAccountGroups(ctx, tx, accountIDs, groupIDs); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

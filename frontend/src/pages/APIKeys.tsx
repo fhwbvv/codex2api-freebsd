@@ -21,10 +21,16 @@ import { useToast } from "../hooks/useToast";
 import type {
   AccountGroup,
   APIKeyLimits,
+  APIKeyScopeLimit,
+  APIKeyScopeUsageItem,
+  APIKeyScopeUsageWindow,
+  APIKeyScopeCumulativeUsage,
+  APIKeyScopeSummaryItem,
   APIKeyRow,
   APIKeyWindowUsage,
   SystemSettings,
 } from "../types";
+import { canStartAPIKeyBulkReset } from "../lib/apiKeyOperationState";
 import { getErrorMessage } from "../utils/error";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
 import { Badge } from "@/components/ui/badge";
@@ -99,24 +105,70 @@ interface LimitsFormState {
   modelAllow: string[];
   modelDeny: string[];
   planAllow: string[];
+  noAffinityGroupIds: number[];
   rpm: string;
   rpd: string;
   maxConcurrency: string;
   costLimit5h: string;
   costLimit7d: string;
   costLimit30d: string;
+  // 自然日(服务器时区,零点清零)限额,与上面的滑动窗口语义不同(issue #460)。
+  costLimitDaily: string;
   tokenLimit5h: string;
   tokenLimit5hUnit: TokenLimitUnit;
   tokenLimit7d: string;
   tokenLimit7dUnit: TokenLimitUnit;
   tokenLimit30d: string;
   tokenLimit30dUnit: TokenLimitUnit;
+  tokenLimitDaily: string;
+  tokenLimitDailyUnit: TokenLimitUnit;
   imageGenerationPolicy: ImageGenerationPolicy;
   upstreamChannel: UpstreamChannel;
+  scopeLimits: ScopeLimitFormState[];
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
 type UpstreamChannel = "auto" | "codex" | "grok";
+
+// ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
+// 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
+interface ScopeLimitFormState {
+  scopeType: "group" | "account";
+  scopeId: string;
+  onExhausted: "skip" | "reject";
+  cost5h: string;
+  cost1d: string;
+  cost7d: string;
+  cost30d: string;
+  token5h: string;
+  token1d: string;
+  token7d: string;
+  token30d: string;
+  requests1d: string;
+  maxConcurrency: string;
+  quotaCost: string;
+  quotaTokens: string;
+  quotaRequests: string;
+}
+
+const emptyScopeLimitRow: ScopeLimitFormState = {
+  scopeType: "group",
+  scopeId: "",
+  onExhausted: "skip",
+  cost5h: "",
+  cost1d: "",
+  cost7d: "",
+  cost30d: "",
+  token5h: "",
+  token1d: "",
+  token7d: "",
+  token30d: "",
+  requests1d: "",
+  maxConcurrency: "",
+  quotaCost: "",
+  quotaTokens: "",
+  quotaRequests: "",
+};
 
 // Grok 账号都未声明模型时的下拉兜底(与 Grok 账号页测试模型列表一致)。
 const DEFAULT_GROK_MODEL_OPTIONS = [
@@ -140,20 +192,25 @@ const emptyLimitsForm: LimitsFormState = {
   modelAllow: [],
   modelDeny: [],
   planAllow: [],
+  noAffinityGroupIds: [],
   rpm: "",
   rpd: "",
   maxConcurrency: "",
   costLimit5h: "",
   costLimit7d: "",
   costLimit30d: "",
+  costLimitDaily: "",
   tokenLimit5h: "",
   tokenLimit5hUnit: "token",
+  tokenLimitDaily: "",
+  tokenLimitDailyUnit: "token",
   tokenLimit7d: "",
   tokenLimit7dUnit: "token",
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
   imageGenerationPolicy: "allow",
   upstreamChannel: "auto",
+  scopeLimits: [],
 };
 
 const initialCreateForm: CreateKeyFormState = {
@@ -197,10 +254,17 @@ export default function APIKeys() {
   const [creating, setCreating] = useState(false);
   const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
+  // 编辑抽屉里展示 scope 预算的当前用量（issue #439）；打开时按需拉一次。
+  const [scopeUsage, setScopeUsage] = useState<APIKeyScopeUsageItem[]>([]);
+  // 列表页的 scope 预算概览：按 Key ID 索引，仅在存在配了预算的 Key 时才有内容。
+  const [scopeSummary, setScopeSummary] = useState<
+    Record<string, APIKeyScopeSummaryItem[]>
+  >({});
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
   const [editTab, setEditTab] = useState<"basic" | "limits">("basic");
   const [editDirty, setEditDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [resettingAll, setResettingAll] = useState(false);
   const [savingPublicUsagePage, setSavingPublicUsagePage] = useState(false);
   const [savingPublicImageStudioPage, setSavingPublicImageStudioPage] =
     useState(false);
@@ -257,6 +321,29 @@ export default function APIKeys() {
   const keys = data.keys;
   const groups = data.groups;
   const modelOptions = data.modelOptions;
+
+  // scope 预算概览单独拉：它需要跨 Key 的用量聚合，不该拖慢 Key 列表本身。
+  const anyScopeBudget = keys.some(
+    (keyRow) => (keyRow.limits?.scope_limits?.length ?? 0) > 0,
+  );
+  useEffect(() => {
+    if (!anyScopeBudget) {
+      setScopeSummary({});
+      return;
+    }
+    let cancelled = false;
+    void api
+      .getAPIKeysScopeSummary()
+      .then((res) => {
+        if (!cancelled) setScopeSummary(res.summary ?? {});
+      })
+      .catch(() => {
+        if (!cancelled) setScopeSummary({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [anyScopeBudget, keys.length]);
   // 模型下拉跟随渠道选择:grok 只列 Grok 模型(账号未声明时用常见兜底),
   // codex 只列 Codex 目录,auto 合并两者。
   const grokModelOptions =
@@ -612,6 +699,12 @@ export default function APIKeys() {
   };
 
   const [resettingIds, setResettingIds] = useState<Set<number>>(new Set());
+  const canResetAllQuotas = canStartAPIKeyBulkReset({
+    keyCount: keys.length,
+    resettingAll,
+    resettingIds,
+    deletingIds,
+  });
 
   const handleResetQuota = async (keyRow: APIKeyRow) => {
     const confirmed = await confirm({
@@ -624,24 +717,21 @@ export default function APIKeys() {
     if (!confirmed) return;
 
     setResettingIds((prev) => new Set(prev).add(keyRow.id));
-    const previousUsed = keyRow.quota_used;
     setData((current) => ({
       ...current,
       keys: current.keys.map((item) =>
-        item.id === keyRow.id ? { ...item, quota_used: 0 } : item,
+        item.id === keyRow.id ? resetAPIKeyQuotaUsage(item) : item,
       ),
     }));
     try {
-      await api.updateAPIKey(keyRow.id, { reset_quota: true });
+      await api.resetAPIKeyQuota(keyRow.id);
       showToast(t("apiKeys.resetQuotaSuccess"));
       void reloadSilently();
     } catch (error) {
       setData((current) => ({
         ...current,
         keys: current.keys.map((item) =>
-          item.id === keyRow.id
-            ? { ...item, quota_used: previousUsed }
-            : item,
+          item.id === keyRow.id ? keyRow : item,
         ),
       }));
       showToast(
@@ -654,6 +744,38 @@ export default function APIKeys() {
         next.delete(keyRow.id);
         return next;
       });
+    }
+  };
+
+  const handleResetAllQuotas = async () => {
+    if (!canResetAllQuotas) return;
+    const confirmed = await confirm({
+      title: t("apiKeys.resetAllQuotasTitle"),
+      description: t("apiKeys.resetAllQuotasDesc", { count: keys.length }),
+      confirmText: t("apiKeys.resetAllQuotasConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+
+    setResettingAll(true);
+    try {
+      const result = await api.resetAllAPIKeyQuotas();
+      setData((current) => ({
+        ...current,
+        keys: current.keys.map(resetAPIKeyQuotaUsage),
+      }));
+      showToast(
+        t("apiKeys.resetAllQuotasSuccess", { count: result.reset_count }),
+      );
+      void reloadSilently();
+    } catch (error) {
+      showToast(
+        `${t("apiKeys.resetAllQuotasFailed")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setResettingAll(false);
     }
   };
 
@@ -732,6 +854,13 @@ export default function APIKeys() {
 
   const startEditing = (keyRow: APIKeyRow) => {
     setEditingKey(keyRow);
+    setScopeUsage([]);
+    if ((keyRow.limits?.scope_limits?.length ?? 0) > 0) {
+      void api
+        .getAPIKeyScopeUsage(keyRow.id)
+        .then((res) => setScopeUsage(res.items ?? []))
+        .catch(() => setScopeUsage([]));
+    }
     setEditForm({
       name: keyRow.name,
       quotaLimit: keyRow.quota_limit > 0 ? String(keyRow.quota_limit) : "",
@@ -742,6 +871,32 @@ export default function APIKeys() {
     });
     setEditDirty(false);
     setEditTab("basic");
+  };
+
+  // 重置某条 scope 的累计额度：累计额度不随时间回落，用完必须手动重置。
+  const resetScopeQuota = async (
+    scopeType: "group" | "account",
+    scopeId: number,
+  ) => {
+    if (!editingKey) return;
+    const confirmed = await confirm({
+      title: t("apiKeys.limits.scopeQuotaResetTitle"),
+      description: t("apiKeys.limits.scopeQuotaResetDesc"),
+      confirmText: t("apiKeys.limits.scopeQuotaReset"),
+      tone: "warning",
+    });
+    if (!confirmed) return;
+    try {
+      await api.resetAPIKeyScopeQuota(editingKey.id, {
+        scope_type: scopeType,
+        scope_id: scopeId,
+      });
+      showToast(t("apiKeys.limits.scopeQuotaResetDone"), "success");
+      const res = await api.getAPIKeyScopeUsage(editingKey.id);
+      setScopeUsage(res.items ?? []);
+    } catch (err) {
+      showToast(getErrorMessage(err), "error");
+    }
   };
 
   const closeEditDialog = async () => {
@@ -759,6 +914,7 @@ export default function APIKeys() {
     setEditForm(initialEditForm);
     setEditTab("basic");
     setEditDirty(false);
+    setScopeUsage([]);
   };
 
   const updateEditForm = (patch: Partial<EditKeyFormState>) => {
@@ -871,13 +1027,29 @@ export default function APIKeys() {
             </span>
           }
           actions={
-            <Button
-              onClick={() => setCreateDialogOpen(true)}
-              className="max-sm:w-full"
-            >
-              <Plus className="size-3.5" />
-              {t("apiKeys.createKey")}
-            </Button>
+            <>
+              <Button
+                variant="outline"
+                disabled={!canResetAllQuotas}
+                onClick={() => void handleResetAllQuotas()}
+                className="max-sm:flex-1"
+              >
+                {resettingAll ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <RotateCcw className="size-3.5" />
+                )}
+                {t("apiKeys.resetAllQuotas")}
+              </Button>
+              <Button
+                disabled={resettingAll}
+                onClick={() => setCreateDialogOpen(true)}
+                className="max-sm:flex-1"
+              >
+                <Plus className="size-3.5" />
+                {t("apiKeys.createKey")}
+              </Button>
+            </>
           }
         />
 
@@ -1123,6 +1295,7 @@ export default function APIKeys() {
                         const isVisible = visibleKeys.has(keyRow.id);
                         const isNew = createdKeyId === keyRow.id;
                         const isBusy =
+                          resettingAll ||
                           deletingIds.has(keyRow.id) ||
                           resettingIds.has(keyRow.id);
                         const displayKey = isVisible
@@ -1158,6 +1331,10 @@ export default function APIKeys() {
                                     t={t}
                                   />
                                   <KeyChannelBadge keyRow={keyRow} t={t} />
+                                  <KeyScopeBudgetBadge
+                                    items={scopeSummary[String(keyRow.id)]}
+                                    t={t}
+                                  />
                                   {isBusy ? (
                                     <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                                   ) : null}
@@ -1239,22 +1416,22 @@ export default function APIKeys() {
                             </div>
 
                             <div className="mt-3 flex flex-wrap gap-1.5">
-                              {keyRow.quota_limit > 0 ? (
-                                <Button
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={resettingIds.has(keyRow.id)}
-                                  onClick={() => void handleResetQuota(keyRow)}
-                                  className="min-w-[7rem] flex-1"
-                                >
-                                  {resettingIds.has(keyRow.id) ? (
-                                    <Loader2 className="size-3.5 animate-spin" />
-                                  ) : (
-                                    <RotateCcw className="size-3.5" />
-                                  )}
-                                  {t("apiKeys.resetQuota")}
-                                </Button>
-                              ) : null}
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={
+                                  resettingAll || resettingIds.has(keyRow.id)
+                                }
+                                onClick={() => void handleResetQuota(keyRow)}
+                                className="min-w-[7rem] flex-1"
+                              >
+                                {resettingIds.has(keyRow.id) ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <RotateCcw className="size-3.5" />
+                                )}
+                                {t("apiKeys.resetQuota")}
+                              </Button>
                               <Button
                                 variant="outline"
                                 size="sm"
@@ -1268,7 +1445,7 @@ export default function APIKeys() {
                               <Button
                                 variant="destructive"
                                 size="sm"
-                                disabled={deletingIds.has(keyRow.id)}
+                                disabled={isBusy}
                                 onClick={() => void handleDeleteKey(keyRow.id)}
                                 className="min-w-[6rem] flex-1"
                               >
@@ -1306,6 +1483,7 @@ export default function APIKeys() {
                             const isVisible = visibleKeys.has(keyRow.id);
                             const isNew = createdKeyId === keyRow.id;
                             const isBusy =
+                              resettingAll ||
                               deletingIds.has(keyRow.id) ||
                               resettingIds.has(keyRow.id);
                             const displayKey = isVisible
@@ -1344,6 +1522,10 @@ export default function APIKeys() {
                                         t={t}
                                       />
                                       <KeyChannelBadge keyRow={keyRow} t={t} />
+                                      <KeyScopeBudgetBadge
+                                        items={scopeSummary[String(keyRow.id)]}
+                                        t={t}
+                                      />
                                     </div>
                                   </div>
                                 </TableCell>
@@ -1444,24 +1626,25 @@ export default function APIKeys() {
                                 </TableCell>
                                 <TableCell>
                                   <div className="flex flex-wrap items-center justify-end gap-1.5">
-                                    {keyRow.quota_limit > 0 ? (
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        disabled={resettingIds.has(keyRow.id)}
-                                        onClick={() =>
-                                          void handleResetQuota(keyRow)
-                                        }
-                                        title={t("apiKeys.resetQuota")}
-                                      >
-                                        {resettingIds.has(keyRow.id) ? (
-                                          <Loader2 className="size-3.5 animate-spin" />
-                                        ) : (
-                                          <RotateCcw className="size-3.5" />
-                                        )}
-                                        {t("apiKeys.resetQuota")}
-                                      </Button>
-                                    ) : null}
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={
+                                        resettingAll ||
+                                        resettingIds.has(keyRow.id)
+                                      }
+                                      onClick={() =>
+                                        void handleResetQuota(keyRow)
+                                      }
+                                      title={t("apiKeys.resetQuota")}
+                                    >
+                                      {resettingIds.has(keyRow.id) ? (
+                                        <Loader2 className="size-3.5 animate-spin" />
+                                      ) : (
+                                        <RotateCcw className="size-3.5" />
+                                      )}
+                                      {t("apiKeys.resetQuota")}
+                                    </Button>
                                     <Button
                                       variant="outline"
                                       size="sm"
@@ -1475,7 +1658,7 @@ export default function APIKeys() {
                                     <Button
                                       variant="destructive"
                                       size="sm"
-                                      disabled={deletingIds.has(keyRow.id)}
+                                      disabled={isBusy}
                                       onClick={() =>
                                         void handleDeleteKey(keyRow.id)
                                       }
@@ -1886,6 +2069,8 @@ export default function APIKeys() {
               modelOptions={modelOptionsForChannel(
                 createForm.limits.upstreamChannel,
               )}
+              groups={groups}
+              allowedGroupIds={createForm.allowedGroupIds}
             />
           </form>
         </Modal>
@@ -2065,6 +2250,28 @@ export default function APIKeys() {
                       {t("apiKeys.allowedGroupsHint")}
                     </p>
                   </FormField>
+
+                  <FormField
+                    label={t("apiKeys.noAffinityGroupsLabel")}
+                    icon={<Waypoints className="size-3.5" />}
+                    as="div"
+                  >
+                    <GroupMultiSelect
+                      groups={groups}
+                      value={editForm.limits.noAffinityGroupIds}
+                      onChange={(noAffinityGroupIds) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, noAffinityGroupIds },
+                        })
+                      }
+                      allLabel={t("apiKeys.noAffinityGroupsDisabled")}
+                      placeholder={t("apiKeys.noAffinityGroupsPlaceholder")}
+                      emptyLabel={t("accounts.groupsNone")}
+                    />
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      {t("apiKeys.noAffinityGroupsHint")}
+                    </p>
+                  </FormField>
                 </>
               ) : (
                 <LimitsEditor
@@ -2073,6 +2280,10 @@ export default function APIKeys() {
                   modelOptions={modelOptionsForChannel(
                     editForm.limits.upstreamChannel,
                   )}
+                  groups={groups}
+                  scopeUsage={scopeUsage}
+                  allowedGroupIds={editForm.allowedGroupIds}
+                  onResetQuota={resetScopeQuota}
                   expanded
                 />
               )}
@@ -2206,10 +2417,14 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
   const token5h = formatTokenLimitForForm(limits.token_limit_5h);
   const token7d = formatTokenLimitForForm(limits.token_limit_7d);
   const token30d = formatTokenLimitForForm(limits.token_limit_30d);
+  const tokenDaily = formatTokenLimitForForm(limits.token_limit_daily);
   return {
     modelAllow: Array.isArray(limits.model_allow) ? limits.model_allow : [],
     modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
     planAllow: Array.isArray(limits.plan_allow) ? limits.plan_allow : [],
+    noAffinityGroupIds: Array.isArray(limits.no_affinity_group_ids)
+      ? limits.no_affinity_group_ids
+      : [],
     rpm: limits.rpm && limits.rpm > 0 ? String(limits.rpm) : "",
     rpd: limits.rpd && limits.rpd > 0 ? String(limits.rpd) : "",
     maxConcurrency:
@@ -2228,18 +2443,73 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.cost_limit_30d && limits.cost_limit_30d > 0
         ? String(limits.cost_limit_30d)
         : "",
+    costLimitDaily:
+      limits.cost_limit_daily && limits.cost_limit_daily > 0
+        ? String(limits.cost_limit_daily)
+        : "",
     tokenLimit5h: token5h.value,
     tokenLimit5hUnit: token5h.unit,
     tokenLimit7d: token7d.value,
     tokenLimit7dUnit: token7d.unit,
     tokenLimit30d: token30d.value,
     tokenLimit30dUnit: token30d.unit,
+    tokenLimitDaily: tokenDaily.value,
+    tokenLimitDailyUnit: tokenDaily.unit,
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
     upstreamChannel:
       limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
         ? limits.upstream_channel
         : "auto",
+    scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
   };
+}
+
+// scopeLimitsFromAPIKey 把后端的 scope 限额数组转成表单行。0 值统一还原成空串,
+// 保证「保存后再打开」不会把未配置的项显示成 0。
+function scopeLimitsFromAPIKey(
+  scopes: APIKeyScopeLimit[] | undefined,
+): ScopeLimitFormState[] {
+  if (!Array.isArray(scopes)) return [];
+  const numToInput = (value?: number) =>
+    value && value > 0 ? String(value) : "";
+  return scopes.map((scope) => ({
+    scopeType: scope.scope_type === "account" ? "account" : "group",
+    scopeId: scope.scope_id > 0 ? String(scope.scope_id) : "",
+    onExhausted: scope.on_exhausted === "reject" ? "reject" : "skip",
+    cost5h: numToInput(scope.cost_5h),
+    cost1d: numToInput(scope.cost_1d),
+    cost7d: numToInput(scope.cost_7d),
+    cost30d: numToInput(scope.cost_30d),
+    token5h: numToInput(scope.token_5h),
+    token1d: numToInput(scope.token_1d),
+    token7d: numToInput(scope.token_7d),
+    token30d: numToInput(scope.token_30d),
+    requests1d: numToInput(scope.requests_1d),
+    maxConcurrency: numToInput(scope.max_concurrency),
+    quotaCost: numToInput(scope.quota_cost),
+    quotaTokens: numToInput(scope.quota_tokens),
+    quotaRequests: numToInput(scope.quota_requests),
+  }));
+}
+
+// scopeLimitRowHasLimit 判断一行是否配了至少一个上限。没配上限的行不会被提交,
+// 后端也会丢弃(避免白白多跑一次窗口聚合查询)。
+function scopeLimitRowHasLimit(row: ScopeLimitFormState): boolean {
+  return [
+    row.cost5h,
+    row.cost1d,
+    row.cost7d,
+    row.cost30d,
+    row.token5h,
+    row.token1d,
+    row.token7d,
+    row.token30d,
+    row.requests1d,
+    row.maxConcurrency,
+    row.quotaCost,
+    row.quotaTokens,
+    row.quotaRequests,
+  ].some((value) => Number(value.trim()) > 0);
 }
 
 // UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
@@ -2360,15 +2630,18 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
     plan_allow: form.planAllow.map((p) => p.trim()).filter(Boolean),
+    no_affinity_group_ids: form.noAffinityGroupIds,
     rpm: intNum(form.rpm),
     rpd: intNum(form.rpd),
     max_concurrency: intNum(form.maxConcurrency),
     cost_limit_5h: num(form.costLimit5h),
     cost_limit_7d: num(form.costLimit7d),
     cost_limit_30d: num(form.costLimit30d),
+    cost_limit_daily: num(form.costLimitDaily),
     token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
     token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
+    token_limit_daily: parseTokenLimit(form.tokenLimitDaily, form.tokenLimitDailyUnit),
     image_generation_policy:
       form.imageGenerationPolicy === "allow"
         ? undefined
@@ -2378,6 +2651,27 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
       form.imageGenerationPolicy === "block" || undefined,
     upstream_channel:
       form.upstreamChannel === "auto" ? undefined : form.upstreamChannel,
+    scope_limits: form.scopeLimits
+      .filter((row) => Number(row.scopeId.trim()) > 0)
+      .filter(scopeLimitRowHasLimit)
+      .map((row) => ({
+        scope_type: row.scopeType,
+        scope_id: Number(row.scopeId.trim()),
+        on_exhausted: row.onExhausted,
+        cost_5h: num(row.cost5h),
+        cost_1d: num(row.cost1d),
+        cost_7d: num(row.cost7d),
+        cost_30d: num(row.cost30d),
+        token_5h: intNum(row.token5h),
+        token_1d: intNum(row.token1d),
+        token_7d: intNum(row.token7d),
+        token_30d: intNum(row.token30d),
+        requests_1d: intNum(row.requests1d),
+        max_concurrency: intNum(row.maxConcurrency),
+        quota_cost: num(row.quotaCost),
+        quota_tokens: intNum(row.quotaTokens),
+        quota_requests: intNum(row.quotaRequests),
+      })),
   };
 }
 
@@ -2403,6 +2697,20 @@ function getAPIKeyStatus(keyRow: APIKeyRow): APIKeyStatus {
     return "quota_exhausted";
   }
   return "active";
+}
+
+function resetAPIKeyQuotaUsage(keyRow: APIKeyRow): APIKeyRow {
+  return {
+    ...keyRow,
+    quota_used: 0,
+    window_usage: keyRow.window_usage
+      ? {
+          ...keyRow.window_usage,
+          cost_5h: 0,
+          cost_7d: 0,
+        }
+      : keyRow.window_usage,
+  };
 }
 
 function usageToneClass(pct: number) {
@@ -2471,6 +2779,49 @@ function KeyStatusBadge({
     >
       <span className={cn("size-1.5 rounded-full", config.dot)} />
       {t(`apiKeys.status.${status}`)}
+    </Badge>
+  );
+}
+
+// KeyScopeBudgetBadge 在列表里展示该 Key 的分组/账号预算状态：有耗尽的就标红并给数量，
+// 否则显示最紧那条的占比。详情（每个窗口、累计额度、命中次数）留在编辑抽屉里。
+function KeyScopeBudgetBadge({
+  items,
+  t,
+}: {
+  items?: APIKeyScopeSummaryItem[];
+  t: Translator;
+}) {
+  if (!items || items.length === 0) return null;
+  const exhausted = items.filter((item) => item.exhausted);
+  if (exhausted.length > 0) {
+    return (
+      <Badge
+        variant="outline"
+        className="gap-1 border-destructive/40 text-[10px] text-destructive"
+        title={exhausted
+          .map((item) => item.scope_name || `#${item.scope_id}`)
+          .join(", ")}
+      >
+        <ShieldAlert className="size-3" />
+        {t("apiKeys.limits.scopeBadgeExhausted", {
+          count: exhausted.length,
+          total: items.length,
+        })}
+      </Badge>
+    );
+  }
+  const tightest = items.reduce(
+    (best, item) => (item.ratio > best.ratio ? item : best),
+    items[0],
+  );
+  return (
+    <Badge variant="outline" className="gap-1 text-[10px] text-muted-foreground">
+      <ShieldCheck className="size-3" />
+      {t("apiKeys.limits.scopeBadgeActive", {
+        percent: Math.min(100, Math.round(tightest.ratio * 100)),
+        window: tightest.window || "-",
+      })}
     </Badge>
   );
 }
@@ -2560,6 +2911,13 @@ function WindowCostBars({
   usage: APIKeyWindowUsage;
 }) {
   const bars: { label: string; used: number; limit: number }[] = [];
+  if (limits.cost_limit_daily && limits.cost_limit_daily > 0) {
+    bars.push({
+      label: "1D",
+      used: usage.cost_today ?? 0,
+      limit: limits.cost_limit_daily,
+    });
+  }
   if (limits.cost_limit_5h && limits.cost_limit_5h > 0) {
     bars.push({ label: "5h", used: usage.cost_5h, limit: limits.cost_limit_5h });
   }
@@ -2724,11 +3082,22 @@ function LimitsEditor({
   value,
   onChange,
   modelOptions,
+  groups,
+  scopeUsage,
+  allowedGroupIds,
+  onResetQuota,
   expanded,
 }: {
   value: LimitsFormState;
   onChange: (next: LimitsFormState) => void;
   modelOptions: string[];
+  groups: AccountGroup[];
+  scopeUsage?: APIKeyScopeUsageItem[];
+  allowedGroupIds: number[];
+  onResetQuota?: (
+    scopeType: "group" | "account",
+    scopeId: number,
+  ) => void | Promise<void>;
   expanded?: boolean;
 }) {
   const { t } = useTranslation();
@@ -2742,9 +3111,12 @@ function LimitsEditor({
     value.costLimit5h !== "" ||
     value.costLimit7d !== "" ||
     value.costLimit30d !== "" ||
+    value.costLimitDaily !== "" ||
     value.tokenLimit5h !== "" ||
     value.tokenLimit7d !== "" ||
     value.tokenLimit30d !== "" ||
+    value.tokenLimitDaily !== "" ||
+    value.scopeLimits.length > 0 ||
     value.imageGenerationPolicy !== "allow";
   const [open, setOpen] = useState(hasAny || !!expanded);
   const tokenUnitOptions = useMemo(
@@ -2885,7 +3257,7 @@ function LimitsEditor({
         title={t("apiKeys.limits.sectionCost")}
         description={t("apiKeys.limits.sectionCostDesc")}
       >
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <LimitNumberField
             label={t("apiKeys.limits.cost5h")}
             value={value.costLimit5h}
@@ -2907,7 +3279,17 @@ function LimitsEditor({
             suffix="$"
             step="0.01"
           />
+          <LimitNumberField
+            label={t("apiKeys.limits.costDaily")}
+            value={value.costLimitDaily}
+            onChange={(costLimitDaily) => patch({ costLimitDaily })}
+            suffix="$"
+            step="0.01"
+          />
         </div>
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          {t("apiKeys.limits.dailyHint")}
+        </p>
       </LimitSection>
 
       <LimitSection
@@ -2940,7 +3322,30 @@ function LimitsEditor({
             onValueChange={(tokenLimit30d) => patch({ tokenLimit30d })}
             onUnitChange={(tokenLimit30dUnit) => patch({ tokenLimit30dUnit })}
           />
+          <TokenLimitField
+            label={t("apiKeys.limits.tokensDaily")}
+            value={value.tokenLimitDaily}
+            unit={value.tokenLimitDailyUnit}
+            unitOptions={tokenUnitOptions}
+            onValueChange={(tokenLimitDaily) => patch({ tokenLimitDaily })}
+            onUnitChange={(tokenLimitDailyUnit) => patch({ tokenLimitDailyUnit })}
+          />
         </div>
+      </LimitSection>
+
+      <LimitSection
+        icon={<ShieldCheck className="size-3.5" />}
+        title={t("apiKeys.limits.sectionScope")}
+        description={t("apiKeys.limits.sectionScopeDesc")}
+      >
+        <ScopeLimitsEditor
+          value={value.scopeLimits}
+          onChange={(scopeLimits) => patch({ scopeLimits })}
+          groups={groups}
+          scopeUsage={scopeUsage}
+          allowedGroupIds={allowedGroupIds}
+          onResetQuota={onResetQuota}
+        />
       </LimitSection>
     </div>
   );
@@ -3175,6 +3580,413 @@ function TokenLimitField({
   );
 }
 
+// ScopeLimitsEditor 编辑「该 Key × 某分组/账号」的用量预算（issue #439）。
+// 每张卡片一个 scope：先选分组（或填账号 ID），再填窗口上限；成本上限常用，
+// Token / 请求数上限收进「更多口径」里，避免默认铺满 9 个输入框。
+function ScopeLimitsEditor({
+  value,
+  onChange,
+  groups,
+  scopeUsage,
+  allowedGroupIds,
+  onResetQuota,
+}: {
+  value: ScopeLimitFormState[];
+  onChange: (next: ScopeLimitFormState[]) => void;
+  groups: AccountGroup[];
+  scopeUsage?: APIKeyScopeUsageItem[];
+  allowedGroupIds: number[];
+  onResetQuota?: (
+    scopeType: "group" | "account",
+    scopeId: number,
+  ) => void | Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const scopeTypeOptions: SelectOption[] = [
+    { label: t("apiKeys.limits.scopeTypeGroup"), value: "group" },
+    { label: t("apiKeys.limits.scopeTypeAccount"), value: "account" },
+  ];
+  const onExhaustedOptions: SelectOption[] = [
+    { label: t("apiKeys.limits.scopeOnExhaustedSkip"), value: "skip" },
+    { label: t("apiKeys.limits.scopeOnExhaustedReject"), value: "reject" },
+  ];
+  const groupOptions: SelectOption[] = [
+    { label: t("apiKeys.limits.scopeGroupPlaceholder"), value: "" },
+    ...groups.map((group) => ({
+      label: group.name,
+      value: String(group.id),
+    })),
+  ];
+
+  const patchRow = (index: number, next: Partial<ScopeLimitFormState>) =>
+    onChange(
+      value.map((row, i) => (i === index ? { ...row, ...next } : row)),
+    );
+
+  return (
+    <div className="space-y-3">
+      {value.length === 0 && (
+        <p className="text-[11px] text-muted-foreground">
+          {t("apiKeys.limits.scopeEmpty")}
+        </p>
+      )}
+
+      {value.map((row, index) => (
+        <ScopeLimitCard
+          key={index}
+          row={row}
+          groups={groups}
+          groupOptions={groupOptions}
+          scopeTypeOptions={scopeTypeOptions}
+          onExhaustedOptions={onExhaustedOptions}
+          usage={findScopeUsage(scopeUsage, row)}
+          allowedGroupIds={allowedGroupIds}
+          onResetQuota={
+            onResetQuota && Number(row.scopeId) > 0
+              ? () => onResetQuota(row.scopeType, Number(row.scopeId))
+              : undefined
+          }
+          onPatch={(next) => patchRow(index, next)}
+          onRemove={() => onChange(value.filter((_, i) => i !== index))}
+        />
+      ))}
+
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        onClick={() => onChange([...value, { ...emptyScopeLimitRow }])}
+        className="w-full text-xs"
+      >
+        <Plus className="mr-1 size-3.5" />
+        {t("apiKeys.limits.scopeAdd")}
+      </Button>
+    </div>
+  );
+}
+
+// formatScopeUsageWindow 把一个窗口的用量压成一行紧凑文本，优先展示配了上限的口径。
+function formatScopeUsageWindow(window: APIKeyScopeUsageWindow): string {
+  if (window.cost_limit && window.cost_limit > 0) {
+    return `${window.window} $${window.user_billed.toFixed(2)} / $${window.cost_limit.toFixed(2)}`;
+  }
+  if (window.token_limit && window.token_limit > 0) {
+    return `${window.window} ${window.tokens} / ${window.token_limit} tok`;
+  }
+  if (window.request_limit && window.request_limit > 0) {
+    return `${window.window} ${window.requests} / ${window.request_limit} req`;
+  }
+  return `${window.window} $${window.user_billed.toFixed(2)}`;
+}
+
+// formatScopeCumulative 把累计额度状态压成一行：优先展示配了上限的那个口径。
+function formatScopeCumulative(
+  cumulative: APIKeyScopeCumulativeUsage,
+  t: (key: string) => string,
+): string {
+  const prefix = t("apiKeys.limits.scopeQuotaLabel");
+  if (cumulative.quota_cost && cumulative.quota_cost > 0) {
+    return `${prefix} $${cumulative.used_cost.toFixed(2)} / $${cumulative.quota_cost.toFixed(2)}`;
+  }
+  if (cumulative.quota_tokens && cumulative.quota_tokens > 0) {
+    return `${prefix} ${cumulative.used_tokens} / ${cumulative.quota_tokens} tok`;
+  }
+  if (cumulative.quota_requests && cumulative.quota_requests > 0) {
+    return `${prefix} ${cumulative.used_requests} / ${cumulative.quota_requests} req`;
+  }
+  return `${prefix} $${cumulative.used_cost.toFixed(2)}`;
+}
+
+// findScopeUsage 用 (维度, 目标 ID) 把后端返回的用量对上表单行。
+function findScopeUsage(
+  scopeUsage: APIKeyScopeUsageItem[] | undefined,
+  row: ScopeLimitFormState,
+): APIKeyScopeUsageItem | undefined {
+  if (!scopeUsage || row.scopeId === "") return undefined;
+  const scopeId = Number(row.scopeId);
+  return scopeUsage.find(
+    (item) => item.scope_type === row.scopeType && item.scope_id === scopeId,
+  );
+}
+
+function ScopeLimitCard({
+  row,
+  groups,
+  groupOptions,
+  scopeTypeOptions,
+  onExhaustedOptions,
+  usage,
+  allowedGroupIds,
+  onResetQuota,
+  onPatch,
+  onRemove,
+}: {
+  row: ScopeLimitFormState;
+  groups: AccountGroup[];
+  groupOptions: SelectOption[];
+  scopeTypeOptions: SelectOption[];
+  onExhaustedOptions: SelectOption[];
+  usage?: APIKeyScopeUsageItem;
+  allowedGroupIds: number[];
+  onResetQuota?: () => void | Promise<void>;
+  onPatch: (next: Partial<ScopeLimitFormState>) => void;
+  onRemove: () => void;
+}) {
+  const { t } = useTranslation();
+  const hasOtherMetrics =
+    row.token5h !== "" ||
+    row.token1d !== "" ||
+    row.token7d !== "" ||
+    row.token30d !== "" ||
+    row.requests1d !== "";
+  const [showOther, setShowOther] = useState(hasOtherMetrics);
+  const groupMissing =
+    row.scopeType === "group" &&
+    row.scopeId !== "" &&
+    !groups.some((group) => String(group.id) === row.scopeId);
+  // 唯一允许的分组又配了 skip 预算：预算耗尽后没有别的组可落，等价于整把 Key 停用。
+  const selfLockWarning =
+    row.scopeType === "group" &&
+    row.onExhausted === "skip" &&
+    allowedGroupIds.length === 1 &&
+    String(allowedGroupIds[0]) === row.scopeId;
+
+  return (
+    <div className="space-y-3 rounded-lg border border-border/80 bg-background p-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+        <div className="w-full space-y-1 sm:w-32">
+          <label className="text-[11px] font-medium text-muted-foreground">
+            {t("apiKeys.limits.scopeType")}
+          </label>
+          <Select
+            value={row.scopeType}
+            options={scopeTypeOptions}
+            onValueChange={(next) =>
+              onPatch({
+                scopeType: next === "account" ? "account" : "group",
+                scopeId: "",
+              })
+            }
+            className="text-xs"
+          />
+        </div>
+        <div className="w-full min-w-0 flex-1 space-y-1">
+          <label className="text-[11px] font-medium text-muted-foreground">
+            {t("apiKeys.limits.scopeTarget")}
+          </label>
+          {row.scopeType === "group" ? (
+            <Select
+              value={row.scopeId}
+              options={groupOptions}
+              onValueChange={(scopeId) => onPatch({ scopeId })}
+              className="text-xs"
+            />
+          ) : (
+            <Input
+              type="number"
+              min="1"
+              value={row.scopeId}
+              onChange={(e) => onPatch({ scopeId: e.target.value })}
+              placeholder={t("apiKeys.limits.scopeAccountPlaceholder")}
+              className="text-xs"
+            />
+          )}
+        </div>
+        <div className="w-full space-y-1 sm:w-44">
+          <label className="text-[11px] font-medium text-muted-foreground">
+            {t("apiKeys.limits.scopeOnExhausted")}
+          </label>
+          <Select
+            value={row.onExhausted}
+            options={onExhaustedOptions}
+            onValueChange={(next) =>
+              onPatch({ onExhausted: next === "reject" ? "reject" : "skip" })
+            }
+            className="text-xs"
+          />
+        </div>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={onRemove}
+          aria-label={t("apiKeys.limits.scopeRemove")}
+          className="shrink-0 self-end text-muted-foreground hover:text-destructive"
+        >
+          <Trash2 className="size-4" />
+        </Button>
+      </div>
+
+      {groupMissing && (
+        <p className="text-[11px] text-destructive">
+          {t("apiKeys.limits.scopeGroupMissing")}
+        </p>
+      )}
+
+      {usage?.cumulative && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md bg-muted/40 px-2 py-1.5">
+          <span
+            className={cn(
+              "text-[10px] tabular-nums",
+              usage.cumulative.exhausted
+                ? "font-semibold text-destructive"
+                : "text-muted-foreground",
+            )}
+          >
+            {formatScopeCumulative(usage.cumulative, t)}
+          </span>
+          {usage.cumulative.reset_count > 0 && (
+            <span className="text-[10px] text-muted-foreground">
+              {t("apiKeys.limits.scopeQuotaResetCount", {
+                count: usage.cumulative.reset_count,
+              })}
+            </span>
+          )}
+          {onResetQuota && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-6 px-2 text-[10px]"
+              onClick={() => void onResetQuota()}
+            >
+              <RotateCcw className="mr-1 size-3" />
+              {t("apiKeys.limits.scopeQuotaReset")}
+            </Button>
+          )}
+        </div>
+      )}
+
+      {usage?.skips && (
+        <p className="text-[10px] text-muted-foreground">
+          {t("apiKeys.limits.scopeSkipStat", {
+            count: usage.skips.requests,
+            time: formatRelativeTime(usage.skips.last_at),
+          })}
+        </p>
+      )}
+
+      {selfLockWarning && (
+        <p className="text-[11px] text-[hsl(var(--warning))]">
+          {t("apiKeys.limits.scopeSelfLockWarning")}
+        </p>
+      )}
+
+      {usage && usage.windows.length > 0 && (
+        <div className="flex flex-wrap gap-x-3 gap-y-1 rounded-md bg-muted/40 px-2 py-1.5">
+          {usage.windows.map((window) => (
+            <span
+              key={window.window}
+              className={cn(
+                "text-[10px] tabular-nums",
+                window.exhausted
+                  ? "font-semibold text-destructive"
+                  : "text-muted-foreground",
+              )}
+            >
+              {formatScopeUsageWindow(window)}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <LimitNumberField
+          label={t("apiKeys.limits.scopeCost5h")}
+          value={row.cost5h}
+          onChange={(cost5h) => onPatch({ cost5h })}
+          suffix="$"
+          step="0.01"
+        />
+        <LimitNumberField
+          label={t("apiKeys.limits.scopeCost1d")}
+          value={row.cost1d}
+          onChange={(cost1d) => onPatch({ cost1d })}
+          suffix="$"
+          step="0.01"
+        />
+        <LimitNumberField
+          label={t("apiKeys.limits.scopeCost7d")}
+          value={row.cost7d}
+          onChange={(cost7d) => onPatch({ cost7d })}
+          suffix="$"
+          step="0.01"
+        />
+        <LimitNumberField
+          label={t("apiKeys.limits.scopeCost30d")}
+          value={row.cost30d}
+          onChange={(cost30d) => onPatch({ cost30d })}
+          suffix="$"
+          step="0.01"
+        />
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setShowOther((v) => !v)}
+        className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+      >
+        {showOther
+          ? t("apiKeys.limits.scopeHideOther")
+          : t("apiKeys.limits.scopeShowOther")}
+      </button>
+
+      {showOther && (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeMaxConcurrency")}
+            value={row.maxConcurrency}
+            onChange={(maxConcurrency) => onPatch({ maxConcurrency })}
+            suffix={t("apiKeys.limits.concurrencySuffix")}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeQuotaCost")}
+            value={row.quotaCost}
+            onChange={(quotaCost) => onPatch({ quotaCost })}
+            suffix="$"
+            step="0.01"
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeQuotaTokens")}
+            value={row.quotaTokens}
+            onChange={(quotaTokens) => onPatch({ quotaTokens })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeQuotaRequests")}
+            value={row.quotaRequests}
+            onChange={(quotaRequests) => onPatch({ quotaRequests })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeToken5h")}
+            value={row.token5h}
+            onChange={(token5h) => onPatch({ token5h })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeToken1d")}
+            value={row.token1d}
+            onChange={(token1d) => onPatch({ token1d })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeToken7d")}
+            value={row.token7d}
+            onChange={(token7d) => onPatch({ token7d })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeToken30d")}
+            value={row.token30d}
+            onChange={(token30d) => onPatch({ token30d })}
+          />
+          <LimitNumberField
+            label={t("apiKeys.limits.scopeRequests1d")}
+            value={row.requests1d}
+            onChange={(requests1d) => onPatch({ requests1d })}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LimitNumberField({
   label,
   value,
@@ -3235,5 +4047,3 @@ function FormField({
     </Component>
   );
 }
-
-

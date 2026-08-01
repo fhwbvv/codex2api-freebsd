@@ -3,12 +3,14 @@
 // 入口:enforceAPIKeyLimits()。在请求鉴权后、转发上游前调用。失败返回 (httpStatus, message),
 // handler 直接以该响应短路;成功则返回 (0, "")。
 //
-// 6 类限制:
+// 7 类限制:
 //   - ModelAllow / ModelDeny: O(1) string set,本机内存即可,无副作用。
 //   - RPM:  滑动 60s 内请求数。Redis INCR + EXPIRE 60s 计数器(没 Redis 时回退 DB 聚合 + 短缓存)。
 //   - RPD:  滑动 24h 内请求数。同上,EXPIRE 86400。
 //   - CostLimit5h / CostLimit7d:    滑动 5h / 7d 内 user_billed 累计。Redis 60s 缓存 + DB 聚合兜底。
 //   - TokenLimit5h / TokenLimit7d:  同 cost,聚合 total_tokens。
+//   - CostLimitDaily / TokenLimitDaily: 自然日(本地时区)累计,零点清零。缓存 key 带日期戳,
+//     午夜自动失效,不会把前一天的用量泄漏进新的一天。
 //
 // Redis 失效或不存在时一律退到 DB 聚合 + 1 分钟缓存,保证可用性优先。
 package proxy
@@ -131,7 +133,27 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
-	// 4. cost / token 5h & 7d
+	// 4. 自然日 cost / token (issue #460)。固定窗口:服务器本地时区零点清零,
+	// 与下面的滑动窗口不同,到点全额恢复,报错文案带重置时刻。
+	if limits.CostLimitDaily > 0 || limits.TokenLimitDaily > 0 {
+		dayStart := database.StartOfDay(time.Now())
+		usage, err := h.apiKeyDailyUsage(ctx, row.ID, dayStart)
+		if err == nil && usage != nil {
+			resetAt := dayStart.AddDate(0, 0, 1).Format(time.RFC3339)
+			if limits.CostLimitDaily > 0 && usage.UserBilled >= limits.CostLimitDaily {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key daily cost limit exceeded: $%.2f / $%.2f today (resets at %s)",
+						usage.UserBilled, limits.CostLimitDaily, resetAt)
+			}
+			if limits.TokenLimitDaily > 0 && usage.Tokens >= limits.TokenLimitDaily {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key daily token limit exceeded: %d / %d today (resets at %s)",
+						usage.Tokens, limits.TokenLimitDaily, resetAt)
+			}
+		}
+	}
+
+	// 5. cost / token 5h & 7d
 	if limits.CostLimit5h > 0 || limits.TokenLimit5h > 0 {
 		usage, err := h.apiKeyWindowUsage(ctx, row.ID, "5h", apiKey5hWindow)
 		if err == nil && usage != nil {
@@ -175,6 +197,18 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 					fmt.Sprintf("API key token limit exceeded: %d / %d in last 30d",
 						usage.Tokens, limits.TokenLimit30d)
 			}
+		}
+	}
+
+	// 6. 分组 / 账号维度预算 (issue #439)。reject 类超额在此短路;skip 类挂到
+	// gin context 上，由各 handler 的账号过滤链剔除对应候选。
+	if len(limits.ScopeLimits) > 0 {
+		gate, rejectMsg := h.evaluateAPIKeyScopeBudgets(ctx, row)
+		if rejectMsg != "" {
+			return http.StatusTooManyRequests, rejectMsg
+		}
+		if gate != nil {
+			c.Set(contextScopeBudgetGate, gate)
 		}
 	}
 
@@ -284,6 +318,21 @@ func (h *Handler) apiKeyWindowRequests(ctx context.Context, apiKeyID int64, labe
 	}
 	h.writeAPIKeyLimitCache(ctx, cacheKey, usage)
 	return usage.Requests, nil
+}
+
+// apiKeyDailyUsage 返回某 API Key 当天(自 dayStart 起)的累计用量。
+// 缓存 key 编入日期戳,跨过午夜后旧缓存自然失效,新的一天从零开始。
+func (h *Handler) apiKeyDailyUsage(ctx context.Context, apiKeyID int64, dayStart time.Time) (*database.APIKeyWindowUsage, error) {
+	cacheKey := apiKeyLimitsCacheKey(apiKeyID, "usage", "daily:"+dayStart.Format("2006-01-02"))
+	if v, ok := h.readAPIKeyLimitCache(ctx, cacheKey); ok {
+		return v, nil
+	}
+	usage, err := h.db.GetAPIKeyUsageSince(ctx, apiKeyID, dayStart)
+	if err != nil {
+		return nil, err
+	}
+	h.writeAPIKeyLimitCache(ctx, cacheKey, usage)
+	return usage, nil
 }
 
 func (h *Handler) apiKeyWindowUsage(ctx context.Context, apiKeyID int64, label string, window time.Duration) (*database.APIKeyWindowUsage, error) {

@@ -15,10 +15,23 @@ const (
 	// 心跳间隔：每 30 秒发送 Ping
 	HeartbeatPingInterval = 30 * time.Second
 
-	// 读超时：120 秒无响应则断开。
-	// 心跳 30s 仍提供 4 个窗口容错；放宽到 120s 避免长推理 / priority 排队的
-	// 活跃 turn（上游一段时间不下发增量帧）被误判为连接断开。
-	ReadTimeout = 120 * time.Second
+	// 活跃流存活复核间隔：业务帧静默达到 120 秒时不直接断开，而是先检查
+	// 最近入站活动，再按需发送带唯一 payload 的 Ping 等待匹配 Pong。
+	ReadLivenessCheckInterval = 120 * time.Second
+
+	// 活跃流近期入站窗口：覆盖两个心跳周期，允许偶发一次 Pong 延迟或丢失。
+	// 数据帧、对端 Ping、我方 Ping 的 Pong 回执都会刷新入站时间。
+	ActiveReadRecentInboundWindow = 2 * HeartbeatPingInterval
+
+	// 活跃流探活超时：仅在既无业务帧、近期也无任何入站活动时触发。
+	// 正常请求和有心跳回执的长推理不会产生这次额外往返。
+	ActiveReadProbeTimeout = 5 * time.Second
+
+	// 活跃流业务帧静默上限：存活复核证明传输层活着,但证明不了上游还在处理
+	// 本请求;单轮响应两个业务帧之间的静默超过该值即按超时收尾,防止 worker
+	// 卡死但心跳仍通的连接把请求与租约无限钉死。
+	// env CODEX_WS_MAX_TURN_SILENCE 可调("0" 关闭)。
+	ActiveReadMaxTurnSilence = 15 * time.Minute
 
 	// 写超时：30 秒
 	WriteTimeout = 30 * time.Second
@@ -34,9 +47,6 @@ const (
 
 	// 握手超时：30 秒
 	HandshakeTimeout = 30 * time.Second
-
-	// Pending 请求超时：2 分钟
-	PendingRequestTimeout = 2 * time.Minute
 
 	// 复用同一 session 的连接时，等待其空闲的轮询退避参数。
 	AcquireInitialBackoff = 10 * time.Millisecond  // 初始退避
@@ -76,7 +86,10 @@ type PendingRequest struct {
 
 // NewPendingRequest 创建新的等待请求
 func NewPendingRequest(sessionID string) *PendingRequest {
-	ctx, cancel := context.WithTimeout(context.Background(), PendingRequestTimeout)
+	// Ctx 仅用于 Close 时的取消广播;请求时长的应用层上限由读路径的业务帧
+	// 静默上限(ActiveReadMaxTurnSilence)执行。历史上这里的 2min WithTimeout
+	// 从无消费者,却让"Pending 有 2 分钟兜底"的注释在别处流传,故改为 WithCancel。
+	ctx, cancel := context.WithCancel(context.Background())
 	return &PendingRequest{
 		RequestID:    uuid.New().String(),
 		SessionID:    sessionID,
@@ -161,7 +174,7 @@ func (s *Session) Touch() {
 func (s *Session) IsExpired() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return time.Since(s.LastActiveAt) > IdleTimeout
+	return time.Since(s.LastActiveAt) > connectionIdleTimeout()
 }
 
 // SetConnected 设置连接状态
@@ -284,11 +297,18 @@ func (s *Session) heartbeatTick(sendPing func() error) {
 		return
 	}
 
+	// 弱网模式不靠心跳无限续住空闲连接；没有在途请求时停止心跳，
+	// 让短空闲窗口把连接自然轮换掉。在途请求仍保留原心跳保护。
+	if weakNetworkModeEnabled() && s.PendingCount() == 0 {
+		s.StopHeartbeat()
+		return
+	}
+
 	// 发送 Ping
 	if err := sendPing(); err != nil {
 		// Ping 写失败只说明写路径故障，读路径可能仍在正常下发；有在途请求时
 		// 不能 Close（会把本会话全部 pending 同秒截断，issue #436），交给读路径
-		// 裁决：pump 读错误或 ReadMessage 超时会走各自的失败处理。连接本身已被
+		// 裁决：pump 读错误或 ReadMessage 存活复核失败会走各自的失败处理。连接本身已被
 		// SendHeartbeat 摘出池子，不会再有新请求进来；心跳链就此停止。
 		if s.PendingCount() > 0 {
 			s.StopHeartbeat()
@@ -319,7 +339,7 @@ func (s *Session) StopHeartbeat() {
 	s.mu.Unlock()
 }
 
-// HandlePong 处理 Pong 响应，重置读超时
+// HandlePong 处理 Pong 响应并刷新会话活动时间。
 func (s *Session) HandlePong() {
 	s.Touch()
 }

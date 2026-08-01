@@ -16,9 +16,9 @@ import (
 
 // Grok billing 端点（cli-chat-proxy，与官方 Grok CLI 对齐）。
 const (
-	grokBillingWeeklyPath  = "/billing?format=credits"
-	grokBillingMonthlyPath = "/billing"
-	grokSuperGrokCents     = 15_000   // $150
+	grokBillingWeeklyPath   = "/billing?format=credits"
+	grokBillingMonthlyPath  = "/billing"
+	grokSuperGrokCents      = 15_000  // $150
 	grokSuperGrokHeavyCents = 150_000 // $1,500
 )
 
@@ -30,16 +30,16 @@ type GrokProductUsage struct {
 
 // GrokBillingSummary 是 Grok 周/月额度的合并视图，供列表展示。
 type GrokBillingSummary struct {
-	Plan              string
-	WeeklyPercent     *float64
-	WeeklyPeriodStart string
-	WeeklyPeriodEnd   string
-	ProductUsage      []GrokProductUsage
-	OnDemandCapCents  *float64
-	OnDemandUsedCents *float64
-	MonthlyLimitCents *float64
-	MonthlyUsedCents  *float64
-	MonthlyPercent    *float64
+	Plan               string
+	WeeklyPercent      *float64
+	WeeklyPeriodStart  string
+	WeeklyPeriodEnd    string
+	ProductUsage       []GrokProductUsage
+	OnDemandCapCents   *float64
+	OnDemandUsedCents  *float64
+	MonthlyLimitCents  *float64
+	MonthlyUsedCents   *float64
+	MonthlyPercent     *float64
 	MonthlyPeriodStart string
 	MonthlyPeriodEnd   string
 }
@@ -66,7 +66,7 @@ type grokBillingPayload struct {
 }
 
 type grokBillingConfig struct {
-	CurrentPeriod      *struct {
+	CurrentPeriod *struct {
 		Type  string `json:"type"`
 		Start string `json:"start"`
 		End   string `json:"end"`
@@ -109,7 +109,11 @@ func FetchGrokBilling(ctx context.Context, account *auth.Account, proxyURL strin
 		return nil, fmt.Errorf("billing 探针失败: weekly=%v monthly=%v", weeklyErr, monthlyErr)
 	}
 
-	summary := &GrokBillingSummary{}
+	// OAuth access_token 的 tier claim 能区分 X Basic / X Premium(+)
+	// / SuperGrok Lite 等完整套餐；billing 金额仅作为旧 token 的兜底。
+	summary := &GrokBillingSummary{
+		Plan: auth.GrokPlanTypeFromAccessToken(account.GetAccessToken()),
+	}
 	if weekly != nil && weekly.Config != nil {
 		cfg := weekly.Config
 		if cfg.CreditUsagePercent != nil {
@@ -151,7 +155,9 @@ func FetchGrokBilling(ctx context.Context, account *auth.Account, proxyURL strin
 		if len(summary.ProductUsage) == 0 {
 			summary.ProductUsage = parseGrokProductUsage(cfg)
 		}
-		summary.Plan = resolveGrokPlan(summary.MonthlyLimitCents)
+		if summary.Plan == "" {
+			summary.Plan = resolveGrokPlan(summary.MonthlyLimitCents)
+		}
 	}
 	// weekly 载荷也可能带 onDemand 字段，作为兜底。
 	if summary.OnDemandCapCents == nil && weekly != nil && weekly.Config != nil {
@@ -226,11 +232,15 @@ func ApplyGrokBilling(store *auth.Store, account *auth.Account, summary *GrokBil
 	now := time.Now()
 	credentials := map[string]interface{}{}
 
-	if plan := strings.TrimSpace(summary.Plan); plan != "" {
+	planType := ""
+	if plan, ok := auth.ResolveGrokPlan(summary.Plan); ok {
+		planType = plan.Key
+	}
+	if planType != "" {
 		account.Mu().Lock()
-		account.PlanType = plan
+		account.PlanType = planType
 		account.Mu().Unlock()
-		credentials["plan_type"] = plan
+		credentials["plan_type"] = planType
 	}
 
 	// 周额度映射到 5h 字段位（前端进度条复用）；月额度映射到 7d。
@@ -275,7 +285,7 @@ func ApplyGrokBilling(store *auth.Store, account *auth.Account, summary *GrokBil
 	// 完整额度视图（产品用量、按量付费、月度金额）单独落一个 JSON 凭据，
 	// 供账号列表透出给前端渲染。
 	detail := &GrokBillingDetail{
-		Plan:               strings.TrimSpace(summary.Plan),
+		Plan:               planType,
 		WeeklyPercent:      summary.WeeklyPercent,
 		WeeklyPeriodStart:  summary.WeeklyPeriodStart,
 		WeeklyPeriodEnd:    summary.WeeklyPeriodEnd,
@@ -305,9 +315,9 @@ func resolveGrokPlan(monthlyLimitCents *float64) string {
 	}
 	switch math.Round(*monthlyLimitCents) {
 	case grokSuperGrokCents:
-		return "SuperGrok"
+		return "supergrok"
 	case grokSuperGrokHeavyCents:
-		return "SuperGrok Heavy"
+		return "supergrok_heavy"
 	case 0:
 		return "free"
 	default:

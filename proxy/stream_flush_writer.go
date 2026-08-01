@@ -203,6 +203,31 @@ func (w *streamFlushWriter) WriteSSEData(data []byte) error {
 	return nil
 }
 
+// WriteSSEComment 写一条 SSE 注释(如 ": keepalive\n\n")并立即冲刷传输。
+// 注释不是模型输出:输出过滤关闭时先排空合并缓冲再直写底层,绕开扫描器;
+// 输出过滤开启时必须走常规写路径——扫描器持有跨块安全窗,底层流可能正停在
+// 某个事件的中间,绕过扫描器直写会把注释插进半个事件里。走扫描器意味着注释
+// 可能延迟到下一次冲刷才真正落到下游,保活周期(15s)远大于冲刷间隔,可接受。
+func (w *streamFlushWriter) WriteSSEComment(comment string) error {
+	if w == nil || w.writer == nil || comment == "" {
+		return nil
+	}
+	if w.outputScanner != nil {
+		return w.WriteString(comment)
+	}
+	if w.buffer.Len() > 0 {
+		if err := w.writeUnderlying(w.buffer.Bytes()); err != nil {
+			return err
+		}
+		w.buffer.Reset()
+	}
+	if err := w.writeUnderlyingString(comment); err != nil {
+		return err
+	}
+	w.flushTransport()
+	return nil
+}
+
 func (w *streamFlushWriter) Flush() error {
 	if w == nil {
 		return nil

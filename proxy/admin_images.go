@@ -36,6 +36,13 @@ func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte,
 	}
 	ginCtx.Request = req
 
+	// 这条 in-process 路径刻意不放 contextAPIKeyRow（否则并发槽会被重复占用），
+	// 因此 Key 级限额由调用方在外层请求上校验。scope 预算（issue #439）是调度层面的
+	// 过滤，只有挂在这个 gin context 上才生效，所以在这里单独算一次。
+	if status, msg := h.applyAdminScopeBudget(ctx, ginCtx, apiKey); status != 0 {
+		return nil, status, fmt.Errorf("%s", msg)
+	}
+
 	h.ImagesGenerations(ginCtx)
 
 	body := recorder.Body.Bytes()
@@ -86,6 +93,10 @@ func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte,
 	}
 	ginCtx.Request = req
 
+	if status, msg := h.applyAdminScopeBudget(ctx, ginCtx, apiKey); status != 0 {
+		return nil, status, fmt.Errorf("%s", msg)
+	}
+
 	h.ImagesEdits(ginCtx)
 
 	body := recorder.Body.Bytes()
@@ -101,4 +112,20 @@ func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte,
 
 func gjsonGetString(body []byte, path string) string {
 	return gjson.GetBytes(body, path).String()
+}
+
+// applyAdminScopeBudget 为 in-process 的管理端生图任务计算 scope 预算闸门：
+// reject 类超额直接返回 429，skip 类挂到该 gin context 上供账号过滤链剔除候选。
+func (h *Handler) applyAdminScopeBudget(ctx context.Context, ginCtx *gin.Context, apiKey *database.APIKeyRow) (int, string) {
+	if apiKey == nil || len(apiKey.Limits.ScopeLimits) == 0 {
+		return 0, ""
+	}
+	gate, rejectMsg := h.evaluateAPIKeyScopeBudgets(ctx, apiKey)
+	if rejectMsg != "" {
+		return http.StatusTooManyRequests, rejectMsg
+	}
+	if gate != nil {
+		ginCtx.Set(contextScopeBudgetGate, gate)
+	}
+	return 0, ""
 }

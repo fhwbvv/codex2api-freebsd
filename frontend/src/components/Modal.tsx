@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils'
 
 interface ModalProps {
   show: boolean
-  title: string
+  title: ReactNode
   onClose: () => void
   children: ReactNode
   footer?: ReactNode

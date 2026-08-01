@@ -176,7 +176,7 @@ func (f *grokSSOFlow) convert(ctx context.Context) (*GrokSSOBuildResult, error) 
 	}
 
 	// 2) 启动 device flow
-	form := url.Values{"client_id": {GrokDefaultOAuthClientID}, "scope": {GrokDefaultOAuthScope}}
+	form := url.Values{"client_id": {EffectiveGrokOAuthClientID()}, "scope": {GrokDefaultOAuthScope}}
 	status, _, body, err := f.do(ctx, http.MethodPost, grokSSODeviceURL, form)
 	if err != nil {
 		return nil, err
@@ -260,7 +260,7 @@ func (f *grokSSOFlow) pollToken(ctx context.Context, deviceCode string, interval
 	for {
 		status, _, body, err := f.do(ctx, http.MethodPost, GrokDefaultTokenURL, url.Values{
 			"grant_type":  {GrokDeviceCodeGrantType},
-			"client_id":   {GrokDefaultOAuthClientID},
+			"client_id":   {EffectiveGrokOAuthClientID()},
 			"device_code": {deviceCode},
 		})
 		if err != nil {
@@ -292,6 +292,7 @@ func (f *grokSSOFlow) pollToken(ctx context.Context, deviceCode string, interval
 				AccessToken:  payload.AccessToken,
 				RefreshToken: payload.RefreshToken,
 				IDToken:      payload.IDToken,
+				PlanType:     GrokPlanTypeFromAccessToken(payload.AccessToken),
 				ExpiresAt:    expiresAt,
 			}, nil
 		}

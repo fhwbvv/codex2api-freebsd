@@ -2503,6 +2503,56 @@ func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 	}
 }
 
+// 终结块必须带 "delta":{}(OpenAI 官方形状)。缺失会让 Rust/serde 系客户端
+// 报 "missing field `delta`" 并整轮失败。
+func TestFinalChunk_AlwaysCarriesEmptyDeltaObject(t *testing.T) {
+	assertDelta := func(t *testing.T, label string, chunk []byte) {
+		t.Helper()
+		delta := gjson.GetBytes(chunk, "choices.0.delta")
+		if !delta.Exists() {
+			t.Fatalf("%s: final chunk missing choices.0.delta; chunk=%s", label, chunk)
+		}
+		if !delta.IsObject() {
+			t.Fatalf("%s: choices.0.delta is not an object; chunk=%s", label, chunk)
+		}
+	}
+
+	// 无状态翻译:文本轮结束
+	statelessChunk, done := TranslateStreamChunk(
+		[]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3}}}`),
+		"grok-4.5", "chatcmpl-test", 0,
+	)
+	if !done {
+		t.Fatal("stateless: response.completed should be terminal")
+	}
+	assertDelta(t, "stateless", statelessChunk)
+
+	// 有状态翻译:纯文本轮(finish_reason=stop)
+	stText := NewStreamTranslator("chatcmpl-test", "grok-4.5", 0)
+	stText.Translate([]byte(`{"type":"response.output_text.delta","delta":"Hello"}`))
+	textChunk, done := stText.Translate([]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3}}}`))
+	if !done {
+		t.Fatal("stateful text: response.completed should be terminal")
+	}
+	assertDelta(t, "stateful text", textChunk)
+
+	// 有状态翻译:工具调用轮(finish_reason=tool_calls)
+	stTool := NewStreamTranslator("chatcmpl-test", "grok-4.5", 0)
+	stTool.Translate([]byte(`{
+		"type":"response.output_item.added",
+		"output_index":0,
+		"item":{"type":"function_call","id":"fc_001","call_id":"call_1","name":"func_a","arguments":""}
+	}`))
+	toolChunk, done := stTool.Translate([]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}`))
+	if !done {
+		t.Fatal("stateful tool: response.completed should be terminal")
+	}
+	if got := gjson.GetBytes(toolChunk, "choices.0.finish_reason").String(); got != "tool_calls" {
+		t.Fatalf("stateful tool: finish_reason = %q, want tool_calls", got)
+	}
+	assertDelta(t, "stateful tool", toolChunk)
+}
+
 func TestStreamTranslator_TextOnly(t *testing.T) {
 	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 

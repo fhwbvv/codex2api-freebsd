@@ -28,7 +28,7 @@ type ModelPricingOverride struct {
 	CachedInputPriority float64 `json:"cached_input_priority,omitempty"`
 	OutputPriority      float64 `json:"output_priority,omitempty"`
 
-	// 长上下文档（input > 272K）
+	// 长上下文档（input 超过该模型的分档线：OpenAI 272K、Grok 200K）
 	InputLong       float64 `json:"input_long,omitempty"`
 	CachedInputLong float64 `json:"cached_input_long,omitempty"`
 	OutputLong      float64 `json:"output_long,omitempty"`

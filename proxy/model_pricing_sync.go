@@ -142,10 +142,12 @@ type modelsDevCost struct {
 	Tiers []modelsDevCostTier `json:"tiers"`
 }
 
+type modelsDevModel struct {
+	Cost *modelsDevCost `json:"cost"`
+}
+
 type modelsDevProvider struct {
-	Models map[string]struct {
-		Cost *modelsDevCost `json:"cost"`
-	} `json:"models"`
+	Models map[string]modelsDevModel `json:"models"`
 }
 
 // parseModelPricingPayload 解析定价源 JSON，自动识别两种格式：
@@ -170,12 +172,17 @@ func parseModelPricingPayload(body []byte) (map[string]database.ModelPricingOver
 	return raw, nil
 }
 
-// convertModelsDevPricing 把 models.dev 数据转成覆盖表。只取 openai provider
+// modelsDevFirstPartyProviders 是取价的第一方 provider，按优先级排列：
+// 网关同时代理 Codex（openai）与 Grok（xai），两家的官方价都要同步进来。
+// 其余 provider 是转售商，同名模型加价不一，取了会串价，故不参与。
+var modelsDevFirstPartyProviders = []string{"openai", "xai"}
+
+// convertModelsDevPricing 把 models.dev 数据转成覆盖表。只取第一方 provider
 // （其余 provider 的同名模型定价可能不同，避免串价）；键归一为规范定价键。
 // 两轮写入：先写模型 ID 即规范键的条目，别名 ID（如 chat-latest 变体）只在
 // 规范键尚无条目时补位，避免别名价覆盖正主价。
 func convertModelsDevPricing(providers map[string]modelsDevProvider) map[string]database.ModelPricingOverride {
-	models := providers["openai"].Models
+	models := mergeModelsDevProviders(providers, modelsDevFirstPartyProviders)
 	if len(models) == 0 {
 		// 自建镜像可能只留了别的 provider 名，退化为合并全部（按名序保证确定性）。
 		providerNames := make([]string, 0, len(providers))
@@ -183,16 +190,7 @@ func convertModelsDevPricing(providers map[string]modelsDevProvider) map[string]
 			providerNames = append(providerNames, name)
 		}
 		sort.Strings(providerNames)
-		models = map[string]struct {
-			Cost *modelsDevCost `json:"cost"`
-		}{}
-		for _, name := range providerNames {
-			for id, m := range providers[name].Models {
-				if _, ok := models[id]; !ok {
-					models[id] = m
-				}
-			}
-		}
+		models = mergeModelsDevProviders(providers, providerNames)
 	}
 
 	ids := make([]string, 0, len(models))
@@ -222,6 +220,21 @@ func convertModelsDevPricing(providers map[string]modelsDevProvider) map[string]
 		}
 	}
 	return out
+}
+
+// mergeModelsDevProviders 按给定顺序合并多个 provider 的模型表，先出现的 provider
+// 在同名模型上优先（列表按优先级排列，缺失的 provider 直接跳过）。
+func mergeModelsDevProviders(providers map[string]modelsDevProvider, names []string) map[string]modelsDevModel {
+	merged := make(map[string]modelsDevModel)
+	for _, name := range names {
+		for id, m := range providers[name].Models {
+			if _, ok := merged[id]; ok {
+				continue
+			}
+			merged[id] = m
+		}
+	}
+	return merged
 }
 
 func modelsDevCostToOverride(cost modelsDevCost) database.ModelPricingOverride {

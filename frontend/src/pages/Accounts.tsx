@@ -8,6 +8,7 @@ import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
 import Modal from "../components/Modal";
 import ChannelLogo from "../components/ChannelLogo";
 import ModelLogo from "../components/ModelLogo";
+import OperationResultsModal from "../components/OperationResultsModal";
 import { cn } from "@/lib/utils";
 import GrokAccounts from "./GrokAccounts";
 import PageHeader from "../components/PageHeader";
@@ -42,6 +43,17 @@ import type {
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
+import {
+  collectAccountOperationResult,
+  resolveChannelBatchTestAccountIDs,
+  snapshotAccountOperationResults,
+  type AccountOperationResult,
+  type AccountOperationResultsState,
+} from "../lib/accountOperationResults";
+import {
+  readOperationResultsVisibility,
+  writeOperationResultsVisibility,
+} from "../lib/operationResultsPreference";
 import {
   formatLongUsageWindowLabel,
   needsUsageReload,
@@ -121,6 +133,7 @@ import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import { useImportGroupIds } from "../hooks/useImportGroupIds";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
   accountMatchesGroupFilter,
@@ -639,6 +652,8 @@ type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh";
 interface BatchOperationEvent {
   type: "start" | "progress" | "complete";
   action: BatchOperationAction;
+  status?: string;
+  http_status?: number;
   current?: number;
   total?: number;
   success?: number;
@@ -786,6 +801,15 @@ export default function Accounts() {
   const [batchTesting, setBatchTesting] = useState(false);
   const [operationProgress, setOperationProgress] =
     useState<OperationProgressState | null>(null);
+  const [operationResults, setOperationResults] =
+    useState<AccountOperationResultsState | null>(null);
+  const [showOperationResults, setShowOperationResults] = useState(
+    readOperationResultsVisibility,
+  );
+  const showOperationResultsRef = useRef(showOperationResults);
+  const operationResultMap = useRef<Map<number, AccountOperationResult>>(
+    new Map(),
+  );
   const operationProgressHideTimer = useRef<number | null>(null);
   const operationProgressFrame = useRef<number | null>(null);
   const operationProgressFlushTimer = useRef<number | null>(null);
@@ -991,6 +1015,12 @@ export default function Accounts() {
     EMPTY_ACCOUNT_GROUP_FILTER,
   );
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
+  // 导入/添加账号时直接绑定的分组（记住上次选择，添加弹窗与导入弹窗共用，与 allowDuplicate 同风格）。
+  const {
+    groupIds: importGroupIds,
+    setGroupIds: setImportGroupIds,
+    prune: pruneImportGroupIds,
+  } = useImportGroupIds();
   const [showGroupManager, setShowGroupManager] = useState(false);
   const [groupDraft, setGroupDraft] = useState<AccountGroupDraft>({
     id: null,
@@ -1376,6 +1406,7 @@ export default function Accounts() {
         window.clearTimeout(operationProgressFlushTimer.current);
       }
       pendingOperationProgress.current = null;
+      operationResultMap.current.clear();
     };
   }, []);
 
@@ -1386,6 +1417,18 @@ export default function Accounts() {
     }
     setOperationProgress(null);
   }, []);
+
+  const handleOperationResultsVisibilityChange = useCallback(
+    (visible: boolean) => {
+      showOperationResultsRef.current = visible;
+      setShowOperationResults(visible);
+      writeOperationResultsVisibility(visible);
+      if (!visible) {
+        setOperationResults(null);
+      }
+    },
+    [],
+  );
 
   const scheduleOperationProgressClose = useCallback(() => {
     if (operationProgressHideTimer.current !== null) {
@@ -1399,6 +1442,9 @@ export default function Accounts() {
 
   const commitOperationProgressEvent = useCallback(
     (title: string, event: BatchOperationEvent) => {
+      const results = snapshotAccountOperationResults(
+        operationResultMap.current,
+      );
       setOperationProgress((prev) => ({
         show: true,
         action: event.action,
@@ -1414,6 +1460,16 @@ export default function Accounts() {
         message: event.error || event.message || prev?.message,
       }));
       if (event.type === "complete") {
+        if (
+          showOperationResultsRef.current &&
+          (event.action === "batch_test" ||
+            event.action === "batch_refresh")
+        ) {
+          setOperationResults({
+            action: event.action,
+            results,
+          });
+        }
         scheduleOperationProgressClose();
       }
     },
@@ -1431,6 +1487,10 @@ export default function Accounts() {
 
   const applyOperationProgressEvent = useCallback(
     (title: string, event: BatchOperationEvent) => {
+      collectAccountOperationResult(operationResultMap.current, event);
+      if (event.type === "start") {
+        setOperationResults(null);
+      }
       if (operationProgressHideTimer.current !== null) {
         window.clearTimeout(operationProgressHideTimer.current);
         operationProgressHideTimer.current = null;
@@ -1599,7 +1659,8 @@ export default function Accounts() {
 
   useEffect(() => {
     setGroupFilter((current) => pruneAccountGroupFilter(current, allGroups));
-  }, [allGroups]);
+    pruneImportGroupIds(allGroups);
+  }, [allGroups, pruneImportGroupIds]);
 
   useEffect(() => {
     const missingUsageIds = accounts
@@ -1964,12 +2025,14 @@ export default function Accounts() {
             refresh_token: "",
             allow_duplicate: allowDuplicate,
             custom_headers: parsedCustomHeaders.value,
+            group_ids: importGroupIds,
           }
         : {
             ...addForm,
             session_token: "",
             allow_duplicate: allowDuplicate,
             custom_headers: parsedCustomHeaders.value,
+            group_ids: importGroupIds,
           };
     if (
       !payload.refresh_token?.trim() &&
@@ -2027,6 +2090,7 @@ export default function Accounts() {
         ...atForm,
         allow_duplicate: allowDuplicate,
         custom_headers: parsedCustomHeaders.value,
+        group_ids: importGroupIds,
       });
       setShowAdd(false);
       await readImportSSE(res);
@@ -2060,6 +2124,10 @@ export default function Accounts() {
     }));
   }, []);
 
+  const clearOpenAIModels = useCallback(() => {
+    setOpenAIForm((form) => ({ ...form, models: [] }));
+  }, []);
+
   const addEditOpenAIModelValues = useCallback((raw: string) => {
     const nextModels = parseModelTokens(raw);
     if (nextModels.length === 0) return;
@@ -2075,6 +2143,10 @@ export default function Accounts() {
       ...form,
       models: form.models.filter((item) => item !== model),
     }));
+  }, []);
+
+  const clearEditOpenAIModels = useCallback(() => {
+    setEditOpenAIForm((form) => ({ ...form, models: [] }));
   }, []);
 
   const handleFetchOpenAIModels = async () => {
@@ -2586,6 +2658,9 @@ export default function Accounts() {
         );
       }
       if (allowDuplicate) formData.append("allow_duplicate", "true");
+      if (importGroupIds.length > 0) {
+        formData.append("group_ids", JSON.stringify(importGroupIds));
+      }
       for (const f of files) formData.append("file", f);
       const res = await fetch("/api/admin/accounts/import", {
         method: "POST",
@@ -2895,11 +2970,11 @@ export default function Accounts() {
         const blob = new Blob([JSON.stringify(data, null, 2)], {
           type: "application/json",
         });
-        downloadBlob(blob, `codex2api-${ts}-${data.length}.json`);
+        downloadBlob(blob, `codex2api-codex-${ts}-${data.length}.json`);
       } else {
         const text = data.map((e) => e.refresh_token).join("\n");
         const blob = new Blob([text], { type: "text/plain" });
-        downloadBlob(blob, `codex2api-rt-${ts}-${data.length}.txt`);
+        downloadBlob(blob, `codex2api-codex-rt-${ts}-${data.length}.txt`);
       }
       showToast(t("accounts.exportSuccess", { count: data.length }));
     } catch (error) {
@@ -3558,9 +3633,7 @@ export default function Accounts() {
   const batchBaseConcurrencyInvalid =
     batchUpdateBaseConcurrency &&
     batchBaseConcurrencyTrimmed !== "" &&
-    (batchBaseConcurrencyValue === null ||
-      batchBaseConcurrencyValue < 1 ||
-      batchBaseConcurrencyValue > 50);
+    (batchBaseConcurrencyValue === null || batchBaseConcurrencyValue < 1);
   const batchSchedulerPriorityInvalid =
     batchUpdateSchedulerPriority &&
     isSchedulerPriorityInputInvalid(batchSchedulerPriorityInput);
@@ -3669,12 +3742,17 @@ export default function Accounts() {
   };
 
   const handleBatchTest = async (ids?: number[]) => {
-    if (ids && ids.length === 0) return;
+    const scopedIDs = resolveChannelBatchTestAccountIDs(
+      accounts,
+      "codex",
+      ids,
+    );
+    if (scopedIDs.length === 0) return;
     setBatchTesting(true);
     try {
       const result = await runStreamingAccountOperation(
         "/accounts/batch-test?stream=true",
-        ids ? { ids } : undefined,
+        { ids: scopedIDs },
         t("accounts.batchTestProgressTitle"),
       );
       showToast(
@@ -3899,9 +3977,7 @@ export default function Accounts() {
       parsedScoreBias > 200);
   const concurrencyInputInvalid =
     concurrencyMode === "custom" &&
-    (parsedBaseConcurrency === null ||
-      parsedBaseConcurrency < 1 ||
-      parsedBaseConcurrency > 50);
+    (parsedBaseConcurrency === null || parsedBaseConcurrency < 1);
   const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause5hThresholdInput,
   );
@@ -4082,9 +4158,7 @@ export default function Accounts() {
   );
   const groupBaseConcurrencyInvalid =
     groupDraft.baseConcurrencyInput.trim() !== "" &&
-    (parsedGroupBaseConcurrency === null ||
-      parsedGroupBaseConcurrency < 1 ||
-      parsedGroupBaseConcurrency > 50);
+    (parsedGroupBaseConcurrency === null || parsedGroupBaseConcurrency < 1);
 
   const resetGroupDraft = () => {
     setGroupDraft({
@@ -4225,7 +4299,13 @@ export default function Accounts() {
     // key 触发渠道切换时整块内容淡入过渡，切换器由 headerSlot 常驻不闪。
     return (
       <div key="provider-grok" className="animate-channel-switch-in">
-        <GrokAccounts headerSlot={providerSwitcher} />
+        <GrokAccounts
+          headerSlot={providerSwitcher}
+          showOperationResults={showOperationResults}
+          onShowOperationResultsChange={
+            handleOperationResultsVisibilityChange
+          }
+        />
       </div>
     );
   }
@@ -4255,6 +4335,12 @@ export default function Accounts() {
       <OperationProgressToast
         progress={operationProgress}
         onClose={closeOperationProgress}
+      />
+      <OperationResultsModal
+        state={showOperationResults ? operationResults : null}
+        accounts={accounts}
+        channel="codex"
+        onClose={() => setOperationResults(null)}
       />
       <StateShell
         variant="page"
@@ -4448,6 +4534,25 @@ export default function Accounts() {
                             : t("accounts.testConnection")}
                         </span>
                       </Button>
+                      <label
+                        className="inline-flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-muted-foreground"
+                        title={t(
+                          "accounts.operationResultsPreferenceHint",
+                        )}
+                      >
+                        <Switch
+                          checked={showOperationResults}
+                          onCheckedChange={
+                            handleOperationResultsVisibilityChange
+                          }
+                          aria-label={t(
+                            "accounts.operationResultsPreference",
+                          )}
+                        />
+                        <span className="hidden lg:inline">
+                          {t("accounts.operationResultsPreference")}
+                        </span>
+                      </label>
                       <Button
                         variant="outline"
                         size="sm"
@@ -6375,11 +6480,23 @@ export default function Accounts() {
                     onRemove={removeOpenAIModel}
                     emptyLabel={t("accounts.openaiModelsEmpty")}
                   />
-                  <p className="mt-1.5 text-xs text-muted-foreground">
-                    {t("accounts.openaiModelsHint", {
-                      count: openAIForm.models.length,
-                    })}
-                  </p>
+                  <div className="mt-1.5 flex items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">
+                      {t("accounts.openaiModelsHint", {
+                        count: openAIForm.models.length,
+                      })}
+                    </p>
+                    {openAIForm.models.length > 0 && (
+                      <button
+                        type="button"
+                        className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                        disabled={openAIModelsLoading || submitting}
+                        onClick={clearOpenAIModels}
+                      >
+                        {t("accounts.supportedModelsClearAll")}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {renderModelMappingEditor({
                   value: openAIModelMappingText,
@@ -6604,6 +6721,35 @@ export default function Accounts() {
                 )}
               </div>
             )}
+            {(addMethod === "rt" ||
+              addMethod === "st" ||
+              addMethod === "at") && (
+              <div className="mt-4 space-y-1.5 border-t border-border pt-4">
+                <label className="text-sm font-semibold text-muted-foreground">
+                  {t("accounts.importGroupsLabel")}
+                </label>
+                <AccountGroupMultiSelect
+                  groups={allGroups}
+                  value={importGroupIds}
+                  onChange={setImportGroupIds}
+                  allLabel={t("accounts.groupsUnbound")}
+                  selectedLabel={t("accounts.groupsSelected", {
+                    count: importGroupIds.length,
+                  })}
+                  placeholder={t("accounts.importGroupsPlaceholder")}
+                  emptyLabel={t("accounts.groupsNone")}
+                  emptyHint={t("accounts.groupsSelectHint")}
+                  onCreateGroup={handleCreateGroupInline}
+                  createLabel={t("accounts.groupCreate")}
+                  createPlaceholder={t("accounts.groupNamePlaceholder")}
+                  creatingLabel={t("accounts.groupCreating")}
+                  createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("accounts.importGroupsHint")}
+                </p>
+              </div>
+            )}
           </Modal>
 
           <Modal
@@ -6639,6 +6785,31 @@ export default function Accounts() {
                 />
                 {t("accounts.allowDuplicate")}
               </label>
+              <div className="space-y-1.5 pt-1">
+                <label className="text-xs font-medium text-foreground">
+                  {t("accounts.importGroupsLabel")}
+                </label>
+                <AccountGroupMultiSelect
+                  groups={allGroups}
+                  value={importGroupIds}
+                  onChange={setImportGroupIds}
+                  allLabel={t("accounts.groupsUnbound")}
+                  selectedLabel={t("accounts.groupsSelected", {
+                    count: importGroupIds.length,
+                  })}
+                  placeholder={t("accounts.importGroupsPlaceholder")}
+                  emptyLabel={t("accounts.groupsNone")}
+                  emptyHint={t("accounts.groupsSelectHint")}
+                  onCreateGroup={handleCreateGroupInline}
+                  createLabel={t("accounts.groupCreate")}
+                  createPlaceholder={t("accounts.groupNamePlaceholder")}
+                  creatingLabel={t("accounts.groupCreating")}
+                  createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("accounts.importGroupsHint")}
+                </p>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <button
@@ -7325,11 +7496,23 @@ export default function Accounts() {
                         onRemove={removeEditOpenAIModel}
                         emptyLabel={t("accounts.openaiModelsEmpty")}
                       />
-                      <p className="mt-1.5 text-xs text-muted-foreground">
-                        {t("accounts.openaiModelsHint", {
-                          count: editOpenAIForm.models.length,
-                        })}
-                      </p>
+                      <div className="mt-1.5 flex items-center justify-between gap-2">
+                        <p className="text-xs text-muted-foreground">
+                          {t("accounts.openaiModelsHint", {
+                            count: editOpenAIForm.models.length,
+                          })}
+                        </p>
+                        {editOpenAIForm.models.length > 0 && (
+                          <button
+                            type="button"
+                            className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                            disabled={editOpenAIModelsLoading || editSubmitting}
+                            onClick={clearEditOpenAIModels}
+                          >
+                            {t("accounts.supportedModelsClearAll")}
+                          </button>
+                        )}
+                      </div>
                     </div>
                     {renderModelMappingEditor({
                       value: editOpenAIModelMappingText,
@@ -8689,7 +8872,6 @@ export default function Accounts() {
                     <Input
                       type="number"
                       min={1}
-                      max={50}
                       step={1}
                       inputMode="numeric"
                       value={groupDraft.baseConcurrencyInput}

@@ -11,12 +11,12 @@ import (
 
 // Validation constants
 const (
-	MaxModelLength         = 100
+	MaxModelLength         = 255
 	MaxEmailLength         = 255
 	MaxProxyURLLength      = 500
 	MaxTokenLength         = 8192
 	MaxHeaderSize          = 16 * 1024 // 16KB
-	AllowedModelPattern    = `^[a-zA-Z0-9._-]+$`
+	AllowedModelPattern    = `^[\p{L}\p{N}._:/@+-]+$`
 	AllowedEndpointPattern = `^[a-zA-Z0-9/_-]+$`
 )
 

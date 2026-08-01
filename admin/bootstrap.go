@@ -375,7 +375,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		PromptFilterCustomPatterns:        "[]",
 		PromptFilterDisabledPatterns:      "[]",
 		ClientCompatMode:                  proxy.ClientCompatModePreserve,
-		CodexMinCLIVersion:                "0.118.0",
+		CodexMinCLIVersion:                "0.144.1",
 		UsageLogMode:                      database.UsageLogModeFull,
 		UsageLogBatchSize:                 200,
 		UsageLogFlushIntervalSeconds:      5,
@@ -385,7 +385,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		FirstTokenTimeoutSeconds:          0,
 		BillingTierPolicy:                 proxy.BillingTierPolicyActual,
 		AffinityMode:                      "bounded",
-		GrokConfig:                        `{"affinity_mode":"strict","probe_enabled":false,"probe_interval_minutes":30,"max_rate_limit_retries":0}`,
+		GrokConfig:                        `{"affinity_mode":"strict","probe_enabled":false,"probe_interval_minutes":30,"max_rate_limit_retries":0,"oauth_client_id":""}`,
 		PublicKeyUsagePageEnabled:         true,
 		PublicImageStudioPageEnabled:      true,
 		CodexWSHideUpstreamErrors:         true,
@@ -396,5 +396,6 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		SmartPacingMinConcurrency:         1,
 		SmartPacingWindows:                "5h,7d",
 		AutoResetCreditsBeforeExpiryMin:   60,
+		UTLSShutdownTimeoutMinutes:        30,
 	}
 }

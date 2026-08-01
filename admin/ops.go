@@ -3,6 +3,7 @@ package admin
 import (
 	"bufio"
 	"context"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
@@ -10,8 +11,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
+
+type memStatsReader func(*runtime.MemStats)
 
 type cpuSampler struct {
 	mu        sync.Mutex
@@ -103,6 +107,12 @@ func readLinuxCPUTicks() (uint64, uint64, error) {
 }
 
 func readSystemMemory() (usedBytes uint64, totalBytes uint64, percent float64) {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	return readSystemMemoryWithFallback(&mem)
+}
+
+func readSystemMemoryWithFallback(mem *runtime.MemStats) (usedBytes uint64, totalBytes uint64, percent float64) {
 	if runtime.GOOS == "linux" {
 		file, err := os.Open("/proc/meminfo")
 		if err == nil {
@@ -129,8 +139,9 @@ func readSystemMemory() (usedBytes uint64, totalBytes uint64, percent float64) {
 		}
 	}
 
-	var mem runtime.MemStats
-	runtime.ReadMemStats(&mem)
+	if mem == nil {
+		return 0, 0, 0
+	}
 	usedBytes = mem.Alloc
 	totalBytes = mem.Sys
 	if totalBytes > 0 {
@@ -152,6 +163,106 @@ func parseMeminfoKB(line string) uint64 {
 	}
 
 	return v
+}
+
+func parseLinuxProcessRSS(r io.Reader) (uint64, bool) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		if rssKB := parseMeminfoKB(line); rssKB > 0 {
+			return rssKB * 1024, true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// readProcessMemory 返回当前进程实际驻留在物理内存中的字节数。
+//
+// runtime.MemStats.Sys 是 Go 运行时从 OS 申请/保留过的虚拟内存总量，包含已空闲
+// 甚至已归还的堆页，流量峰值过后仍会保持高水位，不能当成当前进程内存展示。
+// Linux/Docker 使用 /proc/self/status 的 VmRSS；非 Linux 才回退到 Sys。
+func readProcessMemory() uint64 {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	return readProcessMemoryWithFallback(&mem)
+}
+
+func readProcessMemoryWithFallback(mem *runtime.MemStats) uint64 {
+	if runtime.GOOS == "linux" {
+		file, err := os.Open("/proc/self/status")
+		if err == nil {
+			defer file.Close()
+			if rss, ok := parseLinuxProcessRSS(file); ok {
+				return rss
+			}
+		}
+	}
+
+	if mem == nil {
+		return 0
+	}
+	return mem.Sys
+}
+
+func collectOpsMemory(readMemStats memStatsReader) opsMemoryResponse {
+	if readMemStats == nil {
+		readMemStats = runtime.ReadMemStats
+	}
+	var mem runtime.MemStats
+	readMemStats(&mem)
+	usedBytes, totalBytes, percent := readSystemMemoryWithFallback(&mem)
+	return opsMemoryResponse{
+		Percent:           percent,
+		UsedBytes:         usedBytes,
+		TotalBytes:        totalBytes,
+		ProcessBytes:      readProcessMemoryWithFallback(&mem),
+		HeapAllocBytes:    mem.HeapAlloc,
+		HeapInuseBytes:    mem.HeapInuse,
+		HeapReleasedBytes: mem.HeapReleased,
+		NumGC:             mem.NumGC,
+	}
+}
+
+func responseCacheConfigOpsResponse(config proxy.ResponseCacheAppliedConfig) opsResponseCacheConfig {
+	return opsResponseCacheConfig{
+		Generation:          config.Generation,
+		LocalMaxBytes:       config.LocalMaxBytes,
+		LocalMaxEntryBytes:  config.LocalMaxEntryBytes,
+		ReconstructMaxBytes: config.ReconstructMaxBytes,
+	}
+}
+
+func responseCacheOpsResponseFromSnapshot(snapshot proxy.ResponseCacheOpsSnapshot) opsResponseCache {
+	lastSyncAt := ""
+	if !snapshot.LastConfigSyncAt.IsZero() {
+		lastSyncAt = snapshot.LastConfigSyncAt.Format(time.RFC3339Nano)
+	}
+	return opsResponseCache{
+		EffectiveConfig:        responseCacheConfigOpsResponse(snapshot.EffectiveConfig),
+		AppliedConfig:          responseCacheConfigOpsResponse(snapshot.AppliedConfig),
+		Entries:                snapshot.Stats.Entries,
+		MaxEntries:             snapshot.EffectiveConfig.MaxEntries,
+		CurrentBytes:           snapshot.Stats.Bytes,
+		MaxBytes:               snapshot.EffectiveConfig.LocalMaxBytes,
+		HighWaterBytes:         snapshot.Stats.HighWaterBytes,
+		LargestEntryBytes:      snapshot.Stats.LargestSeenEntryBytes,
+		LocalHits:              snapshot.Stats.LocalHits,
+		LocalMisses:            snapshot.Stats.LocalMisses,
+		RemoteHits:             snapshot.Stats.RemoteHits,
+		RemoteMisses:           snapshot.Stats.RemoteMisses,
+		Expirations:            snapshot.Stats.Expirations,
+		CountEvictions:         snapshot.Stats.CountEvictions,
+		ByteEvictions:          snapshot.Stats.ByteEvictions,
+		OversizeBypasses:       snapshot.Stats.OversizeBypasses,
+		OversizeRejections:     snapshot.Stats.OversizeRejections,
+		KnownUnavailableErrors: snapshot.Stats.KnownUnavailableErrors,
+		LastConfigSyncAt:       lastSyncAt,
+		LastConfigSyncError:    snapshot.LastConfigSyncError,
+	}
 }
 
 // GetOpsOverview 获取系统运维概览
@@ -200,13 +311,9 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 		}
 	}
 
-	usedMemory, totalMemory, memoryPercent := readSystemMemory()
+	memorySnapshot := collectOpsMemory(h.memReader)
 	cpuPercent := h.cpuSampler.Sample()
-
-	var processMemory uint64
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-	processMemory = memStats.Sys
+	responseCacheSnapshot := proxy.GetResponseCacheOpsSnapshot()
 
 	var activeRequests int64
 	var totalRuntimeRequests int64
@@ -226,12 +333,7 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 			Percent: cpuPercent,
 			Cores:   runtime.NumCPU(),
 		},
-		Memory: opsMemoryResponse{
-			Percent:      memoryPercent,
-			UsedBytes:    usedMemory,
-			TotalBytes:   totalMemory,
-			ProcessBytes: processMemory,
-		},
+		Memory: memorySnapshot,
 		Runtime: opsRuntimeResponse{
 			Goroutines:        runtime.NumGoroutine(),
 			AvailableAccounts: h.store.AvailableCount(),
@@ -271,5 +373,6 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 			RPMLimit:      h.rateLimiter.GetRPM(),
 			AvgDurationMs: usageStats.AvgDurationMs,
 		},
+		ResponseCache: responseCacheOpsResponseFromSnapshot(responseCacheSnapshot),
 	})
 }

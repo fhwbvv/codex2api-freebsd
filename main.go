@@ -95,7 +95,7 @@ func main() {
 			PromptFilterCustomPatterns:        "[]",
 			PromptFilterDisabledPatterns:      "[]",
 			ClientCompatMode:                  proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                "0.118.0",
+			CodexMinCLIVersion:                "0.144.1",
 			UsageLogMode:                      database.UsageLogModeFull,
 			UsageLogBatchSize:                 200,
 			UsageLogFlushIntervalSeconds:      5,
@@ -116,6 +116,7 @@ func main() {
 			SmartPacingMinConcurrency:         1,
 			SmartPacingWindows:                "5h,7d",
 			AutoResetCreditsBeforeExpiryMin:   60,
+			UTLSShutdownTimeoutMinutes:        30,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -145,7 +146,7 @@ func main() {
 			PromptFilterCustomPatterns:        "[]",
 			PromptFilterDisabledPatterns:      "[]",
 			ClientCompatMode:                  proxy.ClientCompatModePreserve,
-			CodexMinCLIVersion:                "0.118.0",
+			CodexMinCLIVersion:                "0.144.1",
 			UsageLogMode:                      database.UsageLogModeFull,
 			UsageLogBatchSize:                 200,
 			UsageLogFlushIntervalSeconds:      5,
@@ -166,6 +167,7 @@ func main() {
 			SmartPacingMinConcurrency:         1,
 			SmartPacingWindows:                "5h,7d",
 			AutoResetCreditsBeforeExpiryMin:   60,
+			UTLSShutdownTimeoutMinutes:        30,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -174,6 +176,20 @@ func main() {
 	if envPolicy := strings.TrimSpace(os.Getenv("CODEX_BILLING_TIER_POLICY")); envPolicy != "" {
 		settings.BillingTierPolicy = proxy.NormalizeBillingTierPolicy(envPolicy)
 	}
+	responseCacheCtx, responseCacheCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := proxy.LoadResponseCacheSettings(responseCacheCtx, db); err != nil {
+		responseCacheCancel()
+		log.Fatalf("加载响应缓存设置失败: %v", err)
+	}
+	responseCacheCancel()
+	appliedResponseCache := proxy.GetResponseCacheAppliedConfig()
+	log.Printf(
+		"响应缓存设置已加载: generation=%d total=%d entry=%d reconstruct=%d",
+		appliedResponseCache.Generation,
+		appliedResponseCache.LocalMaxBytes,
+		appliedResponseCache.LocalMaxEntryBytes,
+		appliedResponseCache.ReconstructMaxBytes,
+	)
 
 	// 4. 初始化缓存（使用数据库中保存的连接池大小）
 	redisPoolSize := 30
@@ -278,6 +294,9 @@ func main() {
 	defer store.Stop()
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
+	if !proxy.StartResponseCacheSettingsPoller(backgroundCtx, db) {
+		log.Fatalf("启动响应缓存设置同步失败")
+	}
 	adminHandler.StartAutoResetCredits(backgroundCtx)
 	// Grok 账号状态定期探测（默认关，由 grok 系统设置开关/间隔控制）
 	adminHandler.StartGrokStatusProbe(backgroundCtx)

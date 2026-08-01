@@ -30,8 +30,8 @@ func TestModelPricingOverride_MergeAndPrecedence(t *testing.T) {
 	}
 
 	// gpt-5.6-terra 是独立规范键：不跟随 gpt-5.4 的 custom 覆盖。
-	if terra := GetModelPricing("gpt-5.6-terra"); terra.OutputPricePerMToken != 15.0 {
-		t.Fatalf("terra should keep own default 15, got %.2f", terra.OutputPricePerMToken)
+	if terra := GetModelPricing("gpt-5.6-terra"); terra.OutputPricePerMToken != 12.0 {
+		t.Fatalf("terra should keep own default 12, got %.2f", terra.OutputPricePerMToken)
 	}
 	// terra 自身覆盖可独立生效。
 	SetModelPricingOverrides(map[string]ModelPricingOverride{

@@ -3,7 +3,10 @@ package admin
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
+
+	"github.com/codex2api/auth"
 )
 
 // grokProbeRunGuard 单轮探测的整体超时兜底,避免异常账号把整轮卡死。
@@ -48,21 +51,69 @@ func (h *Handler) StartGrokStatusProbe(ctx context.Context) {
 	})
 }
 
-// triggerGrokUsageProbe schedules the short post-import billing probe under
-// the database lifecycle so it cannot outlive account persistence on shutdown.
+// grokImportProbeSlots 限制导入后探针的并发:每号要做 AT 刷新 + billing 探针 +
+// 连通性测试(最多 3 个上游请求),批量导入几千个文件时不设闸会同时打爆上游/代理。
+var grokImportProbeSlots = make(chan struct{}, 4)
+
+// triggerGrokUsageProbe schedules the post-import probe chain under the
+// database lifecycle so it cannot outlive account persistence on shutdown.
+//
+// 导入后的号要能直接在列表上看到套餐与用量进度条,需要三步:
+//  1. AT 缺失或已过期先强刷一次——导入的 auth.json 常带过期 AT(文件躺了几小时),
+//     拿它打 billing 会 401,套餐拿不到还可能被误标 unauthorized 冷却;
+//  2. billing 探针:拉套餐/周月额度(套餐列、额度上限);
+//  3. 连通性测试:写账号状态(active/限流),真实请求带回 x-ratelimit-* 头、
+//     429 时解析权威用量,用量进度条由此点亮。
 func (h *Handler) triggerGrokUsageProbe(accountID int64) {
 	if h == nil || h.store == nil || h.probeUsage == nil {
 		return
 	}
 	h.startDBBackgroundTask(func(parent context.Context) {
+		select {
+		case grokImportProbeSlots <- struct{}{}:
+		case <-parent.Done():
+			return
+		}
+		defer func() { <-grokImportProbeSlots }()
+
 		account := h.store.FindByID(accountID)
 		if account == nil {
 			return
 		}
+
+		if account.GrokAuthKind() == auth.GrokAuthKindOAuth && grokAccessTokenStale(account) {
+			refreshCtx, cancel := context.WithTimeout(parent, 30*time.Second)
+			if err := h.store.RefreshSingle(refreshCtx, account.DBID); err != nil {
+				log.Printf("[账号 %d] 导入后 AT 刷新失败(探针继续): %v", account.DBID, err)
+			}
+			cancel()
+		}
+
 		probeCtx, cancel := context.WithTimeout(parent, 25*time.Second)
-		defer cancel()
 		_ = h.probeUsage(probeCtx, account)
+		cancel()
+
+		testCtx, cancel := context.WithTimeout(parent, batchTestAccountTimeout+5*time.Second)
+		h.runSingleBatchTest(testCtx, account)
+		cancel()
 	})
+}
+
+// grokAccessTokenStale 判断账号的 access_token 是否缺失或已过期/临期(2 分钟余量)。
+// ExpiresAt 未知时保守视为可用,交给 billing 探针的 401 分支兜底。
+func grokAccessTokenStale(account *auth.Account) bool {
+	if account == nil {
+		return true
+	}
+	account.Mu().RLock()
+	defer account.Mu().RUnlock()
+	if strings.TrimSpace(account.AccessToken) == "" {
+		return true
+	}
+	if account.ExpiresAt.IsZero() {
+		return false
+	}
+	return time.Now().Add(2 * time.Minute).After(account.ExpiresAt)
 }
 
 // runGrokStatusProbe 对所有未停用的 Grok 账号跑一轮写状态的连通性测试。

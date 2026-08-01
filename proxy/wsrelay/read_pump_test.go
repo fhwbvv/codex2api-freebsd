@@ -101,6 +101,23 @@ func waitForReadPumpCondition(t *testing.T, condition func() bool, message strin
 	t.Fatal(message)
 }
 
+func commitReadPumpTestLease(t *testing.T, wc *WsConnection, requestID string) {
+	t.Helper()
+	if err := wc.BeginReadLease(requestID); err != nil {
+		t.Fatalf("BeginReadLease: %v", err)
+	}
+	state := wc.ensureReadState()
+	state.mu.Lock()
+	activeLease := state.activeLease
+	leasePhase := state.leasePhase
+	if activeLease != requestID || leasePhase != readLeaseReserved {
+		state.mu.Unlock()
+		t.Fatalf("reserved lease = (%q, %d), want (%q, %d)", activeLease, leasePhase, requestID, readLeaseReserved)
+	}
+	state.leasePhase = readLeaseCommitted
+	state.mu.Unlock()
+}
+
 func TestReadPumpProcessesPingWhileIdle(t *testing.T) {
 	pongPayload := make(chan string, 1)
 	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
@@ -323,6 +340,414 @@ func TestReadPumpProbeDoesNotWaitForDataWriteLock(t *testing.T) {
 	}
 	wc.writeMu.Unlock()
 	locked = false
+}
+
+func TestReadMessageLivenessUsesRecentInboundWithoutExtraProbe(t *testing.T) {
+	serverReady := make(chan struct{})
+	clientProbe := make(chan string, 1)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+
+	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+		defaultPingHandler := conn.PingHandler()
+		conn.SetPingHandler(func(appData string) error {
+			select {
+			case clientProbe <- appData:
+			default:
+			}
+			return defaultPingHandler(appData)
+		})
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		close(serverReady)
+
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for i := 0; i < 8; i++ {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, []byte("server-heartbeat"), time.Now().Add(time.Second)); err != nil {
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"recent-inbound"}}`)); err != nil {
+			t.Errorf("write terminal response: %v", err)
+			return
+		}
+		<-stop
+	})
+
+	<-serverReady
+	commitReadPumpTestLease(t, wc, "recent-inbound")
+	messageType, payload, err := wc.readMessageWithLiveness(30*time.Millisecond, 25*time.Millisecond, 100*time.Millisecond, time.Minute)
+	if err != nil {
+		t.Fatalf("read long-running response with inbound heartbeats: %v", err)
+	}
+	if messageType != websocket.TextMessage || !strings.Contains(string(payload), `"id":"recent-inbound"`) {
+		t.Fatalf("response = (%d, %s), want recent-inbound terminal frame", messageType, payload)
+	}
+	select {
+	case probePayload := <-clientProbe:
+		t.Fatalf("recent inbound activity still triggered an active probe %q", probePayload)
+	default:
+	}
+}
+
+func TestReadMessageLivenessProbeKeepsSilentStreamAlive(t *testing.T) {
+	serverReady := make(chan struct{})
+	twoProbes := make(chan struct{})
+	stop := make(chan struct{})
+	var probeCount atomic.Int32
+	t.Cleanup(func() { close(stop) })
+
+	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+		defaultPingHandler := conn.PingHandler()
+		conn.SetPingHandler(func(appData string) error {
+			if probeCount.Add(1) == 2 {
+				close(twoProbes)
+			}
+			return defaultPingHandler(appData)
+		})
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		close(serverReady)
+
+		select {
+		case <-twoProbes:
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"probe-alive"}}`)); err != nil {
+				t.Errorf("write delayed terminal response: %v", err)
+				return
+			}
+		case <-stop:
+			return
+		}
+		<-stop
+	})
+
+	<-serverReady
+	commitReadPumpTestLease(t, wc, "probe-alive")
+	messageType, payload, err := wc.readMessageWithLiveness(25*time.Millisecond, 5*time.Millisecond, 100*time.Millisecond, time.Minute)
+	if err != nil {
+		t.Fatalf("read response after successful liveness probes: %v", err)
+	}
+	if messageType != websocket.TextMessage || !strings.Contains(string(payload), `"id":"probe-alive"`) {
+		t.Fatalf("response = (%d, %s), want probe-alive terminal frame", messageType, payload)
+	}
+	if got := probeCount.Load(); got < 2 {
+		t.Fatalf("probe count = %d, want at least 2 checkpoints", got)
+	}
+}
+
+func TestReadMessageLivenessFailsWithoutInboundOrMatchingPong(t *testing.T) {
+	serverReady := make(chan struct{})
+	probeSeen := make(chan string, 1)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+
+	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+		conn.SetPingHandler(func(appData string) error {
+			select {
+			case probeSeen <- appData:
+			default:
+			}
+			return nil
+		})
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		close(serverReady)
+		<-stop
+	})
+
+	<-serverReady
+	commitReadPumpTestLease(t, wc, "probe-timeout")
+	_, _, err := wc.readMessageWithLiveness(20*time.Millisecond, 5*time.Millisecond, 40*time.Millisecond, time.Minute)
+	if err == nil {
+		t.Fatal("missing inbound activity and matching Pong did not fail liveness check")
+	}
+	if !strings.Contains(err.Error(), "websocket liveness check timed out") ||
+		!strings.Contains(err.Error(), "no matching pong") {
+		t.Fatalf("liveness error = %v, want explicit probe failure", err)
+	}
+	select {
+	case payload := <-probeSeen:
+		if payload == "" {
+			t.Fatal("liveness probe payload must be unique and non-empty")
+		}
+	case <-time.After(readPumpTestTimeout):
+		t.Fatal("server never received the liveness probe")
+	}
+}
+
+func TestReadMessageLivenessTerminalDuringProbeWinsImmediately(t *testing.T) {
+	serverReady := make(chan struct{})
+	probeSeen := make(chan struct{}, 1)
+	terminalSent := make(chan time.Time, 1)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+
+	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+		conn.SetPingHandler(func(string) error {
+			select {
+			case probeSeen <- struct{}{}:
+			default:
+			}
+			return nil
+		})
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		close(serverReady)
+
+		select {
+		case <-probeSeen:
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"probe-race"}}`)); err != nil {
+				t.Errorf("write terminal response during probe: %v", err)
+				return
+			}
+			terminalSent <- time.Now()
+		case <-stop:
+			return
+		}
+		<-stop
+	})
+
+	<-serverReady
+	commitReadPumpTestLease(t, wc, "probe-race")
+	resultCh := make(chan readPumpMessageResult, 1)
+	go func() {
+		messageType, payload, err := wc.readMessageWithLiveness(20*time.Millisecond, 5*time.Millisecond, 500*time.Millisecond, time.Minute)
+		resultCh <- readPumpMessageResult{messageType: messageType, payload: payload, err: err}
+	}()
+
+	var sentAt time.Time
+	select {
+	case sentAt = <-terminalSent:
+	case <-time.After(readPumpTestTimeout):
+		t.Fatal("server did not send a terminal frame during the probe")
+	}
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("terminal frame lost to probe failure: %v", result.err)
+		}
+		if result.messageType != websocket.TextMessage || !strings.Contains(string(result.payload), `"id":"probe-race"`) {
+			t.Fatalf("response = (%d, %s), want probe-race terminal frame", result.messageType, result.payload)
+		}
+		if elapsed := time.Since(sentAt); elapsed >= 300*time.Millisecond {
+			t.Fatalf("terminal frame delivery waited %s for the 500ms probe timeout", elapsed)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("terminal frame waited for the full liveness probe timeout")
+	}
+}
+
+func TestReadMessageLivenessFailedProbeRescuedByFreshInbound(t *testing.T) {
+	serverReady := make(chan struct{})
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+
+	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+		var peerPingOnce sync.Once
+		conn.SetPingHandler(func(string) error {
+			// 吞掉探针 Ping(不回 Pong),改发一个对端 Ping:客户端 Ping handler
+			// 会 touchInbound,但探针等的匹配 Pong 永远不来。只有 read_pump 的
+			// 探针失败后复检 recentInbound 这条救援分支能救活本测试的流。
+			peerPingOnce.Do(func() {
+				_ = conn.WriteControl(websocket.PingMessage, []byte("peer-ping"), time.Now().Add(time.Second))
+			})
+			return nil
+		})
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		close(serverReady)
+
+		select {
+		case <-time.After(150 * time.Millisecond):
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"probe-rescued"}}`)); err != nil {
+				t.Errorf("write delayed terminal response: %v", err)
+				return
+			}
+		case <-stop:
+			return
+		}
+		<-stop
+	})
+
+	<-serverReady
+	commitReadPumpTestLease(t, wc, "probe-rescued")
+	// 窗口(300ms)远大于探针超时(50ms):探针失败时,探针期间收到的对端 Ping
+	// 在复检处仍然新鲜,必须触发救援而不是杀掉活流。
+	_, payload, err := wc.readMessageWithLiveness(20*time.Millisecond, 300*time.Millisecond, 50*time.Millisecond, time.Minute)
+	if err != nil {
+		t.Fatalf("failed probe with fresh inbound at re-check killed a live stream: %v", err)
+	}
+	if !strings.Contains(string(payload), `"id":"probe-rescued"`) {
+		t.Fatalf("payload = %s, want probe-rescued terminal frame", payload)
+	}
+}
+
+func TestReadMessageLivenessPeerCloseDuringProbeReturnsRealError(t *testing.T) {
+	serverReady := make(chan struct{})
+	holdOpen := make(chan struct{})
+	t.Cleanup(func() { close(holdOpen) })
+
+	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+		conn.SetPingHandler(func(string) error {
+			// 探针进行中对端死亡:必须把真实 close code 归因给消费者
+			// (下游 1009 HTTP 降级等判断依赖它),而不是泛化的 liveness 错误。
+			return conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "died during probe"),
+				time.Now().Add(time.Second),
+			)
+		})
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		close(serverReady)
+		<-holdOpen
+	})
+
+	<-serverReady
+	commitReadPumpTestLease(t, wc, "close-during-probe")
+	_, _, err := wc.readMessageWithLiveness(20*time.Millisecond, 5*time.Millisecond, 500*time.Millisecond, time.Minute)
+	if err == nil {
+		t.Fatal("peer close during probe returned no error")
+	}
+	if strings.Contains(err.Error(), "liveness check timed out") || !strings.Contains(err.Error(), "1011") {
+		t.Fatalf("error = %v, want the real close 1011 cause, not the generic liveness error", err)
+	}
+}
+
+func TestReadMessageLivenessSilenceCapFailsDespiteLiveTransport(t *testing.T) {
+	serverReady := make(chan struct{})
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+
+	_, wc := newReadPumpTestConnection(t, func(conn *websocket.Conn) {
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		close(serverReady)
+
+		// 持续心跳让传输层始终"活着",但永不发业务帧:静默上限必须兜底收尾。
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, []byte("server-heartbeat"), time.Now().Add(time.Second)); err != nil {
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+	})
+
+	<-serverReady
+	commitReadPumpTestLease(t, wc, "silence-cap")
+	started := time.Now()
+	_, _, err := wc.readMessageWithLiveness(15*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond, 60*time.Millisecond)
+	if err == nil {
+		t.Fatal("business-frame silence beyond the cap did not fail despite live transport")
+	}
+	if !strings.Contains(err.Error(), "websocket read timed out") || !strings.Contains(err.Error(), "no business frame within") {
+		t.Fatalf("error = %v, want the silence-cap timeout error", err)
+	}
+	if elapsed := time.Since(started); elapsed < 60*time.Millisecond {
+		t.Fatalf("silence cap fired after %s, before the 60ms cap elapsed", elapsed)
+	}
+}
+
+func TestReadMessageLivenessRejectsNonPositiveTimings(t *testing.T) {
+	wc := &WsConnection{}
+	for _, tt := range []struct {
+		name                    string
+		interval, window, probe time.Duration
+		wantSubstr              string
+	}{
+		{"zero interval", 0, time.Second, time.Second, "check interval must be positive"},
+		{"zero window", time.Second, 0, time.Second, "inbound window must be positive"},
+		{"negative probe", time.Second, time.Second, -1, "probe timeout must be positive"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := wc.readMessageWithLiveness(tt.interval, tt.window, tt.probe, time.Minute)
+			if err == nil || !strings.Contains(err.Error(), tt.wantSubstr) {
+				t.Fatalf("err = %v, want %q", err, tt.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestReadLivenessConstantsInvariants(t *testing.T) {
+	if ActiveReadRecentInboundWindow < 2*HeartbeatPingInterval {
+		t.Fatalf("recent inbound window %s must tolerate one missed heartbeat (>= %s)", ActiveReadRecentInboundWindow, 2*HeartbeatPingInterval)
+	}
+	if ActiveReadRecentInboundWindow >= ReadLivenessCheckInterval {
+		t.Fatalf("recent inbound window %s must be shorter than the check interval %s", ActiveReadRecentInboundWindow, ReadLivenessCheckInterval)
+	}
+	if ActiveReadProbeTimeout <= 0 || ActiveReadProbeTimeout >= ReadLivenessCheckInterval {
+		t.Fatalf("probe timeout %s out of sane range (0, %s)", ActiveReadProbeTimeout, ReadLivenessCheckInterval)
+	}
+	if ActiveReadMaxTurnSilence <= ReadLivenessCheckInterval {
+		t.Fatalf("max turn silence %s must exceed the check interval %s or every long turn dies at the first checkpoint", ActiveReadMaxTurnSilence, ReadLivenessCheckInterval)
+	}
+}
+
+func TestActiveReadMaxTurnSilenceEnvOverride(t *testing.T) {
+	for _, tt := range []struct {
+		name, value string
+		want        time.Duration
+	}{
+		{"default when unset", "", ActiveReadMaxTurnSilence},
+		{"custom duration", "30m", 30 * time.Minute},
+		{"zero disables the cap", "0", 0},
+		{"garbage falls back", "not-a-duration", ActiveReadMaxTurnSilence},
+		{"negative falls back", "-5m", ActiveReadMaxTurnSilence},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CODEX_WS_MAX_TURN_SILENCE", tt.value)
+			if got := activeReadMaxTurnSilence(); got != tt.want {
+				t.Fatalf("activeReadMaxTurnSilence() = %s, want %s", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestReadPumpRejectsFragmentedMessageStartedWhileIdle(t *testing.T) {
@@ -1332,6 +1757,18 @@ func TestProbeSkipsRoundtripAfterRecentInbound(t *testing.T) {
 	wc.touchInbound()
 	if !manager.probe(wc) {
 		t.Fatal("probe must trust a clean connection with recent inbound activity without a ping roundtrip")
+	}
+}
+
+// TestWeakNetworkProbeRequiresRoundtripAfterRecentInbound 验证弱网模式不会因最近
+// 收到过业务帧而跳过探活；每次复用都必须拿到本次 Ping 对应的 Pong（issue #442）。
+func TestWeakNetworkProbeRequiresRoundtripAfterRecentInbound(t *testing.T) {
+	setWeakNetworkModeForTest(t, true)
+	manager, wc := newProbeDeafTestConnection(t)
+
+	wc.touchInbound()
+	if manager.probe(wc) {
+		t.Fatal("weak-network mode must require a fresh ping/pong even after recent inbound activity")
 	}
 }
 

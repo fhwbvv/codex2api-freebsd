@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -195,7 +194,6 @@ func (h *Handler) evaluatePromptGuard(c *gin.Context, rawBody []byte, signedBody
 
 func (h *Handler) evaluatePromptGuardWithConfig(c *gin.Context, cfg promptfilter.Config, rawBody []byte, signedBody []byte, endpoint string, model string, transport promptfilter.Transport) promptGuardEvaluation {
 	requestedModel, effectiveModel, trustedProfile, profileOverride, modeOverride, providerOverride, providerOverrideSet := h.resolvePromptGuardOverrides(c, cfg, signedBody, model)
-	rolloutIdentity := h.resolvePromptGuardRolloutIdentity(c, cfg, signedBody)
 	envelope := promptfilter.BuildEnvelopeWithModelsAndConfig(
 		rawBody,
 		endpoint,
@@ -218,7 +216,7 @@ func (h *Handler) evaluatePromptGuardWithConfig(c *gin.Context, cfg promptfilter
 			extensionErrors = append(extensionErrors, "attachment_parser: "+err.Error())
 		}
 	}
-	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride, rolloutIdentity)
+	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride)
 	if !adapterOnly && evaluation.Decision.ApplicationPromptKind == "" {
 		if err := h.commitPromptGuardSession(c, cfg, sessionPending, evaluation.Decision); err != nil {
 			extensionErrors = append(extensionErrors, "session_commit: "+err.Error())
@@ -236,7 +234,6 @@ func (h *Handler) evaluatePromptGuardText(c *gin.Context, text string, endpoint 
 func (h *Handler) evaluatePromptGuardTextWithConfig(c *gin.Context, cfg promptfilter.Config, text string, endpoint string, model string) promptGuardEvaluation {
 	signedBody := ingressRequestBody(c, nil)
 	requestedModel, effectiveModel, trustedProfile, profileOverride, modeOverride, providerOverride, providerOverrideSet := h.resolvePromptGuardOverrides(c, cfg, signedBody, model)
-	rolloutIdentity := h.resolvePromptGuardRolloutIdentity(c, cfg, signedBody)
 	envelope := promptfilter.BuildTextEnvelopeWithModelsAndConfig(
 		text,
 		endpoint,
@@ -256,7 +253,7 @@ func (h *Handler) evaluatePromptGuardTextWithConfig(c *gin.Context, cfg promptfi
 			extensionErrors = append(extensionErrors, "session_correlation: "+err.Error())
 		}
 	}
-	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride, rolloutIdentity)
+	evaluation := h.evaluatePromptGuardEnvelope(c, cfg, envelope, trustedProfile, profileOverride, modeOverride)
 	if !adapterOnly && evaluation.Decision.ApplicationPromptKind == "" {
 		if err := h.commitPromptGuardSession(c, cfg, sessionPending, evaluation.Decision); err != nil {
 			extensionErrors = append(extensionErrors, "session_commit: "+err.Error())
@@ -286,20 +283,13 @@ func (h *Handler) resolvePromptGuardOverrides(c *gin.Context, cfg promptfilter.C
 	if effectiveModel == "" && policyContext.Meta.UpstreamModel != "" {
 		effectiveModel = policyContext.Meta.UpstreamModel
 	}
+	// NewAPI metadata can describe the original provider/protocol/model for
+	// audit attribution, but it is not an enforcement control plane. The global
+	// GuardPipeline is the sole authority for mode and review profile.
+	profileOverride := ""
+	modeOverride := ""
 	provider := promptfilter.ModelFamily(policyContext.Meta.Provider)
-	return requestedModel, effectiveModel, true, policyContext.Meta.Profile, policyContext.Meta.Mode, provider, provider != promptfilter.ModelFamilyUnknown
-}
-
-func (h *Handler) resolvePromptGuardRolloutIdentity(c *gin.Context, cfg promptfilter.Config, signedBody []byte) promptfilter.RolloutIdentity {
-	if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, signedBody); verified {
-		if userID := strings.TrimSpace(policyContext.Identity.UserID); userID != "" {
-			return promptfilter.RolloutIdentity{Source: promptfilter.RolloutIdentityNewAPIUser, Value: userID}
-		}
-	}
-	if apiKeyID := requestAPIKeyID(c); apiKeyID > 0 {
-		return promptfilter.RolloutIdentity{Source: promptfilter.RolloutIdentityAPIKey, Value: strconv.FormatInt(apiKeyID, 10)}
-	}
-	return promptfilter.RolloutIdentity{}
+	return requestedModel, effectiveModel, true, profileOverride, modeOverride, provider, provider != promptfilter.ModelFamilyUnknown
 }
 
 func applyPromptGuardProviderOverride(envelope *promptfilter.RequestEnvelope, cfg promptfilter.Config, trusted bool, provider promptfilter.ModelFamily, providerSet bool) {
@@ -312,7 +302,7 @@ func applyPromptGuardProviderOverride(envelope *promptfilter.RequestEnvelope, cf
 	}
 }
 
-func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.Config, envelope promptfilter.RequestEnvelope, trustedProfile bool, profileOverride string, modeOverride string, rolloutIdentity promptfilter.RolloutIdentity) promptGuardEvaluation {
+func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.Config, envelope promptfilter.RequestEnvelope, trustedProfile bool, profileOverride string, modeOverride string) promptGuardEvaluation {
 	ctx := context.Background()
 	if c != nil && c.Request != nil {
 		ctx = c.Request.Context()
@@ -323,32 +313,55 @@ func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.C
 		TrustedProfile:  trustedProfile,
 		ProfileOverride: profileOverride,
 		ModeOverride:    modeOverride,
-		RolloutIdentity: rolloutIdentity,
 	})
 	if cfg.Enabled && decision.Mode == promptfilter.GuardModeOff && decision.ReasonCode != promptfilter.ReasonCodeAdapterUnclassified {
 		return h.evaluateLegacyPromptGuard(c, ctx, cfg, envelope, decision.Profile)
 	}
 	verdict := decision.LegacyVerdict()
 	verdict.Mode = legacyModeForPromptGuard(decision.Mode)
-	// The detector selected for audit can come from history, tool output, or
-	// session context. Semantic review, persisted request evidence, and the UI
-	// preview must nevertheless describe only the direct current-user prompt.
-	text := promptGuardReviewText(decision, envelope)
+	// Normal audit evidence describes the direct current-user prompt. The narrow
+	// high-confidence tool-output enforcement exception instead records the exact
+	// triggering segment, avoiding an empty or misleading block log. Semantic
+	// review remains limited by promptGuardShouldInspect and cannot clear an
+	// auxiliary block using unrelated current-user text.
+	text := promptGuardAuditText(decision, envelope)
 	verdict.FullText = text
 	verdict.TextPreview = promptfilter.RedactedPreview(text, 500)
 	verdict.ExtractedChars = len([]rune(text))
-	// Semantic review must examine the text that produced the enforcement
-	// decision. The persisted preview intentionally contains only the current
-	// user prompt, so a history/tool/session enforcement signal cannot safely be
-	// reviewed against that different text: a benign current prompt could clear
-	// an administrator-enabled auxiliary-layer block. Clean-prompt sampling is
-	// still allowed when the pipeline itself made no enforcement decision.
+	// Normal entry review receives the current user request. A narrowly qualified
+	// upstream-compatibility block instead reviews the exact auxiliary evidence;
+	// that result may add context, but it cannot clear the deterministic block or
+	// turn auxiliary provenance into a user strike.
+	reviewText := promptGuardReviewText(decision, envelope)
+	compatibilityBlock := promptGuardAuxiliaryCompatibilityBlock(decision)
 	inspectCurrentPrompt := promptGuardShouldInspect(decision, cfg)
 	if inspectCurrentPrompt {
 		advancedCfg := cfg
 		verdict = h.applyPromptSemanticProtection(c, text, verdict, advancedCfg)
 		if shouldReviewPromptGuardDecision(decision, verdict, cfg) {
-			verdict = h.reviewPromptFilterVerdict(ctx, text, verdict, cfg)
+			if policy, subjectKey, trusted := h.promptRiskTrustPolicyForRequest(c); trusted && promptRiskTrustCanBypassReview(decision, verdict, reviewText) && !promptRiskTrustReviewRequired(c, cfg, policy, subjectKey) {
+				verdict.Reason = "adaptive trusted profile bypassed synchronous model review"
+				decision.ReasonCode = "adaptive_trust_review_bypass"
+				h.recordPromptRiskTrustBypass(c, policy, subjectKey)
+			} else {
+				localTrustRisk := trusted && promptRiskTrustShouldSuspend(decision, verdict)
+				verdict = h.reviewPromptFilterVerdict(ctx, reviewText, verdict, cfg)
+				var terminalBypassed bool
+				verdict, terminalBypassed = applyPromptGuardTerminalModelBypass(verdict, envelope, cfg)
+				if terminalBypassed {
+					localTrustRisk = false
+				}
+				if compatibilityBlock {
+					verdict = retainPromptGuardAuxiliaryCompatibilityBlock(verdict)
+				}
+				if trusted && !localTrustRisk && verdict.ReviewModel != "" && verdict.ReviewError == "" && !verdict.ReviewFlagged && verdict.Action == promptfilter.ActionAllow {
+					h.recordPromptRiskTrustModelReview(c, policy, subjectKey)
+				}
+				reviewTrustRisk := promptRiskTrustReviewShouldSuspend(verdict)
+				if trusted && (localTrustRisk || reviewTrustRisk) {
+					h.suspendPromptRiskTrustPolicy(policy, subjectKey, "模型复核或本地高危规则命中")
+				}
+			}
 		}
 		if advancedCfg.Advanced.Risk.Enabled {
 			verdict = h.applyPromptRisk(c, verdict, advancedCfg)
@@ -492,13 +505,32 @@ func promptGuardShadowLoggingEnabled(job promptGuardShadowAuditJob) bool {
 // Guard mode off disables the extensible pipeline, not the existing prompt
 // filter. The master prompt-filter switch remains the only way to turn all
 // input filtering off, so adopting GuardPipeline cannot accidentally create a
-// bypass during rollout or via a trusted downstream mode override.
+// bypass through a trusted downstream mode override.
 func (h *Handler) evaluateLegacyPromptGuard(c *gin.Context, ctx context.Context, cfg promptfilter.Config, envelope promptfilter.RequestEnvelope, profile string) promptGuardEvaluation {
 	text := envelopeCurrentUserText(envelope)
 	verdict := promptfilter.InspectText(text, cfg)
 	verdict = h.applyPromptSemanticProtection(c, text, verdict, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		verdict = h.reviewPromptFilterVerdict(ctx, text, verdict, cfg)
+		if policy, subjectKey, trusted := h.promptRiskTrustPolicyForRequest(c); trusted && verdict.Action == promptfilter.ActionAllow && verdict.Score == 0 && verdict.RawScore == 0 && len(verdict.Matched) == 0 && strings.TrimSpace(text) != "" && !promptRiskTrustReviewRequired(c, cfg, policy, subjectKey) {
+			verdict.Reason = "adaptive trusted profile bypassed synchronous model review"
+			h.recordPromptRiskTrustBypass(c, policy, subjectKey)
+		} else {
+			localTrustRisk := trusted && (verdict.Action != promptfilter.ActionAllow || verdict.Score > 0 || verdict.RawScore > 0 || len(verdict.Matched) > 0)
+			verdict = h.reviewPromptFilterVerdict(ctx, text, verdict, cfg)
+			var terminalBypassed bool
+			verdict, terminalBypassed = applyPromptGuardTerminalModelBypass(verdict, envelope, cfg)
+			if terminalBypassed {
+				localTrustRisk = false
+			}
+			verdict = promptfilter.ApplyReviewMode(verdict, cfg.Mode)
+			if trusted && !localTrustRisk && verdict.ReviewModel != "" && verdict.ReviewError == "" && !verdict.ReviewFlagged && verdict.Action == promptfilter.ActionAllow {
+				h.recordPromptRiskTrustModelReview(c, policy, subjectKey)
+			}
+			reviewTrustRisk := promptRiskTrustReviewShouldSuspend(verdict)
+			if trusted && (localTrustRisk || reviewTrustRisk) {
+				h.suspendPromptRiskTrustPolicy(policy, subjectKey, "模型复核或本地高危规则命中")
+			}
+		}
 	}
 	if cfg.Advanced.Risk.Enabled {
 		verdict = h.applyPromptRisk(c, verdict, cfg)
@@ -553,6 +585,9 @@ func promptGuardShouldInspect(decision promptfilter.Decision, cfg promptfilter.C
 	if decision.ReasonCode == promptfilter.ReasonCodeAdapterUnclassified {
 		return false
 	}
+	if promptfilter.NormalizeReviewConfig(cfg.Review).Ready() {
+		return true
+	}
 	if promptGuardHasReviewableEnforcement(decision) {
 		return true
 	}
@@ -566,12 +601,65 @@ func promptGuardShouldInspect(decision promptfilter.Decision, cfg promptfilter.C
 }
 
 func promptGuardReviewText(decision promptfilter.Decision, envelope promptfilter.RequestEnvelope) string {
-	if decision.ApplicationPromptKind != "" || decision.PrimaryOrigin == promptfilter.OriginApplicationCandidate || decision.PrimaryOrigin == promptfilter.OriginCurrentUser {
+	if decision.ApplicationPromptKind != "" || decision.PrimaryOrigin == promptfilter.OriginApplicationCandidate || decision.PrimaryOrigin == promptfilter.OriginCurrentUser || promptGuardAuxiliaryCompatibilityBlock(decision) {
 		if candidate := strings.TrimSpace(decision.ReviewText); candidate != "" {
 			return candidate
 		}
 	}
 	return envelopeCurrentUserText(envelope)
+}
+
+func promptGuardAuxiliaryCompatibilityBlock(decision promptfilter.Decision) bool {
+	return decision.Action == promptfilter.ActionBlock &&
+		decision.PrimaryOrigin == promptfilter.OriginToolOutput &&
+		!decision.StrikeEligible && !decision.Terminal &&
+		strings.TrimSpace(decision.ReviewText) != ""
+}
+
+func retainPromptGuardAuxiliaryCompatibilityBlock(verdict promptfilter.Verdict) promptfilter.Verdict {
+	verdict.Action = promptfilter.ActionBlock
+	verdict.TerminalStrictHit = false
+	verdict.TerminalCategoryHit = false
+	verdict.SensitiveIntent = false
+	if !verdict.ReviewFlagged {
+		verdict.Reason = "upstream compatibility guard retained auxiliary risk block"
+	}
+	return verdict
+}
+
+func applyPromptGuardTerminalModelBypass(verdict promptfilter.Verdict, envelope promptfilter.RequestEnvelope, cfg promptfilter.Config) (promptfilter.Verdict, bool) {
+	if !verdict.Reviewed || verdict.ReviewError != "" || verdict.ReviewFlagged ||
+		(!verdict.TerminalStrictHit && !verdict.TerminalCategoryHit) {
+		return verdict, false
+	}
+	requestedModel := strings.ToLower(strings.TrimSpace(envelope.RequestedModel))
+	if requestedModel == "" {
+		return verdict, false
+	}
+	matched := false
+	for _, model := range cfg.Advanced.Enforcement.TerminalBypassModels {
+		if strings.EqualFold(strings.TrimSpace(model), requestedModel) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return verdict, false
+	}
+	verdict.Action = promptfilter.ActionAllow
+	verdict.TerminalStrictHit = false
+	verdict.TerminalCategoryHit = false
+	verdict.Reason = "clean prompt review cleared terminal match for exempt requested model"
+	return verdict, true
+}
+
+func promptGuardAuditText(decision promptfilter.Decision, envelope promptfilter.RequestEnvelope) string {
+	if decision.Action == promptfilter.ActionBlock && decision.PrimaryOrigin == promptfilter.OriginToolOutput {
+		if evidence := strings.TrimSpace(decision.ReviewText); evidence != "" {
+			return evidence
+		}
+	}
+	return promptGuardReviewText(decision, envelope)
 }
 
 func envelopeCurrentUserText(envelope promptfilter.RequestEnvelope) string {
@@ -587,9 +675,6 @@ func envelopeCurrentUserText(envelope promptfilter.RequestEnvelope) string {
 }
 
 func shouldReviewPromptGuardDecision(decision promptfilter.Decision, verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
-	if decision.Profile == promptfilter.GuardProfileStrict && decision.Terminal && decision.StrikeEligible {
-		return false
-	}
 	return shouldReviewPromptFilterVerdict(verdict, cfg)
 }
 
@@ -609,13 +694,19 @@ func finalizePromptGuardDecision(decision promptfilter.Decision, verdict promptf
 		}
 	}
 	decision.Action = finalAction
+	if verdict.Reviewed && verdict.ReviewFlagged && finalAction != promptfilter.ActionAllow && len(verdict.Matched) == 0 &&
+		(decision.PrimaryOrigin == "" || decision.PrimaryOrigin == promptfilter.OriginCurrentUser) {
+		decision.PrimaryOrigin = promptfilter.OriginCurrentUser
+		decision.PrimaryDetector = "external_review"
+		decision.StrikeEligible = false
+	}
 	if decision.ApplicationPromptKind != "" && finalAction != promptfilter.ActionAllow && decision.PrimaryOrigin == "" {
 		decision.PrimaryOrigin = promptfilter.OriginApplicationCandidate
 	}
 	if decision.PrimaryOrigin == promptfilter.OriginApplicationCandidate {
 		decision.StrikeEligible = false
 	}
-	if verdict.Reviewed && !verdict.ReviewFlagged {
+	if verdict.Reviewed && !verdict.ReviewFlagged && finalAction == promptfilter.ActionAllow {
 		decision.Terminal = false
 		decision.StrikeEligible = false
 	}

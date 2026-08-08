@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { RefreshCw } from 'lucide-react'
+import { Loader2, RefreshCw } from 'lucide-react'
 import { api } from '../api'
 import OpsTabs from '../components/OpsTabs'
 import PageHeader from '../components/PageHeader'
@@ -8,7 +8,7 @@ import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import StatusBadge from '../components/StatusBadge'
-import type { AccountRow, OpsOverviewResponse } from '../types'
+import type { AccountListSummary, AccountRow, OpsOverviewResponse } from '../types'
 import { formatCompactEmail } from '../lib/utils'
 import { formatLongUsageWindowLabel } from '../lib/usageFormat'
 import { Badge } from '@/components/ui/badge'
@@ -25,26 +25,51 @@ export default function SchedulerBoard() {
   const [sortBy, setSortBy] = useState('risk')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  const requestAbortRef = useRef<AbortController | null>(null)
 
   const loadSchedulerData = useCallback(async () => {
+    requestAbortRef.current?.abort()
+    const controller = new AbortController()
+    requestAbortRef.current = controller
+    const healthTier = tierFilter === 'everything'
+      ? undefined
+      : tierFilter === 'all'
+        ? 'attention' as const
+        : tierFilter as 'healthy' | 'warm' | 'risky' | 'banned'
+    const sort = sortBy === 'score_asc'
+      ? 'dispatch_score' as const
+      : sortBy === 'usage_desc'
+        ? 'usage' as const
+        : sortBy === 'latency_penalty'
+          ? 'latency_penalty' as const
+          : sortBy === 'unauthorized'
+            ? 'unauthorized' as const
+            : 'risk' as const
+    const order = sortBy === 'score_asc' ? 'asc' as const : 'desc' as const
     const [overview, accountsResponse] = await Promise.all([
-      api.getOpsOverview(),
-      api.getAccounts(),
+      api.getOpsOverview(controller.signal),
+      api.getAccountsPage({ channel: 'codex', page, pageSize, healthTier, sort, order }, controller.signal),
     ])
 
     return {
       overview,
       accounts: accountsResponse.accounts ?? [],
+      total: accountsResponse.total,
+      summary: accountsResponse.summary,
     }
-  }, [])
+  }, [page, pageSize, sortBy, tierFilter])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     overview: OpsOverviewResponse | null
     accounts: AccountRow[]
+    total: number
+    summary: AccountListSummary | null
   }>({
     initialData: {
       overview: null,
       accounts: [],
+      total: 0,
+      summary: null,
     },
     load: loadSchedulerData,
   })
@@ -57,75 +82,26 @@ export default function SchedulerBoard() {
     return () => window.clearInterval(timer)
   }, [reloadSilently])
 
+  useEffect(() => () => requestAbortRef.current?.abort(), [])
+
   const overview = data.overview
   const accounts = data.accounts
   const updatedLabel = overview?.updated_at ? formatTimeLabel(overview.updated_at) : '--:--:--'
-  const schedulerCounts = useMemo(() => ({
-    healthy: accounts.filter((account) => account.health_tier === 'healthy').length,
-    warm: accounts.filter((account) => account.health_tier === 'warm').length,
-    risky: accounts.filter((account) => account.health_tier === 'risky').length,
-    banned: accounts.filter((account) => account.health_tier === 'banned' || account.status === 'unauthorized').length,
-  }), [accounts])
-  const recentIssueCounts = useMemo(() => {
-    const now = Date.now()
-    const withinWindow = (iso?: string, minutes = 60) => {
-      if (!iso) return false
-      const ts = new Date(iso).getTime()
-      if (Number.isNaN(ts)) return false
-      return now - ts <= minutes * 60 * 1000
-    }
-
-    return {
-      unauthorized24h: accounts.filter((account) => withinWindow(account.last_unauthorized_at, 24 * 60)).length,
-      rateLimited1h: accounts.filter((account) => withinWindow(account.last_rate_limited_at, 60)).length,
-      timeout15m: accounts.filter((account) => withinWindow(account.last_timeout_at, 15)).length,
-    }
-  }, [accounts])
-  const spotlightAccounts = useMemo(() => {
-    const priority = (account: AccountRow) => {
-      if (account.health_tier === 'banned' || account.status === 'unauthorized') return 3
-      if (account.health_tier === 'risky') return 2
-      if (account.health_tier === 'warm') return 1
-      return 0
-    }
-
-    return [...accounts]
-      .filter((account) => {
-        if (tierFilter === 'everything') return true
-        if (tierFilter === 'all') {
-          return priority(account) > 0
-        }
-        if (tierFilter === 'healthy') {
-          return account.health_tier === 'healthy'
-        }
-        if (tierFilter === 'banned') {
-          return account.health_tier === 'banned' || account.status === 'unauthorized'
-        }
-        return account.health_tier === tierFilter
-      })
-      .sort((left, right) => {
-        switch (sortBy) {
-          case 'score_asc':
-            return getDispatchScore(left) - getDispatchScore(right)
-          case 'usage_desc':
-            return (right.usage_percent_7d ?? -1) - (left.usage_percent_7d ?? -1)
-          case 'latency_penalty':
-            return (right.scheduler_breakdown?.latency_penalty ?? 0) - (left.scheduler_breakdown?.latency_penalty ?? 0)
-          case 'unauthorized':
-            return Number(Boolean(right.last_unauthorized_at)) - Number(Boolean(left.last_unauthorized_at))
-          case 'risk':
-          default: {
-            const priorityDiff = priority(right) - priority(left)
-            if (priorityDiff !== 0) return priorityDiff
-            return getDispatchScore(left) - getDispatchScore(right)
-          }
-        }
-      })
-  }, [accounts, tierFilter, sortBy])
-
-  const totalPages = Math.max(1, Math.ceil(spotlightAccounts.length / pageSize))
+  const schedulerCounts = {
+    healthy: data.summary?.healthy ?? 0,
+    warm: data.summary?.warm ?? 0,
+    risky: data.summary?.risky ?? 0,
+    banned: data.summary?.banned ?? 0,
+  }
+  const recentIssueCounts = {
+    unauthorized24h: data.summary?.unauthorized_24h ?? 0,
+    rateLimited1h: data.summary?.rate_limited_1h ?? 0,
+    timeout15m: data.summary?.timeout_15m ?? 0,
+  }
+  const spotlightAccounts = accounts
+  const totalPages = Math.max(1, Math.ceil(data.total / pageSize))
   const currentPage = Math.min(page, totalPages)
-  const pagedAccounts = spotlightAccounts.slice((currentPage - 1) * pageSize, currentPage * pageSize)
+  const pagedAccounts = spotlightAccounts
 
   // 筛选/排序变更时重置页码
   useEffect(() => {
@@ -146,8 +122,8 @@ export default function SchedulerBoard() {
   return (
     <StateShell
       variant="page"
-      loading={loading}
-      error={error}
+      loading={loading && accounts.length === 0}
+      error={accounts.length === 0 ? error : null}
       onRetry={() => void reload()}
       loadingTitle={t('scheduler.loadingTitle')}
       loadingDescription={t('scheduler.loadingDesc')}
@@ -169,10 +145,26 @@ export default function SchedulerBoard() {
         />
         <OpsTabs />
 
+        {error && accounts.length > 0 ? (
+          <div className="mb-2 flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">
+            <span className="truncate">{error}</span>
+            <Button variant="outline" size="sm" onClick={() => void reload()}>
+              {t('common.retry')}
+            </Button>
+          </div>
+        ) : null}
+
+        {loading && accounts.length > 0 ? (
+          <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
+            <Loader2 className="size-3 animate-spin" />
+            {t('common.loading')}
+          </div>
+        ) : null}
+
         {overview ? (
           <>
             <div className="mb-6 grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-4 sm:gap-4">
-              <SummaryPill label={t('scheduler.totalAccounts')} value={formatNumber(accounts.length)} />
+              <SummaryPill label={t('scheduler.totalAccounts')} value={formatNumber(data.summary?.total ?? 0)} />
               <SummaryPill label={t('scheduler.availableAccounts')} value={`${overview.runtime.available_accounts} / ${overview.runtime.total_accounts}`} />
               <SummaryPill label="Healthy + Warm" value={formatNumber(schedulerCounts.healthy + schedulerCounts.warm)} />
               <SummaryPill label={t('scheduler.highRiskAccounts')} value={formatNumber(schedulerCounts.risky + schedulerCounts.banned)} />
@@ -287,7 +279,7 @@ export default function SchedulerBoard() {
                         page={currentPage}
                         totalPages={totalPages}
                         onPageChange={setPage}
-                        totalItems={spotlightAccounts.length}
+                        totalItems={data.total}
                         pageSize={pageSize}
                         pageSizeOptions={PAGE_SIZE_OPTIONS}
                         onPageSizeChange={handlePageSizeChange}

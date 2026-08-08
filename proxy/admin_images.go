@@ -16,7 +16,7 @@ import (
 
 // GenerateImageOnceForAdmin executes the existing Images API handler in-process.
 // It keeps model aliasing, account dispatch, usage logging, and image parsing in one code path.
-func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow) ([]byte, int, error) {
+func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow, sharedAPIKeyConcurrency bool) ([]byte, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -30,15 +30,19 @@ func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte,
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != nil && strings.TrimSpace(apiKey.Key) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey.Key)
+		ginCtx.Set(contextAPIKeyRow, apiKey)
 		ginCtx.Set(contextAPIKeyID, apiKey.ID)
 		ginCtx.Set(contextAPIKeyName, strings.TrimSpace(apiKey.Name))
 		ginCtx.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKey.Key))
 	}
 	ginCtx.Request = req
 
-	// 这条 in-process 路径刻意不放 contextAPIKeyRow（否则并发槽会被重复占用），
-	// 因此 Key 级限额由调用方在外层请求上校验。scope 预算（issue #439）是调度层面的
-	// 过滤，只有挂在这个 gin context 上才生效，所以在这里单独算一次。
+	// 每个批量输出都是一次真实上游请求，因此复用标准 Images handler 的
+	// API Key 限额。并发槽由调用方决定：入队时已经为整个任务占过槽的路径
+	// 传 true，否则这里会为同一个 Key 再占一次，把上限打对折。
+	if sharedAPIKeyConcurrency {
+		ginCtx.Set(contextAPIKeyConcurrencyInherited, true)
+	}
 	if status, msg := h.applyAdminScopeBudget(ctx, ginCtx, apiKey); status != 0 {
 		return nil, status, fmt.Errorf("%s", msg)
 	}
@@ -73,7 +77,7 @@ func extractAdminImageErrorMessage(body []byte) string {
 
 // GenerateImageEditForAdmin executes the ImagesEdits handler in-process for
 // image-to-image (edit) jobs from the admin image studio.
-func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow) ([]byte, int, error) {
+func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow, sharedAPIKeyConcurrency bool) ([]byte, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -87,12 +91,16 @@ func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte,
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != nil && strings.TrimSpace(apiKey.Key) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey.Key)
+		ginCtx.Set(contextAPIKeyRow, apiKey)
 		ginCtx.Set(contextAPIKeyID, apiKey.ID)
 		ginCtx.Set(contextAPIKeyName, strings.TrimSpace(apiKey.Name))
 		ginCtx.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKey.Key))
 	}
 	ginCtx.Request = req
 
+	if sharedAPIKeyConcurrency {
+		ginCtx.Set(contextAPIKeyConcurrencyInherited, true)
+	}
 	if status, msg := h.applyAdminScopeBudget(ctx, ginCtx, apiKey); status != 0 {
 		return nil, status, fmt.Errorf("%s", msg)
 	}

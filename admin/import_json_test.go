@@ -14,6 +14,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/openaiidentity"
 	"github.com/gin-gonic/gin"
 )
 
@@ -1031,6 +1032,59 @@ func TestImportAccountsCommonAllowsDuplicateWithoutWorkspace(t *testing.T) {
 	}
 }
 
+func TestImportAccountsCommonSeparatesCredentialWorkspaceRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	t.Cleanup(store.Stop)
+	handler := &Handler{db: db, store: store}
+
+	if _, err := db.InsertAccountWithCredentials(context.Background(), "personal", map[string]interface{}{
+		"refresh_token": "rt-import-shared",
+	}, ""); err != nil {
+		t.Fatalf("Insert personal: %v", err)
+	}
+
+	runImport := func(workspaceID string, allowDuplicate bool) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", nil)
+		headers := map[string]string(nil)
+		if workspaceID != "" {
+			headers = map[string]string{"Chatgpt-Account-Id": workspaceID}
+		}
+		handler.importAccountsCommon(ctx, []importToken{{
+			refreshToken: "rt-import-shared",
+		}}, "", allowDuplicate, headers)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("workspace %q status = %d: %s", workspaceID, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	runImport("team-a", false)
+	runImport("team-a", true)
+	runImport("team-b", false)
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("active rows = %d, want personal + team-a + team-b", len(rows))
+	}
+	gotRoutes := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		gotRoutes[openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers"))] = true
+	}
+	for _, workspaceID := range []string{"", "team-a", "team-b"} {
+		if !gotRoutes[workspaceID] {
+			t.Fatalf("persisted routes = %#v, missing %q", gotRoutes, workspaceID)
+		}
+	}
+}
+
 // TestAddAccountDedupsRefreshToken 验证：RT 单账号添加默认按 RT 原文对已有库去重。
 func TestAddAccountDedupsRefreshToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1083,6 +1137,78 @@ func TestAddAccountDedupsRefreshToken(t *testing.T) {
 	}
 	if rows, _ := db.ListActive(context.Background()); len(rows) != 2 {
 		t.Fatalf("active rows = %d, want 2 (duplicate allowed)", len(rows))
+	}
+}
+
+func TestAddAccountSeparatesRefreshTokenWorkspaceRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.SetLazyMode(true)
+	t.Cleanup(store.Stop)
+	handler := &Handler{db: db, store: store}
+
+	add := func(workspaceID string, allowDuplicate bool) map[string]interface{} {
+		payload := map[string]interface{}{
+			"refresh_token":   "rt-shared-route",
+			"allow_duplicate": allowDuplicate,
+		}
+		if workspaceID != "" {
+			payload["custom_headers"] = map[string]string{
+				"Chatgpt-Account-Id": workspaceID,
+			}
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts", bytes.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		handler.AddAccount(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		var response map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return response
+	}
+
+	if response := add("", false); response["success"] != float64(1) {
+		t.Fatalf("personal add = %#v, want success=1", response)
+	}
+	if response := add("team-a", false); response["success"] != float64(1) {
+		t.Fatalf("team-a add = %#v, want success=1", response)
+	}
+	if response := add("team-a", true); response["duplicate"] != float64(1) {
+		t.Fatalf("team-a duplicate = %#v, want duplicate=1 even with allow_duplicate", response)
+	}
+	if response := add("team-b", false); response["success"] != float64(1) {
+		t.Fatalf("team-b add = %#v, want success=1", response)
+	}
+	if response := add("", false); response["duplicate"] != float64(1) {
+		t.Fatalf("personal duplicate = %#v, want duplicate=1", response)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("active rows = %d, want personal + team-a + team-b", len(rows))
+	}
+	gotRoutes := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		gotRoutes[openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers"))] = true
+	}
+	for _, workspaceID := range []string{"", "team-a", "team-b"} {
+		if !gotRoutes[workspaceID] {
+			t.Fatalf("persisted routes = %#v, missing %q", gotRoutes, workspaceID)
+		}
 	}
 }
 
@@ -1152,6 +1278,129 @@ func TestAddATAccountCountsUpdateNotNew(t *testing.T) {
 	}
 }
 
+func TestAddOpaqueATPersistsAndDeduplicatesWorkspaceRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	t.Cleanup(store.Stop)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	add := func(workspaceID string, allowDuplicate bool) map[string]interface{} {
+		payload := map[string]interface{}{
+			"access_token":    "at-opaque-shared",
+			"allow_duplicate": allowDuplicate,
+		}
+		if workspaceID != "" {
+			payload["custom_headers"] = map[string]string{
+				"Chatgpt-Account-Id": workspaceID,
+			}
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal request: %v", err)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/at", bytes.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+		handler.AddATAccount(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		var response map[string]interface{}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		return response
+	}
+
+	if response := add("", false); response["success"] != float64(1) {
+		t.Fatalf("personal add = %#v, want success=1", response)
+	}
+	if response := add("team-a", false); response["success"] != float64(1) {
+		t.Fatalf("team-a add = %#v, want success=1", response)
+	}
+	if response := add("team-a", true); response["duplicate"] != float64(1) {
+		t.Fatalf("team-a duplicate = %#v, want duplicate=1 even with allow_duplicate", response)
+	}
+	if response := add("team-b", false); response["success"] != float64(1) {
+		t.Fatalf("team-b add = %#v, want success=1", response)
+	}
+	if response := add("", false); response["duplicate"] != float64(1) {
+		t.Fatalf("personal duplicate = %#v, want duplicate=1", response)
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("active rows = %d, want personal + team-a + team-b", len(rows))
+	}
+	gotRoutes := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		if got := row.GetCredential("access_token"); got != "at-opaque-shared" {
+			t.Fatalf("access_token = %q, want at-opaque-shared", got)
+		}
+		if got := row.GetCredential("access_token_type"); got != accessTokenTypeCodexAT {
+			t.Fatalf("access_token_type = %q, want %s", got, accessTokenTypeCodexAT)
+		}
+		gotRoutes[openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers"))] = true
+	}
+	for _, workspaceID := range []string{"", "team-a", "team-b"} {
+		if !gotRoutes[workspaceID] {
+			t.Fatalf("persisted routes = %#v, missing %q", gotRoutes, workspaceID)
+		}
+	}
+}
+
+func TestStreamAddOpaqueATPersistsWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	t.Cleanup(store.Stop)
+	handler := &Handler{
+		db:    db,
+		store: store,
+		probeUsage: func(context.Context, *auth.Account) error {
+			return nil
+		},
+	}
+
+	body := []byte(`{
+		"access_token": "at-opaque-stream",
+		"custom_headers": {"chatgpt-account-id": "team-stream"}
+	}`)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/at?stream=true", bytes.NewReader(body))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.AddATAccount(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("active rows = %d, want 1", len(rows))
+	}
+	headers := rows[0].GetCredentialStringMap("custom_headers")
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(headers); got != "team-stream" {
+		t.Fatalf("workspace override = %q, want team-stream", got)
+	}
+}
+
 // RT 刷新后 workspace 身份可知时，应把新凭证合并进已有账号。
 func TestMergeRefreshedDuplicateIntoExisting(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1207,6 +1456,129 @@ func TestMergeRefreshedDuplicateIntoExisting(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].ID != oldID {
 		t.Fatalf("active rows = %d (first id %d), want 1 row with id %d", len(rows), rows[0].ID, oldID)
+	}
+}
+
+func TestMergeRefreshedDuplicateKeepsDifferentWorkspaceRoutes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{db: db, store: store}
+
+	personalID, err := db.InsertAccountWithCredentials(context.Background(), "personal", map[string]interface{}{
+		"access_token": "at-shared",
+		"email":        "solo@example.com",
+		"workspace_id": "personal-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert personal: %v", err)
+	}
+	teamID, err := db.InsertAccountWithCredentials(context.Background(), "team", map[string]interface{}{
+		"access_token": "at-shared",
+		"email":        "solo@example.com",
+		"workspace_id": "personal-workspace",
+		"custom_headers": map[string]string{
+			"Chatgpt-Account-Id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert team: %v", err)
+	}
+	store.AddAccount(&auth.Account{DBID: teamID, AccessToken: "at-shared", Status: auth.StatusReady})
+
+	if merged := handler.mergeRefreshedDuplicateIntoExisting(teamID, "test"); merged {
+		t.Fatal("different effective workspace routes must not merge")
+	}
+
+	teamDuplicateID, err := db.InsertAccountWithCredentials(context.Background(), "team-duplicate", map[string]interface{}{
+		"refresh_token": "rt-upgrade",
+		"access_token":  "at-rotated",
+		"email":         "solo@example.com",
+		"workspace_id":  "personal-workspace",
+		"custom_headers": map[string]string{
+			"chatgpt-account-id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert team duplicate: %v", err)
+	}
+	store.AddAccount(&auth.Account{DBID: teamDuplicateID, RefreshToken: "rt-upgrade", AccessToken: "at-rotated", Status: auth.StatusReady})
+
+	if merged := handler.mergeRefreshedDuplicateIntoExisting(teamDuplicateID, "test"); !merged {
+		t.Fatal("same effective workspace route should merge")
+	}
+
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("active rows = %d, want personal + team", len(rows))
+	}
+	active := map[int64]bool{}
+	for _, row := range rows {
+		active[row.ID] = true
+	}
+	if !active[personalID] || !active[teamID] || active[teamDuplicateID] {
+		t.Fatalf("active ids = %#v, want personal=%d team=%d", active, personalID, teamID)
+	}
+	teamRow, err := db.GetAccountByID(context.Background(), teamID)
+	if err != nil {
+		t.Fatalf("GetAccountByID team: %v", err)
+	}
+	if got := teamRow.GetCredential("refresh_token"); got != "rt-upgrade" {
+		t.Fatalf("team refresh_token = %q, want rt-upgrade", got)
+	}
+}
+
+func TestMergeRefreshedDuplicatePreservesOverrideBackedRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{db: db, store: store}
+	ctx := context.Background()
+
+	oldID, err := db.InsertAccountWithCredentials(ctx, "team-native", map[string]interface{}{
+		"access_token": "team-old-at",
+		"email":        "solo@example.com",
+		"workspace_id": "team-workspace",
+		"account_id":   "team-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("insert old route: %v", err)
+	}
+	newID, err := db.InsertAccountWithCredentials(ctx, "team-override", map[string]interface{}{
+		"refresh_token": "shared-rt",
+		"access_token":  "personal-new-at",
+		"email":         "solo@example.com",
+		"workspace_id":  "personal-workspace",
+		"account_id":    "personal-workspace",
+		"custom_headers": map[string]string{
+			"chatgpt-account-id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("insert new route: %v", err)
+	}
+	store.AddAccount(&auth.Account{DBID: newID, RefreshToken: "shared-rt", AccessToken: "personal-new-at", Status: auth.StatusReady})
+
+	if merged := handler.mergeRefreshedDuplicateIntoExisting(newID, "test"); !merged {
+		t.Fatal("same effective route should merge")
+	}
+	oldRow, err := db.GetAccountByID(ctx, oldID)
+	if err != nil {
+		t.Fatalf("get survivor: %v", err)
+	}
+	if got := openaiidentity.EffectiveWorkspaceID(
+		oldRow.GetCredential("workspace_id"),
+		oldRow.GetCredentialStringMap("custom_headers"),
+	); got != "team-workspace" {
+		t.Fatalf("survivor effective workspace = %q, want team-workspace", got)
+	}
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(oldRow.GetCredentialStringMap("custom_headers")); got != "team-workspace" {
+		t.Fatalf("survivor override = %q, want team-workspace", got)
 	}
 }
 

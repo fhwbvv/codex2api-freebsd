@@ -185,6 +185,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			color TEXT DEFAULT '',
 			sort_order INTEGER DEFAULT 0,
 			base_concurrency_override INTEGER NULL,
+			proxy_urls TEXT DEFAULT '[]',
+			channel TEXT DEFAULT 'codex',
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
@@ -250,6 +252,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				public_account_portal_page_enabled INTEGER DEFAULT 0,
 				scheduler_mode TEXT DEFAULT 'round_robin',
 					affinity_mode TEXT DEFAULT 'bounded',
+					session_affinity_spread INTEGER DEFAULT 0,
 					codex_force_websocket INTEGER DEFAULT 0,
 					codex_ws_weak_network_mode INTEGER DEFAULT 0,
 					codex_ws_keepalive_enabled INTEGER DEFAULT 0,
@@ -280,7 +283,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					response_cache_local_max_bytes INTEGER NOT NULL DEFAULT 67108864,
 					response_cache_local_max_entry_bytes INTEGER NOT NULL DEFAULT 8388608,
 					response_cache_reconstruct_max_bytes INTEGER NOT NULL DEFAULT 67108864,
-					response_cache_config_generation INTEGER NOT NULL DEFAULT 1
+					response_cache_config_generation INTEGER NOT NULL DEFAULT 1,
+					relay_model_cooldown_mode TEXT NOT NULL DEFAULT 'off',
+					relay_model_cooldown_seconds INTEGER NOT NULL DEFAULT 2,
+					relay_model_cooldown_backoff_enabled INTEGER NOT NULL DEFAULT 0,
+					oauth_model_cooldown_mode TEXT NOT NULL DEFAULT 'adaptive',
+					oauth_model_cooldown_seconds INTEGER NOT NULL DEFAULT 300,
+					oauth_model_cooldown_backoff_enabled INTEGER NOT NULL DEFAULT 1
 				);`,
 		`CREATE TABLE IF NOT EXISTS model_registry (
 			id TEXT PRIMARY KEY,
@@ -392,13 +401,16 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			review_model TEXT DEFAULT '',
 			review_flagged INTEGER DEFAULT 0,
 			review_error TEXT DEFAULT '',
+			reviewed INTEGER DEFAULT 0,
+			review_confidence REAL NULL,
+			review_threshold REAL NULL,
+			review_reason TEXT DEFAULT '',
+			review_endpoint TEXT DEFAULT '',
+			review_request_mode TEXT DEFAULT '',
+			review_latency_ms INTEGER NULL,
 			full_text TEXT DEFAULT ''
 		);`,
-		`CREATE TABLE IF NOT EXISTS prompt_filter_secrets (
-			id INTEGER PRIMARY KEY,
-			newapi_secret TEXT NOT NULL DEFAULT '',
-			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-		);`,
+		`DROP TABLE IF EXISTS prompt_filter_secrets;`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -470,6 +482,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"account_groups", "color", "TEXT DEFAULT ''"},
 		{"account_groups", "sort_order", "INTEGER DEFAULT 0"},
 		{"account_groups", "base_concurrency_override", "INTEGER NULL"},
+		{"account_groups", "proxy_urls", "TEXT DEFAULT '[]'"},
+		{"account_groups", "channel", "TEXT DEFAULT 'codex'"},
 		{"account_groups", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
 		{"account_groups", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP"},
 		{"system_settings", "site_name", "TEXT DEFAULT 'CodexProxy'"},
@@ -524,6 +538,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "response_cache_local_max_entry_bytes", "INTEGER NOT NULL DEFAULT 8388608"},
 		{"system_settings", "response_cache_reconstruct_max_bytes", "INTEGER NOT NULL DEFAULT 67108864"},
 		{"system_settings", "response_cache_config_generation", "INTEGER NOT NULL DEFAULT 1"},
+		{"system_settings", "relay_model_cooldown_mode", "TEXT NOT NULL DEFAULT 'off'"},
+		{"system_settings", "relay_model_cooldown_seconds", "INTEGER NOT NULL DEFAULT 2"},
+		{"system_settings", "relay_model_cooldown_backoff_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"system_settings", "oauth_model_cooldown_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
+		{"system_settings", "oauth_model_cooldown_seconds", "INTEGER NOT NULL DEFAULT 300"},
+		{"system_settings", "oauth_model_cooldown_backoff_enabled", "INTEGER NOT NULL DEFAULT 1"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
@@ -553,6 +573,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"prompt_filter_logs", "review_model", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "review_flagged", "INTEGER DEFAULT 0"},
 		{"prompt_filter_logs", "review_error", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "reviewed", "INTEGER DEFAULT 0"},
+		{"prompt_filter_logs", "review_confidence", "REAL NULL"},
+		{"prompt_filter_logs", "review_threshold", "REAL NULL"},
+		{"prompt_filter_logs", "review_reason", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "review_endpoint", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "review_request_mode", "TEXT DEFAULT ''"},
+		{"prompt_filter_logs", "review_latency_ms", "INTEGER NULL"},
 		{"prompt_filter_logs", "full_text", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "match_context", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "audit_score", "INTEGER DEFAULT 0"},
@@ -580,6 +607,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "public_account_portal_page_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "scheduler_mode", "TEXT DEFAULT 'round_robin'"},
 		{"system_settings", "affinity_mode", "TEXT DEFAULT 'bounded'"},
+		{"system_settings", "session_affinity_spread", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_pause_5h_threshold", "REAL DEFAULT 0"},
 		{"system_settings", "auto_pause_7d_threshold", "REAL DEFAULT 0"},
 		{"system_settings", "auto_pause_5h_guard_band_percent", "REAL DEFAULT 5"},
@@ -621,6 +649,10 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);`,
 		`CREATE INDEX IF NOT EXISTS idx_accounts_cooldown_until ON accounts(cooldown_until);`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_upstream_type_id ON accounts(LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')), id);`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_active_upstream_type_id ON accounts(LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')), id) WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted';`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_created_id ON accounts(created_at, id);`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_updated_id ON accounts(updated_at, id);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_created_at ON usage_logs(account_id, created_at);`,
@@ -641,6 +673,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_image_assets_job_id ON image_assets(job_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_source_id ON prompt_filter_logs(source, id DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_reviewed_id ON prompt_filter_logs(reviewed, id DESC);`,
 	}
 	for _, stmt := range indexStatements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -762,139 +796,76 @@ func (db *DB) getTrafficSnapshotSQLite(ctx context.Context) (*TrafficSnapshot, e
 
 func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Time, bucketMinutes int, channel string) (*ChartAggregation, error) {
 	startArg, endArg := db.timeRangeArgs(start, end)
+	if bucketMinutes < 1 {
+		bucketMinutes = 5
+	}
 	query := `
-		SELECT created_at, duration_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, model, status_code
+		SELECT
+			datetime((CAST(strftime('%s', created_at) AS INTEGER) / ($3 * 60)) * ($3 * 60), 'unixepoch') AS bucket,
+			COUNT(*), COALESCE(AVG(duration_ms), 0),
+			COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(reasoning_tokens), 0), COALESCE(SUM(cached_tokens), 0),
+			COALESCE(SUM(CASE WHEN status_code >= 400 AND status_code < 500 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status_code >= 500 AND status_code < 600 THEN 1 ELSE 0 END), 0)
 		FROM usage_logs
-		WHERE created_at >= $1 AND created_at <= $2
+		WHERE created_at >= $1 AND created_at < $2
 		  AND status_code <> 499
 	`
-	args := []interface{}{startArg, endArg}
+	args := []interface{}{startArg, endArg, bucketMinutes}
 	if channel != "" {
-		query += " AND channel = $3"
+		query += " AND channel = $4"
 		args = append(args, channel)
 	}
+	query += " GROUP BY 1 ORDER BY 1"
 	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	type bucketAgg struct {
-		requests        int64
-		totalLatency    float64
-		inputTokens     int64
-		outputTokens    int64
-		reasoningTokens int64
-		cachedTokens    int64
-		errors4xx       int64
-		errors5xx       int64
-	}
-
 	result := &ChartAggregation{}
-	timelineMap := make(map[string]*bucketAgg)
-	modelMap := make(map[string]int64)
-
 	for rows.Next() {
-		var createdRaw interface{}
-		var durationMs int
-		var inputTokens int64
-		var outputTokens int64
-		var reasoningTokens int64
-		var cachedTokens int64
-		var model sql.NullString
-		var statusCode int
-		if err := rows.Scan(&createdRaw, &durationMs, &inputTokens, &outputTokens, &reasoningTokens, &cachedTokens, &model, &statusCode); err != nil {
+		var point ChartTimelinePoint
+		if err := rows.Scan(&point.Bucket, &point.Requests, &point.AvgLatency, &point.InputTokens,
+			&point.OutputTokens, &point.ReasoningTokens, &point.CachedTokens, &point.Errors4xx, &point.Errors5xx); err != nil {
 			return nil, err
 		}
-		createdAt, err := parseDBTimeValue(createdRaw)
-		if err != nil || createdAt.IsZero() {
-			continue
-		}
-
-		bucket := createdAt.Truncate(time.Duration(bucketMinutes) * time.Minute).Format("2006-01-02T15:04:05")
-		agg, ok := timelineMap[bucket]
-		if !ok {
-			agg = &bucketAgg{}
-			timelineMap[bucket] = agg
-		}
-		agg.requests++
-		agg.totalLatency += float64(durationMs)
-		agg.inputTokens += inputTokens
-		agg.outputTokens += outputTokens
-		agg.reasoningTokens += reasoningTokens
-		agg.cachedTokens += cachedTokens
-		if statusCode >= 400 && statusCode < 500 {
-			agg.errors4xx++
-		}
-		if statusCode >= 500 && statusCode < 600 {
-			agg.errors5xx++
-		}
-
-		modelName := "unknown"
-		if model.Valid && model.String != "" {
-			modelName = model.String
-		}
-		modelMap[modelName]++
+		point.Bucket = strings.Replace(point.Bucket, " ", "T", 1) + "Z"
+		result.Timeline = append(result.Timeline, point)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	keys := make([]string, 0, len(timelineMap))
-	for key := range timelineMap {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		agg := timelineMap[key]
-		avgLatency := 0.0
-		if agg.requests > 0 {
-			avgLatency = agg.totalLatency / float64(agg.requests)
-		}
-		result.Timeline = append(result.Timeline, ChartTimelinePoint{
-			Bucket:          key,
-			Requests:        agg.requests,
-			AvgLatency:      avgLatency,
-			InputTokens:     agg.inputTokens,
-			OutputTokens:    agg.outputTokens,
-			ReasoningTokens: agg.reasoningTokens,
-			CachedTokens:    agg.cachedTokens,
-			Errors4xx:       agg.errors4xx,
-			Errors5xx:       agg.errors5xx,
-		})
-	}
 	if result.Timeline == nil {
 		result.Timeline = []ChartTimelinePoint{}
 	}
 
-	type modelAgg struct {
-		model    string
-		requests int64
+	modelQuery := `SELECT COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown'), COUNT(*)
+		FROM usage_logs WHERE created_at >= $1 AND created_at < $2 AND status_code <> 499`
+	modelArgs := []interface{}{startArg, endArg}
+	if channel != "" {
+		modelQuery += " AND channel = $3"
+		modelArgs = append(modelArgs, channel)
 	}
-	models := make([]modelAgg, 0, len(modelMap))
-	for model, requests := range modelMap {
-		models = append(models, modelAgg{model: model, requests: requests})
+	modelQuery += " GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 10"
+	modelRows, err := db.conn.QueryContext(ctx, modelQuery, modelArgs...)
+	if err != nil {
+		return nil, err
 	}
-	sort.Slice(models, func(i, j int) bool {
-		if models[i].requests == models[j].requests {
-			return models[i].model < models[j].model
+	defer modelRows.Close()
+	for modelRows.Next() {
+		var point ChartModelPoint
+		if err := modelRows.Scan(&point.Model, &point.Requests); err != nil {
+			return nil, err
 		}
-		return models[i].requests > models[j].requests
-	})
-	if len(models) > 10 {
-		models = models[:10]
-	}
-	for _, model := range models {
-		result.Models = append(result.Models, ChartModelPoint{
-			Model:    model.model,
-			Requests: model.requests,
-		})
+		result.Models = append(result.Models, point)
 	}
 	if result.Models == nil {
 		result.Models = []ChartModelPoint{}
 	}
 
-	return result, nil
+	return result, modelRows.Err()
 }
 
 // getAccountEventTrendSQLite SQLite 版账号事件趋势聚合（内存分桶）
@@ -975,20 +946,26 @@ func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Ti
 
 // getUsageStatsSQLite SQLite 版使用统计（内存聚合，避免 PG 特有语法）。
 // rangeStart 为零值时回落到"今日"(本地 0 点起);rangeEnd 为零值表示至今。
-func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time, channel string) (*UsageStats, error) {
+func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time.Time, channel string, includeBreakdowns bool) (*UsageStats, error) {
 	now := time.Now()
+	explicitRange := !rangeStart.IsZero()
 	if rangeStart.IsZero() {
 		rangeStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	}
 	minuteAgo := now.Add(-1 * time.Minute)
 
-	query := `
-			SELECT created_at, total_tokens, prompt_tokens, completion_tokens,
-			       cached_tokens, first_token_ms, duration_ms, status_code, account_billed, user_billed
-			FROM usage_logs
-			WHERE created_at >= $1 AND status_code <> 499
-		`
-	args := []interface{}{db.timeArg(rangeStart)}
+	query := `SELECT COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(prompt_tokens), 0),
+		COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(cached_tokens), 0),
+		COALESCE(SUM(account_billed), 0), COALESCE(SUM(user_billed), 0),
+		COALESCE(AVG(duration_ms), 0),
+		COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0)
+	FROM usage_logs WHERE created_at >= $1 AND status_code <> 499`
+	args := []interface{}{db.timeArg(rangeStart), db.timeArg(minuteAgo)}
 	if !rangeEnd.IsZero() {
 		query += fmt.Sprintf(" AND created_at < $%d", len(args)+1)
 		args = append(args, db.timeArg(rangeEnd))
@@ -998,66 +975,22 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		args = append(args, channel)
 	}
 
-	rows, err := db.conn.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
 	stats := &UsageStats{}
+	var err error
 	var todayErrors int64
-	var totalDuration float64
 	var totalFirstTokenMs float64
 	var totalFirstTokenSamples int64
 	var todayCacheHitRequests int64
-
-	for rows.Next() {
-		var createdRaw interface{}
-		var totalTokens, promptTokens, completionTokens, cachedTokens int64
-		var firstTokenMs, durationMs int
-		var statusCode int
-		var accountBilled, userBilled float64
-		if err := rows.Scan(&createdRaw, &totalTokens, &promptTokens, &completionTokens,
-			&cachedTokens, &firstTokenMs, &durationMs, &statusCode, &accountBilled, &userBilled); err != nil {
-			return nil, err
-		}
-		createdAt, err := parseDBTimeValue(createdRaw)
-		if err != nil || createdAt.IsZero() {
-			continue
-		}
-
-		stats.TodayRequests++
-		stats.TodayTokens += totalTokens
-		stats.TodayPrompt += promptTokens
-		stats.TodayCompletion += completionTokens
-		stats.TotalCachedTokens += cachedTokens
-		stats.TodayCachedTokens += cachedTokens
-		stats.TodayAccountBilled += accountBilled
-		stats.TodayUserBilled += userBilled
-		totalDuration += float64(durationMs)
-		if firstTokenMs > 0 {
-			totalFirstTokenMs += float64(firstTokenMs)
-			totalFirstTokenSamples++
-		}
-		if cachedTokens > 0 {
-			todayCacheHitRequests++
-		}
-
-		if statusCode >= 400 {
-			todayErrors++
-		}
-		// 最近 1 分钟窗口：RPM / TPM
-		if !createdAt.Before(minuteAgo) {
-			stats.RPM++
-			stats.TPM += float64(totalTokens)
-		}
-	}
-	if err := rows.Err(); err != nil {
+	if err := db.conn.QueryRowContext(ctx, query, args...).Scan(
+		&stats.TodayRequests, &stats.TodayTokens, &stats.TodayPrompt, &stats.TodayCompletion,
+		&stats.TodayCachedTokens, &stats.TodayAccountBilled, &stats.TodayUserBilled,
+		&stats.AvgDurationMs, &totalFirstTokenMs, &totalFirstTokenSamples,
+		&todayCacheHitRequests, &todayErrors, &stats.RPM, &stats.TPM,
+	); err != nil {
 		return nil, err
 	}
 
 	if stats.TodayRequests > 0 {
-		stats.AvgDurationMs = totalDuration / float64(stats.TodayRequests)
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100
 		stats.TodayCacheRate = float64(todayCacheHitRequests) / float64(stats.TodayRequests) * 100
 	}
@@ -1065,66 +998,39 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		stats.AvgFirstTokenMs = totalFirstTokenMs / float64(totalFirstTokenSamples)
 	}
 
-	// 可见请求总数（排除 499）
-	var visibleTotal, visibleCacheHitRequests, visibleFirstTokenSamples int64
-	var currentTokens, currentPrompt, currentCompletion, currentCached int64
-	var currentFirstTokenMsSum float64
-	var currentAccountBilled, currentUserBilled float64
-	totalWhere := "status_code <> 499"
-	totalArgs := []interface{}{}
-	if channel != "" {
-		totalWhere += " AND channel = $1"
-		totalArgs = append(totalArgs, channel)
+	rollup, err := db.loadUsageStatsRollup(ctx, channel)
+	if err != nil {
+		return nil, fmt.Errorf("读取用量累计汇总: %w", err)
 	}
-	_ = db.conn.QueryRowContext(ctx, `
-		SELECT
-			COUNT(*),
-			COALESCE(SUM(total_tokens), 0),
-			COALESCE(SUM(prompt_tokens), 0),
-			COALESCE(SUM(completion_tokens), 0),
-			COALESCE(SUM(cached_tokens), 0),
-			COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(account_billed), 0),
-			COALESCE(SUM(user_billed), 0)
-		FROM usage_logs
-		WHERE `+totalWhere, totalArgs...).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
-
-	// 基线值；渠道过滤时 baseline 无渠道维度，跳过（口径与 Postgres 侧一致）。
-	var bReq, bTok, bPrompt, bComp, bCached, bCacheHitRequests, bFirstTokenSamples int64
-	var bFirstTokenMsSum float64
-	var bAccountBilled, bUserBilled float64
-	if channel == "" {
-		_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens, cache_hit_requests, first_token_ms_sum, first_token_samples, account_billed, user_billed
-		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached, &bCacheHitRequests, &bFirstTokenMsSum, &bFirstTokenSamples, &bAccountBilled, &bUserBilled)
-	}
-
-	stats.TotalRequests = visibleTotal + bReq
-	stats.TotalTokens = currentTokens + bTok
-	stats.TotalPrompt = currentPrompt + bPrompt
-	stats.TotalCompletion = currentCompletion + bComp
-	stats.TotalCachedTokens = currentCached + bCached
-	stats.TotalAccountBilled = currentAccountBilled + bAccountBilled
-	stats.TotalUserBilled = currentUserBilled + bUserBilled
+	stats.TotalRequests = rollup.TotalRequests
+	stats.TotalTokens = rollup.TotalTokens
+	stats.TotalPrompt = rollup.PromptTokens
+	stats.TotalCompletion = rollup.CompletionTokens
+	stats.TotalCachedTokens = rollup.CachedTokens
+	stats.TotalAccountBilled = rollup.TotalAccountBilled
+	stats.TotalUserBilled = rollup.TotalUserBilled
 	if stats.TotalRequests > 0 {
-		stats.TotalCacheRate = float64(visibleCacheHitRequests+bCacheHitRequests) / float64(stats.TotalRequests) * 100
+		stats.TotalCacheRate = float64(rollup.CacheHitRequests) / float64(stats.TotalRequests) * 100
 	}
-	if visibleFirstTokenSamples+bFirstTokenSamples > 0 {
-		stats.AvgFirstTokenMs = (currentFirstTokenMsSum + bFirstTokenMsSum) / float64(visibleFirstTokenSamples+bFirstTokenSamples)
+	if !explicitRange && rollup.FirstTokenSamples > 0 {
+		stats.AvgFirstTokenMs = rollup.FirstTokenMsSum / float64(rollup.FirstTokenSamples)
 	}
 	if stats.TotalRequests > 0 {
 		stats.AvgAccountBilled = stats.TotalAccountBilled / float64(stats.TotalRequests)
 		stats.AvgUserBilled = stats.TotalUserBilled / float64(stats.TotalRequests)
 	}
-	stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel)
-	if err != nil {
-		return nil, err
-	}
-	if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel); err != nil {
-		return nil, err
+	if includeBreakdowns {
+		stats.ModelStats, err = db.getUsageModelStats(ctx, 10, rangeStart, rangeEnd, channel)
+		if err != nil {
+			return nil, err
+		}
+		if err := db.populateUsageBreakdownStats(ctx, stats, rangeStart, rangeEnd, channel); err != nil {
+			return nil, err
+		}
+	} else {
+		stats.ModelStats = []UsageModelStat{}
+		stats.EndpointStats = []UsageEndpointStat{}
+		stats.APIKeyStats = []UsageAPIKeyStat{}
 	}
 
 	return stats, nil

@@ -667,6 +667,10 @@ func ValidateInput() ValidationRule {
 			return nil
 		}
 
+		// GPT-5.6 store=false conversations can replay opaque encrypted
+		// context as a first-class input item. The prompt guard recognizes
+		// and deliberately does not inspect the ciphertext; validation must
+		// still allow the item to reach the upstream Responses endpoint.
 		validTypes := map[string]bool{
 			"message": true,
 			// multi-agent 会话的代理间消息历史项,续会话时随 input 回放,上游原生接受
@@ -702,6 +706,7 @@ func ValidateInput() ValidationRule {
 			"compaction":              true,
 			"compaction_trigger":      true,
 			"context_compaction":      true,
+			"encrypted_content":       true,
 			"input_text":              true,
 			"input_image":             true,
 			"output_text":             true,

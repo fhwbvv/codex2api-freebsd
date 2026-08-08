@@ -34,18 +34,20 @@ import type {
   CodexClientMetadataMode,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
-  OpsOverviewResponse,
+  AccountAnalysisResponse,
   AccountGroup,
   SystemSettings,
   RecycleBinAccountRow,
   AgentIdentityImportItem,
+  AccountListSummary,
+  AccountEmailDomainFacet,
+  AccountOperationSelector,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
 import {
   collectAccountOperationResult,
-  resolveChannelBatchTestAccountIDs,
   snapshotAccountOperationResults,
   type AccountOperationResult,
   type AccountOperationResultsState,
@@ -58,6 +60,10 @@ import {
   formatLongUsageWindowLabel,
   needsUsageReload,
 } from "../lib/usageFormat";
+import {
+  applyOptionalWorkspaceRouteHeader,
+  applyWorkspaceRouteHeader,
+} from "../lib/workspaceRoute";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -203,6 +209,8 @@ type AccountGroupDraft = {
   baseConcurrencyInput: string;
   auto_pause_5h_threshold: number;
   auto_pause_7d_threshold: number;
+  proxyURLsInput: string;
+  channel: "codex" | "grok";
 };
 
 function getDefaultAccountVisibleColumns(): Record<
@@ -662,6 +670,8 @@ interface BatchOperationEvent {
   rate_limited?: number;
   deleted?: number;
   account_id?: number;
+  account_name?: string;
+  account_email?: string;
   message?: string;
   error?: string;
 }
@@ -746,12 +756,36 @@ export default function Accounts() {
   // 由路由驱动（/accounts vs /accounts/grok），刷新浏览器后停留在当前视图。
   const location = useLocation();
   const navigate = useNavigate();
-  const providerView: "codex" | "grok" = location.pathname.replace(/\/+$/, "").endsWith("/accounts/grok")
+  // ?groupManager=1 深链直接打开分组管理器(Grok 页的「管理分组」跳转入口,issue #487)。
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get("groupManager") === "1") {
+      setShowGroupManager(true);
+      params.delete("groupManager");
+      const query = params.toString();
+      navigate(
+        { pathname: location.pathname, search: query ? `?${query}` : "" },
+        { replace: true },
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location.search]);
+  const normalizedPath = location.pathname.replace(/\/+$/, "");
+  const providerView: "codex" | "grok" = normalizedPath.endsWith("/accounts/grok")
     ? "grok"
     : "codex";
   const setProviderView = useCallback(
     (view: "codex" | "grok") => {
       navigate(view === "grok" ? "/accounts/grok" : "/accounts");
+    },
+    [navigate],
+  );
+  // Codex 邀请视图同样由路由驱动（/accounts/invite），与 Grok 视图一致：
+  // 可直接分享链接、刷新浏览器停在原处、浏览器返回键能退回账号列表。
+  const showInvite = normalizedPath.endsWith("/accounts/invite");
+  const setShowInvite = useCallback(
+    (open: boolean) => {
+      navigate(open ? "/accounts/invite" : "/accounts");
     },
     [navigate],
   );
@@ -773,6 +807,8 @@ export default function Accounts() {
     | "locked"
   >("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedSearchQuery, setDebouncedSearchQuery] = useState("");
+  const accountPageAbortRef = useRef<AbortController | null>(null);
   const [planFilter, setPlanFilter] = useState<
     "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
@@ -780,12 +816,23 @@ export default function Accounts() {
     "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedSearchQuery(searchQuery);
+      setPage(1);
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery]);
+
+  useEffect(() => () => accountPageAbortRef.current?.abort(), []);
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: "",
     session_token: "",
     proxy_url: "",
   });
   const [addCustomHeadersText, setAddCustomHeadersText] = useState("");
+  const [workspaceRouteID, setWorkspaceRouteID] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set());
@@ -826,6 +873,8 @@ export default function Accounts() {
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null);
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null);
   const [detailAccountId, setDetailAccountId] = useState<number | null>(null);
+  const [detailAccountData, setDetailAccountData] = useState<AccountRow | null>(null);
+  const detailNavigationTargetRef = useRef<"first" | "last" | null>(null);
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null);
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editTab, setEditTab] = useState<"scheduler" | "account">("scheduler");
@@ -895,6 +944,7 @@ export default function Accounts() {
   const [showImportPicker, setShowImportPicker] = useState(false);
   const [importProxyUrl, setImportProxyUrl] = useState("");
   const [importCustomHeadersText, setImportCustomHeadersText] = useState("");
+  const [importWorkspaceRouteID, setImportWorkspaceRouteID] = useState("");
   const [showSub2APIImport, setShowSub2APIImport] = useState(false);
   const [showPasteImport, setShowPasteImport] = useState(false);
   const [pasteImportText, setPasteImportText] = useState("");
@@ -906,8 +956,12 @@ export default function Accounts() {
   const [showAnalysisCharts, setShowAnalysisCharts] = useState(
     getInitialAnalysisVisibility,
   );
+  const [accountAnalysis, setAccountAnalysis] =
+    useState<AccountAnalysisResponse | null>(null);
+  const [accountAnalysisLoading, setAccountAnalysisLoading] = useState(false);
+  const [accountAnalysisError, setAccountAnalysisError] = useState<string | null>(null);
+  const accountAnalysisAbortRef = useRef<AbortController | null>(null);
   const [showRecycleBin, setShowRecycleBin] = useState(false);
-  const [showInvite, setShowInvite] = useState(false);
   const [showEmailDomainTags, setShowEmailDomainTags] = useState(
     getInitialEmailDomainVisibility,
   );
@@ -1015,6 +1069,14 @@ export default function Accounts() {
     EMPTY_ACCOUNT_GROUP_FILTER,
   );
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
+  // 分组按渠道隔离(issue #487):Codex 页的所有分组选择器只出 codex 渠道分组;
+  // 管理器仍显示全部渠道(带徽标),徽标解析也用全量以兼容迁移前的跨渠道成员。
+  const codexGroups = useMemo(
+    () => allGroups.filter((group) => group.channel !== "grok"),
+    [allGroups],
+  );
+  const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([]);
+  const [lazyMode, setLazyMode] = useState(false);
   // 导入/添加账号时直接绑定的分组（记住上次选择，添加弹窗与导入弹窗共用，与 allowDuplicate 同风格）。
   const {
     groupIds: importGroupIds,
@@ -1030,6 +1092,8 @@ export default function Accounts() {
     baseConcurrencyInput: "",
     auto_pause_5h_threshold: 0,
     auto_pause_7d_threshold: 0,
+    proxyURLsInput: "",
+    channel: "codex",
   });
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [showBatchMetaEditor, setShowBatchMetaEditor] = useState(false);
@@ -1081,7 +1145,6 @@ export default function Accounts() {
   const atFileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
-  const lazyModeRef = useRef<boolean | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
   const ipApiLang = i18n.language?.startsWith("zh") ? "zh-CN" : "en";
@@ -1219,6 +1282,33 @@ export default function Accounts() {
       />
       <p className="mt-1.5 text-xs text-muted-foreground">
         留空表示不设置；JSON 必须是对象，所有请求头值都必须是字符串。
+      </p>
+    </div>
+  );
+
+  const renderWorkspaceRouteInput = ({
+    value = workspaceRouteID,
+    onChange = setWorkspaceRouteID,
+  }: {
+    value?: string;
+    onChange?: (value: string) => void;
+  } = {}) => (
+    <div className="rounded-xl border border-sky-200 bg-sky-50/70 p-4 dark:border-sky-900 dark:bg-sky-950/30">
+      <div className="mb-2 flex items-center gap-2">
+        <Layers className="size-4 text-sky-600 dark:text-sky-400" />
+        <label className="text-sm font-semibold text-foreground">
+          {t("accounts.workspaceRouteLabel")}
+        </label>
+      </div>
+      <Input
+        value={value}
+        placeholder={t("accounts.workspaceRoutePlaceholder")}
+        onChange={(event: ChangeEvent<HTMLInputElement>) =>
+          onChange(event.target.value)
+        }
+      />
+      <p className="mt-2 text-xs leading-5 text-muted-foreground">
+        {t("accounts.workspaceRouteHint")}
       </p>
     </div>
   );
@@ -1557,59 +1647,121 @@ export default function Accounts() {
     [applyOperationProgressEvent],
   );
 
-  const loadAccounts = useCallback(async (options?: LoadOptions) => {
-    const shouldLoadSettings = !options?.silent || lazyModeRef.current === null;
-    const [
-      accountsResponse,
-      apiKeysResponse,
-      opsOverview,
-      groupsResponse,
-      settings,
-      healthBars,
-    ] =
-      await Promise.all([
-        // Codex 页只拉非 Grok 账号，与 Grok 页 channel=grok 对称，减少大号池传输。
-        api.getAccounts({ channel: "codex" }),
-        api.getAPIKeys(),
-        api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
-        api.listAccountGroups().catch(() => ({ groups: [] })),
-        shouldLoadSettings
-          ? api.getSettings().catch((): SystemSettings | null => null)
-          : Promise.resolve<SystemSettings | null>(null),
-        api
-          .getAccountHealthBars()
-          .then((res) => res.buckets)
-          .catch((): Record<string, AccountHealthBucket[]> | null => null),
-      ]);
-    if (settings) {
-      lazyModeRef.current = settings.lazy_mode;
-    }
-    setAllGroups(groupsResponse.groups ?? []);
+  const [pagedHealthBars, setPagedHealthBars] = useState<
+    Record<string, AccountHealthBucket[]>
+  >({});
+
+  const loadAccounts = useCallback(async (_options?: LoadOptions) => {
+    accountPageAbortRef.current?.abort();
+    const controller = new AbortController();
+    accountPageAbortRef.current = controller;
+    const accountsResponse = await api.getAccountsPage({
+      channel: "codex",
+      page,
+      pageSize,
+      search: debouncedSearchQuery,
+      status: statusFilter,
+      plan: planFilter,
+      tag: tagFilter,
+      emailDomain: domainFilter,
+      groupInclude: groupFilter.include,
+      groupExclude: groupFilter.exclude,
+      ungrouped: groupFilter.ungrouped,
+      sort: sortKey === "importTime"
+        ? "created_at"
+        : sortKey === "schedulerPriority"
+          ? "scheduler_priority"
+          : sortKey ?? undefined,
+      order: sortDir,
+    }, controller.signal);
     return {
       accounts: accountsResponse.accounts ?? [],
-      apiKeys: apiKeysResponse.keys ?? [],
-      opsOverview,
-      lazyMode: lazyModeRef.current ?? false,
-      healthBars: healthBars ?? {},
+      total: accountsResponse.total,
+      page: accountsResponse.page,
+      summary: accountsResponse.summary,
+      facets: accountsResponse.facets,
+      snapshotAt: accountsResponse.snapshot_at,
+      statsState: accountsResponse.stats_state,
     };
+  }, [debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, sortDir, sortKey, statusFilter, tagFilter]);
+
+  const loadAccountAnalysis = useCallback(async () => {
+    accountAnalysisAbortRef.current?.abort();
+    const controller = new AbortController();
+    accountAnalysisAbortRef.current = controller;
+    setAccountAnalysisLoading(true);
+    setAccountAnalysisError(null);
+    try {
+      const response = await api.getAccountAnalysis("codex", controller.signal);
+      if (!controller.signal.aborted) setAccountAnalysis(response);
+    } catch (analysisError) {
+      if (!controller.signal.aborted) {
+        setAccountAnalysisError(getErrorMessage(analysisError));
+      }
+    } finally {
+      if (!controller.signal.aborted) setAccountAnalysisLoading(false);
+    }
   }, []);
 
-  const { data, loading, error, reload, reloadSilently } = useDataLoader<{
+  useEffect(() => {
+    if (!showAnalysisCharts) {
+      accountAnalysisAbortRef.current?.abort();
+      return undefined;
+    }
+    void loadAccountAnalysis();
+    return () => accountAnalysisAbortRef.current?.abort();
+  }, [loadAccountAnalysis, showAnalysisCharts]);
+
+  // Auxiliary data is intentionally independent from the account page request:
+  // failures or slow settings/overview/group calls must not hold up the first row.
+  useEffect(() => {
+    let cancelled = false;
+    void api.getAPIKeys()
+      .then((response) => { if (!cancelled) setAPIKeys(response.keys ?? []); })
+      .catch(() => undefined);
+    void api.listAccountGroups()
+      .then((response) => { if (!cancelled) setAllGroups(response.groups ?? []); })
+      .catch(() => undefined);
+    void api.getSettings()
+      .then((settings) => { if (!cancelled) setLazyMode(settings.lazy_mode); })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, []);
+
+  const { data, setData, loading, error, reload, reloadSilently } = useDataLoader<{
     accounts: AccountRow[];
-    apiKeys: APIKeyRow[];
-    opsOverview: OpsOverviewResponse | null;
-    lazyMode: boolean;
-    healthBars: Record<string, AccountHealthBucket[]>;
+    total: number;
+    page: number;
+    summary: AccountListSummary | null;
+    facets: { tags: string[]; email_domains: AccountEmailDomainFacet[] };
+    snapshotAt: string;
+    statsState: "ready" | "stale" | "warming";
   }>({
     initialData: {
       accounts: [],
-      apiKeys: [],
-      opsOverview: null,
-      lazyMode: false,
-      healthBars: {},
+      total: 0,
+      page: 1,
+      summary: null,
+      facets: { tags: [], email_domains: [] },
+      snapshotAt: "",
+      statsState: "warming",
     },
     load: loadAccounts,
   });
+  const refreshAccountRow = useCallback(async (id: number) => {
+    const account = await api.getAccount(id);
+    setDetailAccountData((current) => current?.id === id ? account : current);
+    setData((current) => ({
+      ...current,
+      accounts: current.accounts.map((item) => item.id === id ? account : item),
+    }));
+    return account;
+  }, [setData]);
+  const loadAccountDetail = useCallback(
+    (account: AccountRow) =>
+      account.detail_loaded ? Promise.resolve(account) : api.getAccount(account.id),
+    [],
+  );
   // Codex 视图的统计卡/额度分布/列表/批量操作一律排除 Grok 账号
   // （Grok 账号由顶部切换后的 Grok 页单独统计与管理）。
   const allAccounts = data.accounts;
@@ -1617,10 +1769,45 @@ export default function Accounts() {
     () => allAccounts.filter((account) => !account.grok_api),
     [allAccounts],
   );
-  const apiKeys = data.apiKeys;
-  const opsOverview = data.opsOverview;
-  const lazyMode = data.lazyMode;
-  const healthBars = data.healthBars;
+  const accountPageIDsKey = useMemo(
+    () => accounts.map((account) => account.id).join(","),
+    [accounts],
+  );
+  const healthBars = pagedHealthBars;
+
+  useEffect(() => {
+    if (!accountPageIDsKey) {
+      setPagedHealthBars({});
+      return;
+    }
+    let cancelled = false;
+    const ids = accountPageIDsKey.split(",").map(Number);
+    void api.getAccountHealthBars(ids)
+      .then((response) => {
+        if (!cancelled) setPagedHealthBars(response.buckets ?? {});
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [accountPageIDsKey]);
+
+  useEffect(() => {
+    if (!accountPageIDsKey) return undefined;
+    const controller = new AbortController();
+    const ids = accountPageIDsKey.split(",").map(Number);
+    void api.getAccountPageStats(ids, controller.signal)
+      .then((response) => {
+        if (controller.signal.aborted) return;
+        setData((current) => ({
+          ...current,
+          accounts: current.accounts.map((account) => {
+            const stats = response.stats[String(account.id)];
+            return stats ? { ...account, ...stats } : account;
+          }),
+        }));
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [accountPageIDsKey, setData]);
   const usageReloadAttemptsRef = useRef<Map<number, number>>(new Map());
   // 测试连接后需要强制刷新用量的账号 id：即使其用量数据已存在（如已显示 100%），
   // 也要在后台探针跑完后重新拉取，确保进度条更新为最新值。
@@ -1651,11 +1838,11 @@ export default function Accounts() {
     if (loading) return;
     pageModeAutoAppliedRef.current = true;
     setPageMode(
-      accounts.length < ACCOUNT_PERSONAL_MODE_AUTO_THRESHOLD
+      data.total < ACCOUNT_PERSONAL_MODE_AUTO_THRESHOLD
         ? "personal"
         : "pool",
     );
-  }, [loading, accounts.length]);
+  }, [loading, data.total]);
 
   useEffect(() => {
     setGroupFilter((current) => pruneAccountGroupFilter(current, allGroups));
@@ -1707,56 +1894,23 @@ export default function Accounts() {
     return () => window.clearTimeout(timer);
   }, [accounts, reloadSilently]);
 
-  const accountSummary = useMemo(() => {
-    const rateLimitedWindowStats = getRateLimitedWindowStats(accounts);
-    // 健康分类:异常(封禁/错误) > 限流 > 正常。禁用只是调度开关,保留独立计数但不影响健康分类。
-    const bannedAccounts = accounts.filter(
-      (account) => account.status === "unauthorized",
-    ).length;
-    const errorAccounts = accounts.filter(
-      (account) => account.status === "error",
-    ).length;
-    const disabledAccounts = accounts.filter(
-      (account) => account.enabled === false,
-    ).length;
-    const abnormalAccounts = accounts.filter(
-      (account) =>
-        account.status === "unauthorized" ||
-        account.status === "error",
-    ).length;
-    const rateLimitedExclusive = accounts.filter(
-      (account) =>
-        account.status !== "unauthorized" &&
-        account.status !== "error" &&
-        isRateLimitedAccount(account),
-    ).length;
-    const normalAccounts = accounts.length - abnormalAccounts - rateLimitedExclusive;
-    const unsampledAccounts = accounts.filter(isUnsampledQuotaAccount).length;
-    return {
-      totalAccounts: accounts.length,
-      normalAccounts,
-      rateLimitedAccounts: rateLimitedExclusive,
-      rateLimited5hAccounts: rateLimitedWindowStats.fiveHour,
-      rateLimited7dAccounts: rateLimitedWindowStats.sevenDay,
-      abnormalAccounts,
-      bannedAccounts,
-      errorAccounts,
-      unsampledAccounts,
-      disabledAccounts,
-      lockedAccounts: accounts.filter((account) => account.locked).length,
-      subscriptionAccountsToLock: accounts.filter(
-        (account) => isSubscriptionPlan(account.plan_type) && !account.locked,
-      ),
-      healthyAccounts: accounts.filter(
-        (account) => account.health_tier === "healthy",
-      ).length,
-      warmAccounts: accounts.filter((account) => account.health_tier === "warm")
-        .length,
-      riskyAccounts: accounts.filter(
-        (account) => account.health_tier === "risky",
-      ).length,
-    };
-  }, [accounts]);
+  const accountSummary = {
+    totalAccounts: data.summary?.total ?? data.total,
+    normalAccounts: data.summary?.normal ?? 0,
+    rateLimitedAccounts: data.summary?.rate_limited ?? 0,
+    rateLimited5hAccounts: data.summary?.rate_limited_5h ?? 0,
+    rateLimited7dAccounts: data.summary?.rate_limited_7d ?? 0,
+    abnormalAccounts: data.summary?.abnormal ?? 0,
+    bannedAccounts: data.summary?.banned ?? 0,
+    errorAccounts: data.summary?.error ?? 0,
+    unsampledAccounts: data.summary?.unsampled ?? 0,
+    disabledAccounts: data.summary?.disabled ?? 0,
+    lockedAccounts: data.summary?.locked ?? 0,
+    subscriptionAccountsToLockCount: data.summary?.subscription_unlocked ?? 0,
+    healthyAccounts: data.summary?.healthy ?? 0,
+    warmAccounts: data.summary?.warm ?? 0,
+    riskyAccounts: data.summary?.risky ?? 0,
+  };
   const {
     totalAccounts,
     normalAccounts,
@@ -1769,182 +1923,104 @@ export default function Accounts() {
     unsampledAccounts,
     disabledAccounts,
     lockedAccounts,
-    subscriptionAccountsToLock,
+    subscriptionAccountsToLockCount,
     healthyAccounts,
     warmAccounts,
     riskyAccounts,
   } = accountSummary;
 
-  const allTags = useMemo(() => {
-    const tags = new Set<string>();
-    for (const account of accounts) {
-      for (const tag of account.tags ?? []) {
-        tags.add(tag);
-      }
-    }
-    return Array.from(tags).sort();
-  }, [accounts]);
+  const allTags = data.facets.tags;
+  const emailDomainStats = data.facets.email_domains;
+  const currentAccountSelector = useMemo<AccountOperationSelector>(() => ({
+    channel: "codex",
+    search: debouncedSearchQuery || undefined,
+    status: statusFilter === "all" ? undefined : statusFilter,
+    plan: planFilter === "all" ? undefined : planFilter,
+    tag: tagFilter || undefined,
+    email_domain: domainFilter || undefined,
+    group_include: groupFilter.include.length > 0 ? groupFilter.include : undefined,
+    group_exclude: groupFilter.exclude.length > 0 ? groupFilter.exclude : undefined,
+    ungrouped: groupFilter.ungrouped || undefined,
+  }), [debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, planFilter, statusFilter, tagFilter]);
 
-  const emailDomainStats = useMemo(() => {
-    const byDomain = new Map<string, EmailDomainStat>();
-    for (const account of accounts) {
-      const domain = getAccountEmailDomain(account);
-      if (!domain) continue;
-      const stat = byDomain.get(domain) ?? { domain, total: 0, banned: 0 };
-      stat.total += 1;
-      if (account.status === "unauthorized") {
-        stat.banned += 1;
-      }
-      byDomain.set(domain, stat);
-    }
-    return Array.from(byDomain.values()).sort((a, b) => {
-      if (b.banned !== a.banned) return b.banned - a.banned;
-      if (b.total !== a.total) return b.total - a.total;
-      return a.domain.localeCompare(b.domain);
-    });
-  }, [accounts]);
+  // 服务端已完成全池筛选、排序和分页。
+  const filteredAccounts = accounts;
+  const sortedAccounts = accounts;
 
-  const filteredAccounts = useMemo(() => {
-    const query = searchQuery.toLowerCase();
-    return accounts.filter((account) => {
-      switch (statusFilter) {
-        case "normal":
-          if (
-            account.status === "unauthorized" ||
-            account.status === "error" ||
-            isRateLimitedAccount(account)
-          )
-            return false;
-          break;
-        case "rate_limited":
-          if (
-            account.status === "unauthorized" ||
-            account.status === "error"
-          )
-            return false;
-          if (!isRateLimitedAccount(account)) return false;
-          break;
-        case "abnormal":
-          if (
-            account.status !== "unauthorized" &&
-            account.status !== "error"
-          )
-            return false;
-          break;
-        case "banned":
-          if (account.status !== "unauthorized") return false;
-          break;
-        case "error":
-          if (account.status !== "error") return false;
-          break;
-        case "unsampled":
-          if (!isUnsampledQuotaAccount(account)) return false;
-          break;
-        case "disabled":
-          if (account.enabled !== false) return false;
-          break;
-        case "locked":
-          if (!account.locked) return false;
-          break;
-      }
-      if (planFilter !== "all") {
-        const plan = (account.plan_type || "").toLowerCase().trim();
-        if (plan !== planFilter) return false;
-      }
-      if (query) {
-        const email = (account.email || "").toLowerCase();
-        const name = (account.name || "").toLowerCase();
-        const domain = getAccountEmailDomain(account);
-        if (!email.includes(query) && !name.includes(query) && !domain.includes(query))
-          return false;
-      }
-      if (tagFilter && !(account.tags ?? []).includes(tagFilter)) return false;
-      if (domainFilter && getAccountEmailDomain(account) !== domainFilter) return false;
-      if (!accountMatchesGroupFilter(account.group_ids ?? [], groupFilter))
-        return false;
-      return true;
-    });
-  }, [accounts, domainFilter, groupFilter, planFilter, searchQuery, statusFilter, tagFilter]);
-
-  const sortedAccounts = useMemo(() => {
-    if (!sortKey) return filteredAccounts;
-    return [...filteredAccounts].sort((a, b) => {
-      let diff = 0;
-      if (sortKey === "requests") {
-        diff =
-          (a.success_requests ?? 0) +
-          (a.error_requests ?? 0) -
-          ((b.success_requests ?? 0) + (b.error_requests ?? 0));
-      } else if (sortKey === "usage") {
-        diff = (a.usage_percent_7d ?? -1) - (b.usage_percent_7d ?? -1);
-      } else if (sortKey === "importTime") {
-        diff =
-          new Date(a.created_at || 0).getTime() -
-          new Date(b.created_at || 0).getTime();
-      } else if (sortKey === "schedulerPriority") {
-        diff = getSchedulerPriority(a) - getSchedulerPriority(b);
-        if (diff === 0) return a.id - b.id;
-      } else if (sortKey === "group") {
-        const aMeta = getAccountGroupSortMeta(a, allGroups);
-        const bMeta = getAccountGroupSortMeta(b, allGroups);
-        diff = aMeta.order - bMeta.order;
-        if (diff === 0) {
-          diff = aMeta.key.localeCompare(bMeta.key, "zh");
-        }
-        if (diff === 0) return a.id - b.id;
-      }
-      return sortDir === "asc" ? diff : -diff;
-    });
-  }, [allGroups, filteredAccounts, sortDir, sortKey]);
-
-  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize));
+  const totalPages = Math.max(1, Math.ceil(data.total / pageSize));
   const currentPage = Math.min(page, totalPages);
-  const pagedAccounts = useMemo(
-    () =>
-      sortedAccounts.slice(
-        (currentPage - 1) * pageSize,
-        currentPage * pageSize,
-      ),
-    [currentPage, pageSize, sortedAccounts],
-  );
+  const pagedAccounts = accounts;
   const pagedAccountIds = useMemo(
     () => pagedAccounts.map((account) => account.id),
     [pagedAccounts],
   );
-  // 详情抽屉：始终从最新 accounts 列表取行，保证刷新后状态同步。
-  const detailAccount = useMemo(
+  const detailListAccount = useMemo(
     () =>
       detailAccountId == null
         ? null
         : (accounts.find((account) => account.id === detailAccountId) ?? null),
     [accounts, detailAccountId],
   );
+  const detailAccount =
+    detailAccountData?.id === detailAccountId
+      ? detailAccountData
+      : detailListAccount;
   const detailNavIndex = useMemo(() => {
     if (detailAccountId == null) return -1;
     return sortedAccounts.findIndex((account) => account.id === detailAccountId);
   }, [detailAccountId, sortedAccounts]);
   const openAccountDetail = useCallback((account: AccountRow) => {
+    setDetailAccountData(account);
     setDetailAccountId(account.id);
   }, []);
   const closeAccountDetail = useCallback(() => {
     setDetailAccountId(null);
+    setDetailAccountData(null);
   }, []);
   const goDetailPrev = useCallback(() => {
-    if (detailNavIndex <= 0) return;
-    setDetailAccountId(sortedAccounts[detailNavIndex - 1]?.id ?? null);
-  }, [detailNavIndex, sortedAccounts]);
-  const goDetailNext = useCallback(() => {
-    if (detailNavIndex < 0 || detailNavIndex >= sortedAccounts.length - 1) return;
-    setDetailAccountId(sortedAccounts[detailNavIndex + 1]?.id ?? null);
-  }, [detailNavIndex, sortedAccounts]);
-
-  // 账号被删除或过滤后从列表消失时，自动关闭详情抽屉。
-  useEffect(() => {
-    if (detailAccountId == null) return;
-    if (!accounts.some((account) => account.id === detailAccountId)) {
-      setDetailAccountId(null);
+    if (detailNavIndex > 0) {
+      const target = sortedAccounts[detailNavIndex - 1] ?? null;
+      setDetailAccountData(target);
+      setDetailAccountId(target?.id ?? null);
+      return;
     }
-  }, [accounts, detailAccountId]);
+    if (currentPage > 1) {
+      detailNavigationTargetRef.current = "last";
+      setPage(currentPage - 1);
+    }
+  }, [currentPage, detailNavIndex, sortedAccounts]);
+  const goDetailNext = useCallback(() => {
+    if (detailNavIndex >= 0 && detailNavIndex < sortedAccounts.length - 1) {
+      const target = sortedAccounts[detailNavIndex + 1] ?? null;
+      setDetailAccountData(target);
+      setDetailAccountId(target?.id ?? null);
+      return;
+    }
+    if (currentPage < totalPages) {
+      detailNavigationTargetRef.current = "first";
+      setPage(currentPage + 1);
+    }
+  }, [currentPage, detailNavIndex, sortedAccounts, totalPages]);
+
+  useEffect(() => {
+    if (detailAccountId == null) return undefined;
+    const controller = new AbortController();
+    void api.getAccount(detailAccountId, controller.signal)
+      .then((account) => {
+        if (!controller.signal.aborted) setDetailAccountData(account);
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [detailAccountId, detailListAccount?.enabled, detailListAccount?.locked, detailListAccount?.status, detailListAccount?.updated_at]);
+
+  useEffect(() => {
+    const target = detailNavigationTargetRef.current;
+    if (!target || data.page !== page || accounts.length === 0) return;
+    const account = target === "first" ? accounts[0] : accounts[accounts.length - 1];
+    detailNavigationTargetRef.current = null;
+    setDetailAccountData(account ?? null);
+    setDetailAccountId(account?.id ?? null);
+  }, [accounts, data.page, page]);
   // 自用模式（personal）下，主体列表强制走每行 2 列卡片，桌面端也不渲染表格。
   const isPersonalMode = pageMode === "personal";
   const shouldRenderMobileCards =
@@ -2024,14 +2100,20 @@ export default function Accounts() {
             ...addForm,
             refresh_token: "",
             allow_duplicate: allowDuplicate,
-            custom_headers: parsedCustomHeaders.value,
+            custom_headers: applyWorkspaceRouteHeader(
+              parsedCustomHeaders.value,
+              workspaceRouteID,
+            ),
             group_ids: importGroupIds,
           }
         : {
             ...addForm,
             session_token: "",
             allow_duplicate: allowDuplicate,
-            custom_headers: parsedCustomHeaders.value,
+            custom_headers: applyWorkspaceRouteHeader(
+              parsedCustomHeaders.value,
+              workspaceRouteID,
+            ),
             group_ids: importGroupIds,
           };
     if (
@@ -2056,6 +2138,7 @@ export default function Accounts() {
         showToast(t("accounts.addSuccess"));
         setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
         setAddCustomHeadersText("");
+        setWorkspaceRouteID("");
         return;
       }
 
@@ -2064,6 +2147,7 @@ export default function Accounts() {
       setShowAdd(false);
       setAddForm({ refresh_token: "", session_token: "", proxy_url: "" });
       setAddCustomHeadersText("");
+      setWorkspaceRouteID("");
       void reload();
     } catch (error) {
       showToast(
@@ -2089,7 +2173,10 @@ export default function Accounts() {
       const res = await postAdminSSE("/accounts/at?stream=true", {
         ...atForm,
         allow_duplicate: allowDuplicate,
-        custom_headers: parsedCustomHeaders.value,
+        custom_headers: applyWorkspaceRouteHeader(
+          parsedCustomHeaders.value,
+          workspaceRouteID,
+        ),
         group_ids: importGroupIds,
       });
       setShowAdd(false);
@@ -2097,6 +2184,7 @@ export default function Accounts() {
       showToast(t("accounts.addSuccess"));
       setAtForm({ access_token: "", proxy_url: "" });
       setAddCustomHeadersText("");
+      setWorkspaceRouteID("");
     } catch (error) {
       showToast(
         t("accounts.addFailed", { error: getErrorMessage(error) }),
@@ -2190,10 +2278,17 @@ export default function Accounts() {
       const items = Array.isArray(parsed) ? parsed : [parsed];
       const blob = new Blob([JSON.stringify(items)], { type: "application/json" });
       const file = new File([blob], "session.json", { type: "application/json" });
-      await importFiles([file], "json", sessionProxyUrl, addCustomHeadersText);
+      await importFiles(
+        [file],
+        "json",
+        sessionProxyUrl,
+        addCustomHeadersText,
+        workspaceRouteID,
+      );
       setShowAdd(false);
       setSessionJson("");
       setAddCustomHeadersText("");
+      setWorkspaceRouteID("");
     } catch (error) {
       if (error instanceof SyntaxError) {
         showToast(t("accounts.sessionJsonInvalid"), "error");
@@ -2629,6 +2724,7 @@ export default function Accounts() {
     format: "txt" | "json" | "json_at" | "at_txt",
     proxyOverride?: string,
     customHeadersText?: string,
+    workspaceOverride?: string,
   ) => {
     const parsedCustomHeaders = parseCustomHeadersText(customHeadersText ?? "");
     if (!parsedCustomHeaders.ok) {
@@ -2651,10 +2747,14 @@ export default function Accounts() {
       if (format !== "txt") formData.append("format", format);
       const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
       if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
-      if (parsedCustomHeaders.value) {
+      const routedHeaders = applyOptionalWorkspaceRouteHeader(
+        parsedCustomHeaders.value,
+        workspaceOverride,
+      );
+      if (routedHeaders) {
         formData.append(
           "custom_headers",
-          JSON.stringify(parsedCustomHeaders.value),
+          JSON.stringify(routedHeaders),
         );
       }
       if (allowDuplicate) formData.append("allow_duplicate", "true");
@@ -2853,7 +2953,13 @@ export default function Accounts() {
       return;
     }
     setShowImportPicker(false);
-    await importFiles(files, "txt", undefined, importCustomHeadersText);
+    await importFiles(
+      files,
+      "txt",
+      undefined,
+      importCustomHeadersText,
+      importWorkspaceRouteID.trim() || undefined,
+    );
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -2866,6 +2972,7 @@ export default function Accounts() {
       "json",
       undefined,
       importCustomHeadersText,
+      importWorkspaceRouteID.trim() || undefined,
     );
     if (jsonInputRef.current) jsonInputRef.current.value = "";
   };
@@ -2879,6 +2986,7 @@ export default function Accounts() {
       "json_at",
       undefined,
       importCustomHeadersText,
+      importWorkspaceRouteID.trim() || undefined,
     );
     if (jsonAtInputRef.current) jsonAtInputRef.current.value = "";
   };
@@ -2891,7 +2999,13 @@ export default function Accounts() {
       return;
     }
     setShowImportPicker(false);
-    await importFiles(files, "at_txt", undefined, importCustomHeadersText);
+    await importFiles(
+      files,
+      "at_txt",
+      undefined,
+      importCustomHeadersText,
+      importWorkspaceRouteID.trim() || undefined,
+    );
     if (atFileInputRef.current) atFileInputRef.current.value = "";
   };
 
@@ -2919,10 +3033,22 @@ export default function Accounts() {
     );
 
     if (jsonFiles.length > 0) {
-      await importFiles(jsonFiles, "json", undefined, importCustomHeadersText);
+      await importFiles(
+        jsonFiles,
+        "json",
+        undefined,
+        importCustomHeadersText,
+        importWorkspaceRouteID.trim() || undefined,
+      );
     }
     if (txtFiles.length > 0) {
-      await importFiles(txtFiles, "txt", undefined, importCustomHeadersText);
+      await importFiles(
+        txtFiles,
+        "txt",
+        undefined,
+        importCustomHeadersText,
+        importWorkspaceRouteID.trim() || undefined,
+      );
     }
 
     if (folderInputRef.current) folderInputRef.current.value = "";
@@ -2941,7 +3067,13 @@ export default function Accounts() {
     }
     const blob = new Blob([JSON.stringify(items)], { type: "application/json" });
     const file = new File([blob], "paste.json", { type: "application/json" });
-    await importFiles([file], "json", undefined, importCustomHeadersText);
+    await importFiles(
+      [file],
+      "json",
+      undefined,
+      importCustomHeadersText,
+      importWorkspaceRouteID.trim() || undefined,
+    );
     setShowPasteImport(false);
     setPasteImportText("");
   };
@@ -2953,8 +3085,15 @@ export default function Accounts() {
     setExporting(true);
     setShowExportPicker(false);
     try {
-      const params: { filter: "healthy" | "all"; ids?: number[] } = {
+      // Codex 账号页只导出 codex 渠道:不带 channel 时后端会把 Grok 账号一并
+      // 打进 codex 命名的导出文件(Grok 页有专属导出入口)。
+      const params: {
+        filter: "healthy" | "all";
+        ids?: number[];
+        channel: "codex";
+      } = {
         filter: scope === "healthy" ? "healthy" : "all",
+        channel: "codex",
       };
       if (scope === "selected") {
         params.ids = Array.from(selected);
@@ -3107,7 +3246,7 @@ export default function Accounts() {
     try {
       const result = await api.refreshAccount(account.id);
       showToast(result.message || t("accounts.refreshRequested"));
-      void reloadSilently();
+      await refreshAccountRow(account.id);
     } catch (error) {
       showToast(
         t("accounts.refreshFailed", { error: getErrorMessage(error) }),
@@ -3129,7 +3268,7 @@ export default function Accounts() {
       showToast(
         newLocked ? t("accounts.lockSuccess") : t("accounts.unlockSuccess"),
       );
-      void reload();
+      await refreshAccountRow(account.id);
     } catch (error) {
       showToast(
         t("accounts.lockFailed", { error: getErrorMessage(error) }),
@@ -3139,8 +3278,7 @@ export default function Accounts() {
   };
 
   const handleLockSubscriptionAccounts = async () => {
-    const candidates = subscriptionAccountsToLock;
-    if (candidates.length === 0) {
+    if (subscriptionAccountsToLockCount === 0) {
       showToast(t("accounts.noSubscriptionAccountsToLock"));
       return;
     }
@@ -3149,7 +3287,7 @@ export default function Accounts() {
     setLockingSubscriptionAccounts(true);
     try {
       const result = await api.batchUpdateAccounts({
-        ids: candidates.map((account) => account.id),
+        selector: { channel: "codex", subscription_unlocked: true },
         locked: true,
       });
       showToast(
@@ -3179,7 +3317,7 @@ export default function Accounts() {
           ? t("accounts.enableSuccess")
           : t("accounts.disableSuccess"),
       );
-      void reload();
+      await refreshAccountRow(account.id);
     } catch (error) {
       showToast(
         t("accounts.enableFailed", { error: getErrorMessage(error) }),
@@ -3266,15 +3404,17 @@ export default function Accounts() {
     }
   };
 
-  const handleBatchRefresh = async (ids?: number[]) => {
-    const targetIds = ids ?? Array.from(selected);
-    if (targetIds.length === 0) return;
+  const handleBatchRefresh = async (ids?: number[], allRefreshable = false) => {
+    const targetIds = ids ?? (allRefreshable ? [] : Array.from(selected));
+    if (!allRefreshable && targetIds.length === 0) return;
     setBatchLoading(true);
     setBatchRefreshing(true);
     try {
       const result = await runStreamingAccountOperation(
         "/accounts/batch-refresh?stream=true",
-        { ids: targetIds },
+        allRefreshable
+          ? { selector: { channel: "codex", refreshable_only: true } }
+          : { ids: targetIds },
         t("accounts.batchRefreshProgressTitle"),
       );
       const success = result?.success ?? 0;
@@ -3344,12 +3484,59 @@ export default function Accounts() {
     try {
       await api.resetAccountStatus(account.id);
       showToast(t("accounts.resetStatusSuccess"));
-      void reload();
+      await refreshAccountRow(account.id);
     } catch (error) {
       showToast(
         t("accounts.resetStatusFailed", { error: getErrorMessage(error) }),
         "error",
       );
+    }
+  };
+
+  const handleSaveModelCooldownPolicy = async (
+    account: AccountRow,
+    data: {
+      mode: "off" | "fixed" | "adaptive" | null;
+      seconds: number | null;
+      backoff_enabled: boolean | null;
+    },
+  ) => {
+    try {
+      await api.updateAccountModelCooldownPolicy(account.id, data);
+      showToast(t("accounts.modelCooldownPolicySaved"));
+      void reloadSilently();
+    } catch (error) {
+      showToast(
+        t("accounts.modelCooldownPolicySaveFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    }
+  };
+
+  const handleClearModelCooldown = async (
+    account: AccountRow,
+    model: string,
+  ) => {
+    try {
+      await api.clearAccountModelCooldown(account.id, model);
+      showToast(t("accounts.modelCooldownCleared", { model }));
+      void reloadSilently();
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
+    }
+  };
+
+  const handleClearAllModelCooldowns = async (account: AccountRow) => {
+    try {
+      const result = await api.clearAllAccountModelCooldowns(account.id);
+      showToast(
+        t("accounts.allModelCooldownsCleared", { count: result.cleared }),
+      );
+      void reloadSilently();
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
     }
   };
 
@@ -3451,11 +3638,23 @@ export default function Accounts() {
     }
   };
 
-  const openModelsEditor = (account: AccountRow) => {
+  const populateModelsEditor = (account: AccountRow) => {
     setModelsAccount(account);
     setModelsDraft([...(account.models ?? [])]);
     setModelsInputDraft("");
     setProbeBoard([]);
+  };
+
+  const openModelsEditor = (account: AccountRow) => {
+    void loadAccountDetail(account)
+      .then(populateModelsEditor)
+      .catch((error) => showToast(getErrorMessage(error), "error"));
+  };
+
+  const openTestingAccount = (account: AccountRow) => {
+    void loadAccountDetail(account)
+      .then(setTestingAccount)
+      .catch((error) => showToast(getErrorMessage(error), "error"));
   };
 
   const closeModelsEditor = () => {
@@ -3742,17 +3941,13 @@ export default function Accounts() {
   };
 
   const handleBatchTest = async (ids?: number[]) => {
-    const scopedIDs = resolveChannelBatchTestAccountIDs(
-      accounts,
-      "codex",
-      ids,
-    );
-    if (scopedIDs.length === 0) return;
+    if (ids && ids.length === 0) return;
+    if (!ids && data.total === 0) return;
     setBatchTesting(true);
     try {
       const result = await runStreamingAccountOperation(
         "/accounts/batch-test?stream=true",
-        { ids: scopedIDs },
+        ids ? { ids } : { selector: currentAccountSelector },
         t("accounts.batchTestProgressTitle"),
       );
       showToast(
@@ -3843,7 +4038,7 @@ export default function Accounts() {
     }
   };
 
-  const openSchedulerEditor = (account: AccountRow) => {
+  const populateSchedulerEditor = (account: AccountRow) => {
     setEditingAccount(account);
     setEditTab("scheduler");
     setScoreMode(
@@ -3923,6 +4118,12 @@ export default function Accounts() {
     setEditOAuthCallbackUrl("");
     setEditOAuthGenerating(false);
     setEditOAuthUpdating(false);
+  };
+
+  const openSchedulerEditor = (account: AccountRow) => {
+    void loadAccountDetail(account)
+      .then(populateSchedulerEditor)
+      .catch((error) => showToast(getErrorMessage(error), "error"));
   };
 
   const closeSchedulerEditor = (force = false) => {
@@ -4169,6 +4370,8 @@ export default function Accounts() {
       baseConcurrencyInput: "",
       auto_pause_5h_threshold: 0,
       auto_pause_7d_threshold: 0,
+      proxyURLsInput: "",
+      channel: "codex",
     });
   };
 
@@ -4185,6 +4388,8 @@ export default function Accounts() {
           : "",
       auto_pause_5h_threshold: group.auto_pause_5h_threshold ?? 0,
       auto_pause_7d_threshold: group.auto_pause_7d_threshold ?? 0,
+      proxyURLsInput: (group.proxy_urls ?? []).join("\n"),
+      channel: group.channel === "grok" ? "grok" : "codex",
     });
   };
 
@@ -4210,6 +4415,11 @@ export default function Accounts() {
             : parsedGroupBaseConcurrency,
         auto_pause_5h_threshold: groupDraft.auto_pause_5h_threshold,
         auto_pause_7d_threshold: groupDraft.auto_pause_7d_threshold,
+        proxy_urls: groupDraft.proxyURLsInput
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean),
+        channel: groupDraft.channel,
       };
       if (groupDraft.id === null) {
         await api.createAccountGroup(payload);
@@ -4344,8 +4554,8 @@ export default function Accounts() {
       />
       <StateShell
         variant="page"
-        loading={loading}
-        error={error}
+        loading={loading && accounts.length === 0}
+        error={accounts.length === 0 ? error : null}
         onRetry={() => void reload()}
         loadingTitle={t("accounts.loadingTitle")}
         loadingDescription={t("accounts.loadingDesc")}
@@ -4363,6 +4573,7 @@ export default function Accounts() {
           {showInvite ? (
             <CodexInviteView
               accounts={accounts}
+              loading={loading}
               onClose={() => setShowInvite(false)}
             />
           ) : null}
@@ -4413,11 +4624,9 @@ export default function Accounts() {
                           disabled:
                             batchLoading ||
                             batchTesting ||
-                            accounts.length === 0,
+                            data.total === 0,
                           onSelect: () =>
-                            void handleBatchRefresh(
-                              accounts.map((account) => account.id),
-                            ),
+                            void handleBatchRefresh(undefined, true),
                         },
                         {
                           key: "lock-subscription",
@@ -4429,9 +4638,9 @@ export default function Accounts() {
                             batchLoading ||
                             batchTesting ||
                             lockingSubscriptionAccounts ||
-                            accounts.length === 0,
+                            subscriptionAccountsToLockCount === 0,
                           title: t("accounts.lockSubscriptionAccountsHint", {
-                            count: subscriptionAccountsToLock.length,
+                            count: subscriptionAccountsToLockCount,
                           }),
                           onSelect: () => void handleLockSubscriptionAccounts(),
                         },
@@ -4523,7 +4732,7 @@ export default function Accounts() {
                         size="sm"
                         className="shrink-0"
                         disabled={
-                          batchLoading || batchTesting || accounts.length === 0
+                          batchLoading || batchTesting || data.total === 0
                         }
                         onClick={() => void handleBatchTest()}
                       >
@@ -4664,6 +4873,20 @@ export default function Accounts() {
             }
           />
 
+          {error && accounts.length > 0 ? (
+            <div className="mb-2 flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive" role="alert">
+              <span className="truncate">{error}</span>
+              <Button variant="outline" size="sm" onClick={() => void reload()}>
+                {t("common.retry")}
+              </Button>
+            </div>
+          ) : null}
+          {loading || data.statsState !== "ready" ? (
+            <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
+              {loading ? <Loader2 className="size-3 animate-spin" /> : null}
+              {loading ? t("common.loading") : data.statsState}
+            </div>
+          ) : null}
           <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
             <CompactStat
               label={t("accounts.totalAccounts")}
@@ -4719,29 +4942,39 @@ export default function Accounts() {
             />
           </div>
 
-          {showAnalysisCharts ? (
+          {showAnalysisCharts && accountAnalysis ? (
             <div className="mb-4 grid items-stretch gap-4 xl:grid-cols-2">
               <AccountQuotaDistributionChart
-                accounts={accounts}
+                analysis={accountAnalysis.quota}
                 compact
                 className="min-w-0"
                 onProbeStarted={() => {
                   showToast(t('accounts.quotaDistributionRefreshStarted'), 'success')
                   // 探针在后台并发执行；稍等一下再静默拉取，让首批结果有机会回流
                   window.setTimeout(() => {
-                    void reloadSilently()
+                    void loadAccountAnalysis()
                   }, 4000)
                 }}
                 onProbeError={(message) => showToast(message, 'error')}
               />
               <AccountRateLimitRecoveryChart
-                accounts={accounts}
-                currentRpm={opsOverview?.traffic?.rpm}
-                rpmLimit={opsOverview?.traffic?.rpm_limit}
-                avgDurationMs={opsOverview?.traffic?.avg_duration_ms}
+                analysis={accountAnalysis}
                 compact
                 className="min-w-0"
               />
+            </div>
+          ) : showAnalysisCharts ? (
+            <div className="mb-4 flex min-h-28 items-center justify-center rounded-xl border border-dashed border-border bg-muted/20 px-4 text-sm text-muted-foreground">
+              {accountAnalysisError ? (
+                <div className="flex flex-wrap items-center justify-center gap-3 text-center">
+                  <span>{accountAnalysisError}</span>
+                  <Button variant="outline" size="sm" onClick={() => void loadAccountAnalysis()}>
+                    {t("common.retry")}
+                  </Button>
+                </div>
+              ) : (
+                <span>{accountAnalysisLoading ? t("common.loading") : t("common.noData")}</span>
+              )}
             </div>
           ) : null}
 
@@ -4822,10 +5055,7 @@ export default function Accounts() {
                   className="h-9 rounded-lg pl-9 text-[13px] sm:h-8"
                   placeholder={t("accounts.searchPlaceholder")}
                   value={searchQuery}
-                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
-                    setSearchQuery(e.target.value);
-                    setPage(1);
-                  }}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
                 />
               </div>
               <div className="flex max-w-full shrink-0 items-center gap-0.5 overflow-x-auto rounded-lg border border-border bg-muted/30 p-0.5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
@@ -4892,7 +5122,7 @@ export default function Accounts() {
                 />
                 <AccountGroupFilterSelect
                   className="w-full min-w-0 sm:w-40"
-                  groups={allGroups}
+                  groups={codexGroups}
                   value={groupFilter}
                   onChange={(value) => {
                     setGroupFilter(value);
@@ -5285,7 +5515,6 @@ export default function Accounts() {
           )}
 
           <PendingSelfServiceReviewPanel
-            accounts={accounts}
             onApprove={handleApprovePending}
             onReject={handleRejectPending}
             onSaveNote={handleSaveNote}
@@ -5336,7 +5565,7 @@ export default function Accounts() {
                           onEdit={() => openSchedulerEditor(account)}
                           onEditGroups={() => openQuickGroupEditor(account)}
                           onUsage={() => setUsageAccount(account)}
-                          onTest={() => setTestingAccount(account)}
+                          onTest={() => openTestingAccount(account)}
                           onRefresh={() => void handleRefresh(account)}
                           onGenerateAuthJson={() =>
                             void handleGenerateAuthJSON(account)
@@ -5601,12 +5830,24 @@ export default function Accounts() {
                                       ? formatAccountName(account)
                                       : formatAccountListEmail(account)}
                                   </button>
-                                  {account.chatgpt_account_id && (
+                                  {account.effective_workspace_id && (
                                     <span
-                                      className="max-w-full truncate font-mono text-[10px] leading-tight text-muted-foreground/70"
-                                      title={account.chatgpt_account_id}
+                                      className={cn(
+                                        "max-w-full truncate font-mono text-[10px] leading-tight",
+                                        account.workspace_id_override
+                                          ? "rounded bg-sky-500/10 px-1.5 py-0.5 font-semibold text-sky-700 dark:text-sky-300"
+                                          : "text-muted-foreground/70",
+                                      )}
+                                      title={
+                                        account.workspace_id_override
+                                          ? `${t("accounts.workspaceRouteBadge")}: ${account.effective_workspace_id}`
+                                          : account.effective_workspace_id
+                                      }
                                     >
-                                      {account.chatgpt_account_id}
+                                      {account.workspace_id_override
+                                        ? `${t("accounts.workspaceRouteBadge")} · `
+                                        : ""}
+                                      {account.effective_workspace_id}
                                     </span>
                                   )}
                                   {showEmailDomainTags &&
@@ -5796,6 +6037,7 @@ export default function Accounts() {
                                       }
                                       errorMessage={account.error_message}
                                     />
+                                    <UsingCreditsBadge account={account} />
                                     <AccountStatusCountdown account={account} />
                                     {(account.active_requests ?? 0) > 0 && (
                                       <span
@@ -5911,7 +6153,7 @@ export default function Accounts() {
                                     variant="ghost"
                                     size="icon-sm"
                                     className="size-8"
-                                    onClick={() => setTestingAccount(account)}
+                                    onClick={() => openTestingAccount(account)}
                                     title={t("accounts.testConnection")}
                                   >
                                     <Zap className="size-3.5" />
@@ -5934,7 +6176,7 @@ export default function Accounts() {
                                     )}
                                     includeTest={false}
                                     includeDelete={false}
-                                    onTest={() => setTestingAccount(account)}
+                                    onTest={() => openTestingAccount(account)}
                                     onRefresh={() => void handleRefresh(account)}
                                     onGenerateAuthJson={() =>
                                       void handleGenerateAuthJSON(account)
@@ -5968,7 +6210,7 @@ export default function Accounts() {
                   page={currentPage}
                   totalPages={totalPages}
                   onPageChange={setPage}
-                  totalItems={sortedAccounts.length}
+                  totalItems={data.total}
                   pageSize={pageSize}
                   pageSizeOptions={pageSizeOptions}
                   onPageSizeChange={(nextPageSize) => {
@@ -6005,6 +6247,7 @@ export default function Accounts() {
               setSessionJson("");
               setSessionProxyUrl("");
               setAddCustomHeadersText("");
+              setWorkspaceRouteID("");
             }}
             footer={
               <>
@@ -6045,6 +6288,7 @@ export default function Accounts() {
                     setSessionJson("");
                     setSessionProxyUrl("");
                     setAddCustomHeadersText("");
+                    setWorkspaceRouteID("");
                   }}
                 >
                   {t("common.cancel")}
@@ -6233,6 +6477,7 @@ export default function Accounts() {
                       proxy_url: value,
                     })),
                 })}
+                {renderWorkspaceRouteInput()}
                 {renderCustomHeadersTextarea({
                   value: addCustomHeadersText,
                   onChange: setAddCustomHeadersText,
@@ -6266,6 +6511,7 @@ export default function Accounts() {
                       proxy_url: value,
                     })),
                 })}
+                {renderWorkspaceRouteInput()}
                 {renderCustomHeadersTextarea({
                   value: addCustomHeadersText,
                   onChange: setAddCustomHeadersText,
@@ -6302,6 +6548,7 @@ export default function Accounts() {
                       proxy_url: value,
                     })),
                 })}
+                {renderWorkspaceRouteInput()}
                 {renderCustomHeadersTextarea({
                   value: addCustomHeadersText,
                   onChange: setAddCustomHeadersText,
@@ -6332,6 +6579,7 @@ export default function Accounts() {
                   label: t("accounts.importProxyLabel"),
                   onChange: setSessionProxyUrl,
                 })}
+                {renderWorkspaceRouteInput()}
                 {renderCustomHeadersTextarea({
                   value: addCustomHeadersText,
                   onChange: setAddCustomHeadersText,
@@ -6729,7 +6977,7 @@ export default function Accounts() {
                   {t("accounts.importGroupsLabel")}
                 </label>
                 <AccountGroupMultiSelect
-                  groups={allGroups}
+                  groups={codexGroups}
                   value={importGroupIds}
                   onChange={setImportGroupIds}
                   allLabel={t("accounts.groupsUnbound")}
@@ -6776,6 +7024,10 @@ export default function Accounts() {
                 value: importCustomHeadersText,
                 onChange: setImportCustomHeadersText,
               })}
+              {renderWorkspaceRouteInput({
+                value: importWorkspaceRouteID,
+                onChange: setImportWorkspaceRouteID,
+              })}
               <label className="flex cursor-pointer items-center gap-2 pt-1 text-xs text-muted-foreground">
                 <input
                   type="checkbox"
@@ -6790,7 +7042,7 @@ export default function Accounts() {
                   {t("accounts.importGroupsLabel")}
                 </label>
                 <AccountGroupMultiSelect
-                  groups={allGroups}
+                  groups={codexGroups}
                   value={importGroupIds}
                   onChange={setImportGroupIds}
                   allLabel={t("accounts.groupsUnbound")}
@@ -7172,7 +7424,10 @@ export default function Accounts() {
             <AccountUsageModal
               account={usageAccount}
               onClose={() => setUsageAccount(null)}
-              onCreditsReset={() => void reload()}
+              // 必须静默重拉：reload() 会把 StateShell 切成整页 loading，
+              // 而这个弹窗就渲染在 StateShell 里 —— 一开积分开关整个界面连同弹窗
+              // 就被卸载重建（用量数据重新拉、滚动位置丢失），观感就是"闪一下全刷新"。
+              onCreditsReset={() => void reloadSilently()}
             />
           )}
 
@@ -7189,7 +7444,9 @@ export default function Accounts() {
                 : undefined
             }
             sequence={
-              detailNavIndex >= 0 ? detailNavIndex + 1 : undefined
+              detailNavIndex >= 0
+                ? (currentPage - 1) * pageSize + detailNavIndex + 1
+                : undefined
             }
             usageSlot={
               detailAccount ? (
@@ -7200,10 +7457,10 @@ export default function Accounts() {
                 />
               ) : null
             }
-            canGoPrev={detailNavIndex > 0}
+            canGoPrev={detailNavIndex > 0 || currentPage > 1}
             canGoNext={
-              detailNavIndex >= 0 &&
-              detailNavIndex < sortedAccounts.length - 1
+              (detailNavIndex >= 0 && detailNavIndex < sortedAccounts.length - 1) ||
+              currentPage < totalPages
             }
             refreshing={
               detailAccount
@@ -7228,7 +7485,7 @@ export default function Accounts() {
             }}
             onTest={() => {
               if (!detailAccount) return;
-              setTestingAccount(detailAccount);
+              openTestingAccount(detailAccount);
             }}
             onRefresh={() => {
               if (!detailAccount) return;
@@ -7249,6 +7506,18 @@ export default function Accounts() {
             onResetStatus={() => {
               if (!detailAccount) return;
               void handleResetStatus(detailAccount);
+            }}
+            onSaveModelCooldownPolicy={(data) => {
+              if (!detailAccount) return;
+              void handleSaveModelCooldownPolicy(detailAccount, data);
+            }}
+            onClearModelCooldown={(model) => {
+              if (!detailAccount) return;
+              void handleClearModelCooldown(detailAccount, model);
+            }}
+            onClearAllModelCooldowns={() => {
+              if (!detailAccount) return;
+              void handleClearAllModelCooldowns(detailAccount);
             }}
             onResetCredits={() => {
               if (!detailAccount) return;
@@ -8006,7 +8275,7 @@ export default function Accounts() {
                         </div>
                         <div className="mt-3">
                           <AccountGroupMultiSelect
-                            groups={allGroups}
+                            groups={codexGroups}
                             value={editGroupIds}
                             onChange={setEditGroupIds}
                             allLabel={t("accounts.groupsUnbound")}
@@ -8115,7 +8384,7 @@ export default function Accounts() {
                 </Button>
               </div>
               <AccountGroupMultiSelect
-                groups={allGroups}
+                groups={codexGroups}
                 value={quickGroupIds}
                 onChange={setQuickGroupIds}
                 allLabel={t("accounts.groupsUnbound")}
@@ -8528,7 +8797,7 @@ export default function Accounts() {
                 </div>
                 <div className="mt-3">
                   <AccountGroupMultiSelect
-                    groups={allGroups}
+                    groups={codexGroups}
                     value={batchGroupIds}
                     onChange={setBatchGroupIds}
                     allLabel={t(
@@ -8734,6 +9003,15 @@ export default function Accounts() {
                               <span className="truncate text-sm font-semibold text-foreground">
                                 {group.name}
                               </span>
+                              <span
+                                className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ${
+                                  group.channel === "grok"
+                                    ? "bg-violet-50 text-violet-700 dark:bg-violet-950 dark:text-violet-300"
+                                    : "bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300"
+                                }`}
+                              >
+                                {group.channel === "grok" ? "Grok" : "Codex"}
+                              </span>
                               <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-semibold text-muted-foreground">
                                 {t("accounts.groupMembers")}{" "}
                                 {group.member_count}
@@ -8814,6 +9092,48 @@ export default function Accounts() {
                       maxLength={80}
                     />
                   </label>
+                  <div className="space-y-1.5">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {t("accounts.groupChannelLabel")}
+                    </span>
+                    {(() => {
+                      const channelLocked =
+                        groupDraft.id !== null &&
+                        (allGroups.find((g) => g.id === groupDraft.id)
+                          ?.member_count ?? 0) > 0;
+                      return (
+                        <>
+                          <div className="flex gap-2">
+                            {(["codex", "grok"] as const).map((channel) => (
+                              <button
+                                key={channel}
+                                type="button"
+                                disabled={channelLocked}
+                                className={`rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                                  groupDraft.channel === channel
+                                    ? "border-primary bg-primary/10 text-primary"
+                                    : "border-border text-muted-foreground hover:bg-muted/50"
+                                }`}
+                                onClick={() =>
+                                  setGroupDraft((draft) => ({
+                                    ...draft,
+                                    channel,
+                                  }))
+                                }
+                              >
+                                {channel === "grok" ? "Grok" : "Codex"}
+                              </button>
+                            ))}
+                          </div>
+                          <p className="text-[11px] text-muted-foreground">
+                            {channelLocked
+                              ? t("accounts.groupChannelLocked")
+                              : t("accounts.groupChannelHint")}
+                          </p>
+                        </>
+                      );
+                    })()}
+                  </div>
                   <label className="block space-y-1.5">
                     <span className="text-xs font-semibold text-muted-foreground">
                       {t("accounts.groupDescription")}
@@ -8891,6 +9211,27 @@ export default function Accounts() {
                       {groupBaseConcurrencyInvalid
                         ? t("accounts.groupBaseConcurrencyRange")
                         : t("accounts.groupBaseConcurrencyHint")}
+                    </p>
+                  </label>
+                  <label className="block space-y-1.5">
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {t("accounts.groupProxyURLsLabel")}
+                    </span>
+                    <textarea
+                      className="w-full min-h-[80px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                      value={groupDraft.proxyURLsInput}
+                      onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                        setGroupDraft((draft) => ({
+                          ...draft,
+                          proxyURLsInput: event.target.value,
+                        }))
+                      }
+                      placeholder={t("accounts.groupProxyURLsPlaceholder")}
+                      rows={3}
+                      spellCheck={false}
+                    />
+                    <p className="text-[11px] text-muted-foreground">
+                      {t("accounts.groupProxyURLsHint")}
                     </p>
                   </label>
                   <div className="space-y-1.5">
@@ -10416,6 +10757,26 @@ function getSchedulerPriority(account: AccountRow): number {
     : 0;
 }
 
+// UsingCreditsBadge 紧跟在限流徽章后面：账号显示仍是「限流」（用量窗口客观上确实打满了），
+// 这个积分徽章表示"正在用积分顶替限流，因此仍在参与调度"。
+// 后端 using_credits 已经算过全部前提（两个开关 + 当下确有余额 + 窗口真打满），
+// 这里只负责显示，不重算，避免两边判定漂移。
+function UsingCreditsBadge({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  if (!account.using_credits) return null;
+  // 纯图标：余额已经在邮箱下方的徽章里显示过，这里再写一遍是重复信息，
+  // 而且会把「限流 | 7d」和倒计时之间撑开。语义靠 title / aria-label 承载。
+  return (
+    <span
+      className="inline-flex size-5 shrink-0 items-center justify-center rounded-md border border-teal-500/30 bg-teal-500/10 text-teal-700 dark:text-teal-300"
+      title={t("accounts.usingCreditsBadgeTooltip")}
+      aria-label={t("accounts.usingCreditsBadge")}
+    >
+      <Coins className="size-3" />
+    </span>
+  );
+}
+
 function SchedulerPriorityBadge({ account }: { account: AccountRow }) {
   const { t } = useTranslation();
   const priority = getSchedulerPriority(account);
@@ -10500,6 +10861,10 @@ function isPremiumUsagePlan(planType?: string): boolean {
 type RateLimitWindow = "5h" | "7d";
 
 function isRateLimitedAccount(account: AccountRow): boolean {
+  // 积分顶替限流的账号：状态徽章仍写「限流」（用量窗口客观上确实打满了），但调度侧
+  // 照常放行。健康分类与筛选按"可用"计，否则一个正在正常干活的账号会被算进限流数、
+  // 被「限流」筛选捞出来，与旁边的积分徽章互相矛盾。
+  if (account.using_credits) return false;
   return getAccountRateLimitWindow(account) !== null;
 }
 
@@ -10589,7 +10954,11 @@ function getRateLimitedWindowStats(accounts: AccountRow[]): {
 } {
   const stats = accounts.reduce(
     (stats, account) => {
-      const window = getAccountRateLimitWindow(account);
+      // 走 isRateLimitedAccount 而不是直接取窗口：积分顶替限流的账号按可用计，
+      // 这样 5h + 7d 仍然等于总限流数，不会比汇总里的「限流」多出几个。
+      const window = isRateLimitedAccount(account)
+        ? getAccountRateLimitWindow(account)
+        : null;
       if (!window) {
         return stats;
       }
@@ -11811,6 +12180,7 @@ function AccountMobileCard({
               </span>
               <PlanBadge planType={account.plan_type} />
               <SchedulerPriorityBadge account={account} />
+              <UsingCreditsBadge account={account} />
               <AccountStatusCountdown account={account} />
               <ExpiryBadge
                 expiresAt={account.subscription_expires_at}
@@ -12126,7 +12496,8 @@ function AccountMobileCard({
                   detail={getAccountRateLimitWindow(account) ?? undefined}
                   errorMessage={account.error_message}
                 />
-                <div className="mt-1 flex min-h-6 items-center justify-end">
+                <div className="mt-1 flex min-h-6 flex-wrap items-center justify-end gap-1.5">
+                  <UsingCreditsBadge account={account} />
                   <AccountStatusCountdown account={account} />
                 </div>
               </div>
@@ -13196,17 +13567,20 @@ function getAccountStatusCountdownUntil(
   account: AccountRow,
 ): string | undefined {
   const status = account.status;
+  const rateLimited =
+    status === "rate_limited" ||
+    status === "rate_limited_5h" ||
+    status === "rate_limited_7d";
   if (
     account.cooldown_until &&
-    (status === "rate_limited" ||
-      status === "rate_limited_5h" ||
-      status === "rate_limited_7d" ||
-      status === "error" ||
-      status === "cooldown")
+    (rateLimited || status === "error" || status === "cooldown")
   ) {
     return account.cooldown_until;
   }
-  if (status === "quota_paused") {
+  // 限流态但没有 cooldown：积分顶替限流会主动释放本地用量判罚（cooldown_until 被清空），
+  // premium 5h 打满也是直接由用量窗口判定、从不落 cooldown。这两种情况下倒计时改用窗口
+  // 重置时间——徽章上写着「限流 | 7d」，右边就该显示它多久恢复，而不是整个消失。
+  if (rateLimited || status === "quota_paused") {
     const window = getAccountRateLimitWindow(account);
     if (window === "7d") {
       return account.reset_7d_at;
@@ -13277,26 +13651,38 @@ function CooldownTimer({ until }: { until: string }) {
 const SELF_SERVICE_TAG = "self-service";
 
 function PendingSelfServiceReviewPanel({
-  accounts,
   onApprove,
   onReject,
   onSaveNote,
 }: {
-  accounts: AccountRow[];
-  onApprove: (account: AccountRow) => void;
-  onReject: (account: AccountRow) => void;
+  onApprove: (account: AccountRow) => Promise<void>;
+  onReject: (account: AccountRow) => Promise<void>;
   onSaveNote: (account: AccountRow, note: string) => Promise<void>;
 }) {
   const { t } = useTranslation();
-  const pending = useMemo(
-    () =>
-      accounts.filter(
-        (account) =>
-          account.enabled === false &&
-          (account.tags ?? []).includes(SELF_SERVICE_TAG),
-      ),
-    [accounts],
-  );
+  const [pending, setPending] = useState<AccountRow[]>([]);
+  const [pendingPage, setPendingPage] = useState(1);
+  const [pendingTotal, setPendingTotal] = useState(0);
+  const pendingPageSize = 20;
+  const loadPending = useCallback(async () => {
+    try {
+      const response = await api.getAccountsPage({
+        channel: "codex",
+        page: pendingPage,
+        pageSize: pendingPageSize,
+        status: "disabled",
+        tag: SELF_SERVICE_TAG,
+        sort: "created_at",
+        order: "asc",
+      });
+      setPending(response.accounts ?? []);
+      setPendingTotal(response.total ?? 0);
+      if (response.page !== pendingPage) setPendingPage(response.page);
+    } catch {
+      // This auxiliary panel must never block the account list.
+    }
+  }, [pendingPage]);
+  useEffect(() => { void loadPending(); }, [loadPending]);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draftNote, setDraftNote] = useState("");
   const [savingId, setSavingId] = useState<number | null>(null);
@@ -13317,6 +13703,7 @@ function PendingSelfServiceReviewPanel({
     setSavingId(account.id);
     try {
       await onSaveNote(account, draftNote.trim());
+      await loadPending();
       setEditingId(null);
       setDraftNote("");
     } finally {
@@ -13336,7 +13723,7 @@ function PendingSelfServiceReviewPanel({
               {t("accounts.pendingReview.title")}
             </div>
             <div className="text-[11px] text-muted-foreground">
-              {t("accounts.pendingReview.count", { count: pending.length })} ·{" "}
+              {t("accounts.pendingReview.count", { count: pendingTotal })} ·{" "}
               {t("accounts.pendingReview.desc")}
             </div>
           </div>
@@ -13419,7 +13806,7 @@ function PendingSelfServiceReviewPanel({
                   <Button
                     size="sm"
                     className="h-9"
-                    onClick={() => onApprove(account)}
+                    onClick={() => void onApprove(account).then(loadPending)}
                   >
                     <Check className="size-3.5" />
                     {t("accounts.pendingReview.approve")}
@@ -13428,7 +13815,7 @@ function PendingSelfServiceReviewPanel({
                     size="sm"
                     variant="outline"
                     className="h-9"
-                    onClick={() => onReject(account)}
+                    onClick={() => void onReject(account).then(loadPending)}
                   >
                     <Trash2 className="size-3.5" />
                     {t("accounts.pendingReview.reject")}
@@ -13438,6 +13825,17 @@ function PendingSelfServiceReviewPanel({
             );
           })}
         </div>
+        {pendingTotal > pendingPageSize ? (
+          <div className="mt-3">
+            <Pagination
+              page={pendingPage}
+              totalPages={Math.max(1, Math.ceil(pendingTotal / pendingPageSize))}
+              totalItems={pendingTotal}
+              pageSize={pendingPageSize}
+              onPageChange={setPendingPage}
+            />
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );

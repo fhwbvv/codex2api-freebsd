@@ -154,6 +154,26 @@ func TestNormalizeAdvancedConfigClampsDecoderResources(t *testing.T) {
 	}
 }
 
+func TestAdaptiveReviewCompatibilityAndRecommendedDefaults(t *testing.T) {
+	compatibility := NormalizeAdvancedConfig(DefaultAdvancedConfig())
+	if compatibility.AdaptiveReview.Enabled {
+		t.Fatal("compatibility defaults unexpectedly enabled adaptive review")
+	}
+	if compatibility.AdaptiveReview.MinCleanReviews != 10 || compatibility.AdaptiveReview.MinObservationHours != 24 || compatibility.AdaptiveReview.SamplePercent != 5 || compatibility.AdaptiveReview.ForceReviewIntervalMinutes != 360 {
+		t.Fatalf("unexpected adaptive compatibility defaults: %+v", compatibility.AdaptiveReview)
+	}
+	recommended := RecommendedAdvancedConfig()
+	if !recommended.AdaptiveReview.Enabled {
+		t.Fatal("recommended protection did not enable adaptive review")
+	}
+	recommended.AdaptiveReview.SamplePercent = 999
+	recommended.AdaptiveReview.ReactivationCleanReviews = 999
+	recommended = NormalizeAdvancedConfig(recommended)
+	if recommended.AdaptiveReview.SamplePercent != 100 || recommended.AdaptiveReview.ReactivationCleanReviews != recommended.AdaptiveReview.MinCleanReviews {
+		t.Fatalf("adaptive review limits were not normalized: %+v", recommended.AdaptiveReview)
+	}
+}
+
 func compressedBase64(t *testing.T, value string, useGzip bool) string {
 	t.Helper()
 	var compressed bytes.Buffer

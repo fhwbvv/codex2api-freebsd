@@ -79,6 +79,12 @@ func (a *Account) premium5hRateLimitedLocked(now time.Time) bool {
 	if a.skipsUsageWindowLimitsLocked() {
 		return false
 	}
+	return a.rawPremium5hRateLimitedLocked(now)
+}
+
+// rawPremium5hRateLimitedLocked 是不考虑任何跳过开关的 premium 5h 限流判定。
+// 「用积分顶替限流」需要知道窗口本身有没有打满，不能用上面那个已被开关抹平的结果。
+func (a *Account) rawPremium5hRateLimitedLocked(now time.Time) bool {
 	if !isPremium5hPlan(a.PlanType) {
 		return false
 	}

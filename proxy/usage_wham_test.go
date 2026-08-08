@@ -754,6 +754,8 @@ func TestApplyWhamUsage_CreditAccountSkipsPremium5hWindowLimit(t *testing.T) {
 		CreditEnabled:         true,
 		CreditSkipUsageWindow: true,
 	}
+	// 信用开关现在还要求当下确实有积分可花，快照缺失会按「没有积分」处理。
+	account.SetCreditBalance("1000.0000000000", true, false, false)
 
 	now := time.Now()
 	usage := &WhamUsage{PlanType: "plus"}
@@ -801,6 +803,8 @@ func TestApplyWhamUsage_CreditAccountSkips7dWindowLimit(t *testing.T) {
 		CreditEnabled:         true,
 		CreditSkipUsageWindow: true,
 	}
+	// 信用开关现在还要求当下确实有积分可花，快照缺失会按「没有积分」处理。
+	account.SetCreditBalance("1000.0000000000", true, false, false)
 
 	now := time.Now()
 	usage := &WhamUsage{PlanType: "team"}
@@ -811,8 +815,16 @@ func TestApplyWhamUsage_CreditAccountSkips7dWindowLimit(t *testing.T) {
 	if result.Usage7dRateLimited {
 		t.Fatalf("Usage7dRateLimited = true, want false for credit account")
 	}
-	if got := account.RuntimeStatus(); got != "active" {
-		t.Fatalf("RuntimeStatus() = %q, want active for credit account", got)
+	// 窗口打满但积分顶着：显示仍是限流，调度侧不受影响，
+	// 前端据 UsingCredits 在限流徽章后面挂一个积分徽章。
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited for credit account", got)
+	}
+	if !account.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true while credits cover the window")
+	}
+	if !account.UsingCredits() {
+		t.Fatal("UsingCredits() = false, want true while credits cover the window")
 	}
 	pct7d, ok := account.GetUsagePercent7d()
 	if !ok || pct7d != 100 {

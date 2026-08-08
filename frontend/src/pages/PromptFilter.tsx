@@ -2,10 +2,11 @@ import type { Dispatch, ReactNode, SetStateAction, TextareaHTMLAttributes } from
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { Activity, AlertTriangle, BookOpen, CheckCircle2, ChevronDown, ClipboardCheck, Copy, FileText, Gauge, GitBranch, HelpCircle, KeyRound, Layers, ListChecks, Network, Pencil, Plus, Power, PowerOff, RefreshCw, Save, Search, Shield, ShieldAlert, Sparkles, Trash2, Wand2, X } from 'lucide-react'
-import { api } from '../api'
+import { Activity, AlertTriangle, BookOpen, CheckCircle2, ChevronDown, ClipboardCheck, Copy, FileText, Gauge, GitBranch, HelpCircle, Layers, ListChecks, Network, Pencil, Plus, Power, PowerOff, RefreshCw, Save, Search, Shield, ShieldAlert, Sparkles, Trash2, Users, Wand2, X } from 'lucide-react'
+import { AdminAPIError, api } from '../api'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
+import PromptFilterNewAPIBindings from '../components/PromptFilterNewAPIBindings'
 import StateShell from '../components/StateShell'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
 import { useDataLoader } from '../hooks/useDataLoader'
@@ -14,7 +15,7 @@ import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import { getPromptFilterScoreBand, normalizePromptFilterScore } from '../lib/promptFilterScore'
 import { parseAdvancedConfigDocument, patchAdvancedConfigDocument, readAdvancedConfigPath } from '../types'
-import type { AdvancedConfigObject, AdvancedConfigPatch, PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterVerdict, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptIntelligenceCandidate, PromptIntelligenceRun, SystemSettings } from '../types'
+import type { AdvancedConfigObject, AdvancedConfigPatch, PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterTestResponse, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptIdentityUpdateMode, PromptIntelligenceAIAnalysisResponse, PromptIntelligenceAIProvider, PromptIntelligenceCandidate, PromptIntelligenceEvidenceResponse, PromptIntelligenceGatewayKey, PromptIntelligenceRun, PromptPolicyIncident, PromptPolicyIncidentDetailResponse, PromptReviewTestResponse, PromptRiskProfile, PromptRiskProfileDetailResponse, SystemSettings } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -41,7 +42,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 
-const PROMPT_FILTER_VIEWS = ['overview', 'logs', 'rules', 'intelligence', 'docs'] as const
+const PROMPT_FILTER_VIEWS = ['overview', 'logs', 'profiles', 'rules', 'intelligence', 'docs'] as const
 const HIT_START_MARKER = '⟦PF_HIT⟧'
 const HIT_END_MARKER = '⟦/PF_HIT⟧'
 type PromptFilterView = typeof PROMPT_FILTER_VIEWS[number]
@@ -76,6 +77,17 @@ type LogFilters = {
   model: string
   apiKeyId: string
   q: string
+  reviewResult: string
+}
+
+type RiskProfileFilters = {
+  subjectType: string
+  riskLevel: string
+  platform: string
+  apiKeyId: string
+  accountId: string
+  minScore: string
+  q: string
 }
 
 type RulePatternTestState = {
@@ -93,11 +105,107 @@ type CustomRuleDraft = {
   strict: boolean
 }
 
-type PromptGuardEditorConfig = Omit<PromptGuardConfig, 'rollout' | 'performance'>
+type ReviewAdapterFormConfig = {
+  request_mode: 'moderations' | 'chat_completions'
+  scope: 'all_requests' | 'local_candidates' | 'local_blocks'
+  system_prompt: string
+  user_prompt_template: string
+  payload_template: string
+  confidence_threshold: number
+  moderation_thresholds: Record<string, number>
+  max_concurrent: number
+  max_text_length: number
+  circuit_breaker_failures: number
+  circuit_breaker_seconds: number
+}
+
+type AdaptiveReviewFormConfig = {
+  enabled: boolean
+  min_clean_reviews: number
+  min_observation_hours: number
+  sample_percent: number
+  force_review_interval_minutes: number
+}
+
+type RecommendedProtectionStrength = 'monitor' | 'block'
+
+const defaultReviewAdapter: ReviewAdapterFormConfig = {
+  request_mode: 'moderations',
+  scope: 'all_requests',
+  system_prompt: '',
+  user_prompt_template: '',
+  payload_template: '',
+  confidence_threshold: 0.7,
+  moderation_thresholds: {
+    harassment: 0.98,
+    'harassment/threatening': 0.90,
+    hate: 0.65,
+    'hate/threatening': 0.65,
+    illicit: 0.95,
+    'illicit/violent': 0.95,
+    'self-harm': 0.65,
+    'self-harm/intent': 0.85,
+    'self-harm/instructions': 0.65,
+    sexual: 0.65,
+    'sexual/minors': 0.65,
+    violence: 0.95,
+    'violence/graphic': 0.95,
+  },
+  max_concurrent: 32,
+  max_text_length: 32768,
+  circuit_breaker_failures: 3,
+  circuit_breaker_seconds: 30,
+}
+
+const moderationThresholdCategories = Object.keys(defaultReviewAdapter.moderation_thresholds)
+
+function parseReviewAdapter(value: AdvancedConfigObject): ReviewAdapterFormConfig {
+  const raw = value.review_adapter && typeof value.review_adapter === 'object'
+    ? value.review_adapter as Record<string, unknown>
+    : {}
+  const rawThresholds = raw.moderation_thresholds && typeof raw.moderation_thresholds === 'object'
+    ? raw.moderation_thresholds as Record<string, unknown>
+    : {}
+  const moderationThresholds = Object.fromEntries(moderationThresholdCategories.map((category) => {
+    const configured = rawThresholds[category]
+    const threshold = typeof configured === 'number' && Number.isFinite(configured)
+      ? Math.min(1, Math.max(0, configured))
+      : defaultReviewAdapter.moderation_thresholds[category]
+    return [category, threshold]
+  }))
+  return {
+    request_mode: raw.request_mode === 'chat_completions' ? 'chat_completions' : 'moderations',
+    scope: raw.scope === 'local_candidates' || raw.scope === 'local_blocks' ? raw.scope : 'all_requests',
+    system_prompt: typeof raw.system_prompt === 'string' && raw.system_prompt.trim() ? raw.system_prompt : defaultReviewAdapter.system_prompt,
+    user_prompt_template: typeof raw.user_prompt_template === 'string' && raw.user_prompt_template.trim() ? raw.user_prompt_template : defaultReviewAdapter.user_prompt_template,
+    payload_template: typeof raw.payload_template === 'string' ? raw.payload_template : '',
+    confidence_threshold: typeof raw.confidence_threshold === 'number' && raw.confidence_threshold > 0 && raw.confidence_threshold <= 1 ? raw.confidence_threshold : defaultReviewAdapter.confidence_threshold,
+    moderation_thresholds: moderationThresholds,
+    max_concurrent: typeof raw.max_concurrent === 'number' && raw.max_concurrent > 0 ? raw.max_concurrent : defaultReviewAdapter.max_concurrent,
+    max_text_length: typeof raw.max_text_length === 'number' && raw.max_text_length > 0 ? raw.max_text_length : defaultReviewAdapter.max_text_length,
+    circuit_breaker_failures: typeof raw.circuit_breaker_failures === 'number' && raw.circuit_breaker_failures > 0 ? raw.circuit_breaker_failures : defaultReviewAdapter.circuit_breaker_failures,
+    circuit_breaker_seconds: typeof raw.circuit_breaker_seconds === 'number' && raw.circuit_breaker_seconds > 0 ? raw.circuit_breaker_seconds : defaultReviewAdapter.circuit_breaker_seconds,
+  }
+}
+
+function parseAdaptiveReview(value: AdvancedConfigObject): AdaptiveReviewFormConfig {
+  const raw = value.adaptive_review && typeof value.adaptive_review === 'object'
+    ? value.adaptive_review as Record<string, unknown>
+    : {}
+  return {
+    enabled: raw.enabled === true,
+    min_clean_reviews: typeof raw.min_clean_reviews === 'number' && raw.min_clean_reviews > 0 ? raw.min_clean_reviews : 10,
+    min_observation_hours: typeof raw.min_observation_hours === 'number' && raw.min_observation_hours > 0 ? raw.min_observation_hours : 24,
+    sample_percent: typeof raw.sample_percent === 'number' && raw.sample_percent >= 0 ? raw.sample_percent : 5,
+    force_review_interval_minutes: typeof raw.force_review_interval_minutes === 'number' && raw.force_review_interval_minutes > 0 ? raw.force_review_interval_minutes : 360,
+  }
+}
+
+type PromptGuardEditorConfig = Omit<PromptGuardConfig, 'performance'>
 
 type AdvancedProtectionConfig = {
   guard: PromptGuardEditorConfig
-  enforcement: { terminal_categories: string[] }
+  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; conversation_lock_enabled: boolean; cyb_strike_enabled: boolean }
   normalization: {
     enabled: boolean
     decode_url: boolean
@@ -134,8 +242,7 @@ type AdvancedProtectionConfig = {
     allow_remote_urls: boolean
   }
   output: { enabled: boolean; strict_only: boolean }
-  intelligence: { enabled: boolean; interval_hours: number; queries: string[]; max_search_results: number; model_enabled: boolean; model: string; max_model_calls: number; auto_add: boolean }
-  newapi: { enabled: boolean }
+  intelligence: { enabled: boolean; interval_hours: number; queries: string[]; max_search_results: number; model_enabled: boolean; model: string; max_model_calls: number }
 }
 
 const promptGuardModes: PromptGuardMode[] = ['inherit', 'off', 'shadow', 'warn', 'enforce']
@@ -189,7 +296,7 @@ const defaultPromptGuard: PromptGuardEditorConfig = {
 
 const defaultAdvancedProtection: AdvancedProtectionConfig = {
   guard: defaultPromptGuard,
-  enforcement: { terminal_categories: [] },
+  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], conversation_lock_enabled: true, cyb_strike_enabled: false },
   normalization: {
     enabled: true,
     decode_url: true,
@@ -226,8 +333,7 @@ const defaultAdvancedProtection: AdvancedProtectionConfig = {
     allow_remote_urls: false,
   },
   output: { enabled: false, strict_only: true },
-  intelligence: { enabled: false, interval_hours: 24, queries: ['LLM jailbreak prompt injection', 'ChatGPT jailbreak prompt', 'Codex prompt injection jailbreak', '大模型 破限 提示词', 'GPT 破甲 提示词', 'AI 越狱 提示词', '中文 prompt injection 绕过'], max_search_results: 20, model_enabled: false, model: 'gpt-5.4', max_model_calls: 1, auto_add: false },
-  newapi: { enabled: false },
+  intelligence: { enabled: false, interval_hours: 24, queries: ['LLM jailbreak prompt injection', 'ChatGPT jailbreak prompt', 'Codex prompt injection jailbreak', '大模型 破限 提示词', 'GPT 破甲 提示词', 'AI 越狱 提示词', '中文 prompt injection 绕过'], max_search_results: 20, model_enabled: false, model: 'gpt-5.4', max_model_calls: 1 },
 }
 
 function parsePromptGuardMode(value: unknown, fallback: PromptGuardMode = 'inherit'): PromptGuardMode {
@@ -283,6 +389,15 @@ function parseAdvancedProtection(value: AdvancedConfigObject): AdvancedProtectio
       terminal_categories: Array.isArray(enforcement.terminal_categories)
         ? enforcement.terminal_categories.filter((category: unknown): category is string => typeof category === 'string')
         : [],
+      terminal_bypass_models: Array.isArray(enforcement.terminal_bypass_models)
+        ? enforcement.terminal_bypass_models.filter((model: unknown): model is string => typeof model === 'string')
+        : [...defaultAdvancedProtection.enforcement.terminal_bypass_models],
+      conversation_lock_enabled: typeof enforcement.conversation_lock_enabled === 'boolean'
+        ? enforcement.conversation_lock_enabled
+        : defaultAdvancedProtection.enforcement.conversation_lock_enabled,
+      cyb_strike_enabled: typeof enforcement.cyb_strike_enabled === 'boolean'
+        ? enforcement.cyb_strike_enabled
+        : defaultAdvancedProtection.enforcement.cyb_strike_enabled,
     },
     normalization: { ...defaultAdvancedProtection.normalization, ...(value.normalization || {}) },
     context_discount: { ...defaultAdvancedProtection.context_discount, ...(value.context_discount || {}) },
@@ -300,7 +415,6 @@ function parseAdvancedProtection(value: AdvancedConfigObject): AdvancedProtectio
         ? intelligence.queries.filter((query: unknown): query is string => typeof query === 'string')
         : [...defaultAdvancedProtection.intelligence.queries],
     },
-    newapi: { ...defaultAdvancedProtection.newapi, ...(value.newapi || {}) },
   }
 }
 
@@ -333,6 +447,7 @@ const emptyFilters: LogFilters = {
   model: '',
   apiKeyId: '',
   q: '',
+  reviewResult: '',
 }
 
 const defaultCustomRuleDraft: CustomRuleDraft = {
@@ -356,6 +471,10 @@ function parseRuleWeight(raw: string): number | null {
   const weight = Number(trimmed)
   if (!Number.isSafeInteger(weight) || weight <= 0 || weight > 1000) return null
   return weight
+}
+
+function customRuleIdentity(rule: PromptFilterRule): string {
+  return JSON.stringify(rule)
 }
 
 function customRuleDraftFromRule(rule: PromptFilterRule): CustomRuleDraft {
@@ -405,6 +524,8 @@ function parseJSONList<T>(raw: string, fallback: T[] = []): T[] {
 
 function promptFilterSavePayload(form: PromptFilterForm): Partial<SystemSettings> {
   const payload: Partial<SystemSettings> = { ...form }
+  // 自定义规则使用独立的并发保护写入流程；普通设置保存不得回写旧快照。
+  delete payload.prompt_filter_custom_patterns
   // 展示用字段，不参与写入。
   delete payload.prompt_filter_review_api_key_configured
   delete payload.prompt_filter_review_api_key_count
@@ -425,12 +546,11 @@ export default function PromptFilter() {
     () => parseAdvancedConfigDocument(form.prompt_filter_advanced_config).error,
     [form.prompt_filter_advanced_config],
   )
-  const [clearing, setClearing] = useState(false)
   const [testing, setTesting] = useState(false)
   const [testText, setTestText] = useState('')
   const [testEndpoint, setTestEndpoint] = useState('/v1/responses')
   const [testModel, setTestModel] = useState('gpt-5.5')
-  const [testVerdict, setTestVerdict] = useState<PromptFilterVerdict | null>(null)
+  const [testResult, setTestResult] = useState<PromptFilterTestResponse | null>(null)
 
   const loadData = useCallback(async () => {
     const [settings, logsResp, rules] = await Promise.all([
@@ -502,7 +622,12 @@ export default function PromptFilter() {
     setForm(normalizePromptFilterForm(updated))
     setData((current) => ({ ...current, settings: updated }))
     setSaving(false)
-    showToast(t('promptFilter.saveSuccess'))
+    const quarantines = updated.prompt_filter_pattern_quarantines ?? []
+    if (quarantines.length > 0) {
+      showToast(t('promptFilter.saveQuarantined', { count: quarantines.length }), 'warning')
+    } else {
+      showToast(t('promptFilter.saveSuccess'))
+    }
 
     const [rulesResult, logsResult] = await Promise.allSettled([
       api.getPromptFilterRules(),
@@ -527,6 +652,7 @@ export default function PromptFilter() {
       showToast(t('promptFilter.testEmpty'), 'error')
       return
     }
+    setTestResult(null)
     setTesting(true)
     try {
       const result = await api.testPromptFilter({
@@ -534,7 +660,7 @@ export default function PromptFilter() {
         endpoint: testEndpoint,
         model: testModel,
       })
-      setTestVerdict(result.verdict)
+      setTestResult(result)
       showToast(t('promptFilter.testDone'))
     } catch (err) {
       showToast(`${t('promptFilter.testFailed')}: ${getErrorMessage(err)}`, 'error')
@@ -543,17 +669,13 @@ export default function PromptFilter() {
     }
   }
 
-  const clearLogs = async () => {
-    setClearing(true)
-    try {
-      await api.clearPromptFilterLogs()
-      setData((current) => ({ ...current, recentLogs: [], totalLogs: 0 }))
-      showToast(t('promptFilter.logsCleared'))
-    } catch (err) {
-      showToast(`${t('promptFilter.clearFailed')}: ${getErrorMessage(err)}`, 'error')
-    } finally {
-      setClearing(false)
-    }
+  const refreshRecentLogs = async () => {
+    const result = await api.getPromptFilterLogs({ limit: 5 })
+    setData((current) => ({
+      ...current,
+      recentLogs: result.logs ?? [],
+      totalLogs: result.total ?? 0,
+    }))
   }
 
   return (
@@ -604,24 +726,31 @@ export default function PromptFilter() {
             recentLogs={data.recentLogs}
             totalLogs={data.totalLogs}
             testText={testText}
-            setTestText={setTestText}
+            setTestText={(value) => {
+              setTestText(value)
+              setTestResult(null)
+            }}
             testEndpoint={testEndpoint}
-            setTestEndpoint={setTestEndpoint}
+            setTestEndpoint={(value) => {
+              setTestEndpoint(value)
+              setTestResult(null)
+            }}
             testModel={testModel}
-            setTestModel={setTestModel}
+            setTestModel={(value) => {
+              setTestModel(value)
+              setTestResult(null)
+            }}
             testing={testing}
-            testVerdict={testVerdict}
+            testResult={testResult}
             runTest={runTest}
-            clearLogs={clearLogs}
-            clearing={clearing}
             advancedConfigError={advancedConfigError}
             onSave={() => void saveSettings()}
           />
         ) : null}
 
-        {activeView === 'logs' ? (
-          <LogsView clearLogs={clearLogs} clearing={clearing} />
-        ) : null}
+        {activeView === 'logs' ? <LogsView onPromptLogsChanged={refreshRecentLogs} /> : null}
+
+        {activeView === 'profiles' ? <RiskProfilesView /> : null}
 
         {activeView === 'rules' ? (
           <RulesView
@@ -649,6 +778,7 @@ function PromptFilterTabs({ activeView }: { activeView: PromptFilterView }) {
   const tabs = [
     { view: 'overview' as const, label: t('promptFilter.views.overview'), to: '/prompt-filter/overview' },
     { view: 'logs' as const, label: t('promptFilter.views.logs'), to: '/prompt-filter/logs' },
+    { view: 'profiles' as const, label: t('promptFilter.views.profiles'), to: '/prompt-filter/profiles' },
     { view: 'rules' as const, label: t('promptFilter.views.rules'), to: '/prompt-filter/rules' },
     { view: 'intelligence' as const, label: t('promptFilter.views.intelligence'), to: '/prompt-filter/intelligence' },
     { view: 'docs' as const, label: t('promptFilter.views.docs'), to: '/prompt-filter/docs' },
@@ -692,20 +822,20 @@ function AdvancedProtectionEditor({
   onChange: (value: string) => void
 }) {
   const { t } = useTranslation()
-  const [generatedNewAPISecret, setGeneratedNewAPISecret] = useState('')
-  const [secretCopied, setSecretCopied] = useState(false)
-  const [secretStatus, setSecretStatus] = useState<{ configured: boolean; source: string; masked: string }>({ configured: false, source: 'none', masked: '' })
-  const [secretSaving, setSecretSaving] = useState(false)
-  const [secretError, setSecretError] = useState('')
-  const [secretRevealOpen, setSecretRevealOpen] = useState(false)
-  const [secretCloseConfirmOpen, setSecretCloseConfirmOpen] = useState(false)
   const document = useMemo(() => parseAdvancedConfigDocument(value), [value])
   const config = useMemo(
     () => parseAdvancedProtection(document.value ?? {}),
     [document.value],
   )
   const applyPatches = (patches: readonly AdvancedConfigPatch[]) => {
-    const result = patchAdvancedConfigDocument(value, patches)
+    const result = patchAdvancedConfigDocument(value, [
+      ...patches,
+      { path: ['newapi', 'enabled'], remove: true },
+      { path: ['newapi', 'secret'], remove: true },
+      { path: ['newapi', 'offense_window_seconds'], remove: true },
+      { path: ['newapi', 'ban_after'], remove: true },
+      { path: ['intelligence', 'auto_add'], remove: true },
+    ])
     if (!result.ok) return
     onChange(result.serialized)
   }
@@ -715,32 +845,10 @@ function AdvancedProtectionEditor({
   const setBool = <K extends keyof AdvancedProtectionConfig>(section: K, key: string, next: boolean) => {
     update(section, { [key]: next } as never)
   }
-  useEffect(() => { void api.getPromptFilterNewAPISecret().then(setSecretStatus).catch(() => undefined) }, [])
-  const generateNewAPISecret = async () => {
-    if (secretStatus.source === 'environment') return
-    setSecretSaving(true); setSecretError('')
-    try {
-      const result = await api.generatePromptFilterNewAPISecret()
-      setGeneratedNewAPISecret(result.secret); setSecretStatus(result); setSecretCopied(false); setSecretRevealOpen(true)
-    } catch (error) { setSecretError(getErrorMessage(error)) } finally { setSecretSaving(false) }
-  }
-  const copyNewAPISecret = async () => {
-    if (!generatedNewAPISecret) return
-    await navigator.clipboard.writeText(generatedNewAPISecret)
-    setSecretCopied(true)
-  }
-  const requestCloseSecretReveal = () => {
-    if (!generatedNewAPISecret) { setSecretRevealOpen(false); return }
-    setSecretCloseConfirmOpen(true)
-  }
-  const confirmCloseSecretReveal = () => {
-    setSecretCloseConfirmOpen(false)
-    setSecretRevealOpen(false)
-    setGeneratedNewAPISecret('')
-    setSecretCopied(false)
-  }
   const terminalCategoriesText = config.enforcement.terminal_categories.join(', ')
+  const terminalBypassModelsText = config.enforcement.terminal_bypass_models.join(', ')
   const queryCount = config.intelligence.queries.length
+  const enabledExtensionCount = [config.sidecar.enabled, config.session.enabled, config.attachment.enabled, config.intelligence.enabled].filter(Boolean).length
   const guardModeOptions = promptGuardModes.map((mode) => ({
     value: mode,
     label: t(`promptFilter.guard.modes.${mode}.label`),
@@ -810,8 +918,21 @@ function AdvancedProtectionEditor({
     <div className="space-y-3">
       <SectionTitle title={t('promptFilter.advancedVisualTitle')} />
 
-      <AdvancedPanel title={t('promptFilter.guard.title')} hint={t('promptFilter.guard.description')}>
-        <div className="space-y-4">
+      <details className="group overflow-hidden rounded-lg border border-foreground/15 bg-background shadow-sm dark:border-foreground/20">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3.5 marker:content-none [&::-webkit-details-marker]:hidden">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-semibold">{t('promptFilter.guard.title')}</span>
+              <Badge variant="secondary">{t(`promptFilter.guard.profiles.${guardProfileSelection.value}.label`, { defaultValue: guardProfileSelection.value })}</Badge>
+            </div>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.guard.simplifiedSummary')}</p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2 text-xs font-medium text-primary">
+            <span>{t('promptFilter.guard.configureRouting')}</span>
+            <ChevronDown className="size-4 transition-transform group-open:rotate-180" />
+          </div>
+        </summary>
+        <div className="space-y-4 border-t p-4">
           <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-4">
             <div className="rounded-lg border border-foreground/10 bg-muted/15 p-3 dark:border-foreground/15">
               <CompactField label={t('promptFilter.guard.globalMode')} hint={t('promptFilter.guard.globalModeHint')}>
@@ -967,157 +1088,110 @@ function AdvancedProtectionEditor({
           </div>
 
         </div>
-      </AdvancedPanel>
+      </details>
 
       {/* Core defense: bounded decoding and intent-aware scoring keep the default preset useful without widening penalties. */}
       <div className="grid gap-3 lg:grid-cols-2">
         <div className="lg:col-span-2">
           <AdvancedPanel title={t('promptFilter.normalizationTitle')} hint={t('promptFilter.help.normalizationPanel')}>
-            <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-3 xl:grid-cols-6">
-              <SwitchField
-                label={t('promptFilter.enabled')}
-                hint={t('promptFilter.help.normalizationEnabled')}
-                checked={config.normalization.enabled}
-                onCheckedChange={(next) => setBool('normalization', 'enabled', next)}
-              />
-              <CompactField label={t('promptFilter.decodeRuns')} hint={t('promptFilter.help.decodeRuns')}>
-                <DraftNumberInput min={1} max={2} value={config.normalization.max_decode_runs} onValueChange={(v) => update('normalization', { max_decode_runs: v })} />
-              </CompactField>
-              <CompactField label={t('promptFilter.maxDecodedBytes')} hint={t('promptFilter.help.maxDecodedBytes')}>
-                <DraftNumberInput min={1024} max={65536} value={config.normalization.max_decoded_bytes} onValueChange={(v) => update('normalization', { max_decoded_bytes: v })} />
-              </CompactField>
-              <CompactField label={t('promptFilter.maxEncodedBlocks')} hint={t('promptFilter.help.maxEncodedBlocks')}>
-                <DraftNumberInput min={1} max={32} value={config.normalization.max_encoded_blocks} onValueChange={(v) => update('normalization', { max_encoded_blocks: v })} />
-              </CompactField>
-              <SwitchField
-                label={t('promptFilter.decoders.url')}
-                hint={t('promptFilter.help.decodeUrl')}
-                checked={config.normalization.decode_url}
-                onCheckedChange={(next) => setBool('normalization', 'decode_url', next)}
-              />
-              <SwitchField
-                label={t('promptFilter.decoders.html')}
-                hint={t('promptFilter.help.decodeHtml')}
-                checked={config.normalization.decode_html}
-                onCheckedChange={(next) => setBool('normalization', 'decode_html', next)}
-              />
-              <SwitchField
-                label={t('promptFilter.decoders.base64')}
-                hint={t('promptFilter.help.decodeBase64')}
-                checked={config.normalization.decode_base64}
-                onCheckedChange={(next) => setBool('normalization', 'decode_base64', next)}
-              />
-              <SwitchField
-                label={t('promptFilter.decoders.hex')}
-                hint={t('promptFilter.help.decodeHex')}
-                checked={config.normalization.decode_hex}
-                onCheckedChange={(next) => setBool('normalization', 'decode_hex', next)}
-              />
-              <SwitchField
-                label={t('promptFilter.decoders.rot13')}
-                hint={t('promptFilter.help.decodeRot13')}
-                checked={config.normalization.decode_rot13}
-                onCheckedChange={(next) => setBool('normalization', 'decode_rot13', next)}
-              />
-              <SwitchField
-                label={t('promptFilter.decoders.escapes')}
-                hint={t('promptFilter.help.decodeEscapes')}
-                checked={config.normalization.decode_escapes}
-                onCheckedChange={(next) => setBool('normalization', 'decode_escapes', next)}
-              />
-              <SwitchField
-                label={t('promptFilter.decoders.compression')}
-                hint={t('promptFilter.help.decodeCompression')}
-                checked={config.normalization.decode_compression}
-                onCheckedChange={(next) => setBool('normalization', 'decode_compression', next)}
-              />
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <Switch checked={config.normalization.enabled} onCheckedChange={(next) => setBool('normalization', 'enabled', next)} />
+                <div>
+                  <div className="text-sm font-medium">{config.normalization.enabled ? t('common.enabled') : t('common.disabled')}</div>
+                  <p className="text-xs text-muted-foreground">{t('promptFilter.normalizationSimplifiedDesc')}</p>
+                </div>
+              </div>
+              <Badge variant="secondary">{t('promptFilter.normalizationDecoderCount', { count: [config.normalization.decode_url, config.normalization.decode_html, config.normalization.decode_base64, config.normalization.decode_hex, config.normalization.decode_rot13, config.normalization.decode_escapes, config.normalization.decode_compression].filter(Boolean).length })}</Badge>
             </div>
+            <details className="group mt-3 rounded-md border border-foreground/10 bg-muted/10">
+              <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2 text-xs font-medium marker:content-none [&::-webkit-details-marker]:hidden">
+                <span>{t('promptFilter.normalizationTune')}</span>
+                <ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" />
+              </summary>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-3 border-t p-3 sm:grid-cols-3 xl:grid-cols-5">
+                <CompactField label={t('promptFilter.decodeRuns')} hint={t('promptFilter.help.decodeRuns')}><DraftNumberInput min={1} max={2} value={config.normalization.max_decode_runs} onValueChange={(v) => update('normalization', { max_decode_runs: v })} /></CompactField>
+                <CompactField label={t('promptFilter.maxDecodedBytes')} hint={t('promptFilter.help.maxDecodedBytes')}><DraftNumberInput min={1024} max={65536} value={config.normalization.max_decoded_bytes} onValueChange={(v) => update('normalization', { max_decoded_bytes: v })} /></CompactField>
+                <CompactField label={t('promptFilter.maxEncodedBlocks')} hint={t('promptFilter.help.maxEncodedBlocks')}><DraftNumberInput min={1} max={32} value={config.normalization.max_encoded_blocks} onValueChange={(v) => update('normalization', { max_encoded_blocks: v })} /></CompactField>
+                {([
+                  ['decode_url', 'url', 'decodeUrl'],
+                  ['decode_html', 'html', 'decodeHtml'],
+                  ['decode_base64', 'base64', 'decodeBase64'],
+                  ['decode_hex', 'hex', 'decodeHex'],
+                  ['decode_rot13', 'rot13', 'decodeRot13'],
+                  ['decode_escapes', 'escapes', 'decodeEscapes'],
+                  ['decode_compression', 'compression', 'decodeCompression'],
+                ] as const).map(([key, labelKey, hintKey]) => (
+                  <SwitchField key={key} label={t(`promptFilter.decoders.${labelKey}`)} hint={t(`promptFilter.help.${hintKey}`)} checked={config.normalization[key]} onCheckedChange={(next) => setBool('normalization', key, next)} />
+                ))}
+              </div>
+            </details>
           </AdvancedPanel>
         </div>
 
         <AdvancedPanel title={t('promptFilter.contextDiscount.title')} hint={t('promptFilter.contextDiscount.description')}>
-          <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:grid-cols-4">
-            <SwitchField
-              label={t('promptFilter.contextDiscount.enabled')}
-              hint={t('promptFilter.contextDiscount.enabledHint')}
-              checked={config.context_discount.enabled}
-              onCheckedChange={(next) => setBool('context_discount', 'enabled', next)}
-            />
-            <SwitchField
-              label={t('promptFilter.contextDiscount.intentAware')}
-              hint={t('promptFilter.contextDiscount.intentAwareHint')}
-              checked={config.context_discount.intent_aware}
-              onCheckedChange={(next) => setBool('context_discount', 'intent_aware', next)}
-            />
-            <CompactField label={t('promptFilter.contextDiscount.maxDiscount')} hint={t('promptFilter.contextDiscount.maxDiscountHint')}>
-              <DraftNumberInput
-                min={0}
-                max={90}
-                value={config.context_discount.max_discount}
-                onValueChange={(v) => update('context_discount', {
-                  max_discount: v,
-                  operational_max_discount: Math.min(config.context_discount.operational_max_discount, v),
-                })}
-              />
-            </CompactField>
-            <CompactField label={t('promptFilter.contextDiscount.operationalMaxDiscount')} hint={t('promptFilter.contextDiscount.operationalMaxDiscountHint')}>
-              <DraftNumberInput min={0} max={config.context_discount.max_discount} value={config.context_discount.operational_max_discount} onValueChange={(v) => update('context_discount', { operational_max_discount: v })} />
-            </CompactField>
+          <div className="flex items-center gap-3">
+            <Switch checked={config.context_discount.enabled} onCheckedChange={(next) => setBool('context_discount', 'enabled', next)} />
+            <span className="text-sm text-muted-foreground">{t('promptFilter.contextDiscount.simplifiedDesc')}</span>
           </div>
+          <details className="group mt-3 rounded-md border border-foreground/10 bg-muted/10">
+            <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2 text-xs font-medium marker:content-none [&::-webkit-details-marker]:hidden"><span>{t('promptFilter.tuneParameters')}</span><ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" /></summary>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-3 border-t p-3 sm:grid-cols-3">
+              <SwitchField label={t('promptFilter.contextDiscount.intentAware')} hint={t('promptFilter.contextDiscount.intentAwareHint')} checked={config.context_discount.intent_aware} onCheckedChange={(next) => setBool('context_discount', 'intent_aware', next)} />
+              <CompactField label={t('promptFilter.contextDiscount.maxDiscount')} hint={t('promptFilter.contextDiscount.maxDiscountHint')}><DraftNumberInput min={0} max={90} value={config.context_discount.max_discount} onValueChange={(v) => update('context_discount', { max_discount: v, operational_max_discount: Math.min(config.context_discount.operational_max_discount, v) })} /></CompactField>
+              <CompactField label={t('promptFilter.contextDiscount.operationalMaxDiscount')} hint={t('promptFilter.contextDiscount.operationalMaxDiscountHint')}><DraftNumberInput min={0} max={config.context_discount.max_discount} value={config.context_discount.operational_max_discount} onValueChange={(v) => update('context_discount', { operational_max_discount: v })} /></CompactField>
+            </div>
+          </details>
         </AdvancedPanel>
 
-        <AdvancedPanel title={t('promptFilter.terminalCategories')}>
-          <CompactField label={t('promptFilter.terminalCategories')} hint={t('promptFilter.help.terminalCategories')}>
-            <Input
-              value={terminalCategoriesText}
-              placeholder="malware, credential_attack"
-              onChange={(e) => update('enforcement', {
-                terminal_categories: e.target.value.split(',').map((item) => item.trim()).filter(Boolean),
-              })}
-            />
-          </CompactField>
-          <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalCategoriesHint')}</p>
-        </AdvancedPanel>
+        <details className="group rounded-lg border border-foreground/15 bg-background shadow-sm dark:border-foreground/20">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3.5 marker:content-none [&::-webkit-details-marker]:hidden"><div><div className="text-sm font-semibold">{t('promptFilter.terminalPolicyTitle')}</div><p className="mt-1 text-xs text-muted-foreground">{t('promptFilter.terminalCategoriesCollapsedDesc')}</p></div><ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" /></summary>
+          <div className="space-y-2 border-t p-4">
+            <CompactField label={t('promptFilter.terminalCategories')} hint={t('promptFilter.help.terminalCategories')}><Input value={terminalCategoriesText} placeholder="malware, credential_attack" onChange={(e) => update('enforcement', { terminal_categories: e.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} /></CompactField>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalCategoriesHint')}</p>
+            <CompactField label={t('promptFilter.terminalBypassModels')} hint={t('promptFilter.help.terminalBypassModels')}><Input value={terminalBypassModelsText} placeholder="codex-auto-review" onChange={(e) => update('enforcement', { terminal_bypass_models: e.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} /></CompactField>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalBypassModelsHint')}</p>
+            <SwitchField label={t('promptFilter.conversationLockEnabled')} hint={t('promptFilter.help.conversationLockEnabled')} checked={config.enforcement.conversation_lock_enabled} onCheckedChange={(next) => update('enforcement', { conversation_lock_enabled: next })} />
+            <SwitchField label={t('promptFilter.cybStrikeEnabled')} hint={t('promptFilter.help.cybStrikeEnabled')} checked={config.enforcement.cyb_strike_enabled} onCheckedChange={(next) => update('enforcement', { cyb_strike_enabled: next })} />
+          </div>
+        </details>
 
         <AdvancedPanel title={t('promptFilter.riskTitle')}>
-          <div className="grid grid-cols-1 gap-x-3 gap-y-3 sm:grid-cols-2">
-            <SwitchField
-              label={t('promptFilter.enabled')}
-              hint={t('promptFilter.help.riskEnabled')}
-              checked={config.risk.enabled}
-              onCheckedChange={(next) => setBool('risk', 'enabled', next)}
-            />
-            <CompactField label={t('promptFilter.riskWindow')} hint={t('promptFilter.help.riskWindow')}>
-              <DraftNumberInput min={60} max={86400} value={config.risk.window_seconds} onValueChange={(v) => update('risk', { window_seconds: v })} />
-            </CompactField>
-            <CompactField label={t('promptFilter.blockThreshold')} hint={t('promptFilter.help.blockThreshold')}>
-              <DraftNumberInput min={1} max={1000} value={config.risk.block_threshold} onValueChange={(v) => update('risk', { block_threshold: v })} />
-            </CompactField>
-            <CompactField label={t('promptFilter.reviewThreshold')} hint={t('promptFilter.help.reviewThreshold')}>
-              <DraftNumberInput min={1} max={1000} value={config.risk.review_threshold} onValueChange={(v) => update('risk', { review_threshold: v })} />
-            </CompactField>
+          <div className="flex items-center gap-3">
+            <Switch checked={config.risk.enabled} onCheckedChange={(next) => setBool('risk', 'enabled', next)} />
+            <span className="text-sm text-muted-foreground">{t('promptFilter.riskSimplifiedDesc')}</span>
           </div>
+          <details className="group mt-3 rounded-md border border-foreground/10 bg-muted/10">
+            <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2 text-xs font-medium marker:content-none [&::-webkit-details-marker]:hidden"><span>{t('promptFilter.tuneParameters')}</span><ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" /></summary>
+            <div className="grid grid-cols-1 gap-x-3 gap-y-3 border-t p-3 sm:grid-cols-3">
+              <CompactField label={t('promptFilter.riskWindow')} hint={t('promptFilter.help.riskWindow')}><DraftNumberInput min={60} max={86400} value={config.risk.window_seconds} onValueChange={(v) => update('risk', { window_seconds: v })} /></CompactField>
+              <CompactField label={t('promptFilter.blockThreshold')} hint={t('promptFilter.help.blockThreshold')}><DraftNumberInput min={1} max={1000} value={config.risk.block_threshold} onValueChange={(v) => update('risk', { block_threshold: v })} /></CompactField>
+              <CompactField label={t('promptFilter.reviewThreshold')} hint={t('promptFilter.help.reviewThreshold')}><DraftNumberInput min={1} max={1000} value={config.risk.review_threshold} onValueChange={(v) => update('risk', { review_threshold: v })} /></CompactField>
+            </div>
+          </details>
         </AdvancedPanel>
 
         <AdvancedPanel title={t('promptFilter.outputScanTitle')}>
-          <div className="grid grid-cols-1 gap-x-3 gap-y-3 sm:grid-cols-2">
-            <SwitchField
-              label={t('promptFilter.enabled')}
-              hint={t('promptFilter.help.outputEnabled')}
-              checked={config.output.enabled}
-              onCheckedChange={(next) => setBool('output', 'enabled', next)}
-            />
-            <SwitchField
-              label={t('promptFilter.strictOnly')}
-              hint={t('promptFilter.help.strictOnly')}
-              checked={config.output.strict_only}
-              onCheckedChange={(next) => setBool('output', 'strict_only', next)}
-            />
+          <div className="flex items-center gap-3">
+            <Switch checked={config.output.enabled} onCheckedChange={(next) => setBool('output', 'enabled', next)} />
+            <span className="text-sm text-muted-foreground">{t('promptFilter.outputSimplifiedDesc')}</span>
           </div>
+          {config.output.enabled ? <div className="mt-3"><SwitchField label={t('promptFilter.strictOnly')} hint={t('promptFilter.help.strictOnly')} checked={config.output.strict_only} onCheckedChange={(next) => setBool('output', 'strict_only', next)} /></div> : null}
         </AdvancedPanel>
       </div>
 
-      <SectionTitle title={t('promptFilter.extensions.title')} />
+      <details className="group overflow-hidden rounded-lg border border-foreground/15 bg-background shadow-sm dark:border-foreground/20">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3.5 marker:content-none [&::-webkit-details-marker]:hidden">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-semibold">{t('promptFilter.extensions.title')}</span>
+              <Badge variant="outline">{t('promptFilter.extensions.enabledCount', { count: enabledExtensionCount })}</Badge>
+            </div>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.extensions.collapsedDesc')}</p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2 text-xs font-medium text-primary"><span>{t('promptFilter.extensions.configure')}</span><ChevronDown className="size-4 transition-transform group-open:rotate-180" /></div>
+        </summary>
+        <div className="space-y-4 border-t p-4">
       <div className="grid gap-3 xl:grid-cols-2">
         <AdvancedPanel
           title={t('promptFilter.extensions.sidecar.title')}
@@ -1218,66 +1292,8 @@ function AdvancedProtectionEditor({
         </div>
       </div>
 
-      {/* Integration row: NewAPI + Intelligence — matched structure & equal height */}
-      <div className="grid gap-3 xl:grid-cols-2">
-        <AdvancedPanel
-          title={t('promptFilter.newapi.title')}
-          hint={t('promptFilter.newapi.description')}
-          footer={(
-            <details className="group rounded-lg border border-foreground/10 bg-muted/10 open:bg-muted/15 dark:border-foreground/15">
-              <summary className="flex h-9 cursor-pointer list-none items-center justify-between gap-2 px-3 text-sm font-medium marker:content-none [&::-webkit-details-marker]:hidden">
-                <span>{t('promptFilter.newapi.protocolTitle')}</span>
-                <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
-              </summary>
-              <div className="space-y-4 border-t border-foreground/8 px-3 py-3">
-                <div className="grid gap-4 lg:grid-cols-2">
-                  <div className="space-y-2">
-                    <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.newapi.codexEnv')}</div>
-                    <SoftCodeBlock>{t('promptFilter.newapi.codexSecretExample')}</SoftCodeBlock>
-                    <p className="text-xs leading-relaxed text-muted-foreground">{t('promptFilter.newapi.secretStorageHint')}</p>
-                    <div className="rounded-lg border border-foreground/10 bg-background/80 p-3">
-                      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex items-center gap-2 text-sm font-medium"><KeyRound className="size-4 text-muted-foreground" />{t('promptFilter.newapi.generator')}</div>
-                        <Button type="button" size="sm" variant="outline" disabled={secretSaving || secretStatus.source === 'environment'} onClick={() => void generateNewAPISecret()}>
-                          <RefreshCw className={`size-3.5 ${secretSaving ? 'animate-spin' : ''}`} />
-                          {secretStatus.configured ? t('promptFilter.newapi.replaceSecret') : t('promptFilter.newapi.generateSecret')}
-                        </Button>
-                      </div>
-                      {secretError ? <p className="text-xs text-destructive">{secretError}</p> : null}
-                      <p className="text-xs text-muted-foreground">
-                        {secretStatus.configured
-                          ? t('promptFilter.newapi.secretConfigured', {
-                              masked: secretStatus.masked,
-                              source: secretStatus.source === 'environment' ? t('promptFilter.newapi.environment') : t('promptFilter.newapi.database'),
-                            })
-                          : t('promptFilter.newapi.secretUnconfigured')}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="space-y-2">
-                    <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.newapi.newapiEnv')}</div>
-                    <SoftCodeBlock>{t('promptFilter.newapi.newapiEnvExample')}</SoftCodeBlock>
-                  </div>
-                  <div className="space-y-2 lg:col-span-2">
-                    <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.newapi.headersTitle')}</div>
-                    <SoftCodeBlock>{t('promptFilter.newapi.headersExample')}</SoftCodeBlock>
-                    <p className="text-xs leading-relaxed text-muted-foreground">{t('promptFilter.newapi.signatureHint')}</p>
-                  </div>
-                </div>
-              </div>
-            </details>
-          )}
-        >
-          <div className="grid grid-cols-1 gap-x-3 gap-y-3">
-            <SwitchField
-              label={t('promptFilter.newapi.enabled')}
-              hint={t('promptFilter.newapi.enabledHint')}
-              checked={config.newapi.enabled}
-              onCheckedChange={(next) => setBool('newapi', 'enabled', next)}
-            />
-          </div>
-        </AdvancedPanel>
-
+      {/* Optional intelligence service. NewAPI policy passthrough is managed beside the penalty preset. */}
+      <div className="grid gap-3">
         <AdvancedPanel
           title={t('promptFilter.intelligence.configTitle')}
           footer={(
@@ -1339,56 +1355,13 @@ function AdvancedProtectionEditor({
             <CompactField label={t('promptFilter.intelligence.maxModelCalls')} hint={t('promptFilter.help.maxModelCalls')}>
               <DraftNumberInput min={0} max={3} value={config.intelligence.max_model_calls} onValueChange={(v) => update('intelligence', { max_model_calls: v })} />
             </CompactField>
-            <SwitchField
-              label={t('promptFilter.intelligence.autoAdd')}
-              hint={t('promptFilter.help.autoAdd')}
-              checked={config.intelligence.auto_add}
-              onCheckedChange={(next) => setBool('intelligence', 'auto_add', next)}
-            />
           </div>
         </AdvancedPanel>
       </div>
 
-      <Dialog open={secretRevealOpen} onOpenChange={(open) => { if (!open) requestCloseSecretReveal() }}>
-        <DialogContent className="sm:max-w-2xl" onEscapeKeyDown={(event) => { event.preventDefault(); requestCloseSecretReveal() }} onPointerDownOutside={(event) => { event.preventDefault(); requestCloseSecretReveal() }}>
-          <DialogHeader>
-            <DialogTitle>{t('promptFilter.newapi.revealTitle')}</DialogTitle>
-            <DialogDescription>{t('promptFilter.newapi.revealDescription')}</DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="flex gap-2">
-              <Input readOnly value={generatedNewAPISecret} className="font-mono text-xs" />
-              <Button type="button" variant="outline" onClick={() => void copyNewAPISecret()}>
-                <Copy className="size-4" />
-                {secretCopied ? t('promptFilter.newapi.copied') : t('promptFilter.newapi.copySecret')}
-              </Button>
-            </div>
-            <SoftCodeBlock>{`CODEX2API_POLICY_SECRET=${generatedNewAPISecret}`}</SoftCodeBlock>
-            <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-              {t('promptFilter.newapi.revealWarning')}
-            </div>
-          </div>
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={requestCloseSecretReveal}>{t('promptFilter.newapi.close')}</Button>
-            <Button type="button" onClick={() => void copyNewAPISecret()}>
-              <Copy className="size-4" />
-              {secretCopied ? t('promptFilter.newapi.copied') : t('promptFilter.newapi.copyAndConfigure')}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-      <Dialog open={secretCloseConfirmOpen} onOpenChange={setSecretCloseConfirmOpen}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>{t('promptFilter.newapi.closeConfirmTitle')}</DialogTitle>
-            <DialogDescription>{t('promptFilter.newapi.closeConfirmDescription')}</DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={() => setSecretCloseConfirmOpen(false)}>{t('promptFilter.newapi.backToCopy')}</Button>
-            <Button type="button" variant="destructive" onClick={confirmCloseSecretReveal}>{t('promptFilter.newapi.confirmClose')}</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        </div>
+      </details>
+
     </div>
   )
 }
@@ -1496,24 +1469,77 @@ function IntelligenceView() {
   const { t } = useTranslation()
   const { showToast } = useToast()
   const [running, setRunning] = useState(false)
-  const [adding, setAdding] = useState('')
   const [result, setResult] = useState<PromptIntelligenceRun | null>(null)
   const [history, setHistory] = useState<PromptIntelligenceRun[]>([])
+  const [historyTotal, setHistoryTotal] = useState(0)
+  const [historyPage, setHistoryPage] = useState(1)
+  const [historyPageSize, setHistoryPageSize] = useState(10)
   const [historyLoading, setHistoryLoading] = useState(false)
+  const [candidates, setCandidates] = useState<PromptIntelligenceCandidate[]>([])
+  const [candidateTotal, setCandidateTotal] = useState(0)
+  const [candidateLoading, setCandidateLoading] = useState(false)
+  const [candidateStatus, setCandidateStatus] = useState('pending')
+  const [candidateQuery, setCandidateQuery] = useState('')
+  const [candidateQueryDraft, setCandidateQueryDraft] = useState('')
+  const [candidatePage, setCandidatePage] = useState(1)
+  const [candidatePageSize, setCandidatePageSize] = useState(20)
+  const [candidateAction, setCandidateAction] = useState<number | null>(null)
+  const [publishTarget, setPublishTarget] = useState<PromptIntelligenceCandidate | null>(null)
+  const [draftTarget, setDraftTarget] = useState<PromptIntelligenceCandidate | null>(null)
+  const [draftForm, setDraftForm] = useState({ name: '', pattern: '', weight: 35, category: 'cyber_abuse', strict: true, rationale: '' })
+  const [evidenceLoading, setEvidenceLoading] = useState<number | null>(null)
+  const [evidenceDialog, setEvidenceDialog] = useState<PromptIntelligenceEvidenceResponse | null>(null)
+  const [dismissTarget, setDismissTarget] = useState<PromptIntelligenceCandidate | null>(null)
+  const [aiTarget, setAITarget] = useState<PromptIntelligenceCandidate | null>(null)
+  const [aiProvider, setAIProvider] = useState<PromptIntelligenceAIProvider>('review')
+  const [aiModel, setAIModel] = useState('')
+  const [aiAPIKeyID, setAIAPIKeyID] = useState('0')
+  const [identityUpdateMode, setIdentityUpdateMode] = useState<PromptIdentityUpdateMode>('suggest')
+  const [aiLoading, setAILoading] = useState(false)
+  const [aiResult, setAIResult] = useState<PromptIntelligenceAIAnalysisResponse | null>(null)
+  const [gatewayKeys, setGatewayKeys] = useState<PromptIntelligenceGatewayKey[]>([])
+  const candidateLoadSequence = useRef(0)
 
-  const loadHistory = useCallback(async () => {
+  const loadHistory = useCallback(async (page = historyPage) => {
     setHistoryLoading(true)
-    try { setHistory((await api.getPromptIntelligenceHistory(1, 20)).runs) } catch (error) { showToast(getErrorMessage(error), 'error') } finally { setHistoryLoading(false) }
-  }, [showToast])
+    try {
+      const value = await api.getPromptIntelligenceHistory(page, historyPageSize)
+      setHistory(value.runs)
+      setHistoryTotal(value.total)
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [historyPage, historyPageSize, showToast])
+
+  const loadCandidates = useCallback(async () => {
+    const sequence = candidateLoadSequence.current + 1
+    candidateLoadSequence.current = sequence
+    setCandidateLoading(true)
+    try {
+      const value = await api.getPromptIntelligenceCandidates({ page: candidatePage, pageSize: candidatePageSize, status: candidateStatus, q: candidateQuery.trim() })
+      if (candidateLoadSequence.current !== sequence) return
+      setCandidates(value.candidates)
+      setCandidateTotal(value.total)
+    } catch (error) {
+      if (candidateLoadSequence.current !== sequence) return
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      if (candidateLoadSequence.current === sequence) setCandidateLoading(false)
+    }
+  }, [candidatePage, candidatePageSize, candidateQuery, candidateStatus, showToast])
 
   useEffect(() => { void loadHistory() }, [loadHistory])
+  useEffect(() => { void loadCandidates() }, [loadCandidates])
 
   const run = async () => {
     setRunning(true)
     try {
       const value = await api.runPromptIntelligence()
       setResult(value)
-      await loadHistory()
+      setHistoryPage(1)
+      await Promise.all([loadHistory(1), loadCandidates()])
       showToast(t('promptFilter.intelligence.runSuccess', { count: value.candidates.length }))
     } catch (error) {
       showToast(getErrorMessage(error), 'error')
@@ -1522,17 +1548,150 @@ function IntelligenceView() {
     }
   }
 
-  const add = async (candidate: PromptIntelligenceCandidate) => {
-    setAdding(candidate.name)
+  const publish = async (candidate: PromptIntelligenceCandidate) => {
+    setCandidateAction(candidate.id)
     try {
-      const value = await api.addPromptIntelligenceRule(candidate)
+      const value = await api.publishPromptIntelligenceCandidate(candidate.id)
       showToast(value.updated ? t('promptFilter.intelligence.updateSuccess') : value.added ? t('promptFilter.intelligence.addSuccess') : t('promptFilter.intelligence.alreadyExists'))
+      setPublishTarget(null)
+      await loadCandidates()
     } catch (error) {
       showToast(getErrorMessage(error), 'error')
     } finally {
-      setAdding('')
+      setCandidateAction(null)
     }
   }
+
+  const dismiss = async () => {
+    if (!dismissTarget) return
+    setCandidateAction(dismissTarget.id)
+    try {
+      await api.dismissPromptIntelligenceCandidate(dismissTarget.id)
+      showToast(t('promptFilter.intelligence.dismissSuccess'))
+      setDismissTarget(null)
+      await loadCandidates()
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setCandidateAction(null)
+    }
+  }
+
+  const openDraft = (candidate: PromptIntelligenceCandidate) => {
+    setDraftTarget(candidate)
+    setDraftForm({
+      name: '', pattern: '', weight: 35, category: 'cyber_abuse', strict: true,
+      rationale: candidate.sample_preview ? t('promptFilter.intelligence.draftRationaleFromEvidence') : '',
+    })
+  }
+
+  const createDraft = async () => {
+    if (!draftTarget) return
+    setCandidateAction(draftTarget.id)
+    try {
+      const result = await api.createPromptIntelligenceCandidateDraft(draftTarget.id, draftForm)
+      showToast(t('promptFilter.intelligence.draftCreated', { name: result.candidate.name }))
+      setDraftTarget(null)
+      await loadCandidates()
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setCandidateAction(null)
+    }
+  }
+
+  const viewEvidence = async (candidate: PromptIntelligenceCandidate) => {
+    setEvidenceLoading(candidate.id)
+    try {
+      setEvidenceDialog(await api.getPromptIntelligenceCandidateEvidence(candidate.id))
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setEvidenceLoading(null)
+    }
+  }
+
+  const openAIAnalysis = async (candidate: PromptIntelligenceCandidate) => {
+    setAITarget(candidate)
+    const persisted = candidate.latest_ai_analysis ?? null
+    setAIProvider(persisted?.provider ?? 'review')
+    setAIModel(persisted?.model ?? '')
+    setAIAPIKeyID('0')
+    setIdentityUpdateMode(persisted?.identity_update.mode === 'guarded_auto' ? 'guarded_auto' : 'suggest')
+    setAIResult(persisted)
+    if (!gatewayKeys.length) {
+      try {
+        const response = await api.getPromptIntelligenceAIProviders()
+        setGatewayKeys(response.gateway_keys.filter((key) => key.status === 'active'))
+      } catch {
+        // DS analysis remains available even when the optional Key list fails.
+      }
+    }
+  }
+
+  const runAIAnalysis = async () => {
+    if (!aiTarget) return
+    setAILoading(true)
+    try {
+      const value = await api.analyzePromptIntelligenceCandidate(aiTarget.id, {
+        provider: aiProvider,
+        model: aiModel.trim() || undefined,
+        api_key_id: aiProvider === 'account_pool' ? Number(aiAPIKeyID) || undefined : undefined,
+        identity_update_mode: identityUpdateMode,
+      })
+      setAIResult(value)
+      showToast(t('promptFilter.intelligence.aiAnalysisSuccess'))
+      await loadCandidates()
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setAILoading(false)
+    }
+  }
+
+  const applyAIIdentity = async () => {
+    if (!aiTarget || !aiResult) return
+    setAILoading(true)
+    try {
+      const value = await api.applyPromptIntelligenceIdentityUpdate(aiTarget.id, aiResult.analysis_evidence_id)
+      setAIResult((current) => current ? { ...current, identity_update: value.identity_update } : current)
+      setAITarget((current) => current ? { ...current, lifecycle_status: 'published' } : current)
+      showToast(t('promptFilter.intelligence.identityApplied'))
+      await loadCandidates()
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setAILoading(false)
+    }
+  }
+
+  const rollbackAIIdentity = async (candidateID: number, revisionEvidenceID: number) => {
+    setAILoading(true)
+    try {
+      const value = await api.rollbackPromptIntelligenceIdentityUpdate(candidateID, revisionEvidenceID)
+      setAIResult((current) => current ? { ...current, identity_update: value.identity_update } : current)
+      setAITarget((current) => current ? { ...current, lifecycle_status: 'pending' } : current)
+      if (evidenceDialog?.candidate.id === candidateID) {
+        setEvidenceDialog(await api.getPromptIntelligenceCandidateEvidence(candidateID))
+      }
+      showToast(t('promptFilter.intelligence.identityRolledBack'))
+      await loadCandidates()
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setAILoading(false)
+    }
+  }
+
+  const lifecycleLabel = (status: string) => t(`promptFilter.intelligence.lifecycle.${status}`, { defaultValue: status || '-' })
+  const sourceLabel = (source?: string) => t(`promptFilter.intelligence.source.${source || 'unknown'}`, { defaultValue: source || '-' })
+  const candidateTitle = (candidate: PromptIntelligenceCandidate) => candidate.kind === 'evidence'
+    ? t(candidate.lifecycle_status === 'published' ? 'promptFilter.intelligence.attributedEvidence' : 'promptFilter.intelligence.awaitingAttribution')
+    : candidate.name || t('promptFilter.intelligence.unnamedRule')
+
+  const candidateLifecycleLabel = (candidate: PromptIntelligenceCandidate) => candidate.kind === 'evidence' && candidate.lifecycle_status === 'published'
+    ? t('promptFilter.intelligence.attributed')
+    : lifecycleLabel(candidate.lifecycle_status)
 
   return (
     <div className="space-y-5">
@@ -1561,36 +1720,411 @@ function IntelligenceView() {
               <span>{t('promptFilter.intelligence.sources')}: {result.sources.length}</span>
               <span>{t('promptFilter.intelligence.modelCalls')}: {result.model_calls}</span>
               <span>{t('promptFilter.intelligence.candidates')}: {result.candidates.length}</span>
-              <span>{t('promptFilter.intelligence.autoAdded')}: {result.added}</span>
+              <span>{t('promptFilter.intelligence.staged')}: {result.staged}</span>
             </div>
             {result.errors.length ? <div className="mb-4 rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{result.errors.join('；')}</div> : null}
-            <Table>
-              <TableHeader><TableRow><TableHead>{t('promptFilter.intelligence.rule')}</TableHead><TableHead>{t('promptFilter.intelligence.category')}</TableHead><TableHead>{t('promptFilter.intelligence.weight')}</TableHead><TableHead>{t('promptFilter.intelligence.reason')}</TableHead><TableHead className="text-right">{t('common.actions')}</TableHead></TableRow></TableHeader>
-              <TableBody>
-                {result.candidates.map((candidate) => (
-                  <TableRow key={`${candidate.name}-${candidate.pattern}`}>
-                    <TableCell><div className="flex items-center gap-2 font-medium">{candidate.name}<Badge variant="outline" className={candidate.status === 'update' ? 'border-amber-500/40 text-amber-600' : 'border-emerald-500/40 text-emerald-600'}>{candidate.status === 'update' ? t('promptFilter.intelligence.update') : t('promptFilter.intelligence.new')}</Badge></div><code className="mt-1 block max-w-md break-all text-xs text-muted-foreground">{candidate.pattern}</code></TableCell>
-                    <TableCell>{candidate.category}</TableCell><TableCell>{candidate.weight}{candidate.strict ? ' / strict' : ''}</TableCell>
-                    <TableCell className="max-w-sm text-sm text-muted-foreground">{candidate.rationale || '-'}</TableCell>
-                    <TableCell className="text-right"><Button size="sm" variant="outline" disabled={adding === candidate.name} onClick={() => void add(candidate)}>{candidate.status === 'update' ? t('promptFilter.intelligence.updateRule') : t('promptFilter.intelligence.addRule')}</Button></TableCell>
-                  </TableRow>
-                ))}
-                {!result.candidates.length ? <TableRow><TableCell colSpan={5} className="py-8 text-center text-muted-foreground">{t('promptFilter.intelligence.noCandidates')}</TableCell></TableRow> : null}
-              </TableBody>
-            </Table>
+            <p className="text-sm text-muted-foreground">{t('promptFilter.intelligence.resultHint')}</p>
           </CardContent>
         </Card>
       ) : null}
 
       <Card>
         <CardContent className="p-5">
-          <div className="mb-4 flex items-center justify-between"><div><h2 className="text-base font-semibold">{t('promptFilter.intelligence.historyTitle')}</h2><p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.intelligence.historyDesc')}</p></div><Button variant="outline" size="sm" onClick={() => void loadHistory()} disabled={historyLoading}><RefreshCw className="size-4" />{t('common.refresh')}</Button></div>
-          <div className="space-y-3">
-            {history.map((run, index) => <div key={`${run.started_at}-${index}`} className="rounded-lg border p-4"><div className="flex flex-wrap items-center justify-between gap-2"><div className="font-medium">{formatBeijingTime(run.started_at)}</div><div className="flex gap-2"><Badge variant="outline">{t('promptFilter.intelligence.sources')} {run.sources.length}</Badge><Badge variant="outline">{t('promptFilter.intelligence.candidates')} {run.candidates.length}</Badge><Badge variant="outline">{t('promptFilter.intelligence.modelCalls')} {run.model_calls}</Badge></div></div><div className="mt-3 grid gap-2 md:grid-cols-2">{run.sources.map((source) => <a key={source.url} href={source.url} target="_blank" rel="noreferrer" className="rounded-md bg-muted/40 p-2 text-sm hover:text-primary"><div className="font-medium">{source.title}</div><div className="truncate text-xs text-muted-foreground">{source.url}</div></a>)}</div>{run.errors.length ? <div className="mt-3 text-sm text-destructive">{run.errors.join('；')}</div> : null}</div>)}
-            {!historyLoading && !history.length ? <div className="py-8 text-center text-muted-foreground">{t('promptFilter.intelligence.noHistory')}</div> : null}
+          <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-base font-semibold">{t('promptFilter.intelligence.reviewTitle')}</h2>
+              <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.intelligence.reviewDesc')}</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Select
+                value={candidateStatus}
+                onValueChange={(value) => { setCandidateStatus(value); setCandidatePage(1) }}
+                options={['pending', 'published', 'dismissed', 'all'].map((status) => ({ value: status, label: lifecycleLabel(status) }))}
+              />
+              <Input
+                className="w-56"
+                placeholder={t('promptFilter.intelligence.searchPlaceholder')}
+                value={candidateQueryDraft}
+                onChange={(event) => setCandidateQueryDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    setCandidatePage(1)
+                    setCandidateQuery(candidateQueryDraft)
+                  }
+                }}
+              />
+              <Button size="sm" onClick={() => { setCandidatePage(1); setCandidateQuery(candidateQueryDraft) }}>
+                <Search className="size-4" />
+                {t('promptFilter.intelligence.search')}
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => void loadCandidates()} disabled={candidateLoading}>
+                <RefreshCw className="size-4" />
+                {t('common.refresh')}
+              </Button>
+            </div>
           </div>
+          <div className="mb-3 text-xs text-muted-foreground">{t('promptFilter.intelligence.reviewCount', { count: candidateTotal })}</div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>{t('promptFilter.intelligence.ruleOrEvidence')}</TableHead>
+                <TableHead>{t('promptFilter.intelligence.sourceLabel')}</TableHead>
+                <TableHead>{t('promptFilter.intelligence.statusLabel')}</TableHead>
+                <TableHead>{t('promptFilter.intelligence.evidenceCount')}</TableHead>
+                <TableHead>{t('promptFilter.intelligence.lastSeen')}</TableHead>
+                <TableHead className="text-right">{t('common.actions')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {candidates.map((candidate) => (
+                <TableRow key={candidate.id}>
+                  <TableCell className="max-w-xl">
+                    <div className="flex flex-wrap items-center gap-2 font-medium">
+                      {candidateTitle(candidate)}
+                      <Badge variant="outline">{candidate.kind === 'evidence' ? t('promptFilter.intelligence.evidenceOnly') : candidate.change_type === 'update' ? t('promptFilter.intelligence.update') : t('promptFilter.intelligence.new')}</Badge>
+                      {candidate.ai_analyzed ? (
+                        <Badge className="bg-sky-600">
+                          {t('promptFilter.intelligence.aiLearned')}
+                          {candidate.ai_analysis_count && candidate.ai_analysis_count > 1 ? ` ×${candidate.ai_analysis_count}` : ''}
+                        </Badge>
+                      ) : null}
+                    </div>
+                    {candidate.pattern ? <code className="mt-1 block break-all text-xs text-muted-foreground">{candidate.pattern}</code> : null}
+                    {candidate.kind === 'pattern' ? (
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        <Badge variant="outline">{t('promptFilter.intelligence.category')}: {candidate.category || '-'}</Badge>
+                        <Badge variant="outline">{t('promptFilter.intelligence.weight')}: {candidate.weight}</Badge>
+                        {candidate.strict ? <Badge variant="outline" className="border-destructive/40 text-destructive">strict</Badge> : null}
+                      </div>
+                    ) : null}
+                    {candidate.sample_preview ? <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{candidate.sample_preview}</p> : null}
+                    {candidate.rationale ? <p className="mt-1 text-xs text-muted-foreground">{candidate.rationale}</p> : null}
+                  </TableCell>
+                  <TableCell><Badge variant="outline">{sourceLabel(candidate.source)}</Badge></TableCell>
+                  <TableCell><Badge variant="outline">{candidateLifecycleLabel(candidate)}</Badge></TableCell>
+                  <TableCell>{candidate.evidence_count}</TableCell>
+                  <TableCell className="whitespace-nowrap text-sm text-muted-foreground">{candidate.last_seen_at ? formatBeijingTime(candidate.last_seen_at) : '-'}</TableCell>
+                  <TableCell>
+                    <div className="flex justify-end gap-2">
+                      <Button size="sm" variant="outline" disabled={evidenceLoading === candidate.id} onClick={() => void viewEvidence(candidate)}>
+                        <FileText className="size-4" />
+                        {t('promptFilter.intelligence.viewEvidence')}
+                      </Button>
+                      {candidate.lifecycle_status === 'pending' && candidate.kind === 'pattern' ? (
+                        <Button size="sm" disabled={candidateAction === candidate.id} onClick={() => setPublishTarget(candidate)}>
+                          {candidate.change_type === 'update' ? t('promptFilter.intelligence.updateRule') : t('promptFilter.intelligence.addRule')}
+                        </Button>
+                      ) : null}
+                      {candidate.kind === 'evidence' && (candidate.lifecycle_status === 'pending' || candidate.ai_analyzed) ? (
+                        <>
+                          <Button size="sm" variant="outline" disabled={candidateAction === candidate.id} onClick={() => void openAIAnalysis(candidate)}>
+                            <Sparkles className="size-4" />
+                            {candidate.ai_analyzed ? t('promptFilter.intelligence.aiViewResult') : t('promptFilter.intelligence.aiAnalyze')}
+                          </Button>
+                          {candidate.lifecycle_status === 'pending' ? (
+                            <Button size="sm" disabled={candidateAction === candidate.id} onClick={() => openDraft(candidate)}>
+                              <Pencil className="size-4" />
+                              {t('promptFilter.intelligence.createDraft')}
+                            </Button>
+                          ) : null}
+                        </>
+                      ) : null}
+                      {candidate.lifecycle_status === 'pending' ? (
+                        <Button size="sm" variant="outline" disabled={candidateAction === candidate.id} onClick={() => setDismissTarget(candidate)}>
+                          {t('promptFilter.intelligence.dismiss')}
+                        </Button>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+              {!candidateLoading && !candidates.length ? <TableRow><TableCell colSpan={6} className="py-8 text-center text-muted-foreground">{t('promptFilter.intelligence.noReviewCandidates')}</TableCell></TableRow> : null}
+            </TableBody>
+          </Table>
+          <Pagination
+            page={candidatePage}
+            totalPages={Math.max(1, Math.ceil(candidateTotal / candidatePageSize))}
+            totalItems={candidateTotal}
+            pageSize={candidatePageSize}
+            onPageChange={setCandidatePage}
+            onPageSizeChange={(next) => { setCandidatePage(1); setCandidatePageSize(next) }}
+            pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS}
+          />
         </CardContent>
       </Card>
+
+      <Card>
+        <CardContent className="p-5">
+          <div className="mb-4 flex items-center justify-between"><div><h2 className="text-base font-semibold">{t('promptFilter.intelligence.historyTitle')}</h2><p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.intelligence.historyDesc')}</p></div><Button variant="outline" size="sm" onClick={() => void loadHistory()} disabled={historyLoading}><RefreshCw className="size-4" />{t('common.refresh')}</Button></div>
+          <div className="space-y-3">
+            {history.map((run, index) => (
+              <div key={`${run.started_at}-${index}`} className="rounded-lg border p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="font-medium">{formatBeijingTime(run.started_at)}</div>
+                  <div className="flex flex-wrap gap-2">
+                    <Badge variant="outline">{t('promptFilter.intelligence.sources')} {run.sources.length}</Badge>
+                    <Badge variant="outline">{t('promptFilter.intelligence.candidates')} {run.candidates.length}</Badge>
+                    <Badge variant="outline">{t('promptFilter.intelligence.staged')} {run.staged ?? run.added ?? 0}</Badge>
+                    <Badge variant="outline">{t('promptFilter.intelligence.modelCalls')} {run.model_calls}</Badge>
+                  </div>
+                </div>
+                <div className="mt-3 grid gap-2 md:grid-cols-2">
+                  {run.sources.map((source) => (
+                    <a key={source.url} href={source.url} target="_blank" rel="noreferrer" className="rounded-md bg-muted/40 p-2 text-sm hover:text-primary">
+                      <div className="font-medium">{source.title}</div>
+                      <div className="truncate text-xs text-muted-foreground">{source.url}</div>
+                    </a>
+                  ))}
+                </div>
+                {run.candidates.length ? (
+                  <details className="group mt-3 rounded-md border bg-muted/10">
+                    <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2 text-sm font-medium marker:content-none [&::-webkit-details-marker]:hidden">
+                      {t('promptFilter.intelligence.historyCandidates')}
+                      <ChevronDown className="size-4 text-muted-foreground transition-transform group-open:rotate-180" />
+                    </summary>
+                    <div className="space-y-2 border-t p-3">
+                      {run.candidates.map((candidate, candidateIndex) => (
+                        <div key={`${candidate.name}-${candidate.pattern}-${candidateIndex}`} className="rounded-md bg-background p-3 text-sm">
+                          <div className="flex flex-wrap items-center gap-2 font-medium">
+                            {candidate.name || t('promptFilter.intelligence.unnamedRule')}
+                            <Badge variant="outline">{(candidate.change_type || candidate.status) === 'update' ? t('promptFilter.intelligence.update') : t('promptFilter.intelligence.new')}</Badge>
+                          </div>
+                          {candidate.pattern ? <code className="mt-1 block break-all text-xs text-muted-foreground">{candidate.pattern}</code> : null}
+                        </div>
+                      ))}
+                    </div>
+                  </details>
+                ) : null}
+                {run.errors.length ? <div className="mt-3 text-sm text-destructive">{run.errors.join('；')}</div> : null}
+              </div>
+            ))}
+            {!historyLoading && !history.length ? <div className="py-8 text-center text-muted-foreground">{t('promptFilter.intelligence.noHistory')}</div> : null}
+          </div>
+          <Pagination
+            page={historyPage}
+            totalPages={Math.max(1, Math.ceil(historyTotal / historyPageSize))}
+            totalItems={historyTotal}
+            pageSize={historyPageSize}
+            onPageChange={setHistoryPage}
+            onPageSizeChange={(next) => { setHistoryPage(1); setHistoryPageSize(next) }}
+            pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS}
+          />
+        </CardContent>
+      </Card>
+
+      <Dialog open={Boolean(aiTarget)} onOpenChange={(open) => { if (!open && !aiLoading) { setAITarget(null); setAIResult(null) } }}>
+        <DialogContent className="max-h-[90vh] max-w-4xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{t('promptFilter.intelligence.aiAnalysisTitle')}</DialogTitle>
+            <DialogDescription>{t('promptFilter.intelligence.aiAnalysisDesc')}</DialogDescription>
+          </DialogHeader>
+          {aiTarget?.sample_preview ? (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm whitespace-pre-wrap break-words">
+              {aiTarget.sample_preview}
+            </div>
+          ) : null}
+          <div className="grid gap-4 md:grid-cols-2">
+            <Field label={t('promptFilter.intelligence.aiProvider')}>
+              <Select
+                value={aiProvider}
+                onValueChange={(value) => setAIProvider(value as PromptIntelligenceAIProvider)}
+                options={[
+                  { value: 'review', label: t('promptFilter.intelligence.aiProviderReview') },
+                  { value: 'account_pool', label: t('promptFilter.intelligence.aiProviderPool') },
+                ]}
+              />
+            </Field>
+            <Field label={t('promptFilter.intelligence.aiModel')} hint={t('promptFilter.intelligence.aiModelHint')}>
+              <Input value={aiModel} onChange={(event) => setAIModel(event.target.value)} placeholder={t('promptFilter.intelligence.aiModelDefault')} />
+            </Field>
+            {aiProvider === 'account_pool' ? (
+              <Field label={t('promptFilter.intelligence.aiGatewayKey')} hint={t('promptFilter.intelligence.aiGatewayKeyHint')}>
+                <Select
+                  value={aiAPIKeyID}
+                  onValueChange={setAIAPIKeyID}
+                  options={[
+                    { value: '0', label: t('promptFilter.intelligence.aiGatewayKeyAuto') },
+                    ...gatewayKeys.map((key) => ({ value: String(key.id), label: `${key.name || `#${key.id}`} · ${key.masked}` })),
+                  ]}
+                />
+              </Field>
+            ) : null}
+            <Field label={t('promptFilter.intelligence.identityUpdateMode')} hint={t('promptFilter.intelligence.identityUpdateModeHint')}>
+              <Select
+                value={identityUpdateMode}
+                onValueChange={(value) => setIdentityUpdateMode(value as PromptIdentityUpdateMode)}
+                options={[
+                  { value: 'suggest', label: t('promptFilter.intelligence.identitySuggest') },
+                  { value: 'guarded_auto', label: t('promptFilter.intelligence.identityGuardedAuto') },
+                ]}
+              />
+            </Field>
+          </div>
+          <div className="rounded-lg border bg-muted/20 p-3 text-sm text-muted-foreground">
+            {t('promptFilter.intelligence.identitySafetyHint')}
+          </div>
+
+          {aiResult ? (
+            <div className="space-y-4 rounded-xl border p-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge>{t(`promptFilter.intelligence.aiDecision.${aiResult.decision.decision}`, { defaultValue: aiResult.decision.decision })}</Badge>
+                <Badge className="bg-sky-600">{t('promptFilter.intelligence.aiLearned')}</Badge>
+                <Badge variant="outline">{t('promptFilter.intelligence.aiConfidence')}: {(aiResult.decision.confidence * 100).toFixed(0)}%</Badge>
+                <Badge variant="outline">{aiResult.provider} · {aiResult.model}</Badge>
+              </div>
+              <p className="text-sm">{aiResult.decision.reason || t('promptFilter.intelligence.aiNoReason')}</p>
+              {aiResult.decision.rule ? (
+                <div className="rounded-lg border p-3">
+                  <div className="font-medium">{t('promptFilter.intelligence.aiRuleSuggestion')}</div>
+                  <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                    <Badge variant="outline">{aiResult.decision.rule.name}</Badge>
+                    <Badge variant="outline">{aiResult.decision.rule.category}</Badge>
+                    <Badge variant="outline">{t('promptFilter.intelligence.weight')}: {aiResult.decision.rule.weight}</Badge>
+                  </div>
+                  <code className="mt-2 block break-all rounded bg-muted/40 p-2 text-xs">{aiResult.decision.rule.pattern}</code>
+                  {aiResult.rule_candidate ? <p className="mt-2 text-xs text-emerald-600">{t('promptFilter.intelligence.aiRuleStaged')}</p> : null}
+                  {aiResult.rule_error ? <p className="mt-2 text-xs text-destructive">{aiResult.rule_error}</p> : null}
+                </div>
+              ) : null}
+              {aiResult.decision.identity_patch ? (
+                <div className="rounded-lg border p-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="font-medium">{t('promptFilter.intelligence.aiIdentitySuggestion')}</div>
+                    {aiResult.identity_update.applied ? (
+                      <Badge className="bg-emerald-600">{t('promptFilter.intelligence.identityAppliedBadge')}</Badge>
+                    ) : aiResult.identity_update.rolled_back ? (
+                      <Badge variant="outline">{t('promptFilter.intelligence.identityRolledBackBadge')}</Badge>
+                    ) : aiResult.identity_update.block_reason ? (
+                      <Badge variant="outline">{t('promptFilter.intelligence.identityBlockedBadge')}</Badge>
+                    ) : (
+                      <Badge variant="outline">{t('promptFilter.intelligence.identityPendingBadge')}</Badge>
+                    )}
+                  </div>
+                  <ul className="mt-2 list-disc space-y-1 pl-5 text-sm">
+                    {aiResult.decision.identity_patch.clauses.map((clause, index) => <li key={`${clause}-${index}`}>{clause}</li>)}
+                  </ul>
+                  {aiResult.identity_update.block_reason ? <p className="mt-2 text-xs text-amber-600">{aiResult.identity_update.block_reason}</p> : null}
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {!aiResult.identity_update.applied && aiTarget?.lifecycle_status === 'pending' ? (
+                      <Button size="sm" disabled={aiLoading || Boolean(aiResult.identity_update.block_reason)} onClick={() => void applyAIIdentity()}>
+                        <Save className="size-4" />
+                        {t('promptFilter.intelligence.applyIdentityPatch')}
+                      </Button>
+                    ) : null}
+                    {aiResult.identity_update.revision_evidence_id ? (
+                      <Button size="sm" variant="outline" disabled={aiLoading} onClick={() => void rollbackAIIdentity(aiTarget?.id || 0, aiResult.identity_update.revision_evidence_id || 0)}>
+                        {t('promptFilter.intelligence.rollbackIdentityPatch')}
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" disabled={aiLoading} onClick={() => { setAITarget(null); setAIResult(null) }}>{t('common.close')}</Button>
+            <Button disabled={aiLoading || !aiTarget || aiTarget.lifecycle_status !== 'pending' || Boolean(aiResult?.identity_update.applied)} onClick={() => void runAIAnalysis()}>
+              <Sparkles className="size-4" />
+              {aiLoading ? t('promptFilter.intelligence.aiAnalyzing') : aiResult ? t('promptFilter.intelligence.aiRunAgain') : t('promptFilter.intelligence.aiRunAnalysis')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(evidenceDialog)} onOpenChange={(open) => { if (!open) setEvidenceDialog(null) }}>
+        <DialogContent className="max-h-[85vh] max-w-4xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{t('promptFilter.intelligence.evidenceTitle')}</DialogTitle>
+            <DialogDescription>{evidenceDialog ? candidateTitle(evidenceDialog.candidate) : ''}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            {evidenceDialog?.evidence.map((evidence) => (
+              <div key={evidence.id} className="rounded-lg border p-4">
+                <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                  <Badge variant="outline">{sourceLabel(evidence.source_kind)}</Badge>
+                  {evidence.protocol ? <span>{evidence.protocol}</span> : null}
+                  {evidence.provider ? <span>{evidence.provider}</span> : null}
+                  {evidence.model ? <span>{evidence.model}</span> : null}
+                  {evidence.api_key_name ? <span>{evidence.api_key_name}</span> : null}
+                  <span>{formatBeijingTime(evidence.observed_at)}</span>
+                </div>
+                {evidence.sample_preview ? <p className="whitespace-pre-wrap break-words text-sm">{evidence.sample_preview}</p> : null}
+                {evidence.source_ref ? <p className="mt-2 break-all text-xs text-muted-foreground">{t('promptFilter.intelligence.sourceReference')}: {evidence.source_ref}</p> : null}
+                {Object.keys(evidence.metadata || {}).length ? <SoftCodeBlock className="mt-3">{JSON.stringify(evidence.metadata, null, 2)}</SoftCodeBlock> : null}
+                {evidence.source_kind === 'ai_identity_update' && evidenceDialog ? (
+                  <Button className="mt-3" size="sm" variant="outline" disabled={aiLoading} onClick={() => void rollbackAIIdentity(evidenceDialog.candidate.id, evidence.id)}>
+                    {t('promptFilter.intelligence.rollbackIdentityPatch')}
+                  </Button>
+                ) : null}
+              </div>
+            ))}
+            {evidenceDialog && !evidenceDialog.evidence.length ? <div className="py-8 text-center text-muted-foreground">{t('promptFilter.intelligence.noEvidence')}</div> : null}
+          </div>
+          <DialogFooter><Button variant="outline" onClick={() => setEvidenceDialog(null)}>{t('common.close')}</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(dismissTarget)} onOpenChange={(open) => { if (!open && candidateAction === null) setDismissTarget(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('promptFilter.intelligence.dismissTitle')}</DialogTitle>
+            <DialogDescription>{t('promptFilter.intelligence.dismissDesc', { name: dismissTarget ? candidateTitle(dismissTarget) : '' })}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" disabled={candidateAction !== null} onClick={() => setDismissTarget(null)}>{t('common.cancel')}</Button>
+            <Button variant="destructive" disabled={candidateAction !== null} onClick={() => void dismiss()}>{t('promptFilter.intelligence.dismiss')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(draftTarget)} onOpenChange={(open) => { if (!open && candidateAction === null) setDraftTarget(null) }}>
+        <DialogContent className="max-h-[90vh] max-w-3xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{t('promptFilter.intelligence.createDraftTitle')}</DialogTitle>
+            <DialogDescription>{t('promptFilter.intelligence.createDraftDesc')}</DialogDescription>
+          </DialogHeader>
+          {draftTarget?.sample_preview ? (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm whitespace-pre-wrap break-words">{draftTarget.sample_preview}</div>
+          ) : null}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label={t('promptFilter.intelligence.draftName')}><Input value={draftForm.name} onChange={(event) => setDraftForm((current) => ({ ...current, name: event.target.value }))} /></Field>
+            <Field label={t('promptFilter.intelligence.category')}><Input value={draftForm.category} onChange={(event) => setDraftForm((current) => ({ ...current, category: event.target.value }))} /></Field>
+            <Field label={t('promptFilter.intelligence.weight')}><DraftNumberInput min={1} max={100} value={draftForm.weight} onValueChange={(value) => setDraftForm((current) => ({ ...current, weight: value }))} /></Field>
+            <Field label={t('promptFilter.intelligence.strictLabel')}><Select value={draftForm.strict ? 'true' : 'false'} onValueChange={(value) => setDraftForm((current) => ({ ...current, strict: value === 'true' }))} options={[{ label: t('promptFilter.intelligence.strictYes'), value: 'true' }, { label: t('promptFilter.intelligence.strictNo'), value: 'false' }]} /></Field>
+          </div>
+          <Field label={t('promptFilter.intelligence.draftPattern')} hint={t('promptFilter.intelligence.draftPatternHint')}><Textarea rows={5} className="font-mono" value={draftForm.pattern} onChange={(event) => setDraftForm((current) => ({ ...current, pattern: event.target.value }))} /></Field>
+          <Field label={t('promptFilter.intelligence.draftRationale')}><Textarea rows={3} value={draftForm.rationale} onChange={(event) => setDraftForm((current) => ({ ...current, rationale: event.target.value }))} /></Field>
+          <DialogFooter>
+            <Button variant="outline" disabled={candidateAction !== null} onClick={() => setDraftTarget(null)}>{t('common.cancel')}</Button>
+            <Button disabled={candidateAction !== null || !draftForm.name.trim() || !draftForm.pattern.trim()} onClick={() => void createDraft()}>{t('promptFilter.intelligence.saveDraft')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(publishTarget)} onOpenChange={(open) => { if (!open && candidateAction === null) setPublishTarget(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t('promptFilter.intelligence.publishTitle')}</DialogTitle>
+            <DialogDescription>{t('promptFilter.intelligence.publishDesc')}</DialogDescription>
+          </DialogHeader>
+          {publishTarget ? (
+            <div className="space-y-3 rounded-lg border p-4">
+              <div className="font-medium">{candidateTitle(publishTarget)}</div>
+              <code className="block break-all text-xs text-muted-foreground">{publishTarget.pattern}</code>
+              <div className="flex flex-wrap gap-2">
+                <Badge variant="outline">{t('promptFilter.intelligence.category')}: {publishTarget.category || '-'}</Badge>
+                <Badge variant="outline">{t('promptFilter.intelligence.weight')}: {publishTarget.weight}</Badge>
+                <Badge variant="outline">strict: {publishTarget.strict ? t('promptFilter.intelligence.strictYes') : t('promptFilter.intelligence.strictNo')}</Badge>
+                <Badge variant="outline">{t('promptFilter.intelligence.evidenceCount')}: {publishTarget.evidence_count}</Badge>
+              </div>
+            </div>
+          ) : null}
+          <DialogFooter>
+            <Button variant="outline" disabled={candidateAction !== null} onClick={() => setPublishTarget(null)}>{t('common.cancel')}</Button>
+            <Button disabled={candidateAction !== null || !publishTarget} onClick={() => { if (publishTarget) void publish(publishTarget) }}>{t('promptFilter.intelligence.confirmPublish')}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
@@ -2169,10 +2703,8 @@ function OverviewView({
   testModel,
   setTestModel,
   testing,
-  testVerdict,
+  testResult,
   runTest,
-  clearLogs,
-  clearing,
   advancedConfigError,
   onSave,
 }: {
@@ -2191,19 +2723,172 @@ function OverviewView({
   testModel: string
   setTestModel: (value: string) => void
   testing: boolean
-  testVerdict: PromptFilterVerdict | null
+  testResult: PromptFilterTestResponse | null
   runTest: () => void
-  clearLogs: () => Promise<void>
-  clearing: boolean
   advancedConfigError: string | null
   onSave: () => void
 }) {
   const { t } = useTranslation()
+  const { showToast } = useToast()
   const stats = useMemo(() => ({
     blocks: recentLogs.filter((log) => log.action === 'block').length,
-    upstream: recentLogs.filter((log) => log.source === 'upstream_cyber_policy').length,
     latest: recentLogs[0]?.created_at,
   }), [recentLogs])
+  const advancedDocument = useMemo(
+    () => parseAdvancedConfigDocument(form.prompt_filter_advanced_config),
+    [form.prompt_filter_advanced_config],
+  )
+  const reviewAdapter = useMemo(
+    () => parseReviewAdapter(advancedDocument.value ?? {}),
+    [advancedDocument.value],
+  )
+  const adaptiveReview = useMemo(
+    () => parseAdaptiveReview(advancedDocument.value ?? {}),
+    [advancedDocument.value],
+  )
+  const [reviewTestText, setReviewTestText] = useState('请帮我整理今天的会议纪要。')
+  const [reviewTesting, setReviewTesting] = useState(false)
+  const [reviewTestResult, setReviewTestResult] = useState<PromptReviewTestResponse | null>(null)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [reviewSettingsOpen, setReviewSettingsOpen] = useState(false)
+  const [newAPISettingsOpen, setNewAPISettingsOpen] = useState(false)
+  const [expertSettingsOpen, setExpertSettingsOpen] = useState(false)
+  const [recommendedStrength, setRecommendedStrength] = useState<RecommendedProtectionStrength>('block')
+  const advancedProtection = useMemo(
+    () => parseAdvancedProtection(advancedDocument.value ?? {}),
+    [advancedDocument.value],
+  )
+  const protectionStrategy = form.prompt_filter_enabled ? form.prompt_filter_mode : 'off'
+  const reviewStrategy = !form.prompt_filter_review_enabled
+    ? 'off'
+    : form.prompt_filter_review_fail_closed ? 'fail_closed' : 'fail_open'
+  const draftReviewKeyCount = (form.prompt_filter_review_api_key ?? '')
+    .split(/[\s,]+/)
+    .filter(Boolean).length
+  const reviewKeyCount = draftReviewKeyCount || form.prompt_filter_review_api_key_count
+  const enabledAdvancedFeatures = [
+    advancedProtection.normalization.enabled ? t('promptFilter.enabledFeatures.normalization') : null,
+    advancedProtection.context_discount.enabled ? t('promptFilter.enabledFeatures.contextDiscount') : null,
+    advancedProtection.risk.enabled ? t('promptFilter.enabledFeatures.risk') : null,
+    advancedProtection.sidecar.enabled ? t('promptFilter.enabledFeatures.sidecar') : null,
+    advancedProtection.session.enabled ? t('promptFilter.enabledFeatures.session') : null,
+    advancedProtection.attachment.enabled ? t('promptFilter.enabledFeatures.attachment') : null,
+    advancedProtection.output.enabled ? t('promptFilter.enabledFeatures.output') : null,
+    advancedProtection.intelligence.enabled ? t('promptFilter.enabledFeatures.intelligence') : null,
+    adaptiveReview.enabled ? t('promptFilter.enabledFeatures.adaptiveReview') : null,
+  ].filter((label): label is string => Boolean(label))
+  const updateProtectionStrategy = (value: string) => {
+    setForm((current) => value === 'off'
+      ? { ...current, prompt_filter_enabled: false }
+      : { ...current, prompt_filter_enabled: true, prompt_filter_mode: value })
+  }
+  const updateReviewStrategy = (value: string) => {
+    setReviewTestResult(null)
+    setForm((current) => value === 'off'
+      ? { ...current, prompt_filter_review_enabled: false }
+      : {
+          ...current,
+          prompt_filter_review_enabled: true,
+          prompt_filter_review_fail_closed: value === 'fail_closed',
+        })
+  }
+  const updateReviewAdapter = <K extends keyof ReviewAdapterFormConfig>(key: K, value: ReviewAdapterFormConfig[K]) => {
+    const patched = patchAdvancedConfigDocument(form.prompt_filter_advanced_config, [{ path: ['review_adapter', key], value }])
+    if (!patched.ok) {
+      showToast(t('promptFilter.advancedConfigInvalidSave'), 'error')
+      return
+    }
+    setReviewTestResult(null)
+    setForm((current) => ({ ...current, prompt_filter_advanced_config: patched.serialized }))
+  }
+  const updateModerationThreshold = (category: string, percent: number) => {
+    updateReviewAdapter('moderation_thresholds', {
+      ...reviewAdapter.moderation_thresholds,
+      [category]: Math.min(1, Math.max(0, percent / 100)),
+    })
+  }
+  const resetModerationThresholds = () => {
+    updateReviewAdapter('moderation_thresholds', { ...defaultReviewAdapter.moderation_thresholds })
+  }
+  const updateAdaptiveReview = (enabled: boolean) => {
+    const patches = enabled
+      ? [
+          { path: ['adaptive_review', 'enabled'], value: true },
+          { path: ['adaptive_review', 'min_clean_reviews'], value: 3 },
+          { path: ['adaptive_review', 'min_observation_hours'], value: 1 },
+          { path: ['adaptive_review', 'sample_percent'], value: 5 },
+          { path: ['adaptive_review', 'force_review_interval_minutes'], value: 360 },
+          { path: ['adaptive_review', 'trust_duration_hours'], value: 168 },
+          { path: ['adaptive_review', 'reactivation_clean_reviews'], value: 3 },
+          { path: ['adaptive_review', 'reactivation_cooldown_hours'], value: 24 },
+        ]
+      : [{ path: ['adaptive_review', 'enabled'], value: false }]
+    const patched = patchAdvancedConfigDocument(form.prompt_filter_advanced_config, patches)
+    if (!patched.ok) {
+      showToast(t('promptFilter.advancedConfigInvalidSave'), 'error')
+      return
+    }
+    setForm((current) => ({ ...current, prompt_filter_advanced_config: patched.serialized }))
+  }
+  const runReviewConnectionTest = async () => {
+    const text = reviewTestText.trim()
+    if (!text) {
+      showToast(t('promptFilter.testEmpty'), 'error')
+      return
+    }
+    setReviewTesting(true)
+    setReviewTestResult(null)
+    try {
+      const result = await api.testPromptReview({
+        text,
+        api_key: form.prompt_filter_review_api_key?.trim() || undefined,
+        base_url: form.prompt_filter_review_base_url,
+        model: form.prompt_filter_review_model,
+        request_mode: reviewAdapter.request_mode,
+        system_prompt: reviewAdapter.system_prompt,
+        user_prompt_template: reviewAdapter.user_prompt_template,
+        payload_template: reviewAdapter.payload_template,
+        confidence_threshold: reviewAdapter.confidence_threshold,
+        moderation_thresholds: reviewAdapter.moderation_thresholds,
+        timeout_seconds: form.prompt_filter_review_timeout_seconds,
+        max_concurrent: reviewAdapter.max_concurrent,
+        max_text_length: reviewAdapter.max_text_length,
+        test_all_keys: true,
+      })
+      setReviewTestResult(result)
+      showToast(t('promptFilter.reviewTestSuccess'))
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewTestFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewTesting(false)
+    }
+  }
+  const applyRecommendedProtection = () => {
+    setForm((current) => {
+      const patched = patchAdvancedConfigDocument(current.prompt_filter_advanced_config, [
+        { path: ['adaptive_review', 'enabled'], value: true },
+        { path: ['adaptive_review', 'min_clean_reviews'], value: 3 },
+        { path: ['adaptive_review', 'min_observation_hours'], value: 1 },
+        { path: ['adaptive_review', 'sample_percent'], value: 5 },
+        { path: ['adaptive_review', 'force_review_interval_minutes'], value: 360 },
+        { path: ['adaptive_review', 'trust_duration_hours'], value: 168 },
+        { path: ['adaptive_review', 'reactivation_clean_reviews'], value: 3 },
+        { path: ['adaptive_review', 'reactivation_cooldown_hours'], value: 24 },
+        { path: ['review_adapter', 'circuit_breaker_failures'], value: 3 },
+        { path: ['review_adapter', 'circuit_breaker_seconds'], value: 30 },
+      ])
+      return {
+        ...current,
+        prompt_filter_enabled: true,
+        prompt_filter_mode: recommendedStrength === 'monitor' ? 'monitor' : 'block',
+        prompt_filter_strict_terminal_enabled: recommendedStrength !== 'monitor',
+        prompt_filter_log_matches: true,
+        prompt_filter_review_timeout_seconds: Math.min(current.prompt_filter_review_timeout_seconds || 8, 8),
+        prompt_filter_advanced_config: patched.ok ? patched.serialized : current.prompt_filter_advanced_config,
+      }
+    })
+    showToast(t('promptFilter.recommendedAppliedWithStrength', { strength: t(`promptFilter.recommendedStrength.${recommendedStrength}.label`) }))
+  }
 
   return (
     <>
@@ -2224,44 +2909,67 @@ function OverviewView({
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(420px,1.1fr)]">
-        <Card>
+        <Card className="border-primary/20 bg-primary/[0.025]">
           <CardContent className="space-y-5">
-            <SectionTitle title={t('promptFilter.rulesTitle')} />
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-4">
-              <Field label={t('promptFilter.enabled')}>
-                <Select
-                  value={form.prompt_filter_enabled ? 'true' : 'false'}
-                  onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_enabled: value === 'true' }))}
-                  options={booleanOptions}
-                />
-              </Field>
-              <Field label={t('promptFilter.mode')}>
-                <Select
-                  value={form.prompt_filter_mode}
-                  onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_mode: value }))}
-                  options={modeOptions}
-                />
-              </Field>
-              <Field label={t('promptFilter.threshold')}>
-                <DraftNumberInput min={1} max={100} value={form.prompt_filter_threshold} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_threshold: value }))} />
-              </Field>
-              <Field label={t('promptFilter.strictThreshold')}>
-                <DraftNumberInput min={1} max={100} value={form.prompt_filter_strict_threshold} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_strict_threshold: value }))} />
-              </Field>
-              <Field label={t('promptFilter.strictTerminal')} hint={t('promptFilter.strictTerminalHint')}>
-                <Select value={form.prompt_filter_strict_terminal_enabled ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_strict_terminal_enabled: value === 'true' }))} options={booleanOptions} />
-              </Field>
-              <Field label={t('promptFilter.logMatches')}>
-                <Select value={form.prompt_filter_log_matches ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_log_matches: value === 'true' }))} options={booleanOptions} />
-              </Field>
-              <Field label={t('promptFilter.maxTextLength')}>
-                <DraftNumberInput min={1024} max={262144} value={form.prompt_filter_max_text_length} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_max_text_length: value }))} />
-              </Field>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2 font-semibold"><Shield className="size-4 text-primary" />{t('promptFilter.protectionSummaryTitle')}</div>
+                <p className="mt-1 text-sm leading-6 text-muted-foreground">{t('promptFilter.protectionSummaryDesc')}</p>
+              </div>
+              <Button onClick={() => setAdvancedOpen(true)}>
+                <Pencil className="size-4" />
+                {t('promptFilter.manageProtection')}
+              </Button>
             </div>
-            <Field label={t('promptFilter.sensitiveWords')}>
-              <Textarea rows={5} value={form.prompt_filter_sensitive_words} placeholder={t('promptFilter.sensitiveWordsPlaceholder')} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_sensitive_words: event.target.value }))} />
-              <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.sensitiveWordsHint')}</span>
-            </Field>
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-lg border bg-background/80 p-3">
+                <div className="text-xs text-muted-foreground">{t('promptFilter.protectionStrategy')}</div>
+                <div className="mt-1 flex items-center gap-2 text-sm font-semibold">
+                  <Badge variant={form.prompt_filter_enabled ? 'default' : 'outline'}>
+                    {protectionStrategy === 'off'
+                      ? t('promptFilter.strategyOff')
+                      : modeOptions.find((item) => item.value === protectionStrategy)?.label}
+                  </Badge>
+                </div>
+              </div>
+              <div className="rounded-lg border bg-background/80 p-3">
+                <div className="text-xs text-muted-foreground">{t('promptFilter.reviewStrategy')}</div>
+                <div className="mt-1 text-sm font-semibold">
+                  {reviewStrategy === 'off'
+                    ? t('promptFilter.reviewStrategyOff')
+                    : reviewStrategy === 'fail_closed'
+                      ? t('promptFilter.reviewStrategyFailClosed')
+                      : t('promptFilter.reviewStrategyFailOpen')}
+                </div>
+                <div className="mt-1 truncate text-xs text-muted-foreground">{form.prompt_filter_review_model || '-'}</div>
+                {adaptiveReview.enabled ? <Badge className="mt-2" variant="secondary">{t('promptFilter.adaptiveReview.activeBadge')}</Badge> : null}
+              </div>
+              <div className="rounded-lg border bg-background/80 p-3 sm:col-span-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-xs text-muted-foreground">{t('promptFilter.enabledFeaturesTitle')}</div>
+                  <Badge variant="outline">{t('promptFilter.reviewKeyCount', { count: reviewKeyCount })}</Badge>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {enabledAdvancedFeatures.length ? enabledAdvancedFeatures.map((label) => (
+                    <Badge key={label} variant="secondary">{label}</Badge>
+                  )) : (
+                    <span className="text-sm text-muted-foreground">{t('promptFilter.enabledFeaturesEmpty')}</span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t pt-4">
+              <div className="flex flex-wrap gap-1.5">
+                <Badge variant="outline">Responses / Chat / Messages / Images</Badge>
+                <Badge variant="outline">HTTP / SSE / WebSocket</Badge>
+                <Badge variant="outline">{t('promptFilter.coverageEveryRequest')}</Badge>
+              </div>
+              <Button variant="ghost" asChild>
+                <NavLink to="/prompt-filter/intelligence"><ClipboardCheck className="size-4" />{t('promptFilter.openLearningReview')}</NavLink>
+              </Button>
+            </div>
           </CardContent>
         </Card>
 
@@ -2284,91 +2992,256 @@ function OverviewView({
                 <Wand2 className="size-4" />
                 {testing ? t('promptFilter.testing') : t('promptFilter.runTest')}
               </Button>
-              {testVerdict ? <VerdictBadge verdict={testVerdict} /> : null}
+              {testResult ? <TestDecisionBadge result={testResult} /> : null}
             </div>
-            {testVerdict ? <VerdictPanel verdict={testVerdict} /> : null}
+            {testResult ? <PromptFilterTestResultPanel result={testResult} /> : null}
           </CardContent>
         </Card>
       </div>
 
-      <Card className="mt-4">
-        <CardContent className="space-y-5 pt-5">
-          <AdvancedProtectionEditor
-            value={form.prompt_filter_advanced_config}
-            onChange={(value) => setForm((current) => ({ ...current, prompt_filter_advanced_config: value }))}
-          />
+      <Dialog open={advancedOpen} onOpenChange={setAdvancedOpen}>
+        <DialogContent className="max-h-[92vh] w-[calc(100vw-2rem)] max-w-none overflow-y-auto sm:max-w-6xl">
+          <DialogHeader><DialogTitle>{t('promptFilter.advancedTitle')}</DialogTitle><DialogDescription>{t('promptFilter.advancedDescription')}</DialogDescription></DialogHeader>
+          <div className="space-y-4">
+            <div className="rounded-xl border bg-muted/20 p-4">
+              <div className="mb-4">
+                <h3 className="text-sm font-semibold">{t('promptFilter.dailyPolicyTitle')}</h3>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.dailyPolicyDesc')}</p>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label={t('promptFilter.protectionStrategy')}>
+                  <Select
+                    value={protectionStrategy}
+                    onValueChange={updateProtectionStrategy}
+                    options={[
+                      { label: t('promptFilter.strategyOff'), value: 'off' },
+                      ...modeOptions,
+                    ]}
+                  />
+                </Field>
+                <Field label={t('promptFilter.reviewStrategy')}>
+                  <Select
+                    value={reviewStrategy}
+                    onValueChange={updateReviewStrategy}
+                    options={[
+                      { label: t('promptFilter.reviewStrategyOff'), value: 'off' },
+                      { label: t('promptFilter.reviewStrategyFailOpen'), value: 'fail_open' },
+                      { label: t('promptFilter.reviewStrategyFailClosed'), value: 'fail_closed' },
+                    ]}
+                  />
+                </Field>
+              </div>
+              <p className="mt-3 rounded-md border border-primary/15 bg-primary/[0.04] px-3 py-2 text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewScopeHint')}</p>
+            </div>
 
-          <div className="space-y-4 rounded-lg border border-border bg-muted/20 p-4">
-            <div>
-              <SectionTitle title={t('promptFilter.reviewTitle')} />
-              <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.reviewDesc')}</p>
+            <div className="rounded-xl border p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-sm font-semibold"><Activity className="size-4 text-primary" />{t('promptFilter.reviewServiceSummary')}</div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewServiceDesc', { model: form.prompt_filter_review_model || '-', count: reviewKeyCount })}</p>
+                </div>
+                <Button type="button" variant="outline" onClick={() => setReviewSettingsOpen((open) => !open)}>
+                  {reviewSettingsOpen ? t('promptFilter.collapseReviewService') : t('promptFilter.configureReviewService')}
+                  <ChevronDown className={cn('size-4 transition-transform', reviewSettingsOpen && 'rotate-180')} />
+                </Button>
+              </div>
+
+              {reviewSettingsOpen ? (
+                <div className="mt-4 space-y-4 border-t pt-4">
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-primary/15 bg-primary/[0.04] p-4">
+                    <div className="min-w-0">
+                      <div className="text-sm font-semibold">{t('promptFilter.adaptiveReview.title')}</div>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.adaptiveReview.description')}</p>
+                      <p className="mt-1 text-[11px] leading-5 text-muted-foreground">{t('promptFilter.adaptiveReview.defaults', { minClean: adaptiveReview.min_clean_reviews, hours: adaptiveReview.min_observation_hours, sample: adaptiveReview.sample_percent, forceHours: Math.ceil(adaptiveReview.force_review_interval_minutes / 60) })}</p>
+                    </div>
+                    <Switch checked={adaptiveReview.enabled} disabled={!form.prompt_filter_review_enabled} onCheckedChange={updateAdaptiveReview} />
+                  </div>
+                  <div className="grid gap-4 sm:grid-cols-3">
+                    <Field label={t('promptFilter.reviewBaseUrl')}>
+                      <Input value={form.prompt_filter_review_base_url} placeholder="https://api.example.com/v1" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
+                    </Field>
+                    <Field label={t('promptFilter.reviewModel')}>
+                      <Input value={form.prompt_filter_review_model} placeholder="review-model" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
+                    </Field>
+                    <Field label={t('promptFilter.reviewTimeout')}>
+                      <DraftNumberInput min={1} max={60} value={form.prompt_filter_review_timeout_seconds} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_timeout_seconds: value }))} />
+                    </Field>
+                  </div>
+                  <Field label={t('promptFilter.reviewApiKey')}>
+                    <Textarea
+                      rows={3}
+                      className="font-mono"
+                      value={form.prompt_filter_review_api_key ?? ''}
+                      placeholder={form.prompt_filter_review_api_key_configured ? t('promptFilter.reviewApiKeyConfigured', { n: form.prompt_filter_review_api_key_count }) : t('promptFilter.reviewApiKeyPlaceholder')}
+                      onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_api_key: event.target.value }))}
+                    />
+                    <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewApiKeyHint')}</span>
+                  </Field>
+                  <div className="grid gap-4 sm:grid-cols-3">
+                    <Field label={t('promptFilter.reviewRequestMode')}><Select value={reviewAdapter.request_mode} onValueChange={(value) => updateReviewAdapter('request_mode', value as ReviewAdapterFormConfig['request_mode'])} options={[{ label: t('promptFilter.reviewModeChat'), value: 'chat_completions' }, { label: t('promptFilter.reviewModeModerations'), value: 'moderations' }]} /></Field>
+                    <Field label={t('promptFilter.reviewScope')}><Select value={reviewAdapter.scope} onValueChange={(value) => updateReviewAdapter('scope', value as ReviewAdapterFormConfig['scope'])} options={(['all_requests', 'local_candidates', 'local_blocks'] as ReviewAdapterFormConfig['scope'][]).map((scope) => ({ label: t(`promptFilter.reviewScopeOptions.${scope}`), value: scope }))} /></Field>
+                    {reviewAdapter.request_mode === 'chat_completions' ? <Field label={t('promptFilter.reviewConfidenceThreshold')}><DraftNumberInput integer={false} step="0.01" min={0.01} max={1} value={reviewAdapter.confidence_threshold} onValueChange={(value) => updateReviewAdapter('confidence_threshold', value)} /></Field> : null}
+                  </div>
+                  {reviewAdapter.request_mode === 'moderations' ? (
+                    <div className="space-y-3 rounded-lg border bg-muted/20 p-4">
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold">{t('promptFilter.moderationThresholds')}</div>
+                          <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.moderationThresholdsHint')}</p>
+                        </div>
+                        <Button type="button" variant="outline" size="sm" onClick={resetModerationThresholds}>{t('promptFilter.moderationThresholdsReset')}</Button>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        {moderationThresholdCategories.map((category) => (
+                          <Field key={category} label={category} hint={t('promptFilter.moderationThresholdDefault', { percent: defaultReviewAdapter.moderation_thresholds[category] * 100 })}>
+                            <div className="flex items-center gap-2">
+                              <DraftNumberInput integer={false} step="0.1" min={0} max={100} value={reviewAdapter.moderation_thresholds[category] * 100} onValueChange={(value) => updateModerationThreshold(category, value)} />
+                              <span className="text-sm text-muted-foreground">%</span>
+                            </div>
+                          </Field>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <details className="group rounded-lg border border-foreground/10 bg-muted/10 open:bg-muted/20">
+                    <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 marker:content-none [&::-webkit-details-marker]:hidden">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold">{t('promptFilter.reviewResilienceTitle')}</div>
+                        <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewResilienceDesc')}</p>
+                      </div>
+                      <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                    </summary>
+                    <div className="grid gap-4 border-t px-4 py-4 sm:grid-cols-2 lg:grid-cols-4">
+                      <Field label={t('promptFilter.reviewMaxConcurrent')}><DraftNumberInput min={1} max={256} value={reviewAdapter.max_concurrent} onValueChange={(value) => updateReviewAdapter('max_concurrent', value)} /></Field>
+                      <Field label={t('promptFilter.reviewMaxTextLength')}><DraftNumberInput min={1024} max={262144} value={reviewAdapter.max_text_length} onValueChange={(value) => updateReviewAdapter('max_text_length', value)} /></Field>
+                      <Field label={t('promptFilter.reviewCircuitBreakerFailures')}><DraftNumberInput min={1} max={20} value={reviewAdapter.circuit_breaker_failures} onValueChange={(value) => updateReviewAdapter('circuit_breaker_failures', value)} /></Field>
+                      <Field label={t('promptFilter.reviewCircuitBreakerSeconds')}><DraftNumberInput min={1} max={3600} value={reviewAdapter.circuit_breaker_seconds} onValueChange={(value) => updateReviewAdapter('circuit_breaker_seconds', value)} /></Field>
+                    </div>
+                  </details>
+                  <details className="group rounded-lg border border-foreground/10 bg-muted/10 open:bg-muted/20">
+                    <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 marker:content-none [&::-webkit-details-marker]:hidden">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold">{t('promptFilter.reviewTemplatesTitle')}</div>
+                        <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewTemplatesDesc')}</p>
+                      </div>
+                      <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                    </summary>
+                    <div className="space-y-4 border-t px-4 py-4">
+                      <Field label={t('promptFilter.reviewSystemPrompt')} hint={t('promptFilter.reviewSystemPromptHint')}><Textarea rows={16} className="font-mono text-xs leading-5" value={reviewAdapter.system_prompt} placeholder={t('promptFilter.reviewSystemPromptPlaceholder')} onChange={(event) => updateReviewAdapter('system_prompt', event.target.value)} /></Field>
+                      <Field label={t('promptFilter.reviewUserPromptTemplate')} hint={t('promptFilter.reviewUserPromptTemplateHint')}><Textarea rows={9} className="font-mono text-xs leading-5" value={reviewAdapter.user_prompt_template} placeholder={t('promptFilter.reviewUserPromptTemplatePlaceholder')} onChange={(event) => updateReviewAdapter('user_prompt_template', event.target.value)} /></Field>
+                      <Field label={t('promptFilter.reviewPayloadTemplate')} hint={t('promptFilter.reviewPayloadTemplateHint')}><Textarea rows={10} className="font-mono text-xs leading-5" value={reviewAdapter.payload_template} placeholder={'{\n  "model": "{{model}}",\n  "messages": [\n    {"role": "system", "content": "{{system_prompt}}"},\n    {"role": "user", "content": "{{user_prompt}}"}\n  ],\n  "temperature": 0\n}'} onChange={(event) => updateReviewAdapter('payload_template', event.target.value)} /></Field>
+                    </div>
+                  </details>
+                  <div className="space-y-3 rounded-lg bg-muted/40 p-4">
+                    <div>
+                      <h3 className="text-sm font-semibold">{t('promptFilter.reviewConnectionTestTitle')}</h3>
+                      <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewConnectionTestDesc')}</p>
+                    </div>
+                    <Textarea rows={4} value={reviewTestText} onChange={(event) => { setReviewTestText(event.target.value); setReviewTestResult(null) }} />
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button type="button" variant="outline" onClick={() => void runReviewConnectionTest()} disabled={reviewTesting}>
+                        <Activity className="size-4" />
+                        {reviewTesting ? t('promptFilter.reviewTesting') : t('promptFilter.reviewRunTest')}
+                      </Button>
+                      {reviewTestResult ? <Badge variant={reviewTestResult.flagged ? 'destructive' : 'default'}>{reviewTestResult.flagged ? t('promptFilter.testReviewFlagged') : t('promptFilter.testReviewCleared')}</Badge> : null}
+                    </div>
+                    {reviewTestResult ? (
+                      <div className="grid gap-2 rounded-md bg-background p-3 text-xs sm:grid-cols-2">
+                        <div>{t('promptFilter.reviewTestEndpoint')}: <span className="font-mono break-all">{reviewTestResult.endpoint}</span></div>
+                        <div>{t('promptFilter.reviewTestLatency')}: {reviewTestResult.latency_ms} ms</div>
+                        <div>
+                          {reviewAdapter.request_mode === 'moderations' ? t('promptFilter.reviewTestDecision') : t('promptFilter.reviewTestConfidence')}:{' '}
+                          {reviewAdapter.request_mode === 'moderations' ? (
+                            <><span className="font-mono">{reviewTestResult.decision_category || '-'}</span>{' '}{(reviewTestResult.decision_score ?? reviewTestResult.confidence).toFixed(2)} / {typeof reviewTestResult.decision_threshold === 'number' ? reviewTestResult.decision_threshold.toFixed(2) : '-'}</>
+                          ) : `${reviewTestResult.confidence.toFixed(2)} / ${reviewTestResult.confidence_threshold.toFixed(2)}`}
+                        </div>
+                        <div>{t('promptFilter.reviewModel')}: <span className="font-mono">{reviewTestResult.model}</span></div>
+                        {reviewTestResult.highest_category ? <div>{t('promptFilter.reviewTestHighestCategory')}: <span className="font-mono">{reviewTestResult.highest_category}</span></div> : null}
+                        {reviewTestResult.reason ? <div className="sm:col-span-2">{t('promptFilter.reviewTestReason')}: {reviewTestResult.reason}</div> : null}
+                        {reviewTestResult.results?.length ? <div className="sm:col-span-2 mt-1 grid gap-2 md:grid-cols-3">{reviewTestResult.results.map((item) => <div key={item.key_index} className="rounded border bg-background p-2"><div className="flex items-center justify-between gap-2"><span className="font-medium">Key #{item.key_index}</span><Badge variant={item.ok ? 'default' : 'destructive'}>{item.ok ? t('common.success') : t('common.failed')}</Badge></div><div className="mt-1 text-muted-foreground">{item.latency_ms} ms · {item.ok ? item.confidence.toFixed(2) : item.error || '-'}</div></div>)}</div> : null}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
             </div>
-            <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-4">
-              <Field label={t('promptFilter.reviewEnabled')}>
-                <Select
-                  value={form.prompt_filter_review_enabled ? 'true' : 'false'}
-                  onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_enabled: value === 'true' }))}
-                  options={booleanOptions}
-                />
-              </Field>
-              <Field label={t('promptFilter.reviewFailClosed')}>
-                <Select
-                  value={form.prompt_filter_review_fail_closed ? 'true' : 'false'}
-                  onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_fail_closed: value === 'true' }))}
-                  options={[
-                    { label: t('promptFilter.reviewFailClosedBlock'), value: 'true' },
-                    { label: t('promptFilter.reviewFailClosedAllow'), value: 'false' },
-                  ]}
-                />
-              </Field>
-              <Field label={t('promptFilter.reviewTimeout')}>
-                <DraftNumberInput min={1} max={60} value={form.prompt_filter_review_timeout_seconds} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_timeout_seconds: value }))} />
-              </Field>
+
+            <div className="rounded-xl border p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-sm font-semibold"><Network className="size-4 text-primary" />{t('promptFilter.newapiAdapterSummary')}</div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.newapiAdapterDesc')}</p>
+                </div>
+                <Button type="button" variant="outline" onClick={() => setNewAPISettingsOpen((open) => !open)}>
+                  {newAPISettingsOpen ? t('promptFilter.collapseNewAPISettings') : t('promptFilter.configureNewAPISettings')}
+                  <ChevronDown className={cn('size-4 transition-transform', newAPISettingsOpen && 'rotate-180')} />
+                </Button>
+              </div>
+              {newAPISettingsOpen ? (
+                <div className="mt-4 border-t pt-4">
+                  <PromptFilterNewAPIBindings />
+                </div>
+              ) : null}
             </div>
-            <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(180px,0.8fr)]">
-              <Field label={t('promptFilter.reviewBaseUrl')}>
-                <Input value={form.prompt_filter_review_base_url} placeholder="https://api.openai.com" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
-              </Field>
-              <Field label={t('promptFilter.reviewModel')}>
-                <Input value={form.prompt_filter_review_model} placeholder="omni-moderation-latest" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
-              </Field>
+
+            <div className="rounded-xl border p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-sm font-semibold"><Layers className="size-4 text-primary" />{t('promptFilter.expertSettingsSummary')}</div>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.expertSettingsDesc')}</p>
+                </div>
+                <Button type="button" variant="outline" onClick={() => setExpertSettingsOpen((open) => !open)}>
+                  {expertSettingsOpen ? t('promptFilter.collapseExpertSettings') : t('promptFilter.openExpertSettings')}
+                  <ChevronDown className={cn('size-4 transition-transform', expertSettingsOpen && 'rotate-180')} />
+                </Button>
+              </div>
+
+              {expertSettingsOpen ? (
+                <div className="mt-4 space-y-5 border-t pt-4">
+                  <p className="rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-muted-foreground">{t('promptFilter.expertSettingsWarning')}</p>
+                  <div className="grid grid-cols-[repeat(auto-fit,minmax(190px,1fr))] gap-4 rounded-lg border p-4">
+                    <Field label={t('promptFilter.threshold')}><DraftNumberInput min={1} max={100} value={form.prompt_filter_threshold} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_threshold: value }))} /></Field>
+                    <Field label={t('promptFilter.strictThreshold')}><DraftNumberInput min={1} max={100} value={form.prompt_filter_strict_threshold} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_strict_threshold: value }))} /></Field>
+                    <Field label={t('promptFilter.strictTerminal')} hint={t('promptFilter.strictTerminalHint')}><Select value={form.prompt_filter_strict_terminal_enabled ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_strict_terminal_enabled: value === 'true' }))} options={booleanOptions} /></Field>
+                    <Field label={t('promptFilter.logMatches')}><Select value={form.prompt_filter_log_matches ? 'true' : 'false'} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_log_matches: value === 'true' }))} options={booleanOptions} /></Field>
+                    <Field label={t('promptFilter.maxTextLength')}><DraftNumberInput min={1024} max={262144} value={form.prompt_filter_max_text_length} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_max_text_length: value }))} /></Field>
+                  </div>
+                  <Field label={t('promptFilter.sensitiveWords')}><Textarea rows={5} value={form.prompt_filter_sensitive_words} placeholder={t('promptFilter.sensitiveWordsPlaceholder')} onChange={(event) => setForm((current) => ({ ...current, prompt_filter_sensitive_words: event.target.value }))} /><span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.sensitiveWordsHint')}</span></Field>
+                  <AdvancedProtectionEditor value={form.prompt_filter_advanced_config} onChange={(value) => setForm((current) => ({ ...current, prompt_filter_advanced_config: value }))} />
+                </div>
+              ) : null}
             </div>
-            <Field label={t('promptFilter.reviewApiKey')}>
-              <Textarea
-                rows={3}
-                className="font-mono"
-                value={form.prompt_filter_review_api_key ?? ''}
-                placeholder={
-                  form.prompt_filter_review_api_key_configured
-                    ? t('promptFilter.reviewApiKeyConfigured', { n: form.prompt_filter_review_api_key_count })
-                    : t('promptFilter.reviewApiKeyPlaceholder')
-                }
-                onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_api_key: event.target.value }))}
-              />
-              <span className="block text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewApiKeyHint')}</span>
-            </Field>
           </div>
-
-          <Button onClick={onSave} disabled={saving || Boolean(advancedConfigError)}>
-            <Save className="size-4" />
-            {saving ? t('common.saving') : t('common.save')}
-          </Button>
-        </CardContent>
-      </Card>
+          <DialogFooter className="flex-wrap sm:justify-between">
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="min-w-[210px] space-y-1.5">
+                <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.recommendedStrengthTitle')}</div>
+                <Select
+                  value={recommendedStrength}
+                  onValueChange={(value) => setRecommendedStrength(value as RecommendedProtectionStrength)}
+                  options={(['monitor', 'block'] as RecommendedProtectionStrength[]).map((strength) => ({
+                    value: strength,
+                    label: t(`promptFilter.recommendedStrength.${strength}.label`),
+                  }))}
+                />
+              </div>
+              <Button variant="ghost" onClick={applyRecommendedProtection}><Shield className="size-4" />{t('promptFilter.applyRecommended')}</Button>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setAdvancedOpen(false)}>{t('common.close')}</Button>
+              <Button onClick={() => { onSave(); setAdvancedOpen(false) }} disabled={saving || Boolean(advancedConfigError)}><Save className="size-4" />{saving ? t('common.saving') : t('common.save')}</Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Card className="mt-4">
         <CardContent>
           <div className="mb-4 flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch">
             <SectionTitle title={t('promptFilter.recentLogsTitle')} />
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" asChild>
-                <NavLink to="/prompt-filter/logs">{t('promptFilter.viewAllLogs')}</NavLink>
-              </Button>
-              <Button variant="outline" onClick={() => void clearLogs()} disabled={clearing || recentLogs.length === 0}>
-                <Trash2 className="size-3.5" />
-                {clearing ? t('promptFilter.clearing') : t('promptFilter.clearLogs')}
-              </Button>
-            </div>
+            <Button variant="outline" asChild>
+              <NavLink to="/prompt-filter/logs">{t('promptFilter.viewAllLogs')}</NavLink>
+            </Button>
           </div>
           <PromptFilterLogsTable logs={recentLogs} compact />
         </CardContent>
@@ -2377,33 +3250,414 @@ function OverviewView({
   )
 }
 
-function LogsView({ clearLogs, clearing }: { clearLogs: () => Promise<void>; clearing: boolean }) {
+function PromptLogFilterControls({
+  draftFilters,
+  setDraftFilters,
+  onApply,
+  onReset,
+  loading,
+  showAction = false,
+  showSource = false,
+  showReviewResult = false,
+}: {
+  draftFilters: LogFilters
+  setDraftFilters: Dispatch<SetStateAction<LogFilters>>
+  onApply: () => void
+  onReset: () => void
+  loading: boolean
+  showAction?: boolean
+  showSource?: boolean
+  showReviewResult?: boolean
+}) {
   const { t } = useTranslation()
-  const [draftFilters, setDraftFilters] = useState<LogFilters>(emptyFilters)
-  const [filters, setFilters] = useState<LogFilters>(emptyFilters)
-  const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = usePersistedPageSize('prompt_filter_logs', 20, DEFAULT_PAGE_SIZE_OPTIONS)
+
+  return (
+    <>
+      <div className="mb-3 grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3">
+        {showReviewResult ? (
+          <Field label={t('promptFilter.reviewResultFilter')}>
+            <Select
+              value={draftFilters.reviewResult}
+              onValueChange={(value) => setDraftFilters((current) => ({ ...current, reviewResult: value }))}
+              options={[
+                { label: t('common.all'), value: '' },
+                { label: t('promptFilter.labels.reviewFlagged'), value: 'flagged' },
+                { label: t('promptFilter.labels.reviewCleared'), value: 'cleared' },
+                { label: t('promptFilter.reviewResultError'), value: 'error' },
+              ]}
+            />
+          </Field>
+        ) : null}
+        {showAction ? (
+          <Field label={t('promptFilter.reviewFinalAction')}>
+            <Select
+              value={draftFilters.action}
+              onValueChange={(value) => setDraftFilters((current) => ({ ...current, action: value }))}
+              options={[
+                { label: t('common.all'), value: '' },
+                { label: t('promptFilter.modeBlock'), value: 'block' },
+                { label: t('promptFilter.modeWarn'), value: 'warn' },
+                { label: t('promptFilter.actionAllow'), value: 'allow' },
+              ]}
+            />
+          </Field>
+        ) : null}
+        {showSource ? (
+          <Field label={t('promptFilter.source')}>
+            <Select
+              value={draftFilters.source}
+              onValueChange={(value) => setDraftFilters((current) => ({ ...current, source: value }))}
+              options={[
+                { label: t('common.all'), value: '' },
+                { label: t('promptFilter.sources.local_filter'), value: 'local_filter' },
+                { label: t('promptFilter.sources.upstream_cyber_policy'), value: 'upstream_cyber_policy' },
+              ]}
+            />
+          </Field>
+        ) : null}
+        <Field label={t('promptFilter.endpoint')}>
+          <Input value={draftFilters.endpoint} onChange={(event) => setDraftFilters((current) => ({ ...current, endpoint: event.target.value }))} placeholder="/v1/responses" />
+        </Field>
+        <Field label={t('promptFilter.model')}>
+          <Input value={draftFilters.model} onChange={(event) => setDraftFilters((current) => ({ ...current, model: event.target.value }))} placeholder="gpt-5.5" />
+        </Field>
+        <Field label={t('promptFilter.apiKeyId')}>
+          <Input value={draftFilters.apiKeyId} onChange={(event) => setDraftFilters((current) => ({ ...current, apiKeyId: event.target.value }))} placeholder="ID" />
+        </Field>
+        <Field label={t('promptFilter.keyword')}>
+          <Input value={draftFilters.q} onChange={(event) => setDraftFilters((current) => ({ ...current, q: event.target.value }))} placeholder={t('promptFilter.keywordPlaceholder')} />
+        </Field>
+      </div>
+      <div className="mb-4 flex flex-wrap gap-2">
+        <Button onClick={onApply} disabled={loading}>
+          <Search className="size-4" />
+          {t('promptFilter.applyFilters')}
+        </Button>
+        <Button variant="outline" onClick={onReset} disabled={loading}>
+          <X className="size-4" />
+          {t('promptFilter.resetFilters')}
+        </Button>
+      </div>
+    </>
+  )
+}
+
+type PromptLogClearSection = 'incidents' | 'review' | 'local'
+
+function LogsView({ onPromptLogsChanged }: { onPromptLogsChanged: () => Promise<void> }) {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [incidentDraftFilters, setIncidentDraftFilters] = useState<LogFilters>(emptyFilters)
+  const [incidentFilters, setIncidentFilters] = useState<LogFilters>(emptyFilters)
+  const [reviewDraftFilters, setReviewDraftFilters] = useState<LogFilters>(emptyFilters)
+  const [reviewFilters, setReviewFilters] = useState<LogFilters>(emptyFilters)
+  const [localDraftFilters, setLocalDraftFilters] = useState<LogFilters>(emptyFilters)
+  const [localFilters, setLocalFilters] = useState<LogFilters>(emptyFilters)
+  const [logPage, setLogPage] = useState(1)
+  const [logPageSize, setLogPageSize] = usePersistedPageSize('prompt_filter_logs', 20, DEFAULT_PAGE_SIZE_OPTIONS)
+  const [reviewPage, setReviewPage] = useState(1)
+  const [reviewPageSize, setReviewPageSize] = usePersistedPageSize('prompt_review_logs', 20, DEFAULT_PAGE_SIZE_OPTIONS)
+  const [incidentPage, setIncidentPage] = useState(1)
+  const [incidentPageSize, setIncidentPageSize] = usePersistedPageSize('prompt_policy_incidents', 20, DEFAULT_PAGE_SIZE_OPTIONS)
   const [logs, setLogs] = useState<PromptFilterLog[]>([])
   const [total, setTotal] = useState(0)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [reviewLogs, setReviewLogs] = useState<PromptFilterLog[]>([])
+  const [reviewTotal, setReviewTotal] = useState(0)
+  const [incidents, setIncidents] = useState<PromptPolicyIncident[]>([])
+  const [incidentTotal, setIncidentTotal] = useState(0)
+  const [localLoading, setLocalLoading] = useState(false)
+  const [reviewLoading, setReviewLoading] = useState(false)
+  const [incidentLoading, setIncidentLoading] = useState(false)
+  const [localError, setLocalError] = useState<string | null>(null)
+  const [reviewError, setReviewError] = useState<string | null>(null)
+  const [incidentError, setIncidentError] = useState<string | null>(null)
+  const [clearingSection, setClearingSection] = useState<PromptLogClearSection | null>(null)
 
-  const loadLogs = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+  const loadLocalLogs = useCallback(async () => {
+    setLocalLoading(true)
+    setLocalError(null)
     try {
       const result = await api.getPromptFilterLogs({
-        page,
-        pageSize,
-        action: filters.action,
-        source: filters.source,
-        endpoint: filters.endpoint,
-        model: filters.model,
-        apiKeyId: filters.apiKeyId,
-        q: filters.q,
+        page: logPage,
+        pageSize: logPageSize,
+        action: localFilters.action,
+        source: localFilters.source,
+        endpoint: localFilters.endpoint,
+        model: localFilters.model,
+        apiKeyId: localFilters.apiKeyId,
+        q: localFilters.q,
+        reviewed: false,
       })
       setLogs(result.logs ?? [])
       setTotal(result.total ?? 0)
+    } catch (err) {
+      setLocalError(getErrorMessage(err))
+    } finally {
+      setLocalLoading(false)
+    }
+  }, [localFilters, logPage, logPageSize])
+
+  const loadReviewLogs = useCallback(async () => {
+    setReviewLoading(true)
+    setReviewError(null)
+    try {
+      const result = await api.getPromptFilterLogs({
+        page: reviewPage,
+        pageSize: reviewPageSize,
+        action: reviewFilters.action,
+        endpoint: reviewFilters.endpoint,
+        model: reviewFilters.model,
+        apiKeyId: reviewFilters.apiKeyId,
+        q: reviewFilters.q,
+        reviewed: true,
+        reviewResult: reviewFilters.reviewResult,
+      })
+      setReviewLogs(result.logs ?? [])
+      setReviewTotal(result.total ?? 0)
+    } catch (err) {
+      setReviewError(getErrorMessage(err))
+    } finally {
+      setReviewLoading(false)
+    }
+  }, [reviewFilters, reviewPage, reviewPageSize])
+
+  const loadIncidents = useCallback(async () => {
+    setIncidentLoading(true)
+    setIncidentError(null)
+    try {
+      const result = await api.getPromptPolicyIncidents({
+        page: incidentPage,
+        pageSize: incidentPageSize,
+        endpoint: incidentFilters.endpoint,
+        model: incidentFilters.model,
+        apiKeyId: incidentFilters.apiKeyId,
+        q: incidentFilters.q,
+      })
+      setIncidents(result.incidents ?? [])
+      setIncidentTotal(result.total ?? 0)
+    } catch (err) {
+      setIncidentError(getErrorMessage(err))
+    } finally {
+      setIncidentLoading(false)
+    }
+  }, [incidentFilters, incidentPage, incidentPageSize])
+
+  useEffect(() => {
+    void loadLocalLogs()
+  }, [loadLocalLogs])
+
+  useEffect(() => {
+    void loadReviewLogs()
+  }, [loadReviewLogs])
+
+  useEffect(() => {
+    void loadIncidents()
+  }, [loadIncidents])
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([loadIncidents(), loadReviewLogs(), loadLocalLogs()])
+  }, [loadIncidents, loadLocalLogs, loadReviewLogs])
+
+  const clearLogSection = async (section: PromptLogClearSection) => {
+    setClearingSection(section)
+    try {
+      if (section === 'incidents') {
+        await api.clearPromptPolicyIncidents()
+        setIncidents([])
+        setIncidentTotal(0)
+        setIncidentPage(1)
+        showToast(t('promptFilter.cyberIncidentsCleared'))
+        return
+      }
+
+      await api.clearPromptFilterLogs({ reviewed: section === 'review' })
+      if (section === 'review') {
+        setReviewLogs([])
+        setReviewTotal(0)
+        setReviewPage(1)
+        showToast(t('promptFilter.reviewLogsCleared'))
+      } else {
+        setLogs([])
+        setTotal(0)
+        setLogPage(1)
+        showToast(t('promptFilter.localLogsCleared'))
+      }
+
+      try {
+        await onPromptLogsChanged()
+      } catch {
+        showToast(t('promptFilter.logSummaryRefreshFailed'), 'warning')
+      }
+    } catch (err) {
+      showToast(`${t('promptFilter.clearFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setClearingSection(null)
+    }
+  }
+
+  const anyLoading = localLoading || reviewLoading || incidentLoading || clearingSection !== null
+  const logTotalPages = Math.max(1, Math.ceil(total / logPageSize))
+  const reviewTotalPages = Math.max(1, Math.ceil(reviewTotal / reviewPageSize))
+  const incidentTotalPages = Math.max(1, Math.ceil(incidentTotal / incidentPageSize))
+
+  return (
+    <Card>
+      <CardContent>
+        <div className="mb-4 flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch">
+          <div>
+            <SectionTitle title={t('promptFilter.logsTitle')} />
+            <p className="mt-1 text-xs text-muted-foreground">{t('promptFilter.auditRecordsCount', { incidents: incidentTotal, reviews: reviewTotal, logs: total })}</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={() => void refreshAll()} disabled={anyLoading}>
+              <RefreshCw className="size-3.5" />
+              {t('promptFilter.refreshAllLogs')}
+            </Button>
+          </div>
+        </div>
+
+        <div className="space-y-5">
+          <section className="rounded-xl border p-4">
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold">{t('promptFilter.cyberIncidentsTitle')} · {incidentTotal}</div>
+                <p className="mt-1 text-xs text-muted-foreground">{t('promptFilter.sectionRefreshHint')}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => void loadIncidents()} disabled={incidentLoading || clearingSection !== null}>
+                  <RefreshCw className="size-3.5" />
+                  {t('common.refresh')}
+                </Button>
+                <Button size="sm" variant="outline" className="text-destructive hover:text-destructive" onClick={() => void clearLogSection('incidents')} disabled={clearingSection !== null}>
+                  <Trash2 className="size-3.5" />
+                  {clearingSection === 'incidents' ? t('promptFilter.clearing') : t('promptFilter.clearCyberIncidents')}
+                </Button>
+              </div>
+            </div>
+            <PromptLogFilterControls
+              draftFilters={incidentDraftFilters}
+              setDraftFilters={setIncidentDraftFilters}
+              onApply={() => { setIncidentPage(1); setIncidentFilters(incidentDraftFilters) }}
+              onReset={() => { setIncidentDraftFilters(emptyFilters); setIncidentFilters(emptyFilters); setIncidentPage(1) }}
+              loading={incidentLoading}
+            />
+            <StateShell loading={incidentLoading} error={incidentError} isEmpty={!incidentLoading && incidents.length === 0} onRetry={() => void loadIncidents()} emptyTitle={t('promptFilter.noCyberIncidents')}>
+              <PromptPolicyIncidentsTable incidents={incidents} />
+              <Pagination page={incidentPage} totalPages={incidentTotalPages} totalItems={incidentTotal} pageSize={incidentPageSize} onPageChange={setIncidentPage} onPageSizeChange={(next) => { setIncidentPage(1); setIncidentPageSize(next) }} pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS} />
+            </StateShell>
+          </section>
+
+          <section className="rounded-xl border p-4">
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold">{t('promptFilter.reviewHistoryTitle')} · {reviewTotal}</div>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewHistoryDesc')}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => void loadReviewLogs()} disabled={reviewLoading || clearingSection !== null}>
+                  <RefreshCw className="size-3.5" />
+                  {t('common.refresh')}
+                </Button>
+                <Button size="sm" variant="outline" className="text-destructive hover:text-destructive" onClick={() => void clearLogSection('review')} disabled={clearingSection !== null}>
+                  <Trash2 className="size-3.5" />
+                  {clearingSection === 'review' ? t('promptFilter.clearing') : t('promptFilter.clearReviewLogs')}
+                </Button>
+              </div>
+            </div>
+            <PromptLogFilterControls
+              draftFilters={reviewDraftFilters}
+              setDraftFilters={setReviewDraftFilters}
+              onApply={() => { setReviewPage(1); setReviewFilters(reviewDraftFilters) }}
+              onReset={() => { setReviewDraftFilters(emptyFilters); setReviewFilters(emptyFilters); setReviewPage(1) }}
+              loading={reviewLoading}
+              showAction
+              showReviewResult
+            />
+            <StateShell loading={reviewLoading} error={reviewError} isEmpty={!reviewLoading && reviewLogs.length === 0} onRetry={() => void loadReviewLogs()} emptyTitle={t('promptFilter.reviewHistoryEmpty')}>
+              <PromptReviewLogsTable logs={reviewLogs} />
+              <Pagination page={reviewPage} totalPages={reviewTotalPages} totalItems={reviewTotal} pageSize={reviewPageSize} onPageChange={setReviewPage} onPageSizeChange={(next) => { setReviewPage(1); setReviewPageSize(next) }} pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS} />
+            </StateShell>
+          </section>
+
+          <section className="rounded-xl border p-4">
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold">{t('promptFilter.localAuditLogsTitle')} · {total}</div>
+                <p className="mt-1 text-xs text-muted-foreground">{t('promptFilter.sectionRefreshHint')}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => void loadLocalLogs()} disabled={localLoading || clearingSection !== null}>
+                  <RefreshCw className="size-3.5" />
+                  {t('common.refresh')}
+                </Button>
+                <Button size="sm" variant="outline" className="text-destructive hover:text-destructive" onClick={() => void clearLogSection('local')} disabled={clearingSection !== null}>
+                  <Trash2 className="size-3.5" />
+                  {clearingSection === 'local' ? t('promptFilter.clearing') : t('promptFilter.clearLocalLogs')}
+                </Button>
+              </div>
+            </div>
+            <PromptLogFilterControls
+              draftFilters={localDraftFilters}
+              setDraftFilters={setLocalDraftFilters}
+              onApply={() => { setLogPage(1); setLocalFilters(localDraftFilters) }}
+              onReset={() => { setLocalDraftFilters(emptyFilters); setLocalFilters(emptyFilters); setLogPage(1) }}
+              loading={localLoading}
+              showAction
+              showSource
+            />
+            <StateShell loading={localLoading} error={localError} isEmpty={!localLoading && logs.length === 0} onRetry={() => void loadLocalLogs()} emptyTitle={t('promptFilter.noLogs')}>
+              <PromptFilterLogsTable logs={logs} />
+              <Pagination page={logPage} totalPages={logTotalPages} totalItems={total} pageSize={logPageSize} onPageChange={setLogPage} onPageSizeChange={(next) => { setLogPage(1); setLogPageSize(next) }} pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS} />
+            </StateShell>
+          </section>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+const emptyRiskProfileFilters: RiskProfileFilters = {
+  subjectType: 'newapi_user',
+  riskLevel: '',
+  platform: '',
+  apiKeyId: '',
+  accountId: '',
+  minScore: '',
+  q: '',
+}
+
+function RiskProfilesView() {
+  const { t } = useTranslation()
+  const [draftFilters, setDraftFilters] = useState<RiskProfileFilters>(emptyRiskProfileFilters)
+  const [filters, setFilters] = useState<RiskProfileFilters>(emptyRiskProfileFilters)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = usePersistedPageSize('prompt_risk_profiles', 20, DEFAULT_PAGE_SIZE_OPTIONS)
+  const [profiles, setProfiles] = useState<PromptRiskProfile[]>([])
+  const [total, setTotal] = useState(0)
+  const [scoringVersion, setScoringVersion] = useState('')
+  const [guardrail, setGuardrail] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const loadProfiles = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const result = await api.getPromptRiskProfiles({
+        page,
+        pageSize,
+        subjectType: filters.subjectType,
+        riskLevel: filters.riskLevel,
+        platform: filters.platform,
+        apiKeyId: filters.apiKeyId,
+        accountId: filters.accountId,
+        minScore: filters.minScore,
+        q: filters.q,
+      })
+      setProfiles(result.profiles ?? [])
+      setTotal(result.total ?? 0)
+      setScoringVersion(result.scoring_version ?? '')
+      setGuardrail(result.guardrail ?? '')
     } catch (err) {
       setError(getErrorMessage(err))
     } finally {
@@ -2412,79 +3666,290 @@ function LogsView({ clearLogs, clearing }: { clearLogs: () => Promise<void>; cle
   }, [filters, page, pageSize])
 
   useEffect(() => {
-    void loadLogs()
-  }, [loadLogs])
+    void loadProfiles()
+  }, [loadProfiles])
 
   const applyFilters = () => {
     setPage(1)
     setFilters(draftFilters)
   }
-
   const resetFilters = () => {
-    setDraftFilters(emptyFilters)
-    setFilters(emptyFilters)
+    setDraftFilters(emptyRiskProfileFilters)
+    setFilters(emptyRiskProfileFilters)
     setPage(1)
   }
-
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
   return (
     <Card>
       <CardContent>
-        <div className="mb-4 flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-stretch">
-          <SectionTitle title={t('promptFilter.logsTitle')} />
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => void loadLogs()} disabled={loading}>
-              <RefreshCw className="size-3.5" />
-              {t('common.refresh')}
-            </Button>
-            <Button variant="outline" onClick={() => void clearLogs().then(loadLogs)} disabled={clearing || logs.length === 0}>
-              <Trash2 className="size-3.5" />
-              {clearing ? t('promptFilter.clearing') : t('promptFilter.clearLogs')}
-            </Button>
+        <div className="mb-4 flex items-start justify-between gap-3 max-sm:flex-col max-sm:items-stretch">
+          <div>
+            <SectionTitle title={t('promptFilter.risk.title')} />
+            <p className="mt-1 text-sm text-muted-foreground">{t('promptFilter.risk.description')}</p>
           </div>
+          <Button variant="outline" onClick={() => void loadProfiles()} disabled={loading}>
+            <RefreshCw className="size-3.5" />
+            {t('common.refresh')}
+          </Button>
         </div>
 
-        <div className="mb-4 grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-3">
-          <Field label={t('promptFilter.colAction')}>
-            <Select value={draftFilters.action} onValueChange={(value) => setDraftFilters((current) => ({ ...current, action: value }))} options={[{ label: t('common.all'), value: '' }, { label: t('promptFilter.modeBlock'), value: 'block' }, { label: t('promptFilter.modeWarn'), value: 'warn' }, { label: t('promptFilter.actionAllow'), value: 'allow' }]} />
-          </Field>
-          <Field label={t('promptFilter.source')}>
-            <Select value={draftFilters.source} onValueChange={(value) => setDraftFilters((current) => ({ ...current, source: value }))} options={[{ label: t('common.all'), value: '' }, { label: 'local_filter', value: 'local_filter' }, { label: 'upstream_cyber_policy', value: 'upstream_cyber_policy' }]} />
-          </Field>
-          <Field label={t('promptFilter.endpoint')}>
-            <Input value={draftFilters.endpoint} onChange={(event) => setDraftFilters((current) => ({ ...current, endpoint: event.target.value }))} placeholder="/v1/responses" />
-          </Field>
-          <Field label={t('promptFilter.model')}>
-            <Input value={draftFilters.model} onChange={(event) => setDraftFilters((current) => ({ ...current, model: event.target.value }))} placeholder="gpt-5.5" />
-          </Field>
-          <Field label={t('promptFilter.apiKeyId')}>
-            <Input value={draftFilters.apiKeyId} onChange={(event) => setDraftFilters((current) => ({ ...current, apiKeyId: event.target.value }))} placeholder="ID" />
-          </Field>
-          <Field label={t('promptFilter.keyword')}>
-            <Input value={draftFilters.q} onChange={(event) => setDraftFilters((current) => ({ ...current, q: event.target.value }))} placeholder={t('promptFilter.keywordPlaceholder')} />
-          </Field>
+        <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
+          <div className="flex items-start gap-2"><ShieldAlert className="mt-0.5 size-4 shrink-0" /><span>{guardrail || t('promptFilter.risk.guardrail')}</span></div>
+          {scoringVersion ? <div className="mt-1 pl-6 font-mono text-xs opacity-75">{scoringVersion}</div> : null}
         </div>
 
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border bg-muted/20 p-3">
+          <Button size="sm" variant={draftFilters.subjectType === 'newapi_user' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: 'newapi_user' })); setFilters((current) => ({ ...current, subjectType: 'newapi_user' })); setPage(1) }}>
+            <Users className="size-4" />{t('promptFilter.risk.peopleProfiles')}
+          </Button>
+          <Button size="sm" variant={draftFilters.subjectType === '' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: '' })); setFilters((current) => ({ ...current, subjectType: '' })); setPage(1) }}>
+            <Network className="size-4" />{t('promptFilter.risk.allObjects')}
+          </Button>
+          <span className="text-xs leading-5 text-muted-foreground">{draftFilters.subjectType === 'newapi_user' ? t('promptFilter.risk.peopleProfilesHint') : t('promptFilter.risk.nonPersonHint')}</span>
+        </div>
+
+        <div className="mb-4 grid grid-cols-[repeat(auto-fit,minmax(155px,1fr))] gap-3">
+          <Field label={t('promptFilter.risk.subjectType')}>
+            <Select value={draftFilters.subjectType} onValueChange={(value) => setDraftFilters((current) => ({ ...current, subjectType: value }))} options={[
+              { label: t('common.all'), value: '' },
+              ...['newapi_user', 'session', 'api_key', 'client_ip', 'upstream_account'].map((value) => ({ label: t(`promptFilter.risk.subjects.${value}`), value })),
+            ]} />
+          </Field>
+          <Field label={t('promptFilter.risk.level')}>
+            <Select value={draftFilters.riskLevel} onValueChange={(value) => setDraftFilters((current) => ({ ...current, riskLevel: value }))} options={[
+              { label: t('common.all'), value: '' },
+              ...['low', 'observed', 'elevated', 'high', 'critical'].map((value) => ({ label: t(`promptFilter.risk.levels.${value}`), value })),
+            ]} />
+          </Field>
+          <Field label={t('promptFilter.risk.platform')}><Input value={draftFilters.platform} onChange={(event) => setDraftFilters((current) => ({ ...current, platform: event.target.value }))} placeholder="newapi" /></Field>
+          <Field label={t('promptFilter.apiKeyId')}><Input value={draftFilters.apiKeyId} onChange={(event) => setDraftFilters((current) => ({ ...current, apiKeyId: event.target.value }))} placeholder="ID" /></Field>
+          <Field label={t('promptFilter.risk.accountId')}><Input value={draftFilters.accountId} onChange={(event) => setDraftFilters((current) => ({ ...current, accountId: event.target.value }))} placeholder="ID" /></Field>
+          <Field label={t('promptFilter.risk.minScore')}><Input type="number" min={0} max={100} value={draftFilters.minScore} onChange={(event) => setDraftFilters((current) => ({ ...current, minScore: event.target.value }))} placeholder="0" /></Field>
+          <Field label={t('promptFilter.keyword')}><Input value={draftFilters.q} onChange={(event) => setDraftFilters((current) => ({ ...current, q: event.target.value }))} placeholder={t('promptFilter.risk.keywordPlaceholder')} /></Field>
+        </div>
         <div className="mb-4 flex flex-wrap gap-2">
-          <Button onClick={applyFilters}>
-            <Search className="size-4" />
-            {t('promptFilter.applyFilters')}
-          </Button>
-          <Button variant="outline" onClick={resetFilters}>
-            <X className="size-4" />
-            {t('promptFilter.resetFilters')}
-          </Button>
-          <span className="self-center text-xs text-muted-foreground">{loading ? t('common.loading') : t('promptFilter.recordsCount', { count: total })}</span>
+          <Button onClick={applyFilters}><Search className="size-4" />{t('promptFilter.applyFilters')}</Button>
+          <Button variant="outline" onClick={resetFilters}><X className="size-4" />{t('promptFilter.resetFilters')}</Button>
+          <span className="self-center text-xs text-muted-foreground">{loading ? t('common.loading') : t('promptFilter.risk.recordsCount', { total })}</span>
         </div>
 
-        <StateShell loading={loading} error={error} isEmpty={!loading && logs.length === 0} onRetry={() => void loadLogs()} emptyTitle={t('promptFilter.noLogs')}>
-          <PromptFilterLogsTable logs={logs} />
+        <StateShell loading={loading} error={error} isEmpty={!loading && profiles.length === 0} onRetry={() => void loadProfiles()} emptyTitle={t('promptFilter.risk.empty')}>
+          <RiskProfilesTable profiles={profiles} />
           <Pagination page={page} totalPages={totalPages} totalItems={total} pageSize={pageSize} onPageChange={setPage} onPageSizeChange={(next) => { setPage(1); setPageSize(next) }} pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS} />
         </StateShell>
       </CardContent>
     </Card>
   )
+}
+
+function promptRiskIdentityPrimary(profile: Pick<PromptRiskProfile, 'subject_display' | 'newapi_user_name' | 'newapi_user_email'>) {
+  return profile.newapi_user_name || profile.newapi_user_email || profile.subject_display || '-'
+}
+
+function RiskProfilesTable({ profiles }: { profiles: PromptRiskProfile[] }) {
+  const { t } = useTranslation()
+  return (
+    <div className="overflow-x-auto rounded-lg border border-border">
+      <Table>
+        <TableHeader><TableRow>
+          <TableHead>{t('promptFilter.risk.identity')}</TableHead>
+          <TableHead>{t('promptFilter.risk.score')}</TableHead>
+          <TableHead>{t('promptFilter.risk.recent')}</TableHead>
+          <TableHead>{t('promptFilter.risk.evidence')}</TableHead>
+          <TableHead>{t('promptFilter.risk.scope')}</TableHead>
+          <TableHead>{t('promptFilter.risk.recommendation')}</TableHead>
+          <TableHead className="text-right">{t('promptFilter.cyberDetail')}</TableHead>
+        </TableRow></TableHeader>
+        <TableBody>{profiles.map((profile) => (
+          <TableRow key={`${profile.subject_type}:${profile.subject_key}`}>
+            <TableCell>
+              <div className="flex items-center gap-2"><Users className="size-4 text-muted-foreground" /><span className="font-medium">{promptRiskIdentityPrimary(profile)}</span></div>
+              {profile.newapi_user_id || profile.newapi_user_email ? <div className="mt-1 text-xs text-muted-foreground">{profile.newapi_user_id ? `${t('promptFilter.risk.userId')} #${profile.newapi_user_id}` : ''}{profile.newapi_user_id && profile.newapi_user_email ? ' · ' : ''}{profile.newapi_user_email || ''}</div> : null}
+              <div className="mt-1 flex flex-wrap gap-1"><Badge variant={profile.is_person ? 'default' : 'outline'}>{profile.is_person ? t('promptFilter.risk.person') : t('promptFilter.risk.nonPerson')}</Badge><Badge variant={profile.has_activity ? 'secondary' : 'outline'}>{t(profile.has_activity ? 'promptFilter.risk.activeProfile' : 'promptFilter.risk.identityOnly')}</Badge><Badge variant="outline">{t(`promptFilter.risk.subjects.${profile.subject_type}`)}</Badge>{profile.platform ? <Badge variant="secondary">{profile.platform}</Badge> : null}{profile.newapi_user_group ? <Badge variant="secondary">{t('promptFilter.risk.userGroup')}: {profile.newapi_user_group}</Badge> : null}{profile.trust_policy ? <Badge variant={profile.trust_policy.status === 'active' ? 'default' : 'outline'}>{t(`promptFilter.risk.trust.status.${profile.trust_policy.status}`, { defaultValue: profile.trust_policy.status })}</Badge> : null}{profile.conversation_lock?.status === 'active' ? <Badge variant="destructive">{t('promptFilter.risk.conversationLock.active')}</Badge> : null}</div>
+              <div className="mt-1 font-mono text-[11px] text-muted-foreground">{profile.subject_key.slice(0, 18)}</div>
+            </TableCell>
+            <TableCell><div className="flex items-center gap-2"><span className="font-mono text-lg font-semibold">{profile.risk_score}</span><Badge className={promptRiskBadgeClass(profile.risk_level)}>{t(`promptFilter.risk.levels.${profile.risk_level}`)}</Badge></div><div className="text-xs text-muted-foreground">{t('promptFilter.risk.identityConfidence')} {profile.identity_confidence}%</div></TableCell>
+            <TableCell className="font-mono text-xs">{profile.has_activity ? <><div>10m {profile.events_10m} · 24h {profile.events_24h}</div><div className="mt-1 text-muted-foreground">7d {profile.events_7d} · 30d {profile.events_30d}</div></> : <><div className="font-sans text-muted-foreground">{t('promptFilter.risk.noAttributedRequests')}</div>{profile.identity_updated_at ? <div className="mt-1 text-muted-foreground">{formatBeijingTime(profile.identity_updated_at)}</div> : null}</>}</TableCell>
+            <TableCell className="text-xs"><div>CY {profile.upstream_cy_count} · {t('promptFilter.risk.miss')} {profile.confirmed_miss_count}</div><div className="mt-1 text-muted-foreground">{t('promptFilter.risk.block')} {profile.local_block_count} · {t('promptFilter.risk.repeat')} {profile.repeated_fingerprints}</div></TableCell>
+            <TableCell className="text-xs"><div>{profile.api_key_name || profile.api_key_masked || (profile.api_key_id ? `Key #${profile.api_key_id}` : '-')}</div><div className="mt-1 max-w-[180px] truncate text-muted-foreground" title={profile.account_name}>{profile.account_name || (profile.account_id ? `Account #${profile.account_id}` : '-')}</div></TableCell>
+            <TableCell><div className="flex max-w-[240px] flex-wrap gap-1">{profile.recommended_actions.map((action) => <Badge key={action} variant="outline">{t(`promptFilter.risk.actions.${action}`)}</Badge>)}</div></TableCell>
+            <TableCell className="text-right"><PromptRiskProfileDetailButton profile={profile} /></TableCell>
+          </TableRow>
+        ))}</TableBody>
+      </Table>
+    </div>
+  )
+}
+
+function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile }) {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [open, setOpen] = useState(false)
+  const [trustOpen, setTrustOpen] = useState(false)
+  const [trustSaving, setTrustSaving] = useState(false)
+  const [unlockingConversation, setUnlockingConversation] = useState(false)
+  const [trustDraft, setTrustDraft] = useState({ durationHours: 24, riskThreshold: 35, reason: '' })
+  const [detail, setDetail] = useState<PromptRiskProfileDetailResponse | null>(null)
+  const [eventPage, setEventPage] = useState(1)
+  const [eventPageSize, setEventPageSize] = usePersistedPageSize('prompt_risk_profile_events', 20, DEFAULT_PAGE_SIZE_OPTIONS)
+  const [trustEventPage, setTrustEventPage] = useState(1)
+  const [trustEventPageSize, setTrustEventPageSize] = usePersistedPageSize('prompt_risk_profile_trust_events', 20, DEFAULT_PAGE_SIZE_OPTIONS)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const loadDetail = useCallback(async () => {
+    if (!open) return
+    setLoading(true)
+    setError(null)
+    try {
+      setDetail(await api.getPromptRiskProfile(profile.subject_type, profile.subject_key, eventPage, eventPageSize, trustEventPage, trustEventPageSize))
+    } catch (err) {
+      setError(getErrorMessage(err))
+    } finally {
+      setLoading(false)
+    }
+  }, [eventPage, eventPageSize, open, profile.subject_key, profile.subject_type, trustEventPage, trustEventPageSize])
+
+  useEffect(() => { void loadDetail() }, [loadDetail])
+  const item = detail?.profile ?? profile
+  const totalPages = Math.max(1, Math.ceil((detail?.event_total ?? 0) / eventPageSize))
+  const trustEventTotalPages = Math.max(1, Math.ceil((detail?.trust_event_total ?? 0) / trustEventPageSize))
+  const saveTrust = async () => {
+    setTrustSaving(true)
+    try {
+      await api.upsertPromptRiskTrust(item.subject_type, item.subject_key, {
+        duration_hours: trustDraft.durationHours,
+        risk_threshold: trustDraft.riskThreshold,
+        reason: trustDraft.reason.trim(),
+      })
+      setTrustOpen(false)
+      showToast(t('promptFilter.risk.trust.saved'))
+      await loadDetail()
+    } catch (err) {
+      showToast(getErrorMessage(err), 'error')
+    } finally {
+      setTrustSaving(false)
+    }
+  }
+  const revokeTrust = async () => {
+    setTrustSaving(true)
+    try {
+      await api.revokePromptRiskTrust(item.subject_type, item.subject_key)
+      showToast(t('promptFilter.risk.trust.revoked'))
+      await loadDetail()
+    } catch (err) {
+      showToast(getErrorMessage(err), 'error')
+    } finally {
+      setTrustSaving(false)
+    }
+  }
+  const unlockConversation = async () => {
+    const lock = item.conversation_lock
+    if (!lock || !window.confirm(t('promptFilter.risk.conversationLock.confirm'))) return
+    setUnlockingConversation(true)
+    try {
+      await api.unlockPromptConversation(lock.lock_key)
+      showToast(t('promptFilter.risk.conversationLock.unlocked'))
+      await loadDetail()
+    } catch (err) {
+      showToast(getErrorMessage(err), 'error')
+    } finally {
+      setUnlockingConversation(false)
+    }
+  }
+  return <>
+    <Button size="sm" variant="outline" onClick={() => { setEventPage(1); setTrustEventPage(1); setOpen(true) }}>{t('promptFilter.cyberDetail')}</Button>
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogContent className="max-h-[90vh] sm:max-w-6xl overflow-y-auto">
+        <DialogHeader><DialogTitle>{t('promptFilter.risk.detailTitle')}</DialogTitle><DialogDescription>{promptRiskIdentityPrimary(item)} · {t(`promptFilter.risk.subjects.${item.subject_type}`)}</DialogDescription></DialogHeader>
+        {loading && !detail ? <div className="py-8 text-center text-sm text-muted-foreground">{t('common.loading')}</div> : error ? <div className="text-sm text-destructive">{error}</div> : <div className="space-y-4">
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">{detail?.guardrail || t('promptFilter.risk.guardrail')}</div>
+          {item.conversation_lock?.status === 'active' ? <div className="rounded-lg border border-destructive/35 bg-destructive/5 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div><div className="flex items-center gap-2 font-semibold text-destructive"><ShieldAlert className="size-4" />{t('promptFilter.risk.conversationLock.title')}<Badge variant="destructive">{t('promptFilter.risk.conversationLock.active')}</Badge></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.risk.conversationLock.description')}</p></div>
+              <Button size="sm" variant="destructive" disabled={unlockingConversation} onClick={() => void unlockConversation()}>{t('promptFilter.risk.conversationLock.unlock')}</Button>
+            </div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.lockedAt')} value={formatBeijingTime(item.conversation_lock.locked_at)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.reason')} value={item.conversation_lock.reason_code} /><PromptPolicyDetailField label={t('promptFilter.colEndpoint')} value={item.conversation_lock.endpoint || '-'} /><PromptPolicyDetailField label={t('promptFilter.reviewModel')} value={item.conversation_lock.model || '-'} /></div>
+          </div> : null}
+          <div className="rounded-lg border bg-muted/20 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <div className="flex flex-wrap items-center gap-2 font-semibold"><Shield className="size-4" />{t('promptFilter.risk.trust.title')}{item.trust_policy ? <Badge variant={item.trust_policy.status === 'active' ? 'default' : 'outline'}>{t(`promptFilter.risk.trust.status.${item.trust_policy.status}`, { defaultValue: item.trust_policy.status })}</Badge> : null}</div>
+                <p className="mt-1 max-w-3xl text-xs leading-5 text-muted-foreground">{t('promptFilter.risk.trust.description')}</p>
+              </div>
+              {item.is_person ? <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={() => { setTrustDraft({ durationHours: 24, riskThreshold: item.trust_policy?.risk_threshold ?? 35, reason: item.trust_policy?.reason ?? '' }); setTrustOpen(true) }}>{item.trust_policy?.status === 'active' ? t('promptFilter.risk.trust.adjust') : t('promptFilter.risk.trust.enable')}</Button>{item.trust_policy?.status === 'active' ? <Button size="sm" variant="destructive" disabled={trustSaving} onClick={() => void revokeTrust()}>{t('promptFilter.risk.trust.revoke')}</Button> : null}</div> : null}
+            </div>
+            {item.trust_policy ? <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.trust.source')} value={t(`promptFilter.risk.trust.sources.${item.trust_policy.source || 'manual'}`)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.validUntil')} value={formatBeijingTime(item.trust_policy.valid_until)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.threshold')} value={String(item.trust_policy.risk_threshold)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.bypassCount')} value={String(item.trust_policy.bypass_count)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.modelReviewCount')} value={String(item.trust_policy.model_review_count ?? 0)} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.lastModelReview')} value={item.trust_policy.last_model_review_at ? formatBeijingTime(item.trust_policy.last_model_review_at) : '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.trust.lastEvaluation')} value={item.trust_policy.last_evaluated_at ? `${item.trust_policy.last_risk_score} · ${formatBeijingTime(item.trust_policy.last_evaluated_at)}` : '-'} /></div> : <p className="mt-3 text-xs text-muted-foreground">{item.is_person ? t('promptFilter.risk.trust.notEnabled') : t('promptFilter.risk.trust.personOnly')}</p>}
+          </div>
+          {detail?.adaptive_review_basis ? <div className="rounded-lg border border-sky-500/25 bg-sky-500/[0.04] p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div><div className="font-semibold">{t('promptFilter.risk.trust.basisTitle')}</div><p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.risk.trust.basisDescription')}</p></div>
+              <Badge variant={detail.adaptive_review_basis.decision === 'adaptive_active' ? 'default' : 'outline'}>{t(`promptFilter.risk.trust.decisions.${detail.adaptive_review_basis.decision}`, { defaultValue: detail.adaptive_review_basis.decision })}</Badge>
+            </div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+              <PromptPolicyDetailField label={t('promptFilter.risk.trust.cleanReviews')} value={`${detail.adaptive_review_basis.clean_review_count} / ${detail.adaptive_review_basis.min_clean_reviews}`} />
+              <PromptPolicyDetailField label={t('promptFilter.risk.trust.observationPeriod')} value={`${detail.adaptive_review_basis.observation_hours}h / ${detail.adaptive_review_basis.min_observation_hours}h`} />
+              <PromptPolicyDetailField label={t('promptFilter.risk.trust.positiveEvidence')} value={String(detail.adaptive_review_basis.positive_evidence_count)} />
+              <PromptPolicyDetailField label={t('promptFilter.risk.trust.riskBoundary')} value={`${item.risk_score} / ${detail.adaptive_review_basis.risk_threshold}`} />
+              <PromptPolicyDetailField label={t('promptFilter.risk.trust.sampleRate')} value={`${detail.adaptive_review_basis.sample_percent}%`} />
+              <PromptPolicyDetailField label={t('promptFilter.risk.trust.forceReviewInterval')} value={`${detail.adaptive_review_basis.force_review_interval_minutes} min`} />
+              <PromptPolicyDetailField label={t('promptFilter.risk.trust.lastCleanReview')} value={detail.adaptive_review_basis.last_clean_at ? formatBeijingTime(detail.adaptive_review_basis.last_clean_at) : '-'} />
+              <PromptPolicyDetailField label={t('promptFilter.risk.trust.nextForcedReview')} value={detail.adaptive_review_basis.force_review_due ? t('promptFilter.risk.trust.reviewDueNow') : detail.adaptive_review_basis.next_forced_review_at ? formatBeijingTime(detail.adaptive_review_basis.next_forced_review_at) : '-'} />
+            </div>
+            <div className="mt-3 rounded-md border bg-background/70 px-3 py-2 text-xs leading-5 text-muted-foreground">{item.trust_policy?.reason || t('promptFilter.risk.trust.basisFallbackReason')}</div>
+          </div> : null}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <MetricTile label={t('promptFilter.risk.totalScore')}><span className="font-mono text-xl">{item.risk_score}</span> <Badge className={promptRiskBadgeClass(item.risk_level)}>{t(`promptFilter.risk.levels.${item.risk_level}`)}</Badge></MetricTile>
+            <MetricTile label={t('promptFilter.risk.localSignal')}><span className="font-mono text-xl">{item.score_breakdown.local_signal}</span></MetricTile>
+            <MetricTile label={t('promptFilter.risk.upstreamSignal')}><span className="font-mono text-xl">{item.score_breakdown.upstream_signal}</span></MetricTile>
+            <MetricTile label={t('promptFilter.risk.recurrence')}><span className="font-mono text-xl">{item.score_breakdown.recurrence}</span></MetricTile>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+            <PromptPolicyDetailField label={t('promptFilter.risk.identity')} value={`${promptRiskIdentityPrimary(item)} · ${item.is_person ? t('promptFilter.risk.person') : t('promptFilter.risk.nonPerson')}`} />
+            <PromptPolicyDetailField label={t('promptFilter.risk.identityConfidence')} value={`${item.identity_confidence}%`} />
+            <PromptPolicyDetailField label={t('promptFilter.cyberSourceKey')} value={item.api_key_name || item.api_key_masked || (item.api_key_id ? `#${item.api_key_id}` : '-')} />
+            <PromptPolicyDetailField label={t('promptFilter.cyberAccount')} value={item.account_name || (item.account_id ? `#${item.account_id}` : '-')} />
+            <PromptPolicyDetailField label={t('promptFilter.risk.userId')} value={item.newapi_user_id ? `#${item.newapi_user_id}` : '-'} />
+            <PromptPolicyDetailField label={t('promptFilter.risk.userName')} value={item.newapi_user_name || '-'} />
+            <PromptPolicyDetailField label={t('promptFilter.risk.userEmail')} value={item.newapi_user_email || '-'} />
+            <PromptPolicyDetailField label={t('promptFilter.risk.userGroup')} value={item.newapi_user_group || '-'} />
+            <PromptPolicyDetailField label={t('promptFilter.risk.profileState')} value={t(item.has_activity ? 'promptFilter.risk.activeProfile' : 'promptFilter.risk.identityOnly')} />
+            <PromptPolicyDetailField label={t('promptFilter.risk.identitySource')} value={item.identity_source || '-'} />
+          </div>
+          <div><div className="mb-2 text-sm font-semibold">{t('promptFilter.risk.eventHistory')} · {detail?.event_total ?? 0}</div>
+            <div className="overflow-x-auto rounded-lg border border-border"><Table><TableHeader><TableRow><TableHead>{t('promptFilter.colTime')}</TableHead><TableHead>{t('promptFilter.risk.eventKind')}</TableHead><TableHead>{t('promptFilter.risk.requestEvidence')}</TableHead><TableHead>{t('promptFilter.colEndpoint')}</TableHead><TableHead>{t('promptFilter.risk.scope')}</TableHead></TableRow></TableHeader><TableBody>
+              {(detail?.events ?? []).map((event) => <TableRow key={event.id}><TableCell className="whitespace-nowrap text-xs">{formatBeijingTime(event.created_at)}</TableCell><TableCell><Badge variant="outline">{t(`promptFilter.risk.events.${event.event_kind}`)}</Badge>{event.action || event.local_outcome ? <div className="mt-1 text-[11px] text-muted-foreground">{event.action || '-'} · {event.local_outcome || '-'}</div> : null}</TableCell><TableCell className="text-xs"><div className="font-mono">{event.request_risk_score} × {event.evidence_confidence}%</div>{event.reason_code ? <div className="mt-1 text-muted-foreground">{event.reason_code}</div> : null}{event.prompt_preview ? <div className="mt-1 max-w-[360px] line-clamp-2" title={event.prompt_preview}>{event.prompt_preview}</div> : null}{event.incident_id || event.prompt_filter_log_id || event.request_correlation_id ? <div className="mt-1 font-mono text-[10px] text-muted-foreground" title={event.incident_id || event.request_correlation_id}>{event.incident_id ? `incident ${event.incident_id}` : event.prompt_filter_log_id ? `log #${event.prompt_filter_log_id}` : `request ${event.request_correlation_id}`}</div> : null}</TableCell><TableCell><div className="font-mono text-xs">{event.endpoint || '-'}</div><div className="text-xs text-muted-foreground">{event.model || '-'}</div></TableCell><TableCell className="text-xs"><div>{event.newapi_user_name || (event.newapi_user_id ? `${t('promptFilter.risk.userId')} #${event.newapi_user_id}` : event.api_key_name || event.api_key_masked || '-')}</div><div className="text-muted-foreground">{event.newapi_user_group ? `${event.newapi_user_group} · ` : ''}{event.account_name || '-'}</div></TableCell></TableRow>)}
+            </TableBody></Table></div>
+            <Pagination page={eventPage} totalPages={totalPages} totalItems={detail?.event_total ?? 0} pageSize={eventPageSize} onPageChange={setEventPage} onPageSizeChange={(next) => { setEventPage(1); setEventPageSize(next) }} pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS} />
+          </div>
+          <div><div className="mb-2 text-sm font-semibold">{t('promptFilter.risk.trust.history')} · {detail?.trust_event_total ?? 0}</div><div className="overflow-x-auto rounded-lg border"><Table><TableHeader><TableRow><TableHead>{t('promptFilter.colTime')}</TableHead><TableHead>{t('promptFilter.risk.trust.operation')}</TableHead><TableHead>{t('promptFilter.risk.score')}</TableHead><TableHead>{t('promptFilter.risk.trust.requestAudit')}</TableHead><TableHead>{t('promptFilter.risk.trust.reason')}</TableHead></TableRow></TableHeader><TableBody>{detail?.trust_events.map((event) => <TableRow key={event.id}><TableCell className="whitespace-nowrap text-xs">{formatBeijingTime(event.created_at)}</TableCell><TableCell><Badge variant="outline">{t(`promptFilter.risk.trust.events.${event.event_type}`, { defaultValue: event.event_type })}</Badge></TableCell><TableCell className="font-mono text-xs">{event.risk_score}{event.risk_level ? ` · ${t(`promptFilter.risk.levels.${event.risk_level}`, { defaultValue: event.risk_level })}` : ''}</TableCell><TableCell className="font-mono text-[10px] text-muted-foreground" title={event.request_id_hash}>{event.request_id_hash ? event.request_id_hash.slice(0, 20) : '-'}</TableCell><TableCell className="text-xs">{event.reason || '-'}</TableCell></TableRow>)}{!detail?.trust_events.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">{t('promptFilter.risk.trust.noHistory')}</TableCell></TableRow> : null}</TableBody></Table></div><Pagination page={trustEventPage} totalPages={trustEventTotalPages} totalItems={detail?.trust_event_total ?? 0} pageSize={trustEventPageSize} onPageChange={setTrustEventPage} onPageSizeChange={(next) => { setTrustEventPage(1); setTrustEventPageSize(next) }} pageSizeOptions={DEFAULT_PAGE_SIZE_OPTIONS} /></div>
+        </div>}
+      </DialogContent>
+    </Dialog>
+    <Dialog open={trustOpen} onOpenChange={(value) => { if (!trustSaving) setTrustOpen(value) }}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>{t('promptFilter.risk.trust.dialogTitle')}</DialogTitle><DialogDescription>{t('promptFilter.risk.trust.dialogDescription')}</DialogDescription></DialogHeader>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <Field label={t('promptFilter.risk.trust.duration')}><Select value={String(trustDraft.durationHours)} onValueChange={(value) => setTrustDraft((current) => ({ ...current, durationHours: Number(value) }))} options={[{ label: '24h', value: '24' }, { label: '72h', value: '72' }, { label: '7d', value: '168' }, { label: '30d', value: '720' }]} /></Field>
+          <Field label={t('promptFilter.risk.trust.threshold')}><DraftNumberInput min={15} max={79} value={trustDraft.riskThreshold} onValueChange={(value) => setTrustDraft((current) => ({ ...current, riskThreshold: value }))} /></Field>
+        </div>
+        <Field label={t('promptFilter.risk.trust.reason')} hint={t('promptFilter.risk.trust.reasonHint')}><Textarea rows={4} value={trustDraft.reason} onChange={(event) => setTrustDraft((current) => ({ ...current, reason: event.target.value }))} /></Field>
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs leading-5 text-muted-foreground">{t('promptFilter.risk.trust.safetyHint')}</div>
+        <DialogFooter><Button variant="outline" disabled={trustSaving} onClick={() => setTrustOpen(false)}>{t('common.cancel')}</Button><Button disabled={trustSaving || !trustDraft.reason.trim()} onClick={() => void saveTrust()}>{trustSaving ? t('common.saving') : t('common.save')}</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
+  </>
+}
+
+function promptRiskBadgeClass(level: PromptRiskProfile['risk_level']) {
+  switch (level) {
+    case 'critical': return 'border-red-600 bg-red-600 text-white'
+    case 'high': return 'border-orange-500 bg-orange-500 text-white'
+    case 'elevated': return 'border-amber-500 bg-amber-500 text-black'
+    case 'observed': return 'border-blue-500 bg-blue-500 text-white'
+    default: return 'border-emerald-600 bg-emerald-600 text-white'
+  }
 }
 
 function RulesView({
@@ -2499,11 +3964,12 @@ function RulesView({
   onRulesUpdated: (rules: PromptFilterRulesResponse, settings?: SystemSettings) => void
 }) {
   const { t } = useTranslation()
+  const { showToast } = useToast()
   const [infoOpen, setInfoOpen] = useState(false)
   const [previewRule, setPreviewRule] = useState<PromptFilterRule | null>(null)
   const [previewPatternCopied, setPreviewPatternCopied] = useState(false)
   const [customDialogMode, setCustomDialogMode] = useState<'create' | 'edit' | null>(null)
-  const [editingCustomIndex, setEditingCustomIndex] = useState<number | null>(null)
+  const [editingCustomOriginalFingerprint, setEditingCustomOriginalFingerprint] = useState<string | null>(null)
   const [customDialogDraft, setCustomDialogDraft] = useState<CustomRuleDraft>(defaultCustomRuleDraft)
   const [savingRule, setSavingRule] = useState('')
   const [categoryFilter, setCategoryFilter] = useState<string>('')
@@ -2528,7 +3994,10 @@ function RulesView({
   }
 
   const disabled = useMemo(() => parseJSONList<string>(form.prompt_filter_disabled_patterns), [form.prompt_filter_disabled_patterns])
-  const customPatterns = rules?.custom_patterns ?? parseJSONList<PromptFilterRule>(form.prompt_filter_custom_patterns)
+  const customPatterns = useMemo(
+    () => parseJSONList<PromptFilterRule>(form.prompt_filter_custom_patterns),
+    [form.prompt_filter_custom_patterns],
+  )
 
   const allCategories = useMemo(() => {
     const cats = new Set<string>()
@@ -2580,16 +4049,34 @@ function RulesView({
     const names = (rules?.builtin_patterns ?? [])
       .map((item) => item.name)
       .filter((name) => current.has(name.toLowerCase()))
-    await savePartialAndReload({ prompt_filter_disabled_patterns: JSON.stringify(names) })
-    setSelectedRules(new Set())
+    if (await savePartialAndReload({ prompt_filter_disabled_patterns: JSON.stringify(names) })) {
+      setSelectedRules(new Set())
+    }
   }
 
-  const savePartialAndReload = async (partial: Partial<SystemSettings>) => {
+  const savePartialAndReload = async (partial: Partial<SystemSettings>): Promise<boolean> => {
     setSavingRule('rules')
     try {
       const updated = await api.updateSettings(partial)
       const nextRules = await api.getPromptFilterRules()
       onRulesUpdated(nextRules, updated)
+      return true
+    } catch (error) {
+      if (error instanceof AdminAPIError && error.status === 409) {
+        try {
+          const [latestSettings, latestRules] = await Promise.all([
+            api.getSettings(),
+            api.getPromptFilterRules(),
+          ])
+          onRulesUpdated(latestRules, latestSettings)
+          showToast(t('promptFilter.ruleSaveConflict'), 'warning')
+        } catch (refreshError) {
+          showToast(`${t('promptFilter.ruleSaveConflictRefreshFailed')}: ${getErrorMessage(refreshError)}`, 'error')
+        }
+        return false
+      }
+      showToast(`${t('promptFilter.saveFailed')}: ${getErrorMessage(error)}`, 'error')
+      return false
     } finally {
       setSavingRule('')
     }
@@ -2608,13 +4095,16 @@ function RulesView({
     await savePartialAndReload({ prompt_filter_disabled_patterns: JSON.stringify(names) })
   }
 
-  const saveCustomPatterns = async (next: PromptFilterRule[]) => {
-    await savePartialAndReload({ prompt_filter_custom_patterns: JSON.stringify(next) })
+  const saveCustomPatterns = async (next: PromptFilterRule[]): Promise<boolean> => {
+    return savePartialAndReload({
+      prompt_filter_custom_patterns: JSON.stringify(next),
+      prompt_filter_custom_patterns_expected: form.prompt_filter_custom_patterns || '[]',
+    })
   }
 
   const startCreateCustomRule = () => {
     setCustomDialogMode('create')
-    setEditingCustomIndex(null)
+    setEditingCustomOriginalFingerprint(null)
     setCustomDialogDraft(defaultCustomRuleDraft)
   }
 
@@ -2622,13 +4112,13 @@ function RulesView({
     const rule = customPatterns[index]
     if (!rule) return
     setCustomDialogMode('edit')
-    setEditingCustomIndex(index)
+    setEditingCustomOriginalFingerprint(customRuleIdentity(rule))
     setCustomDialogDraft(customRuleDraftFromRule(rule))
   }
 
   const closeCustomRuleDialog = () => {
     setCustomDialogMode(null)
-    setEditingCustomIndex(null)
+    setEditingCustomOriginalFingerprint(null)
     setCustomDialogDraft(defaultCustomRuleDraft)
   }
 
@@ -2639,7 +4129,7 @@ function RulesView({
     if (!name || !pattern.trim() || weight === null) return
 
     if (customDialogMode === 'create') {
-      await saveCustomPatterns([
+      const saved = await saveCustomPatterns([
         ...customPatterns,
         {
           name,
@@ -2650,14 +4140,15 @@ function RulesView({
           enabled: true,
         },
       ])
-      closeCustomRuleDialog()
+      if (saved) closeCustomRuleDialog()
       return
     }
 
-    if (customDialogMode === 'edit' && editingCustomIndex !== null) {
+    if (customDialogMode === 'edit' && editingCustomOriginalFingerprint !== null) {
+      const editingCustomIndex = customPatterns.findIndex((rule) => customRuleIdentity(rule) === editingCustomOriginalFingerprint)
       const existing = customPatterns[editingCustomIndex]
-      if (!existing) {
-        closeCustomRuleDialog()
+      if (editingCustomIndex < 0 || !existing) {
+        showToast(t('promptFilter.ruleEditTargetMissing'), 'warning')
         return
       }
       const next = customPatterns.map((rule, index) => index === editingCustomIndex ? {
@@ -2669,8 +4160,7 @@ function RulesView({
         strict: customDialogDraft.strict,
         enabled: rule.enabled !== false,
       } : rule)
-      await saveCustomPatterns(next)
-      closeCustomRuleDialog()
+      if (await saveCustomPatterns(next)) closeCustomRuleDialog()
     }
   }
 
@@ -2814,7 +4304,7 @@ function RulesView({
                   </TableRow>
                 ) : customPatterns.map((rule, index) => (
                   <RuleRow
-                    key={`${rule.name}-${index}`}
+                    key={`${customRuleIdentity(rule)}-${index}`}
                     rule={{ ...rule, builtin: false, enabled: rule.enabled !== false }}
                     onPreview={() => openRulePreview({ ...rule, builtin: false, enabled: rule.enabled !== false })}
                     onToggle={() => void toggleCustom(index)}
@@ -3122,19 +4612,210 @@ function RuleRow({
   )
 }
 
+function PromptPolicyIncidentsTable({ incidents }: { incidents: PromptPolicyIncident[] }) {
+  const { t } = useTranslation()
+  return (
+    <div className="overflow-x-auto rounded-lg border border-border">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>{t('promptFilter.colTime')}</TableHead>
+            <TableHead>{t('promptFilter.cyberUpstream')}</TableHead>
+            <TableHead>{t('promptFilter.cyberLocalResult')}</TableHead>
+            <TableHead>{t('promptFilter.cyberSourceKey')}</TableHead>
+            <TableHead>{t('promptFilter.cyberAccount')}</TableHead>
+            <TableHead>{t('promptFilter.colScore')}</TableHead>
+            <TableHead>{t('promptFilter.colEndpoint')}</TableHead>
+            <TableHead>{t('promptFilter.cyberAttempt')}</TableHead>
+            <TableHead className="text-right">{t('promptFilter.cyberDetail')}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {incidents.length === 0 ? (
+            <TableRow><TableCell colSpan={9} className="py-8 text-center text-sm text-muted-foreground">{t('promptFilter.noCyberIncidents')}</TableCell></TableRow>
+          ) : incidents.map((incident) => (
+            <TableRow key={incident.incident_id}>
+              <TableCell className="whitespace-nowrap text-xs">{formatBeijingTime(incident.created_at)}</TableCell>
+              <TableCell><Badge variant="destructive">{incident.upstream_error_code || 'cyber_policy'} · {incident.status_code || '-'}</Badge></TableCell>
+              <TableCell>
+                <div className="flex flex-wrap items-center gap-1">
+                  <Badge variant="outline">{t(`promptFilter.cyberState.${incident.local_evaluation_state}`)}</Badge>
+                  <Badge variant="secondary">{t(`promptFilter.cyberOutcome.${incident.local_outcome}`)}</Badge>
+                  <Badge variant={incident.local_comparison === 'confirmed_miss' ? 'destructive' : 'outline'}>{t(`promptFilter.cyberComparisonStatus.${incident.local_comparison}`)}</Badge>
+                </div>
+              </TableCell>
+              <TableCell>
+                <div className="max-w-[160px] truncate text-sm" title={incident.api_key_name}>{incident.api_key_name || incident.api_key_masked || '-'}</div>
+                <div className="font-mono text-xs text-muted-foreground">#{incident.api_key_id || '-'}{incident.api_key_masked ? ` · ${incident.api_key_masked}` : ''}</div>
+              </TableCell>
+              <TableCell>
+                <div className="max-w-[180px] truncate text-sm" title={incident.account_name}>{incident.account_name || `#${incident.account_id || '-'}`}</div>
+                <div className="max-w-[200px] truncate text-xs text-muted-foreground" title={incident.account_group_names?.join(', ')}>{incident.account_group_names?.join(', ') || '-'}</div>
+				{incident.routing_snapshot_state === 'current_inferred' ? <div className="text-[11px] text-amber-600 dark:text-amber-300">{t('promptFilter.cyberRoutingState.current_inferred')}</div> : null}
+              </TableCell>
+              <TableCell className="font-mono text-xs">{formatPromptPolicyScore(incident.local_score, t('promptFilter.cyberUnscored'))} / {formatPromptPolicyScore(incident.local_audit_score, t('promptFilter.cyberUnscored'))}</TableCell>
+              <TableCell><div className="font-mono text-xs">{incident.endpoint || '-'}</div><div className="text-xs text-muted-foreground">{incident.model || '-'}</div></TableCell>
+              <TableCell className="font-mono text-xs">{incident.transport || '-'} · #{incident.attempt_index || '-'}</TableCell>
+              <TableCell className="text-right"><PromptPolicyIncidentDetailButton incident={incident} /></TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  )
+}
+
+function PromptPolicyIncidentDetailButton({ incident }: { incident: PromptPolicyIncident }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [detail, setDetail] = useState<PromptPolicyIncidentDetailResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const show = async () => {
+    setOpen(true)
+    if (detail || loading) return
+    setLoading(true)
+    setError(null)
+    try {
+      setDetail(await api.getPromptPolicyIncident(incident.incident_id))
+    } catch (err) {
+      setError(getErrorMessage(err))
+    } finally {
+      setLoading(false)
+    }
+  }
+  const item = detail?.incident ?? incident
+  const content = (item.prompt_text || item.prompt_preview || '').trim()
+  return (
+    <>
+      <Button size="sm" variant="outline" onClick={() => void show()}>{t('promptFilter.cyberDetail')}</Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="max-h-[90vh] sm:max-w-4xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{t('promptFilter.cyberDetailTitle')}</DialogTitle>
+            <DialogDescription className="break-all font-mono">{item.incident_id}</DialogDescription>
+          </DialogHeader>
+          {loading ? <div className="py-8 text-center text-sm text-muted-foreground">{t('common.loading')}</div> : error ? <div className="text-sm text-destructive">{error}</div> : (
+            <div className="space-y-4 text-sm">
+              {item.local_evaluation_state === 'legacy_unknown' ? <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-amber-700 dark:text-amber-300">{t('promptFilter.cyberLegacyUnknown')}</div> : null}
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                <PromptPolicyDetailField label={t('promptFilter.cyberUpstream')} value={`${item.status_code || '-'} · ${item.upstream_error_code || 'cyber_policy'}`} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberLocalResult')} value={`${t(`promptFilter.cyberState.${item.local_evaluation_state}`)} · ${t(`promptFilter.cyberOutcome.${item.local_outcome}`)}`} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberComparison')} value={t(`promptFilter.cyberComparisonStatus.${item.local_comparison}`)} />
+                <PromptPolicyDetailField label={t('promptFilter.executionScore')} value={formatPromptPolicyScore(item.local_score, t('promptFilter.cyberUnscored'))} />
+                <PromptPolicyDetailField label={t('promptFilter.auditScore')} value={formatPromptPolicyScore(item.local_audit_score, t('promptFilter.cyberUnscored'))} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberProtocolTransport')} value={`${item.protocol || '-'} · ${item.transport || '-'}`} />
+                <PromptPolicyDetailField label={t('promptFilter.model')} value={item.model || '-'} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberSourceKey')} value={`${item.api_key_name || item.api_key_masked || '-'} · #${item.api_key_id || '-'}`} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberAccountAttempt')} value={`${item.account_name || '-'} · #${item.account_id || '-'} · ${t('promptFilter.cyberAttempt')} #${item.attempt_index || '-'}`} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberAccountPlatform')} value={item.account_platform || item.platform || '-'} />
+				<PromptPolicyDetailField label={t('promptFilter.cyberRoutingSource')} value={t(`promptFilter.cyberRoutingState.${item.routing_snapshot_state || 'unavailable'}`)} />
+                <PromptPolicyDetailField label={t('promptFilter.risk.newapiIdentity')} value={item.newapi_user_id ? `${item.newapi_platform || '-'} · ${item.newapi_user_id} · ${item.newapi_policy_status || '-'}` : '-'} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberGroups')} value={item.account_group_names?.join(', ') || item.account_group_ids?.join(', ') || '-'} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberKeyAllowedGroups')} value={item.api_key_allowed_group_names?.join(', ') || item.api_key_allowed_group_ids?.join(', ') || '-'} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberPromptAvailable')} value={item.prompt_available ? t('promptFilter.testResultYes') : t('promptFilter.testResultNo')} />
+                <PromptPolicyDetailField label={t('promptFilter.cyberCandidate')} value={detail?.candidate ? `${detail.candidate.status} · #${detail.candidate.id}` : '-'} />
+              </div>
+              {(item.local_reason || item.local_reason_code) ? <PromptPolicyDetailField label={t('promptFilter.cyberReason')} value={item.local_reason || item.local_reason_code} /> : null}
+              {detail && detail.matches.length > 0 ? <div><div className="mb-2 font-semibold">{t('promptFilter.testResultMatches')}</div><div className="flex flex-wrap gap-1.5">{detail.matches.map((match, index) => <Badge key={`${match.name}-${index}`} variant="secondary">{match.name} · {match.weight}</Badge>)}</div></div> : null}
+              {content ? <div><div className="mb-2 font-semibold">{t('promptFilter.userPromptLabel')}</div><pre className="max-h-[45vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs">{content}</pre></div> : null}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
+function PromptPolicyDetailField({ label, value }: { label: string; value: string }) {
+  return <div className="rounded-md border border-border bg-muted/20 p-2.5"><div className="text-xs font-semibold text-muted-foreground">{label}</div><div className="mt-1 break-words">{value}</div></div>
+}
+
+function formatPromptPolicyScore(value: number | null | undefined, unscored: string) {
+  return value === null || value === undefined ? unscored : String(value)
+}
+
+function PromptReviewLogsTable({ logs }: { logs: PromptFilterLog[] }) {
+  const { t } = useTranslation()
+  return (
+    <div className="overflow-x-auto rounded-lg border border-border">
+      <Table className="min-w-[980px] table-fixed">
+        <TableHeader>
+          <TableRow>
+            <TableHead className="w-[150px]">{t('promptFilter.colTime')}</TableHead>
+            <TableHead className="w-[330px]">{t('promptFilter.reviewRequest')}</TableHead>
+            <TableHead className="w-[300px]">{t('promptFilter.reviewResponse')}</TableHead>
+            <TableHead className="w-[110px]">{t('promptFilter.reviewFinalAction')}</TableHead>
+	            <TableHead>{t('promptFilter.reviewHistoryScope')}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {logs.length === 0 ? (
+            <TableRow><TableCell colSpan={5} className="h-24 text-center text-muted-foreground">{t('promptFilter.reviewHistoryEmpty')}</TableCell></TableRow>
+          ) : logs.map((log) => {
+            const reviewFailed = Boolean(log.review_error)
+            const confidence = typeof log.review_confidence === 'number' ? log.review_confidence.toFixed(2) : t('promptFilter.notScored')
+            const threshold = typeof log.review_threshold === 'number' ? log.review_threshold.toFixed(2) : '-'
+            const moderationCategory = log.review_request_mode === 'moderations'
+              ? log.review_reason?.match(/^moderation decision:\s+(\S+)/)?.[1]
+              : undefined
+            return (
+              <TableRow key={`review-${log.id}`}>
+                <TableCell className="align-top">
+                  <div className="font-medium">{formatRelativeTime(log.created_at, { variant: 'compact' })}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">{formatBeijingTime(log.created_at)}</div>
+                  {typeof log.review_latency_ms === 'number' ? <div className="mt-1 font-mono text-xs text-muted-foreground">{log.review_latency_ms} ms</div> : null}
+                </TableCell>
+                <TableCell className="align-top">
+                  <div className="flex flex-wrap gap-1.5">
+                    <Badge variant="outline">{log.review_model || '-'}</Badge>
+                    {log.review_request_mode ? <Badge variant="secondary">{log.review_request_mode}</Badge> : null}
+                  </div>
+                  <div className="mt-2 font-mono text-xs">{log.endpoint || '-'}</div>
+                  <div className="font-mono text-xs text-muted-foreground">{log.model || '-'}</div>
+                  {log.review_endpoint ? <div className="mt-1 break-all text-[11px] text-muted-foreground">→ {log.review_endpoint}</div> : null}
+                  <div className="mt-2 line-clamp-3 break-words rounded-md bg-muted/40 px-2 py-1.5 text-xs leading-5" title={stripHitMarkers(log.text_preview || '')}>
+                    {log.text_preview ? <HighlightedPromptPreview text={log.text_preview} /> : t('promptFilter.reviewRequestUnavailable')}
+                  </div>
+                </TableCell>
+                <TableCell className="align-top">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <Badge variant={reviewFailed || log.review_flagged ? 'destructive' : 'default'}>
+                      {reviewFailed ? t('promptFilter.reviewResultError') : log.review_flagged ? t('promptFilter.labels.reviewFlagged') : t('promptFilter.labels.reviewCleared')}
+                    </Badge>
+                    <span className="font-mono text-xs">{moderationCategory ? `${moderationCategory} ` : ''}{confidence} / {threshold}</span>
+                  </div>
+                  {log.review_reason ? <p className="mt-2 text-xs leading-5">{log.review_reason}</p> : null}
+                  {log.review_error ? <p className="mt-2 break-words text-xs leading-5 text-destructive">{log.review_error}</p> : null}
+                </TableCell>
+                <TableCell className="align-top"><ActionBadge action={log.action} /></TableCell>
+                <TableCell className="align-top text-xs">
+                  <div>{log.api_key_name || log.api_key_masked || (log.api_key_id ? `#${log.api_key_id}` : '-')}</div>
+                  {log.newapi_user_id ? <div className="mt-1 truncate text-muted-foreground" title={log.newapi_user_id}>{t('promptFilter.newapiUser')} {log.newapi_user_id}</div> : null}
+                  {log.request_correlation_id ? <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={log.request_correlation_id}>{log.request_correlation_id}</div> : null}
+                </TableCell>
+              </TableRow>
+            )
+          })}
+        </TableBody>
+      </Table>
+    </div>
+  )
+}
+
 function PromptFilterLogsTable({ logs, compact = false }: { logs: PromptFilterLog[]; compact?: boolean }) {
   const { t } = useTranslation()
   return (
-    <div className="rounded-lg border border-border">
-      <Table className="table-fixed">
+    <div className="overflow-hidden rounded-lg border border-border">
+      <Table className={cn('table-fixed', compact ? 'min-w-[1180px]' : 'min-w-[1420px]')}>
         <TableHeader>
           <TableRow>
-            <TableHead className={compact ? 'w-[92px]' : 'w-[150px]'}>{t('promptFilter.colTime')}</TableHead>
-            <TableHead className={compact ? 'w-[82px]' : 'w-[96px]'}>{t('promptFilter.colAction')}</TableHead>
+            <TableHead className={compact ? 'w-[96px]' : 'w-[150px]'}>{t('promptFilter.colTime')}</TableHead>
+            <TableHead className={compact ? 'w-[166px]' : 'w-[180px]'}>{t('promptFilter.colAction')}</TableHead>
             <TableHead className={compact ? 'w-[150px]' : 'w-[180px]'}>{t('promptFilter.colEndpoint')}</TableHead>
-            <TableHead className={compact ? 'w-[132px]' : 'w-[156px]'}>{t('promptFilter.colScore')}</TableHead>
-            <TableHead className={compact ? 'w-[150px]' : 'w-[220px]'}>{t('promptFilter.colMatch')}</TableHead>
-            <TableHead className={compact ? 'w-[118px]' : 'w-[160px]'}>{t('promptFilter.colApiKey')}</TableHead>
+            <TableHead className={compact ? 'w-[144px]' : 'w-[156px]'}>{t('promptFilter.colScore')}</TableHead>
+            <TableHead className={compact ? 'w-[190px]' : 'w-[230px]'}>{t('promptFilter.colMatch')}</TableHead>
+            <TableHead className={compact ? 'w-[132px]' : 'w-[170px]'}>{t('promptFilter.colApiKey')}</TableHead>
             <TableHead>{t('promptFilter.colPreview')}</TableHead>
           </TableRow>
         </TableHeader>
@@ -3187,9 +4868,9 @@ function Textarea({ className, ...props }: TextareaHTMLAttributes<HTMLTextAreaEl
   )
 }
 
-function VerdictBadge({ verdict }: { verdict: PromptFilterVerdict }) {
+function TestDecisionBadge({ result }: { result: PromptFilterTestResponse }) {
   const { t } = useTranslation()
-  const action = verdict.action
+  const action = result.decision?.action || result.verdict.action
   if (action === 'block') {
     return (
       <Badge variant="destructive" className="gap-1.5">
@@ -3214,29 +4895,81 @@ function VerdictBadge({ verdict }: { verdict: PromptFilterVerdict }) {
   )
 }
 
-function VerdictPanel({ verdict }: { verdict: PromptFilterVerdict }) {
+function PromptFilterTestResultPanel({ result }: { result: PromptFilterTestResponse }) {
   const { t } = useTranslation()
-  const localizedMode = verdict.mode === 'block'
+  const { verdict, decision } = result
+  const mode = decision?.mode || verdict.mode
+  const action = decision?.action || verdict.action
+  const localizedAction = action === 'block'
     ? t('promptFilter.modeBlock')
-    : verdict.mode === 'warn'
+    : action === 'warn'
       ? t('promptFilter.modeWarn')
-      : verdict.mode === 'monitor'
+      : t('promptFilter.actionAllow')
+  const localizedMode = mode === 'block'
+    ? t('promptFilter.modeBlock')
+    : mode === 'warn'
+      ? t('promptFilter.modeWarn')
+      : mode === 'monitor'
         ? t('promptFilter.modeMonitor')
-        : promptGuardModes.includes(verdict.mode as PromptGuardMode)
-          ? t(`promptFilter.guard.modes.${verdict.mode}.label`)
+        : promptGuardModes.includes(mode as PromptGuardMode)
+          ? t(`promptFilter.guard.modes.${mode}.label`)
           : t('promptFilter.unknownMode')
+  const localizedProfile = decision?.profile && promptGuardProfiles.includes(decision.profile as PromptGuardProfile)
+    ? t(`promptFilter.guard.profiles.${decision.profile}.label`)
+    : t('promptFilter.guard.unknownProfile')
+  const localizedOrigin = decision?.primary_origin
+    ? t(`promptFilter.origins.${decision.primary_origin}`, { defaultValue: decision.primary_origin })
+    : '-'
+  const localizedProvider = result.provider
+    ? t(`promptFilter.guard.providers.${result.provider}.label`, { defaultValue: result.provider })
+    : '-'
+  const decisionReason = decision?.reason?.trim() || ''
+  const verdictReason = verdict.reason?.trim() || ''
   const localizedReview = verdict.reviewed
     ? (verdict.review_flagged ? t('promptFilter.testReviewFlagged') : t('promptFilter.testReviewCleared'))
     : t('promptFilter.testReviewSkipped')
   return (
     <div className="rounded-lg border border-border bg-muted/25 p-3">
-      <div className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-2 text-sm">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-semibold text-foreground">{t('promptFilter.testResultPipelineTitle')}</div>
+          <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+            {decision ? t('promptFilter.testResultPipelineHint') : t('promptFilter.testResultLegacyFallbackHint')}
+          </p>
+        </div>
+        <TestDecisionBadge result={result} />
+      </div>
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(135px,1fr))] gap-2 text-sm">
+        <MiniStat label={t('promptFilter.testResultFinalAction')} value={localizedAction} />
         <MiniStat label={t('promptFilter.testResultMode')} value={localizedMode} />
-        <MiniStat label={t('promptFilter.testResultScore')} value={`${verdict.score} / ${verdict.threshold}`} />
+        <MiniStat label={t('promptFilter.testResultProfile')} value={decision ? localizedProfile : '-'} />
+        <MiniStat
+          label={t('promptFilter.testResultProtocolProvider')}
+          value={[result.protocol || '-', localizedProvider].join(' · ')}
+        />
+        <MiniStat
+          label={t('promptFilter.testResultEndpointModel')}
+          value={[result.endpoint || '-', result.model || '-'].join(' · ')}
+        />
+        <MiniStat label={t('promptFilter.testResultExecutionScore')} value={`${decision?.score ?? verdict.score} / ${verdict.threshold}`} />
+        <MiniStat label={t('promptFilter.testResultAuditScore')} value={String(decision?.audit_score ?? 0)} />
+        <MiniStat label={t('promptFilter.testResultOrigin')} value={localizedOrigin} />
+        <MiniStat label={t('promptFilter.testResultReasonCode')} value={decision?.reason_code || '-'} mono />
+        <MiniStat
+          label={t('promptFilter.testResultStrikeEligible')}
+          value={decision?.strike_eligible ? t('promptFilter.testResultYes') : t('promptFilter.testResultNo')}
+        />
         <MiniStat label={t('promptFilter.testResultMatches')} value={String(verdict.matched?.length ?? 0)} />
         <MiniStat label={t('promptFilter.testResultReview')} value={localizedReview} />
       </div>
-      {verdict.reason ? <p className="mt-3 text-sm text-muted-foreground">{verdict.reason}</p> : null}
+      {decision?.primary_detector ? (
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <span>{t('promptFilter.testResultPrimaryDetector')}</span>
+          <Badge variant="outline" className="font-mono text-[11px]">{decision.primary_detector}</Badge>
+        </div>
+      ) : null}
+      {decisionReason ? <p className="mt-3 text-sm text-muted-foreground">{decisionReason}</p> : null}
+      {verdictReason && verdictReason !== decisionReason ? <p className="mt-3 text-sm text-muted-foreground">{verdictReason}</p> : null}
       {verdict.review_error ? <p className="mt-2 text-sm text-destructive">{verdict.review_error}</p> : null}
       {verdict.matched?.length ? (
         <div className="mt-3 flex flex-wrap gap-1.5">
@@ -3348,11 +5081,11 @@ function stripHitMarkers(text: string): string {
   return text.split(HIT_START_MARKER).join('').split(HIT_END_MARKER).join('')
 }
 
-function MiniStat({ label, value }: { label: string; value: string }) {
+function MiniStat({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="rounded-md border border-border bg-background px-3 py-2">
       <div className="text-[11px] font-bold uppercase text-muted-foreground">{label}</div>
-      <div className="mt-1 font-semibold text-foreground">{value}</div>
+      <div className={cn('mt-1 break-words font-semibold text-foreground', mono && 'font-mono text-xs')}>{value}</div>
     </div>
   )
 }
@@ -3380,6 +5113,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
   const legacyMissingMatchContext = !matchContext && !userPrompt && !fullText &&
     auxiliaryOrigin
   const auditScore = typeof log.audit_score === 'number' ? log.audit_score : undefined
+  const apiKeyLabel = log.api_key_name || log.api_key_masked || '-'
   return (
     <>
     <TableRow>
@@ -3387,25 +5121,42 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         <div className="font-medium text-foreground">{formatRelativeTime(log.created_at, { variant: 'compact' })}</div>
         {!compact ? <div className="text-xs text-muted-foreground">{formatBeijingTime(log.created_at)}</div> : null}
       </TableCell>
-      <TableCell className="min-w-0 align-top">
-        {/* table-fixed 下动作列较窄；徽章默认 whitespace-nowrap 会按内容自然宽度
-            横向溢出盖住相邻端点列（如"当前用户 Prompt"这类长 origin 标签）。
-            允许列内换行，把内容约束在单元格宽度内。 */}
-        <div className="flex min-w-0 flex-col items-start gap-1">
-          <ActionBadge action={log.action} />
-          {log.policy_profile ? <Badge variant="outline" className="h-auto max-w-full whitespace-normal break-words text-left leading-tight text-[11px]">{policyProfileLabel}</Badge> : null}
-          {log.primary_origin ? (
-            <Badge
-              variant="secondary"
-              className="h-auto max-w-full whitespace-normal break-words text-left leading-tight text-[11px]"
-              title={`${t('promptFilter.triggerOrigin')}: ${primaryOriginLabel}`}
-            >
-              {primaryOriginLabel}
-            </Badge>
+      <TableCell className="min-w-0 align-top whitespace-normal">
+        <div className="min-w-0 rounded-lg border border-border/70 bg-muted/20 p-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+            <ActionBadge action={log.action} />
+            {log.policy_profile ? (
+              <span className="min-w-0 truncate text-[11px] font-semibold text-muted-foreground" title={policyProfileLabel}>
+                {policyProfileLabel}
+              </span>
+            ) : null}
+          </div>
+          <div className="mt-2 space-y-1 text-[11px] leading-4 text-muted-foreground">
+            {log.primary_origin ? (
+              <div className="flex min-w-0 items-center gap-1.5" title={`${t('promptFilter.triggerOrigin')}: ${primaryOriginLabel}`}>
+                <FileText className="size-3 shrink-0 text-sky-600 dark:text-sky-400" />
+                <span className="min-w-0 truncate">{primaryOriginLabel}</span>
+              </div>
+            ) : null}
+            {log.review_model ? (
+              <div className="flex min-w-0 items-center gap-1.5">
+                <Sparkles className={cn('size-3 shrink-0', log.review_flagged ? 'text-destructive' : 'text-emerald-600 dark:text-emerald-400')} />
+                <span className="min-w-0 truncate">{log.review_flagged ? t('promptFilter.labels.reviewFlagged') : t('promptFilter.labels.reviewCleared')}</span>
+              </div>
+            ) : null}
+            {log.newapi_policy_status ? (
+              <div className="flex min-w-0 items-center gap-1.5" title={log.newapi_decision_id || undefined}>
+                <Network className={cn('size-3 shrink-0', log.newapi_policy_status === 'verification_failed' ? 'text-destructive' : 'text-muted-foreground')} />
+                <span className="min-w-0 truncate">{t(`promptFilter.newapiPolicyStatus.${log.newapi_policy_status}`)}</span>
+              </div>
+            ) : null}
+          </div>
+          {log.strike_eligible || log.source === 'upstream_cyber_policy' ? (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {log.strike_eligible ? <Badge variant="destructive" className="text-[10px]">{t('promptFilter.labels.strike')}</Badge> : null}
+              {log.source === 'upstream_cyber_policy' ? <Badge variant="outline" className="text-[10px]">{t('promptFilter.labels.upstream')}</Badge> : null}
+            </div>
           ) : null}
-          {log.strike_eligible ? <Badge variant="destructive" className="text-[11px]">strike</Badge> : null}
-          {log.source === 'upstream_cyber_policy' ? <Badge variant="outline" className="text-[11px]">upstream</Badge> : null}
-          {log.review_model ? <Badge variant="outline" className="h-auto max-w-full whitespace-normal break-words text-left leading-tight text-[11px]">{log.review_flagged ? 'review flagged' : 'review cleared'}</Badge> : null}
         </div>
       </TableCell>
       <TableCell>
@@ -3437,17 +5188,32 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
           ) : null}
         </div>
       </TableCell>
-      <TableCell className={compact ? 'w-[150px] min-w-0' : 'w-[220px] min-w-0'}>
+      <TableCell className={cn('min-w-0 align-top whitespace-normal', compact ? 'w-[190px]' : 'w-[230px]')}>
         {matches.length ? (
-          <div className="flex flex-wrap gap-1">
-            {matches.slice(0, 3).map((match, index) => <Badge key={`${match.name}-${index}`} variant="outline">{match.name}</Badge>)}
-            {matches.length > 3 ? <Badge variant="secondary">+{matches.length - 3}</Badge> : null}
+          <div className="min-w-0 space-y-1.5">
+            {matches.slice(0, 3).map((match, index) => (
+              <div
+                key={`${match.name}-${index}`}
+                className="min-w-0 overflow-hidden rounded-md border border-border/70 bg-muted/25 px-2 py-1.5"
+                title={`${match.name} · ${match.weight}`}
+              >
+                <div className="flex min-w-0 items-start gap-1.5">
+                  <span className={cn('mt-1 size-1.5 shrink-0 rounded-full', match.strict ? 'bg-destructive' : 'bg-amber-500')} />
+                  <span className="min-w-0 break-words font-mono text-[11px] leading-4 text-foreground">{match.name.split('_').join('_\u200b')}</span>
+                </div>
+                <div className="mt-1 pl-3 font-mono text-[10px] text-muted-foreground">{t('promptFilter.ruleWeight')} {match.weight}</div>
+              </div>
+            ))}
+            {matches.length > 3 ? <Badge variant="secondary" className="text-[10px]">+{matches.length - 3}</Badge> : null}
           </div>
         ) : <span className="text-muted-foreground">-</span>}
       </TableCell>
-      <TableCell>
-        <div className={compact ? 'max-w-[110px] truncate' : 'max-w-[160px] truncate'}>{log.api_key_name || log.api_key_masked || '-'}</div>
+      <TableCell className="align-top">
+        <div className="whitespace-normal break-all font-mono text-[11px] leading-4 text-foreground" title={apiKeyLabel}>{apiKeyLabel}</div>
         {!compact && log.client_ip ? <div className="text-xs text-muted-foreground">{log.client_ip}</div> : null}
+        {!compact && log.newapi_platform ? <div className="truncate text-xs text-muted-foreground">NewAPI: {log.newapi_platform}</div> : null}
+        {!compact && log.newapi_user_id ? <div className="truncate font-mono text-[11px] text-muted-foreground" title={log.newapi_user_id}>{t('promptFilter.newapiUser')} {log.newapi_user_id}</div> : null}
+        {!compact && log.newapi_request_id ? <div className="truncate font-mono text-[11px] text-muted-foreground" title={log.newapi_request_id}>{t('promptFilter.newapiRequest')} {log.newapi_request_id}</div> : null}
       </TableCell>
       <TableCell className="min-w-0">
         <div className="space-y-1.5">

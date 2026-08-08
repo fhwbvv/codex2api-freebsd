@@ -90,25 +90,12 @@ func (h *Handler) GetAPIKeyScopeUsage(c *gin.Context) {
 		return
 	}
 
-	// 每个用到的窗口只查一次，全部 scope 共享同一份按账号拆分的聚合。
-	usageByWindow := make(map[string]map[int64]database.APIKeyWindowUsage, len(database.APIKeyScopeWindows))
-	for _, window := range database.APIKeyScopeWindows {
-		needed := false
-		for _, scope := range scopes {
-			if scope.NeedsWindow(window.Label) {
-				needed = true
-				break
-			}
-		}
-		if !needed {
-			continue
-		}
-		usage, err := h.db.GetAPIKeyAccountWindowUsage(ctx, id, window.Window)
-		if err != nil {
-			writeInternalError(c, err)
-			return
-		}
-		usageByWindow[window.Label] = usage
+	// Four conditional aggregates share one 30-day index scan. This avoids the
+	// previous 5h/1d/7d/30d repeated scans when opening a Key with scope limits.
+	usageByWindow, err := h.db.GetAPIKeyAccountWindowsUsage(ctx, id)
+	if err != nil {
+		writeInternalError(c, err)
+		return
 	}
 
 	groupNames := h.accountGroupNameIndex(ctx)

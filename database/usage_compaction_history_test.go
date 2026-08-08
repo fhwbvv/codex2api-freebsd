@@ -153,7 +153,7 @@ func TestUsageLogCompactionStatesRoundTripAndFilter(t *testing.T) {
 }
 
 func TestUsageLogInsertColumnCountIncludesCompactionHistory(t *testing.T) {
-	const want = 48
+	const want = 49
 	if usageLogInsertColumnCount != want {
 		t.Fatalf("usageLogInsertColumnCount = %d, want %d", usageLogInsertColumnCount, want)
 	}

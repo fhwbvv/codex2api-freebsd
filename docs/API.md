@@ -378,6 +378,9 @@ data: [DONE]
       "id": 1,
       "name": "account-1",
       "email": "user@example.com",
+      "token_workspace_id": "personal-workspace-id",
+      "workspace_id_override": "team-workspace-id",
+      "effective_workspace_id": "team-workspace-id",
       "plan_type": "pro",
       "status": "ready",
       "health_tier": "healthy",
@@ -435,6 +438,9 @@ data: [DONE]
 | base_concurrency_effective | integer      | 当前生效的基础并发值                                              |
 | skip_warm_tier             | bool         | 是否跳过 warm 层级；仅把 warm 提升为 healthy，不覆盖 risky/banned |
 | allowed_api_key_ids        | integer[]    | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
+| token_workspace_id         | string       | Token 中识别出的默认工作区 ID                                    |
+| workspace_id_override      | string       | `Chatgpt-Account-Id` 指定的目标工作区；未指定时为空               |
+| effective_workspace_id     | string       | 实际路由工作区；优先使用覆盖值，否则使用 Token 默认工作区         |
 | credit_enabled             | bool         | 是否为信用计费模式账号                                            |
 | credit_skip_usage_window   | bool         | 是否跳过 7 天/5 小时用量窗口惩罚                                  |
 | billed_5h                  | number/null  | 过去 5 小时窗口内的累计计费金额（USD）                            |
@@ -571,7 +577,10 @@ data: [DONE]
 {
   "name": "my-account",
   "refresh_token": "rt_xxxxxxxxxxxx",
-  "proxy_url": "http://proxy.example.com:8080"
+  "proxy_url": "http://proxy.example.com:8080",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "team-workspace-id"
+  }
 }
 ```
 
@@ -582,6 +591,9 @@ data: [DONE]
 | name          | string | 否   | 账号名称，批量时自动追加序号，默认 `account-{n}`       |
 | refresh_token | string | 是   | Refresh Token，多个用 `\n` 换行分隔（单次最多 100 个） |
 | proxy_url     | string | 否   | 代理 URL                                               |
+| custom_headers | object | 否   | 自定义上游请求头；`Chatgpt-Account-Id` 用于指定目标工作区 |
+
+同一份 RT 可以分别以“默认工作区”和多个 `Chatgpt-Account-Id` 路由加入账号池。额度、冷却、调度和统计按账号记录独立维护；同一登录身份下的相同目标工作区仍会去重。
 
 批量添加（使用换行分隔）:
 
@@ -635,7 +647,10 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 {
   "name": "my-at-account",
   "access_token": "eyJhbGciOiJSUzI1NiIs...",
-  "proxy_url": "http://proxy.example.com:8080"
+  "proxy_url": "http://proxy.example.com:8080",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "team-workspace-id"
+  }
 }
 ```
 
@@ -646,6 +661,9 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 | name         | string | 否   | 账号名称，批量时自动追加序号，默认 `at-account-{n}`   |
 | access_token | string | 是   | Access Token，多个用 `\n` 换行分隔（单次最多 100 个） |
 | proxy_url    | string | 否   | 代理 URL                                              |
+| custom_headers | object | 否 | 自定义上游请求头；`Chatgpt-Account-Id` 用于指定目标工作区 |
+
+同一个 AT 可以按不同目标工作区保存为多条独立路由。对于无法从 AT 解析登录身份的情况，系统至少会按“AT 原文 + 目标工作区”避免同一路由重复写入。
 
 批量添加:
 

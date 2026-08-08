@@ -45,6 +45,21 @@ func TestSendAnthropicStreamErrorEscapesJSON(t *testing.T) {
 	}
 }
 
+func TestAnthropicStreamErrorCarriesPolicyDetails(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	writer := newStreamFlushWriter(c.Writer, nil)
+	details := gin.H{"codex2api_policy": gin.H{"decision_id": "dec_stream", "strike_eligible": true}}
+
+	if err := writeAnthropicStreamErrorEvent(writer, "invalid_request_error", "blocked", details); err != nil {
+		t.Fatalf("writeAnthropicStreamErrorEvent: %v", err)
+	}
+	data := strings.TrimSuffix(strings.TrimPrefix(recorder.Body.String(), "event: error\ndata: "), "\n\n")
+	if got := gjson.Get(data, "error.details.codex2api_policy.decision_id").String(); got != "dec_stream" {
+		t.Fatalf("policy details missing from Anthropic stream error: %s", data)
+	}
+}
+
 func TestAnthropicStreamContentBlockStartPreservesEmptyFields(t *testing.T) {
 	tests := []struct {
 		name  string

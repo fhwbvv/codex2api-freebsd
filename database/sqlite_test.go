@@ -26,6 +26,36 @@ func TestNewSQLiteInitializesFreshDatabase(t *testing.T) {
 	}
 }
 
+func TestChartAggregationUsesEpochBucketsForDailyRange(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "chart-daily.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	start := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	for _, at := range []time.Time{start.Add(time.Hour), start.Add(23 * time.Hour), start.Add(25 * time.Hour)} {
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (endpoint, model, effective_model, status_code, duration_ms, total_tokens, created_at)
+			VALUES ('/v1/responses', 'gpt-5.4', 'gpt-5.4', 200, 100, 10, $1)
+		`, sqliteTimeParam(at)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	result, err := db.GetChartAggregation(ctx, start, start.Add(48*time.Hour), 24*60, "")
+	if err != nil {
+		t.Fatalf("GetChartAggregation: %v", err)
+	}
+	if len(result.Timeline) != 2 || result.Timeline[0].Requests != 2 || result.Timeline[1].Requests != 1 {
+		t.Fatalf("timeline = %+v, want two daily buckets with 2/1 requests", result.Timeline)
+	}
+	if len(result.Models) != 1 || result.Models[0].Requests != 3 {
+		t.Fatalf("models = %+v, want one model with 3 requests", result.Models)
+	}
+}
+
 func TestSQLitePromptFilterColumnDefaultsRemainUpgradeCompatible(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	db, err := New("sqlite", dbPath)
@@ -261,6 +291,57 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 		t.Fatal("FindActiveAccountByOAuthIdentity 应该排除已删除账号")
 	} else if err != sql.ErrNoRows {
 		t.Fatalf("FindActiveAccountByOAuthIdentity err = %v, want sql.ErrNoRows", err)
+	}
+}
+
+func TestFindActiveAccountByOAuthRouteIdentitySeparatesWorkspaceOverrides(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	personalID, err := db.InsertAccountWithCredentials(ctx, "personal", map[string]interface{}{
+		"access_token": "at-shared",
+		"email":        "user@example.com",
+		"workspace_id": "personal-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials personal 返回错误: %v", err)
+	}
+	teamID, err := db.InsertAccountWithCredentials(ctx, "team", map[string]interface{}{
+		"access_token": "at-shared",
+		"email":        "user@example.com",
+		"workspace_id": "personal-workspace",
+		"custom_headers": map[string]string{
+			"chatgpt-account-id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials team 返回错误: %v", err)
+	}
+
+	got, err := db.FindActiveAccountByOAuthRouteIdentity(ctx, "USER@example.com", "personal-workspace")
+	if err != nil {
+		t.Fatalf("FindActiveAccountByOAuthRouteIdentity personal 返回错误: %v", err)
+	}
+	if got != personalID {
+		t.Fatalf("personal matched id = %d, want %d", got, personalID)
+	}
+
+	got, err = db.FindActiveAccountByOAuthRouteIdentity(ctx, "user@example.com", "team-workspace")
+	if err != nil {
+		t.Fatalf("FindActiveAccountByOAuthRouteIdentity team 返回错误: %v", err)
+	}
+	if got != teamID {
+		t.Fatalf("team matched id = %d, want %d", got, teamID)
+	}
+
+	if _, err := db.FindActiveAccountByOAuthRouteIdentity(ctx, "user@example.com", "other-workspace"); err != sql.ErrNoRows {
+		t.Fatalf("other workspace err = %v, want sql.ErrNoRows", err)
 	}
 }
 
@@ -928,11 +1009,12 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 			ErrorMessage: "client canceled",
 		},
 		{
-			AccountID:  4,
-			Endpoint:   "/v1/responses",
-			Model:      "gpt-5.4",
-			StatusCode: 200,
-			DurationMs: 90,
+			AccountID:    4,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.4",
+			StatusCode:   200,
+			DurationMs:   90,
+			ViaWebsocket: true,
 		},
 	} {
 		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
@@ -1005,6 +1087,54 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 	}
 	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 500 {
 		t.Fatalf("5xx page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	filter = UsageLogFilter{
+		Start:        now.Add(-1 * time.Hour),
+		End:          now.Add(1 * time.Hour),
+		Page:         1,
+		PageSize:     10,
+		StatusFamily: "2xx",
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 2xx 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 200 {
+		t.Fatalf("2xx page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	retryOnly := true
+	filter = UsageLogFilter{
+		Start:           now.Add(-1 * time.Hour),
+		End:             now.Add(1 * time.Hour),
+		Page:            1,
+		PageSize:        10,
+		RetryOnly:       &retryOnly,
+		IncludeCanceled: true,
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged retry 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || !page.Logs[0].IsRetryAttempt {
+		t.Fatalf("retry page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
+	}
+
+	websocketOnly := true
+	filter = UsageLogFilter{
+		Start:            now.Add(-1 * time.Hour),
+		End:              now.Add(1 * time.Hour),
+		Page:             1,
+		PageSize:         10,
+		ViaWebsocketOnly: &websocketOnly,
+	}
+	page, err = db.ListUsageLogsByTimeRangePaged(ctx, filter)
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged websocket 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || !page.Logs[0].ViaWebsocket {
+		t.Fatalf("websocket page = total %d len %d first %+v", page.Total, len(page.Logs), page.Logs)
 	}
 }
 
@@ -1126,6 +1256,49 @@ func TestSQLiteModelCooldownPersistence(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Fatalf("ListActiveModelCooldowns 返回 %d 条，want 0", len(rows))
+	}
+}
+
+func TestModelCooldownSettingsDefaultsAndUpdate(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	defaults, err := db.GetModelCooldownSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetModelCooldownSettings defaults: %v", err)
+	}
+	if defaults.RelayMode != ModelCooldownModeOff || defaults.RelaySeconds != 2 || defaults.RelayBackoffEnabled {
+		t.Fatalf("relay defaults = %#v", defaults)
+	}
+	if defaults.OAuthMode != ModelCooldownModeAdaptive || defaults.OAuthSeconds != 300 || !defaults.OAuthBackoffEnabled {
+		t.Fatalf("oauth defaults = %#v", defaults)
+	}
+
+	mode := ModelCooldownModeFixed
+	seconds := 7
+	backoff := false
+	updated, err := db.UpdateModelCooldownSettings(ctx, ModelCooldownSettingsUpdate{
+		RelayMode:           &mode,
+		RelaySeconds:        &seconds,
+		RelayBackoffEnabled: &backoff,
+	})
+	if err != nil {
+		t.Fatalf("UpdateModelCooldownSettings: %v", err)
+	}
+	if updated.RelayMode != mode || updated.RelaySeconds != seconds || updated.RelayBackoffEnabled {
+		t.Fatalf("updated relay settings = %#v", updated)
+	}
+	reloaded, err := db.GetModelCooldownSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetModelCooldownSettings reload: %v", err)
+	}
+	if reloaded != updated {
+		t.Fatalf("reloaded = %#v, want %#v", reloaded, updated)
 	}
 }
 
@@ -2044,18 +2217,20 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 			APIKeyMasked:    "sk-...1111",
 		},
 		{
-			AccountID:      2,
-			Endpoint:       "/v1/chat/completions",
-			Model:          "gpt-5.4",
-			StatusCode:     500,
-			InputTokens:    100,
-			OutputTokens:   20,
-			TotalTokens:    120,
-			APIKeyID:       8,
-			APIKeyName:     "Cherry Studio",
-			APIKeyMasked:   "sk-...2222",
+			AccountID:    2,
+			Endpoint:     "/v1/chat/completions",
+			Model:        "gpt-5.4",
+			StatusCode:   500,
+			InputTokens:  100,
+			OutputTokens: 20,
+			TotalTokens:  120,
+			APIKeyID:     8,
+			APIKeyName:   "Cherry Studio",
+			APIKeyMasked: "sk-...2222",
+			// attempt_index 是 1-based：这条是「第二次尝试」，也就是真正重试出来的那一次。
+			// 写 1 的话它只是一次首发失败（哪怕 is_retry_attempt=true），不该计入重试数。
 			IsRetryAttempt: true,
-			AttemptIndex:   1,
+			AttemptIndex:   2,
 		},
 		{
 			AccountID:       3,
@@ -2395,6 +2570,72 @@ func TestUsageStatsBaselinePreservesCacheRateAndFirstTokenAfterClear(t *testing.
 	}
 	if stats.AvgFirstTokenMs < 449.9 || stats.AvgFirstTokenMs > 450.1 {
 		t.Fatalf("AvgFirstTokenMs = %.4f, want about 450.00", stats.AvgFirstTokenMs)
+	}
+}
+
+func TestUsageStatsRollupPreservesFullTotalsAndChannelSemantics(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	for _, usageLog := range []*UsageLogInput{
+		{AccountID: 1, Channel: "codex", Endpoint: "/v1/responses", Model: "gpt-5.5", StatusCode: 200, InputTokens: 100, OutputTokens: 50, TotalTokens: 150, CachedTokens: 32, FirstTokenMs: 400},
+		{AccountID: 2, Channel: "grok", Endpoint: "/v1/chat/completions", Model: "grok-4", StatusCode: 500, InputTokens: 60, OutputTokens: 20, TotalTokens: 80, FirstTokenMs: 800},
+		{AccountID: 3, Channel: "codex", Endpoint: "/v1/responses", Model: "gpt-5.5", StatusCode: 499, TotalTokens: 999},
+	} {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	all, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("GetUsageStats(all) 返回错误: %v", err)
+	}
+	if all.TotalRequests != 2 || all.TotalTokens != 230 || all.TotalCachedTokens != 32 || all.AvgFirstTokenMs != 600 {
+		t.Fatalf("完整累计汇总 = %+v, want requests=2 tokens=230 cached=32 first_token=600", all)
+	}
+	codex, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "codex")
+	if err != nil {
+		t.Fatalf("GetUsageStats(codex) 返回错误: %v", err)
+	}
+	if codex.TotalRequests != 1 || codex.TotalTokens != 150 || codex.TotalCachedTokens != 32 {
+		t.Fatalf("codex 累计汇总 = %+v, want requests=1 tokens=150 cached=32", codex)
+	}
+
+	if err := db.ClearUsageLogs(ctx); err != nil {
+		t.Fatalf("ClearUsageLogs 返回错误: %v", err)
+	}
+	cleared, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("GetUsageStats(clear) 返回错误: %v", err)
+	}
+	if cleared.TotalRequests != 2 || cleared.TotalTokens != 230 || cleared.TotalCachedTokens != 32 || cleared.AvgFirstTokenMs != 600 {
+		t.Fatalf("清理日志后完整累计丢失: %+v", cleared)
+	}
+	clearedCodex, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "codex")
+	if err != nil {
+		t.Fatalf("GetUsageStats(codex after clear) 返回错误: %v", err)
+	}
+	if clearedCodex.TotalRequests != 0 {
+		t.Fatalf("清理后渠道累计 = %d, want 0（历史 baseline 无渠道维度）", clearedCodex.TotalRequests)
+	}
+
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{AccountID: 4, Channel: "codex", Endpoint: "/v1/responses", Model: "gpt-5.5", StatusCode: 200, TotalTokens: 70}); err != nil {
+		t.Fatalf("InsertUsageLog(after clear) 返回错误: %v", err)
+	}
+	db.FlushUsageLogs()
+	updated, err := db.GetUsageStats(ctx, time.Time{}, time.Time{}, "")
+	if err != nil {
+		t.Fatalf("GetUsageStats(updated) 返回错误: %v", err)
+	}
+	if updated.TotalRequests != 3 || updated.TotalTokens != 300 {
+		t.Fatalf("清理后新增的完整累计 = requests %d tokens %d, want 3/300", updated.TotalRequests, updated.TotalTokens)
 	}
 }
 
@@ -2854,7 +3095,8 @@ func TestGetAccountUsageStatsAggregatesRecentAccountSummary(t *testing.T) {
 	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 1500, compact = 1 WHERE account_id = 7 AND total_tokens = 2000`); err != nil {
 		t.Fatalf("update second usage quality fields: %v", err)
 	}
-	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 2500, stream = 1, compact = 1, is_retry_attempt = 1, attempt_index = 1 WHERE account_id = 7 AND model = 'gpt-4.1'`); err != nil {
+	// attempt_index = 2：真正重试出来的那一次尝试（1 是首发，计入重试数就等于把每个请求都算成重试）。
+	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET first_token_ms = 2500, stream = 1, compact = 1, is_retry_attempt = 1, attempt_index = 2 WHERE account_id = 7 AND model = 'gpt-4.1'`); err != nil {
 		t.Fatalf("update third usage quality fields: %v", err)
 	}
 
@@ -2991,6 +3233,44 @@ func TestGetAccountsBilledSinceUsesPerAccountWindows(t *testing.T) {
 	}
 	if got[3] != 0 {
 		t.Fatalf("account 3 billed = %.2f, want 0", got[3])
+	}
+}
+
+func TestGetAccountUsageWindowsAggregatesBothRangesInOnePass(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now()
+	for _, item := range []struct {
+		accountID int64
+		createdAt time.Time
+		tokens    int
+		billed    float64
+	}{
+		{accountID: 1, createdAt: now.Add(-time.Hour), tokens: 100, billed: 1},
+		{accountID: 1, createdAt: now.Add(-48 * time.Hour), tokens: 200, billed: 2},
+		{accountID: 2, createdAt: now.Add(-2 * time.Hour), tokens: 300, billed: 3},
+		{accountID: 2, createdAt: now.Add(-8 * 24 * time.Hour), tokens: 999, billed: 9},
+	} {
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO usage_logs (account_id, status_code, total_tokens, account_billed, user_billed, created_at)
+			VALUES ($1, 200, $2, $3, $3, $4)`, item.accountID, item.tokens, item.billed, sqliteTimeParam(item.createdAt)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+	shortWindow, longWindow, err := db.GetAccountUsageWindows(ctx, now.Add(-5*time.Hour), now.Add(-7*24*time.Hour))
+	if err != nil {
+		t.Fatalf("GetAccountUsageWindows: %v", err)
+	}
+	if shortWindow[1].Requests != 1 || shortWindow[1].Tokens != 100 || longWindow[1].Requests != 2 || longWindow[1].Tokens != 300 {
+		t.Fatalf("account 1 windows short=%+v long=%+v", shortWindow[1], longWindow[1])
+	}
+	if shortWindow[2].Requests != 1 || longWindow[2].Requests != 1 || longWindow[2].Tokens != 300 {
+		t.Fatalf("account 2 windows short=%+v long=%+v", shortWindow[2], longWindow[2])
 	}
 }
 
@@ -3214,6 +3494,83 @@ func TestPromptFilterLogsPersistReviewMetadata(t *testing.T) {
 	}
 	if nearest == nil || nearest.MatchContext != "actual trigger excerpt" {
 		t.Fatalf("nearest prompt filter log = %+v", nearest)
+	}
+}
+
+func TestPromptFilterReviewHistorySeparatesIntelligenceAndNullableScores(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	confidence := 0.86
+	threshold := 0.70
+	latencyMS := int64(143)
+	ctx := context.Background()
+	inputs := []*PromptFilterLogInput{
+		{Source: "intel_run", Endpoint: "prompt_intelligence", Action: "completed", Mode: "audit", FullText: `{}`},
+		{Source: "local_filter", Endpoint: "/v1/responses", Model: "gpt-5.6-sol", Action: "block", Mode: "block", TextPreview: "redacted request", Reviewed: true, ReviewModel: "review-model", ReviewFlagged: true, ReviewConfidence: &confidence, ReviewThreshold: &threshold, ReviewReason: "攻击他人系统", ReviewEndpoint: "https://review.example/chat/completions", ReviewRequestMode: "chat_completions", ReviewLatencyMS: &latencyMS},
+		{Source: "local_filter", Endpoint: "/v1/chat/completions", Model: "gpt-5.6-sol", Action: "allow", Mode: "block", TextPreview: "benign request", Reviewed: true, ReviewModel: "review-model", ReviewFlagged: false, ReviewReason: "正常开发"},
+		{Source: "local_filter", Endpoint: "/v1/responses", Model: "gpt-5.6-sol", Action: "allow", Mode: "block", TextPreview: "review timeout", Reviewed: true, ReviewModel: "review-model", ReviewError: "context deadline exceeded"},
+		{Source: "local_filter", Endpoint: "/v1/messages", Model: "claude-sonnet", Action: "warn", Mode: "warn", Score: 70},
+	}
+	for _, input := range inputs {
+		if err := db.InsertPromptFilterLog(ctx, input); err != nil {
+			t.Fatalf("InsertPromptFilterLog(%s): %v", input.Source, err)
+		}
+	}
+
+	reviews, reviewTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, ReviewState: "reviewed", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(reviewed): %v", err)
+	}
+	if reviewTotal != 3 || len(reviews) != 3 {
+		t.Fatalf("review total=%d len=%d, want 3", reviewTotal, len(reviews))
+	}
+	flagged, flaggedTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, ReviewState: "reviewed", ReviewResult: "flagged", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(flagged): %v", err)
+	}
+	if flaggedTotal != 1 || len(flagged) != 1 {
+		t.Fatalf("flagged total=%d len=%d, want 1", flaggedTotal, len(flagged))
+	}
+	got := flagged[0]
+	if !got.Reviewed || got.ReviewConfidence == nil || *got.ReviewConfidence != confidence || got.ReviewThreshold == nil || *got.ReviewThreshold != threshold || got.ReviewLatencyMS == nil || *got.ReviewLatencyMS != latencyMS {
+		t.Fatalf("nullable review metadata = %+v", got)
+	}
+	if got.ReviewReason != "攻击他人系统" || got.ReviewEndpoint != "https://review.example/chat/completions" || got.ReviewRequestMode != "chat_completions" {
+		t.Fatalf("review request/response metadata = %+v", got)
+	}
+	cleared, clearedTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, ReviewResult: "cleared", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(cleared): %v", err)
+	}
+	if clearedTotal != 1 || len(cleared) != 1 || cleared[0].Endpoint != "/v1/chat/completions" {
+		t.Fatalf("cleared total=%d logs=%+v", clearedTotal, cleared)
+	}
+	reviewErrors, reviewErrorTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, ReviewResult: "error", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(error): %v", err)
+	}
+	if reviewErrorTotal != 1 || len(reviewErrors) != 1 || reviewErrors[0].ReviewError != "context deadline exceeded" {
+		t.Fatalf("review error total=%d logs=%+v", reviewErrorTotal, reviewErrors)
+	}
+
+	local, localTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, ReviewState: "not_reviewed", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(not reviewed): %v", err)
+	}
+	if localTotal != 1 || len(local) != 1 || local[0].Endpoint != "/v1/messages" {
+		t.Fatalf("local logs total=%d logs=%+v", localTotal, local)
+	}
+
+	intelligence, intelligenceTotal, err := db.ListPromptFilterLogsPage(ctx, PromptFilterLogQuery{Page: 1, PageSize: 10, Source: "intel_run", ExcludeIntelligence: true})
+	if err != nil {
+		t.Fatalf("ListPromptFilterLogsPage(intelligence history): %v", err)
+	}
+	if intelligenceTotal != 1 || len(intelligence) != 1 || intelligence[0].Action != "completed" {
+		t.Fatalf("intelligence history total=%d logs=%+v", intelligenceTotal, intelligence)
 	}
 }
 

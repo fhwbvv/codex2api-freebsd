@@ -35,6 +35,8 @@ type AdvancedConfig struct {
 	Intelligence    IntelligenceConfig    `json:"intelligence"`
 	NewAPI          NewAPIConfig          `json:"newapi"`
 	Guard           GuardConfig           `json:"guard"`
+	ReviewAdapter   ReviewAdapterConfig   `json:"review_adapter"`
+	AdaptiveReview  AdaptiveReviewConfig  `json:"adaptive_review"`
 }
 
 const (
@@ -62,7 +64,6 @@ type GuardConfig struct {
 	DefaultProfile        string                 `json:"default_profile"`
 	AllowTrustedOverrides bool                   `json:"allow_trusted_overrides"`
 	ProviderProfiles      map[string]string      `json:"provider_profiles,omitempty"`
-	Rollout               GuardRolloutConfig     `json:"rollout"`
 	Layers                GuardLayerConfig       `json:"layers"`
 	Performance           GuardPerformanceConfig `json:"performance"`
 }
@@ -106,19 +107,6 @@ const (
 	RecommendedGuardScanOverlapBytes = 512
 )
 
-// GuardRolloutConfig limits enforce mode to a stable subset of authenticated
-// users. Rollout is deliberately downgrade-only: requests outside the selected
-// cohort use FallbackMode, which is restricted to warn or shadow.
-type GuardRolloutConfig struct {
-	Enabled             bool     `json:"enabled"`
-	Percent             int      `json:"percent"`
-	FallbackMode        string   `json:"fallback_mode"`
-	NewAPIUserAllowlist []string `json:"newapi_user_allowlist"`
-	APIKeyAllowlist     []int64  `json:"api_key_allowlist"`
-	Protocols           []string `json:"protocols"`
-	Providers           []string `json:"providers"`
-}
-
 type GuardLayerConfig struct {
 	CurrentUser       GuardLayerModeConfig `json:"current_user"`
 	History           GuardLayerModeConfig `json:"history"`
@@ -136,17 +124,19 @@ type GuardLayerModeConfig struct {
 	Mode string `json:"mode"`
 }
 
-// NewAPIConfig controls signed identity propagation and repeat-offender directives.
+// NewAPIConfig controls signed identity verification for the request-local
+// Codex2API Key binding. Enabled is runtime-only: persisted/global configuration
+// must never enable NewAPI identity verification without a concrete binding.
 type NewAPIConfig struct {
-	Enabled              bool   `json:"enabled"`
-	MaxClockSkewSeconds  int    `json:"max_clock_skew_seconds"`
-	OffenseWindowSeconds int    `json:"offense_window_seconds"`
-	BanAfter             int    `json:"ban_after"`
-	Secret               string `json:"-"`
+	Enabled             bool `json:"-"`
+	MaxClockSkewSeconds int  `json:"max_clock_skew_seconds"`
 }
 
 type EnforcementConfig struct {
-	TerminalCategories []string `json:"terminal_categories"`
+	TerminalCategories      []string `json:"terminal_categories"`
+	TerminalBypassModels    []string `json:"terminal_bypass_models"`
+	ConversationLockEnabled bool     `json:"conversation_lock_enabled"`
+	CYBStrikeEnabled        bool     `json:"cyb_strike_enabled"`
 }
 
 type NormalizationConfig struct {
@@ -181,6 +171,21 @@ type RiskConfig struct {
 	UserWeightPercent    int  `json:"user_weight_percent"`
 	IPWeightPercent      int  `json:"ip_weight_percent"`
 	SessionWeightPercent int  `json:"session_weight_percent"`
+}
+
+// AdaptiveReviewConfig reduces synchronous model-review latency only after a
+// signed person identity has accumulated enough clean reviewed evidence. Local
+// deterministic protection remains active on every request, and periodic
+// sampling plus an upper review interval prevent trust from becoming permanent.
+type AdaptiveReviewConfig struct {
+	Enabled                    bool `json:"enabled"`
+	MinCleanReviews            int  `json:"min_clean_reviews"`
+	MinObservationHours        int  `json:"min_observation_hours"`
+	SamplePercent              int  `json:"sample_percent"`
+	ForceReviewIntervalMinutes int  `json:"force_review_interval_minutes"`
+	TrustDurationHours         int  `json:"trust_duration_hours"`
+	ReactivationCleanReviews   int  `json:"reactivation_clean_reviews"`
+	ReactivationCooldownHours  int  `json:"reactivation_cooldown_hours"`
 }
 
 type SidecarConfig struct {
@@ -231,7 +236,8 @@ type OutputConfig struct {
 }
 
 // IntelligenceConfig controls the optional public-source rule intelligence job.
-// It is disabled by default and never auto-adds rules unless AutoAdd is explicitly enabled.
+// Generated proposals are always staged for human review and never enter the
+// runtime rule engine until an administrator explicitly publishes them.
 type IntelligenceConfig struct {
 	Enabled          bool     `json:"enabled"`
 	IntervalHours    int      `json:"interval_hours"`
@@ -240,7 +246,6 @@ type IntelligenceConfig struct {
 	ModelEnabled     bool     `json:"model_enabled"`
 	Model            string   `json:"model"`
 	MaxModelCalls    int      `json:"max_model_calls"`
-	AutoAdd          bool     `json:"auto_add"`
 }
 
 func DefaultIntelligenceQueries() []string {
@@ -260,12 +265,14 @@ func DefaultAdvancedConfig() AdvancedConfig {
 		Normalization:   NormalizationConfig{MaxDecodeRuns: 1, MaxDecodedBytes: 32768, MaxEncodedBlocks: 16},
 		ContextDiscount: ContextDiscountConfig{Enabled: true, IntentAware: true, MaxDiscount: 90, OperationalMaxDiscount: 0},
 		Risk:            RiskConfig{WindowSeconds: 600, BlockThreshold: 100, ReviewThreshold: 60, UserWeightPercent: 50, IPWeightPercent: 30, SessionWeightPercent: 20},
+		AdaptiveReview:  AdaptiveReviewConfig{MinCleanReviews: 10, MinObservationHours: 24, SamplePercent: 5, ForceReviewIntervalMinutes: 360, TrustDurationHours: 168, ReactivationCleanReviews: 5, ReactivationCooldownHours: 24},
 		Sidecar:         SidecarConfig{TimeoutSeconds: 1, FailClosed: false, MinScore: 30, SamplePercent: 5, Mode: GuardModeShadow, MaxTextLength: 8192, CacheTTLSeconds: 60, MaxConcurrent: 16, CircuitBreakerFailures: 3, CircuitBreakerSeconds: 30},
 		Session:         SessionConfig{WindowSeconds: 300, MaxFragments: 3, MaxTextLength: 4096, ShortFragmentMaxChars: 24, RequireSignedIdentity: true},
 		Attachment:      AttachmentConfig{TimeoutSeconds: 2, MaxFiles: 4, MaxBytes: 65536, MaxExtractedChars: 8192, CacheTTLSeconds: 300, MaxConcurrent: 8, CircuitBreakerFailures: 3, CircuitBreakerSeconds: 30},
 		Output:          OutputConfig{BufferBytes: 4096, OverlapBytes: 512, StrictOnly: true},
 		Intelligence:    IntelligenceConfig{IntervalHours: 24, Queries: DefaultIntelligenceQueries(), MaxSearchResults: 20, Model: "gpt-5.4", MaxModelCalls: 1},
-		NewAPI:          NewAPIConfig{MaxClockSkewSeconds: 120, OffenseWindowSeconds: 86400, BanAfter: 2},
+		NewAPI:          NewAPIConfig{MaxClockSkewSeconds: 120},
+		Enforcement:     EnforcementConfig{TerminalBypassModels: []string{"codex-auto-review"}, ConversationLockEnabled: true, CYBStrikeEnabled: false},
 		Guard:           DefaultGuardConfig(),
 	}
 }
@@ -292,11 +299,12 @@ func RecommendedAdvancedConfig() AdvancedConfig {
 	cfg.Risk.UserWeightPercent = 60
 	cfg.Risk.IPWeightPercent = 20
 	cfg.Risk.SessionWeightPercent = 20
+	cfg.AdaptiveReview.Enabled = true
 	cfg.Sidecar.FailClosed = false
-	// Session persistence still uses synchronous cache lease/get/set. Keep it
-	// disabled in the production preset until the cache interface provides the
-	// CAS semantics required for ordered, non-blocking writes.
-	cfg.Session.Enabled = false
+	// Signed session correlation is enabled for the recommended preset. Only an
+	// explicit continuation inherits the preceding accepted user intent for
+	// enforcement; heuristic short-fragment correlation remains opt-in.
+	cfg.Session.Enabled = true
 	cfg.Guard.DefaultProfile = GuardProfileBalanced
 	cfg.Guard.Performance.AsyncShadowAuxiliaryEnabled = true
 	cfg.Guard.Performance.MaxSegments = RecommendedGuardMaxSegments
@@ -325,10 +333,6 @@ func DefaultGuardConfig() GuardConfig {
 		Mode:             GuardModeInherit,
 		DefaultProfile:   GuardProfileBalanced,
 		ProviderProfiles: map[string]string{},
-		Rollout: GuardRolloutConfig{
-			Percent:      0,
-			FallbackMode: GuardModeWarn,
-		},
 		Performance: GuardPerformanceConfig{
 			ExactSegmentCacheEnabled:    true,
 			ExactSegmentCacheEntries:    4096,
@@ -388,7 +392,16 @@ func ParseAdvancedConfigDocument(raw string) (AdvancedConfigDocument, error) {
 	if err != nil {
 		return AdvancedConfigDocument{}, err
 	}
-	effective, err := ParseAdvancedConfig(raw)
+	// Stable-cohort rollout used to be downgrade-only. Removing the field
+	// without migrating an enabled legacy document would silently turn a
+	// partial enforce deployment into full enforce. Collapse that retired
+	// state to its configured safe fallback before deriving runtime config.
+	migrateAdvancedConfigRetiredFields(root)
+	migrated, err := json.Marshal(root)
+	if err != nil {
+		return AdvancedConfigDocument{}, err
+	}
+	effective, err := ParseAdvancedConfig(string(migrated))
 	if err != nil {
 		return AdvancedConfigDocument{}, err
 	}
@@ -451,6 +464,7 @@ func parseAdvancedConfigObject(raw string) (map[string]json.RawMessage, error) {
 
 func marshalAdvancedConfigDocument(root map[string]json.RawMessage, cfg AdvancedConfig) (string, error) {
 	removeAdvancedConfigSensitiveFields(root)
+	removeAdvancedConfigRetiredFields(root)
 	knownRaw, err := json.Marshal(NormalizeAdvancedConfig(cfg))
 	if err != nil {
 		return "", err
@@ -469,19 +483,173 @@ func marshalAdvancedConfigDocument(root map[string]json.RawMessage, cfg Advanced
 	return string(formatted), nil
 }
 
-func removeAdvancedConfigSensitiveFields(root map[string]json.RawMessage) {
-	newAPI, ok := decodeAdvancedConfigObject(root["newapi"])
-	if !ok {
-		return
-	}
-	// The shared secret has a dedicated encrypted/database-backed endpoint and
-	// is intentionally json:"-" in NewAPIConfig. Never mistake it for a future
-	// field and persist or expose it through the general settings document.
-	for key := range newAPI {
-		if strings.EqualFold(strings.TrimSpace(key), "secret") {
-			delete(newAPI, key)
+// migrateAdvancedConfigRetiredFields converts an enabled legacy rollout into
+// its safe global mode before removing the retired object. Explicit off,
+// shadow and warn modes are already safe and are left untouched. Explicit
+// enforce can preserve the old warn/shadow fallback. Missing, inherit and
+// invalid modes depend on an outer legacy setting that is unavailable in this
+// document; they therefore migrate to shadow so parsing can never promote a
+// previously monitoring deployment to warn or enforce.
+func migrateAdvancedConfigRetiredFields(root map[string]json.RawMessage) {
+	for rootKey, raw := range root {
+		if !strings.EqualFold(strings.TrimSpace(rootKey), "guard") {
+			continue
+		}
+		guard, ok := decodeAdvancedConfigObject(raw)
+		if !ok {
+			continue
+		}
+		for key, rolloutRaw := range guard {
+			if !strings.EqualFold(strings.TrimSpace(key), "rollout") {
+				continue
+			}
+			rollout, rolloutOK := decodeAdvancedConfigObject(rolloutRaw)
+			if legacyRolloutCouldBeEnabled(rolloutRaw, rollout, rolloutOK) {
+				mode := strings.ToLower(strings.TrimSpace(advancedConfigObjectString(guard, "mode")))
+				switch mode {
+				case GuardModeOff, GuardModeShadow, GuardModeWarn:
+					// The explicit mode was never promoted by rollout.
+				case GuardModeEnforce:
+					fallback := strings.ToLower(strings.TrimSpace(advancedConfigObjectString(rollout, "fallback_mode")))
+					if fallback != GuardModeShadow && fallback != GuardModeWarn {
+						fallback = GuardModeWarn
+					}
+					setAdvancedConfigObjectString(guard, "mode", fallback)
+				default:
+					setAdvancedConfigObjectString(guard, "mode", GuardModeShadow)
+				}
+			}
+			delete(guard, key)
+		}
+		encoded, err := json.Marshal(guard)
+		if err == nil {
+			root[rootKey] = encoded
 		}
 	}
+}
+
+func removeAdvancedConfigRetiredFields(root map[string]json.RawMessage) {
+	for rootKey, raw := range root {
+		if !strings.EqualFold(strings.TrimSpace(rootKey), "guard") {
+			continue
+		}
+		guard, ok := decodeAdvancedConfigObject(raw)
+		if !ok {
+			continue
+		}
+		// Stable cohort rollout has been retired. Unlike unknown future fields,
+		// an old rollout object must not survive document round trips because
+		// older values could otherwise appear active even though runtime
+		// enforcement no longer consults them.
+		for key := range guard {
+			if strings.EqualFold(strings.TrimSpace(key), "rollout") {
+				delete(guard, key)
+			}
+		}
+		encoded, err := json.Marshal(guard)
+		if err == nil {
+			root[rootKey] = encoded
+		}
+	}
+}
+
+func legacyRolloutCouldBeEnabled(raw json.RawMessage, object map[string]json.RawMessage, decoded bool) bool {
+	if isJSONNull(raw) {
+		return false
+	}
+	// A malformed retired object could not have been interpreted reliably by
+	// the old runtime. Treat it as potentially active so an upgrade cannot turn
+	// ambiguous persisted state into full enforcement.
+	if !decoded {
+		return true
+	}
+	for key, raw := range object {
+		if !strings.EqualFold(strings.TrimSpace(key), "enabled") {
+			continue
+		}
+		var value bool
+		if json.Unmarshal(raw, &value) != nil {
+			return true
+		}
+		return value
+	}
+	return false
+}
+
+func advancedConfigObjectString(object map[string]json.RawMessage, wanted string) string {
+	for key, raw := range object {
+		if !strings.EqualFold(strings.TrimSpace(key), wanted) {
+			continue
+		}
+		var value string
+		if json.Unmarshal(raw, &value) == nil {
+			return value
+		}
+		return ""
+	}
+	return ""
+}
+
+func setAdvancedConfigObjectString(object map[string]json.RawMessage, wanted string, value string) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	for key := range object {
+		if strings.EqualFold(strings.TrimSpace(key), wanted) {
+			object[key] = encoded
+			return
+		}
+	}
+	object[wanted] = encoded
+}
+
+func removeAdvancedConfigSensitiveFields(root map[string]json.RawMessage) {
+	keys := make([]string, 0, 1)
+	for key := range root {
+		if strings.EqualFold(strings.TrimSpace(key), "newapi") {
+			keys = append(keys, key)
+		}
+	}
+	// Merge case variants into the canonical lower-case object, with an exact
+	// lower-case key taking precedence when malformed historical documents
+	// contain both forms.
+	sort.SliceStable(keys, func(i, j int) bool {
+		if keys[i] == "newapi" {
+			return false
+		}
+		if keys[j] == "newapi" {
+			return true
+		}
+		return keys[i] < keys[j]
+	})
+	newAPI := map[string]json.RawMessage{}
+	foundObject := false
+	for _, rootKey := range keys {
+		raw := root[rootKey]
+		delete(root, rootKey)
+		object, ok := decodeAdvancedConfigObject(raw)
+		if !ok {
+			continue
+		}
+		foundObject = true
+		for key := range object {
+			normalized := strings.ToLower(strings.TrimSpace(key))
+			if normalized == "secret" || normalized == "enabled" || normalized == "offense_window_seconds" || normalized == "ban_after" {
+				delete(object, key)
+			}
+		}
+		for key, value := range object {
+			newAPI[key] = value
+		}
+	}
+	if !foundObject {
+		return
+	}
+	// Global enablement, secrets, and penalty counters were retired in favor of
+	// mandatory one-to-one identity bindings plus NewAPI-owned enforcement.
+	// Strip the legacy fields so they cannot reactivate or misrepresent runtime
+	// behavior after an upgrade.
 	encoded, err := json.Marshal(newAPI)
 	if err == nil {
 		root["newapi"] = encoded
@@ -562,6 +730,20 @@ func NormalizeAdvancedConfig(cfg AdvancedConfig) AdvancedConfig {
 		}
 	}
 	cfg.Enforcement.TerminalCategories = categories
+	bypassModels := cfg.Enforcement.TerminalBypassModels
+	if bypassModels == nil {
+		bypassModels = d.Enforcement.TerminalBypassModels
+	}
+	seenBypassModels := map[string]bool{}
+	normalizedBypassModels := make([]string, 0, len(bypassModels))
+	for _, model := range bypassModels {
+		model = strings.ToLower(strings.TrimSpace(model))
+		if model != "" && !seenBypassModels[model] {
+			seenBypassModels[model] = true
+			normalizedBypassModels = append(normalizedBypassModels, model)
+		}
+	}
+	cfg.Enforcement.TerminalBypassModels = normalizedBypassModels
 	if cfg.Normalization.MaxDecodeRuns <= 0 {
 		cfg.Normalization.MaxDecodeRuns = d.Normalization.MaxDecodeRuns
 	}
@@ -603,6 +785,48 @@ func NormalizeAdvancedConfig(cfg AdvancedConfig) AdvancedConfig {
 	}
 	if cfg.Risk.ReviewThreshold <= 0 {
 		cfg.Risk.ReviewThreshold = d.Risk.ReviewThreshold
+	}
+	if cfg.AdaptiveReview.MinCleanReviews <= 0 {
+		cfg.AdaptiveReview.MinCleanReviews = d.AdaptiveReview.MinCleanReviews
+	}
+	if cfg.AdaptiveReview.MinCleanReviews > 1000 {
+		cfg.AdaptiveReview.MinCleanReviews = 1000
+	}
+	if cfg.AdaptiveReview.MinObservationHours <= 0 {
+		cfg.AdaptiveReview.MinObservationHours = d.AdaptiveReview.MinObservationHours
+	}
+	if cfg.AdaptiveReview.MinObservationHours > 30*24 {
+		cfg.AdaptiveReview.MinObservationHours = 30 * 24
+	}
+	if cfg.AdaptiveReview.SamplePercent < 0 {
+		cfg.AdaptiveReview.SamplePercent = 0
+	}
+	if cfg.AdaptiveReview.SamplePercent > 100 {
+		cfg.AdaptiveReview.SamplePercent = 100
+	}
+	if cfg.AdaptiveReview.ForceReviewIntervalMinutes <= 0 {
+		cfg.AdaptiveReview.ForceReviewIntervalMinutes = d.AdaptiveReview.ForceReviewIntervalMinutes
+	}
+	if cfg.AdaptiveReview.ForceReviewIntervalMinutes > 7*24*60 {
+		cfg.AdaptiveReview.ForceReviewIntervalMinutes = 7 * 24 * 60
+	}
+	if cfg.AdaptiveReview.TrustDurationHours <= 0 {
+		cfg.AdaptiveReview.TrustDurationHours = d.AdaptiveReview.TrustDurationHours
+	}
+	if cfg.AdaptiveReview.TrustDurationHours > 30*24 {
+		cfg.AdaptiveReview.TrustDurationHours = 30 * 24
+	}
+	if cfg.AdaptiveReview.ReactivationCleanReviews <= 0 {
+		cfg.AdaptiveReview.ReactivationCleanReviews = d.AdaptiveReview.ReactivationCleanReviews
+	}
+	if cfg.AdaptiveReview.ReactivationCleanReviews > cfg.AdaptiveReview.MinCleanReviews {
+		cfg.AdaptiveReview.ReactivationCleanReviews = cfg.AdaptiveReview.MinCleanReviews
+	}
+	if cfg.AdaptiveReview.ReactivationCooldownHours <= 0 {
+		cfg.AdaptiveReview.ReactivationCooldownHours = d.AdaptiveReview.ReactivationCooldownHours
+	}
+	if cfg.AdaptiveReview.ReactivationCooldownHours > 30*24 {
+		cfg.AdaptiveReview.ReactivationCooldownHours = 30 * 24
 	}
 	if cfg.Sidecar.TimeoutSeconds <= 0 {
 		cfg.Sidecar.TimeoutSeconds = d.Sidecar.TimeoutSeconds
@@ -769,18 +993,6 @@ func NormalizeAdvancedConfig(cfg AdvancedConfig) AdvancedConfig {
 	if cfg.NewAPI.MaxClockSkewSeconds > 600 {
 		cfg.NewAPI.MaxClockSkewSeconds = 600
 	}
-	if cfg.NewAPI.OffenseWindowSeconds < 60 {
-		cfg.NewAPI.OffenseWindowSeconds = d.NewAPI.OffenseWindowSeconds
-	}
-	if cfg.NewAPI.OffenseWindowSeconds > 2592000 {
-		cfg.NewAPI.OffenseWindowSeconds = 2592000
-	}
-	if cfg.NewAPI.BanAfter < 2 {
-		cfg.NewAPI.BanAfter = d.NewAPI.BanAfter
-	}
-	if cfg.NewAPI.BanAfter > 10 {
-		cfg.NewAPI.BanAfter = 10
-	}
 	queries := make([]string, 0, len(cfg.Intelligence.Queries))
 	for _, query := range cfg.Intelligence.Queries {
 		query = strings.TrimSpace(query)
@@ -796,7 +1008,6 @@ func NormalizeGuardConfig(cfg GuardConfig) GuardConfig {
 	d := DefaultGuardConfig()
 	cfg.Mode = normalizeGuardMode(cfg.Mode, d.Mode)
 	cfg.DefaultProfile = normalizeGuardProfileName(cfg.DefaultProfile, d.DefaultProfile)
-	cfg.Rollout = normalizeGuardRolloutConfig(cfg.Rollout, d.Rollout)
 	if cfg.Performance.MaxSegments < MinGuardMaxSegments {
 		cfg.Performance.MaxSegments = d.Performance.MaxSegments
 	} else if cfg.Performance.MaxSegments > MaxGuardMaxSegments {
@@ -895,63 +1106,6 @@ func normalizeAuxiliaryGuardMode(mode string, fallback string) string {
 		return GuardModeShadow
 	}
 	return mode
-}
-
-func normalizeGuardRolloutConfig(cfg GuardRolloutConfig, defaults GuardRolloutConfig) GuardRolloutConfig {
-	if cfg.Percent < 0 {
-		cfg.Percent = 0
-	} else if cfg.Percent > 100 {
-		cfg.Percent = 100
-	}
-	switch strings.ToLower(strings.TrimSpace(cfg.FallbackMode)) {
-	case GuardModeShadow:
-		cfg.FallbackMode = GuardModeShadow
-	case GuardModeWarn:
-		cfg.FallbackMode = GuardModeWarn
-	default:
-		cfg.FallbackMode = defaults.FallbackMode
-	}
-	cfg.NewAPIUserAllowlist = normalizeGuardRolloutStrings(cfg.NewAPIUserAllowlist, false)
-	cfg.APIKeyAllowlist = normalizeGuardRolloutAPIKeyIDs(cfg.APIKeyAllowlist)
-	cfg.Protocols = normalizeGuardRolloutStrings(cfg.Protocols, true)
-	cfg.Providers = normalizeGuardRolloutStrings(cfg.Providers, true)
-	return cfg
-}
-
-func normalizeGuardRolloutStrings(values []string, lowercase bool) []string {
-	seen := make(map[string]struct{}, len(values))
-	normalized := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if lowercase {
-			value = strings.ToLower(value)
-		}
-		if value == "" {
-			continue
-		}
-		if _, exists := seen[value]; exists {
-			continue
-		}
-		seen[value] = struct{}{}
-		normalized = append(normalized, value)
-	}
-	return normalized
-}
-
-func normalizeGuardRolloutAPIKeyIDs(values []int64) []int64 {
-	seen := make(map[int64]struct{}, len(values))
-	normalized := make([]int64, 0, len(values))
-	for _, value := range values {
-		if value <= 0 {
-			continue
-		}
-		if _, exists := seen[value]; exists {
-			continue
-		}
-		seen[value] = struct{}{}
-		normalized = append(normalized, value)
-	}
-	return normalized
 }
 
 func normalizeGuardMode(mode string, fallback string) string {
@@ -2024,7 +2178,7 @@ func decodedSafetyPriorityNormalizedWithHints(normalized string, scanner decoded
 		// admitted for inspection, but they are not enforcement evidence and must
 		// never consume the finite out-of-budget candidate pool ahead of a real
 		// decision rule.
-		if candidatePattern.pattern.cfg.SignalOnly {
+		if candidatePattern.pattern.cfg.SignalOnly && !candidatePattern.pattern.cfg.Strict {
 			continue
 		}
 		if len(candidatePattern.hintClauses) > 0 && !containsDecodedSafetyHintClauseWithMatches(normalized, candidatePattern.hintClauses, matchedHints) {
@@ -2441,6 +2595,16 @@ func decodedSafetyLiteralGuaranteedHintClauses(expression *syntax.Regexp) ([][]s
 }
 
 func decodedSafetyMandatoryHintClauses(pattern compiledPattern) [][]string {
+	if pattern.cfg.Name == "self_harm_facilitation" {
+		// Every branch of the dedicated grammar contains one of these target
+		// terms. Keep the list explicit so future relationship refinements do not
+		// make the syntax extractor drop this strict rule from large-request and
+		// decoded-content fast paths.
+		return singleDecodedSafetyHintClauses([]string{
+			"suicide", "self-harm", "self harm", "cutting", "starve myself", "starving myself",
+			"自杀", "自残", "割腕", "伤害自己", "绝食",
+		})
+	}
 	if pattern.cfg.Name == "prompt_unrestricted_mode" {
 		return singleDecodedSafetyHintClauses([]string{
 			"unrestricted mode", "unrestricted model", "unrestricted assistant", "unrestricted access",

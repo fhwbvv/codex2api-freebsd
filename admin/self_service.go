@@ -22,9 +22,9 @@ import (
 const (
 	selfServiceTag       = "self-service"
 	selfServiceSource    = "self-service"
-	selfServiceRateLimit = 10           // 单 IP 窗口内最多请求数
-	selfServiceRateWin   = time.Hour    // 限流窗口
-	selfServiceEmailMax  = 254          // 邮箱长度上限
+	selfServiceRateLimit = 10        // 单 IP 窗口内最多请求数
+	selfServiceRateWin   = time.Hour // 限流窗口
+	selfServiceEmailMax  = 254       // 邮箱长度上限
 )
 
 var selfServiceEmailRe = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
@@ -243,7 +243,7 @@ func (h *Handler) SubmitAccountPortalCode(c *gin.Context) {
 // 不加入运行时调度池（管理员批准后再启用）。重复账号返回 errDuplicateOAuthIdentity。
 func (h *Handler) upsertSelfServiceAccount(ctx context.Context, name, proxyURL string, seed tokenCredentialSeed, contactEmail string) (int64, error) {
 	seed = normalizeTokenCredentialSeed(seed)
-	if seed.email != "" && seed.workspaceID != "" {
+	if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
 		h.mergeDuplicateMu.Lock()
 		defer h.mergeDuplicateMu.Unlock()
 		if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, 0); err != nil {

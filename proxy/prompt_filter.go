@@ -4,12 +4,18 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
+)
+
+const (
+	upstreamCyberPolicyUserMessage       = "此内容因可能存在网络安全风险而被标记，本次已记录。请重新表述请求；再次触发可能会停用账号。如果确认是误判，请联系管理员。"
+	upstreamCyberPolicyLockedUserMessage = "此内容因可能存在网络安全风险而被标记，本次已记录并锁定当前对话。请新建对话后继续；再次触发可能会停用账号。如果确认是误判，请联系管理员解锁。"
 )
 
 // promptFilterFullTextMaxRunes limits the persisted redacted blocked-request text preview.
@@ -40,12 +46,18 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 		return false
 	}
 	cfg := h.promptFilterConfigForRequest(c)
+	signedBody := ingressRequestBody(c, rawBody)
+	if h.rejectRequiredNewAPIIdentity(c, cfg.Advanced.NewAPI, signedBody) {
+		return true
+	}
+	if h.rejectLockedPromptConversation(c, cfg, signedBody, rawBody, endpoint, model) {
+		return true
+	}
 	// Skip envelope construction and body traversal when neither the local
 	// filter nor a body-dependent extension is enabled (issue #417).
 	if !promptfilter.RequiresRequestText(cfg) {
 		return false
 	}
-	signedBody := ingressRequestBody(c, rawBody)
 	evaluation := h.evaluatePromptGuardWithConfig(c, cfg, rawBody, signedBody, endpoint, model, promptfilter.TransportHTTP)
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
@@ -75,6 +87,12 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 		return false
 	}
 	cfg := h.promptFilterConfigForRequest(c)
+	if h.rejectRequiredNewAPIIdentity(c, cfg.Advanced.NewAPI, ingressRequestBody(c, nil)) {
+		return true
+	}
+	if h.rejectLockedPromptConversation(c, cfg, ingressRequestBody(c, nil), []byte(text), endpoint, model) {
+		return true
+	}
 	if !promptfilter.RequiresRequestText(cfg) {
 		return false
 	}
@@ -103,10 +121,17 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		return false
 	}
 	cfg := h.promptFilterConfigForRequest(c)
+	signedBody := ingressRequestBody(c, rawBody)
+	if apiErr := h.requiredNewAPIIdentityError(c, cfg.Advanced.NewAPI, signedBody); apiErr != nil {
+		sendAnthropicError(c, http.StatusUnauthorized, "authentication_error", apiErr.Message)
+		return true
+	}
+	if h.rejectLockedPromptConversation(c, cfg, signedBody, rawBody, endpoint, model) {
+		return true
+	}
 	if !promptfilter.RequiresRequestText(cfg) {
 		return false
 	}
-	signedBody := ingressRequestBody(c, rawBody)
 	evaluation := h.evaluatePromptGuardWithConfig(c, cfg, rawBody, signedBody, endpoint, model, promptfilter.TransportHTTP)
 	verdict := evaluation.Verdict
 	h.logPromptGuardEvaluation(c, endpoint, model, "local_filter", "", evaluation)
@@ -138,6 +163,7 @@ func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model 
 }
 
 func (h *Handler) logPromptGuardEvaluation(c *gin.Context, endpoint string, model string, source string, errorCode string, evaluation promptGuardEvaluation) {
+	h.capturePromptRuleLearningEvidence(c, endpoint, model, evaluation)
 	h.logPromptFilterVerdictWithDecision(c, endpoint, model, source, errorCode, evaluation.Verdict, &evaluation.Decision, &evaluation.Envelope)
 	h.scheduleDeferredPromptGuardAudit(c, endpoint, model, source, errorCode, evaluation)
 }
@@ -146,7 +172,10 @@ func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint st
 	if h == nil || h.db == nil || !verdict.Enabled {
 		return
 	}
-	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && verdict.ReviewModel == "" && !promptFilterDecisionRequiresAudit(decision) {
+	// Full model review runs on every extractable request, but a clean pass with
+	// no local evidence must not turn the prompt log into a full traffic archive.
+	// Persist flagged results, failures, local matches, and explicit audit states.
+	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && !verdict.Reviewed && !promptFilterDecisionRequiresAudit(decision) {
 		return
 	}
 	logMatches := true
@@ -159,6 +188,25 @@ func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint st
 		}
 	}
 	auditContext := h.capturePromptFilterAuditContext(c)
+	if verdict.Action == promptfilter.ActionBlock && decision != nil && auditContext.NewAPIPolicyStatus == "verified" {
+		if cached, exists := c.Get(newAPIPolicyMetaContextKey); exists {
+			if policyContext, ok := cached.(verifiedNewAPIPolicyContext); ok {
+				metadata := buildNewAPIPolicyDecisionMetadataWithSecret(
+					policyContext.Identity,
+					*decision,
+					verdict,
+					cfg,
+					[]byte(verdict.FullText),
+					endpoint,
+					model,
+					"",
+					policyContext.VerificationSecret,
+				)
+				auditContext.NewAPIPolicyStatus = "signed_response"
+				auditContext.NewAPIDecisionID = metadata.DecisionID
+			}
+		}
+	}
 	input := h.buildPromptFilterLogInput(auditContext, endpoint, model, source, errorCode, verdict, decision, envelope, logMatches)
 	if input == nil {
 		return
@@ -174,13 +222,24 @@ func (h *Handler) logPromptFilterVerdictWithDecision(c *gin.Context, endpoint st
 }
 
 type promptFilterAuditContext struct {
-	ClientIP     string
-	APIKeyID     int64
-	APIKeyName   string
-	APIKeyMasked string
-	Endpoint     string
-	Protocol     string
-	Provider     string
+	ClientIP             string
+	APIKeyID             int64
+	APIKeyName           string
+	APIKeyMasked         string
+	Endpoint             string
+	Protocol             string
+	Provider             string
+	RequestCorrelationID string
+	NewAPIPolicyStatus   string
+	NewAPIPlatform       string
+	NewAPIUserID         string
+	NewAPIUserName       string
+	NewAPIUserEmail      string
+	NewAPIUserGroup      string
+	NewAPIRequestID      string
+	NewAPIDecisionID     string
+	SessionHash          string
+	ClientIPHash         string
 }
 
 func (h *Handler) capturePromptFilterAuditContext(c *gin.Context) promptFilterAuditContext {
@@ -193,15 +252,62 @@ func (h *Handler) capturePromptFilterAuditContext(c *gin.Context) promptFilterAu
 	// cyber-policy logging simply omits metadata if no verified context exists.
 	h.populateCachedVerifiedNewAPIAuditMeta(c, input)
 	populatePromptFilterAPIKeyMeta(c, input)
-	return promptFilterAuditContext{
-		ClientIP:     input.ClientIP,
-		APIKeyID:     input.APIKeyID,
-		APIKeyName:   input.APIKeyName,
-		APIKeyMasked: input.APIKeyMasked,
-		Endpoint:     input.Endpoint,
-		Protocol:     input.Protocol,
-		Provider:     input.Provider,
+	newAPIStatus, policyContext := h.cachedNewAPIPolicyAuditState(c)
+	sessionHash := ""
+	newAPIUserName, newAPIUserEmail, newAPIUserGroup := "", "", ""
+	if (newAPIStatus == "verified" || newAPIStatus == "signed_response") && policyContext.MetaVerified {
+		sessionHash = hashRiskIdentity(policyContext.Meta.SessionFingerprint)
+		newAPIUserName = policyContext.Meta.UserName
+		newAPIUserEmail = policyContext.Meta.UserEmail
+		newAPIUserGroup = policyContext.Meta.UserGroup
+	} else if newAPIStatus == "unbound" {
+		sessionHash = hashRiskIdentity(promptSessionID(c))
 	}
+	clientIP := input.ClientIP
+	if (newAPIStatus == "verified" || newAPIStatus == "signed_response") && strings.TrimSpace(policyContext.Identity.ClientIP) != "" {
+		clientIP = policyContext.Identity.ClientIP
+	}
+	return promptFilterAuditContext{
+		ClientIP:             input.ClientIP,
+		APIKeyID:             input.APIKeyID,
+		APIKeyName:           input.APIKeyName,
+		APIKeyMasked:         input.APIKeyMasked,
+		Endpoint:             input.Endpoint,
+		Protocol:             input.Protocol,
+		Provider:             input.Provider,
+		RequestCorrelationID: ensurePromptPolicyRequestCorrelationID(c),
+		NewAPIPolicyStatus:   newAPIStatus,
+		NewAPIPlatform:       policyContext.Platform,
+		NewAPIUserID:         policyContext.Identity.UserID,
+		NewAPIUserName:       newAPIUserName,
+		NewAPIUserEmail:      newAPIUserEmail,
+		NewAPIUserGroup:      newAPIUserGroup,
+		NewAPIRequestID:      policyContext.Identity.RequestID,
+		SessionHash:          sessionHash,
+		ClientIPHash:         hashRiskIdentity(clientIP),
+	}
+}
+
+func (h *Handler) cachedNewAPIPolicyAuditState(c *gin.Context) (string, verifiedNewAPIPolicyContext) {
+	if c == nil || h == nil || h.store == nil {
+		return "unbound", verifiedNewAPIPolicyContext{}
+	}
+	binding, bound := h.resolvePromptFilterNewAPIBinding(c)
+	if !bound {
+		return "unbound", verifiedNewAPIPolicyContext{}
+	}
+	if !binding.Enabled {
+		return "binding_disabled", verifiedNewAPIPolicyContext{Platform: normalizedNewAPIPlatform(binding.PlatformCode)}
+	}
+	if cached, exists := c.Get(newAPIPolicyMetaContextKey); exists {
+		if policyContext, ok := cached.(verifiedNewAPIPolicyContext); ok && policyContext.APIKeyID == requestAPIKeyID(c) {
+			return "verified", policyContext
+		}
+	}
+	if strings.TrimSpace(c.GetHeader("X-NewAPI-Signature")) == "" {
+		return "unsigned_request", verifiedNewAPIPolicyContext{Platform: normalizedNewAPIPlatform(binding.PlatformCode)}
+	}
+	return "verification_failed", verifiedNewAPIPolicyContext{Platform: normalizedNewAPIPlatform(binding.PlatformCode)}
 }
 
 func (h *Handler) logPromptFilterVerdictWithAuditContext(_ context.Context, auditContext promptFilterAuditContext, endpoint string, model string, source string, errorCode string, verdict promptfilter.Verdict, decision *promptfilter.Decision, envelope *promptfilter.RequestEnvelope, logMatches bool) error {
@@ -223,28 +329,46 @@ func (h *Handler) buildPromptFilterLogInput(auditContext promptFilterAuditContex
 	if h == nil || !verdict.Enabled {
 		return nil
 	}
-	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && verdict.ReviewModel == "" && !promptFilterDecisionRequiresAudit(decision) {
+	if source == "local_filter" && len(verdict.Matched) == 0 && verdict.Action == promptfilter.ActionAllow && verdict.ReviewError == "" && !verdict.Reviewed && !promptFilterDecisionRequiresAudit(decision) {
 		return nil
 	}
 	if source == "local_filter" && !logMatches {
 		return nil
 	}
 	input := &database.PromptFilterLogInput{
-		Source:          source,
-		Endpoint:        endpoint,
-		Model:           model,
-		Action:          verdict.Action,
-		Mode:            verdict.Mode,
-		Score:           verdict.Score,
-		Threshold:       verdict.Threshold,
-		MatchedPatterns: promptfilter.MatchesJSON(verdict.Matched),
-		TextPreview:     promptfilter.RedactedPreview(verdict.TextPreview, 500),
-		MatchContext:    promptfilter.RedactedPreview(verdict.MatchContext, promptFilterMatchContextMaxRunes),
-		ClientIP:        auditContext.ClientIP,
-		ErrorCode:       errorCode,
-		ReviewModel:     verdict.ReviewModel,
-		ReviewFlagged:   verdict.ReviewFlagged,
-		ReviewError:     verdict.ReviewError,
+		Source:               source,
+		Endpoint:             endpoint,
+		Model:                model,
+		Action:               verdict.Action,
+		Mode:                 verdict.Mode,
+		Score:                verdict.Score,
+		Threshold:            verdict.Threshold,
+		MatchedPatterns:      promptfilter.MatchesJSON(verdict.Matched),
+		TextPreview:          promptfilter.RedactedPreview(verdict.TextPreview, 500),
+		MatchContext:         promptfilter.RedactedPreview(verdict.MatchContext, promptFilterMatchContextMaxRunes),
+		ClientIP:             auditContext.ClientIP,
+		ErrorCode:            errorCode,
+		ReviewModel:          verdict.ReviewModel,
+		ReviewFlagged:        verdict.ReviewFlagged,
+		ReviewError:          verdict.ReviewError,
+		Reviewed:             verdict.Reviewed,
+		ReviewConfidence:     verdict.ReviewConfidence,
+		ReviewThreshold:      verdict.ReviewThreshold,
+		ReviewReason:         promptfilter.RedactedPreview(verdict.ReviewReason, 500),
+		ReviewEndpoint:       verdict.ReviewEndpoint,
+		ReviewRequestMode:    verdict.ReviewRequestMode,
+		ReviewLatencyMS:      verdict.ReviewLatencyMS,
+		RequestCorrelationID: auditContext.RequestCorrelationID,
+		NewAPIPolicyStatus:   auditContext.NewAPIPolicyStatus,
+		NewAPIPlatform:       auditContext.NewAPIPlatform,
+		NewAPIUserID:         auditContext.NewAPIUserID,
+		NewAPIUserName:       auditContext.NewAPIUserName,
+		NewAPIUserEmail:      auditContext.NewAPIUserEmail,
+		NewAPIUserGroup:      auditContext.NewAPIUserGroup,
+		NewAPIRequestID:      auditContext.NewAPIRequestID,
+		NewAPIDecisionID:     auditContext.NewAPIDecisionID,
+		SessionHash:          auditContext.SessionHash,
+		ClientIPHash:         auditContext.ClientIPHash,
 	}
 	if envelope != nil {
 		if envelope.Protocol != promptfilter.ProtocolUnknown {
@@ -269,6 +393,13 @@ func (h *Handler) buildPromptFilterLogInput(auditContext promptFilterAuditContex
 		input.ReasonCode = decision.ReasonCode
 		input.PrimaryOrigin = string(decision.PrimaryOrigin)
 		input.StrikeEligible = decision.StrikeEligible
+	}
+	// The adapter-unclassified audit otherwise carries no evidence. Surface the
+	// unrecognized typed-payload names (schema-only, no user content) so operators
+	// can see which future block/item type needs an explicit adapter mapping.
+	if decision != nil && decision.ReasonCode == promptfilter.ReasonCodeAdapterUnclassified &&
+		input.MatchContext == "" && envelope != nil && len(envelope.AdapterUnclassifiedTypes) > 0 {
+		input.MatchContext = "unclassified_types: " + strings.Join(envelope.AdapterUnclassifiedTypes, ", ")
 	}
 	// 被拦截（block）的请求仅记录脱敏后的检查文本预览，便于排查触发原因，
 	// 同时避免把 Authorization/API Key/token 等敏感值持久化到日志。
@@ -327,43 +458,57 @@ func applyVerifiedNewAPIAuditMeta(policyContext verifiedNewAPIPolicyContext, inp
 	}
 }
 
-func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model string, body []byte) {
-	if h == nil || h.store == nil {
-		return
-	}
+func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model string, body []byte, attempts ...upstreamCyberPolicyAttempt) (string, bool) {
 	errorCode := upstreamCyberPolicyCode(body)
 	if errorCode == "" {
-		return
+		return "", false
 	}
-	cfg := h.promptFilterConfigForRequest(c)
-	verdict := promptfilter.Verdict{
-		Enabled:   true,
-		Mode:      cfg.Mode,
-		Action:    promptfilter.ActionBlock,
-		Score:     0,
-		Threshold: cfg.Threshold,
-		Reason:    "upstream returned cyber policy",
-		// 上游 cyber_policy 没有本地提取文本，把脱敏后的上游错误体作为「详细内容」记录，
-		// 方便在日志里看清触发详情，同时避免持久化敏感字段。
-		FullText: promptfilter.RedactSensitive(string(body)),
+	attempt := upstreamCyberPolicyAttempt{}
+	if len(attempts) > 0 {
+		attempt = attempts[0]
 	}
-	h.logPromptFilterVerdict(c, endpoint, model, "upstream_cyber_policy", errorCode, verdict)
+	incidentID, accepted := h.enqueueUpstreamCyberPolicyEvidence(c, endpoint, model, errorCode, body, attempt)
+	// NewAPI owns strike counting and account punishment. Emission intentionally
+	// does not depend on the local async audit queue: a temporary Codex2API audit
+	// storage failure must not turn a verified upstream CYB into an untracked one.
+	metadata, delegated := h.emitNewAPIUpstreamCyberPolicyDecision(c, endpoint, model, body)
+	if delegated {
+		metadata.ConversationLocked = h.lockPromptConversationAfterUpstreamCYB(c, endpoint, model, incidentID, metadata)
+		c.Set(newAPIUpstreamCyberDecisionContextKey, metadata)
+	}
+	return incidentID, accepted
+}
+
+// attachUpstreamCyberPolicyStreamDecision records an explicit upstream CYB
+// before its terminal SSE frame is written, then embeds the signed NewAPI
+// decision in that frame. Callers use the boolean to avoid logging the same
+// terminal event again during stream cleanup.
+func (h *Handler) attachUpstreamCyberPolicyStreamDecision(c *gin.Context, endpoint string, model string, body []byte, attempt upstreamCyberPolicyAttempt) ([]byte, string, bool) {
+	if !isExplicitUpstreamCyberPolicy(body) {
+		return body, "", false
+	}
+	incidentID, accepted := h.logUpstreamCyberPolicy(c, endpoint, model, responseFailedErrorBody(body), attempt)
+	metadata, delegated := newAPIUpstreamCyberPolicyDecision(c)
+	if delegated {
+		body = attachNewAPIPolicyDecisionToResponseFailed(body, metadata)
+	}
+	return body, acceptedPromptPolicyIncidentID(incidentID, accepted), true
 }
 
 func upstreamCyberPolicyCode(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
-	raw := string(body)
-	for _, path := range []string{"codex_error_info", "error.codex_error_info", "error.code", "code"} {
+	for _, path := range []string{"codex_error_info", "error.codex_error_info", "error.code", "error.type", "code", "type"} {
 		if value := strings.TrimSpace(gjson.GetBytes(body, path).String()); strings.EqualFold(value, "cyber_policy") {
 			return "cyber_policy"
 		}
 	}
-	if strings.Contains(strings.ToLower(raw), "cyber_policy") || strings.Contains(strings.ToLower(raw), "cyber security risk") {
-		return "cyber_policy"
-	}
 	return ""
+}
+
+func isExplicitUpstreamCyberPolicy(body []byte) bool {
+	return upstreamCyberPolicyCode(responseFailedErrorBody(body)) != ""
 }
 
 func populatePromptFilterAPIKeyMeta(c *gin.Context, input *database.PromptFilterLogInput) {
@@ -391,13 +536,34 @@ func populatePromptFilterAPIKeyMeta(c *gin.Context, input *database.PromptFilter
 }
 
 func shouldReviewPromptFilterVerdict(verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
-	if verdict.Action != promptfilter.ActionWarn && verdict.Action != promptfilter.ActionBlock {
-		return false
-	}
-	return promptfilter.NormalizeReviewConfig(cfg.Review).Ready()
+	return cfg.Enabled && promptfilter.ShouldReviewVerdict(verdict, cfg.Review)
 }
 
 func (h *Handler) reviewPromptFilterVerdict(ctx context.Context, text string, verdict promptfilter.Verdict, cfg promptfilter.Config) promptfilter.Verdict {
-	flagged, model, err := promptfilter.DefaultReviewClient.ReviewText(ctx, text, cfg.Review)
-	return promptfilter.ApplyReviewResult(verdict, flagged, model, err, cfg.Review)
+	if strings.TrimSpace(text) == "" {
+		return verdict
+	}
+	startedAt := time.Now()
+	outcome, err := promptfilter.DefaultReviewClient.ReviewTextDetailed(ctx, text, cfg.Review)
+	reviewed := promptfilter.ApplyReviewOutcome(verdict, outcome, err, cfg.Review)
+	normalized := promptfilter.NormalizeReviewConfig(cfg.Review)
+	latencyMS := time.Since(startedAt).Milliseconds()
+	reviewed.ReviewLatencyMS = &latencyMS
+	reviewed.ReviewReason = strings.TrimSpace(outcome.Reason)
+	reviewed.ReviewEndpoint = strings.TrimSpace(outcome.Endpoint)
+	reviewed.ReviewRequestMode = normalized.Adapter.RequestMode
+	if err == nil {
+		if normalized.Adapter.RequestMode == promptfilter.ReviewRequestModeModerations && outcome.DecisionCategory != "" {
+			score := outcome.DecisionScore
+			threshold := outcome.DecisionThreshold
+			reviewed.ReviewConfidence = &score
+			reviewed.ReviewThreshold = &threshold
+		} else if normalized.Adapter.RequestMode == promptfilter.ReviewRequestModeChatCompletions {
+			confidence := outcome.Confidence
+			threshold := normalized.Adapter.ConfidenceThreshold
+			reviewed.ReviewConfidence = &confidence
+			reviewed.ReviewThreshold = &threshold
+		}
+	}
+	return reviewed
 }

@@ -92,6 +92,12 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 		), http.StatusUpgradeRequired)
 		return
 	}
+	if h != nil && h.store != nil {
+		cfg := h.promptFilterConfigForRequest(c)
+		if h.rejectRequiredNewAPIIdentity(c, cfg.Advanced.NewAPI, nil) {
+			return
+		}
+	}
 
 	conn, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, newAPIPolicyWebSocketUpgradeHeaders())
 	if err != nil {
@@ -165,9 +171,15 @@ func stripNewAPIPolicyWebSocketEventID(payload []byte) ([]byte, string) {
 }
 
 func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.Conn, rawPayload []byte, policyEventID string, options *responsesWSForwardOptions) error {
+	if apiErr := h.refreshNewAPIWebSocketBinding(c, time.Now()); apiErr != nil {
+		_ = writeResponsesWSError(conn, apiErr)
+		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
+	}
 	// Each response.create is a separate logical request. Keep the verified
-	// connection identity, but never reuse a prior frame's config or body digest.
+	// connection identity only while its binding remains valid, and never reuse a
+	// prior frame's config or body digest.
 	resetPromptRequestSecurityFrame(c)
+	resetPromptPolicyRequestCorrelationID(c)
 	c.Set(promptGuardPolicyEventIDContextKey, policyEventID)
 	rawBody, model, apiErr := normalizeResponsesWebSocketClientPayload(rawPayload)
 	if apiErr != nil {
@@ -474,7 +486,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
+			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody, upstreamCyberPolicyAttempt{
+				Transport: upstreamPromptPolicyTransport(true, useWebsocket), StatusCode: resp.StatusCode,
+				AccountID: account.ID(), AttemptIndex: attempt + 1,
+			}))
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := false
 			if silentRetryEnabled && attempt < maxRetries {
@@ -482,25 +497,26 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:            account.ID(),
-				Endpoint:             "/v1/responses",
-				Model:                logModel,
-				EffectiveModel:       logEffectiveModel,
-				StatusCode:           resp.StatusCode,
-				DurationMs:           durationMs,
-				ReasoningEffort:      reasoningEffort,
-				InboundEndpoint:      "/v1/responses",
-				UpstreamEndpoint:     "/v1/responses",
-				Stream:               true,
-				ViaWebsocket:         useWebsocket,
-				ServiceTier:          usageTiers.ServiceTier,
-				RequestedServiceTier: usageTiers.RequestedServiceTier,
-				ActualServiceTier:    usageTiers.ActualServiceTier,
-				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
-				AttemptIndex:         attempt + 1,
-				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
-				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:              account.ID(),
+				Endpoint:               "/v1/responses",
+				Model:                  logModel,
+				EffectiveModel:         logEffectiveModel,
+				StatusCode:             resp.StatusCode,
+				DurationMs:             durationMs,
+				ReasoningEffort:        reasoningEffort,
+				InboundEndpoint:        "/v1/responses",
+				UpstreamEndpoint:       "/v1/responses",
+				Stream:                 true,
+				ViaWebsocket:           useWebsocket,
+				ServiceTier:            usageTiers.ServiceTier,
+				RequestedServiceTier:   usageTiers.RequestedServiceTier,
+				ActualServiceTier:      usageTiers.ActualServiceTier,
+				BillingServiceTier:     usageTiers.BillingServiceTier,
+				IsRetryAttempt:         shouldRetry,
+				AttemptIndex:           attempt + 1,
+				UpstreamErrorKind:      upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:           usageLogErrorMessage(resp.StatusCode, errBody),
+				PromptPolicyIncidentID: promptPolicyIncidentID,
 			})
 
 			if shouldRetry {
@@ -511,6 +527,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 					return errResponsesWSClientGone
 				}
 				continue
+			}
+			if metadata, delegated := newAPIUpstreamCyberPolicyDecision(c); delegated && metadata.EventID != "" {
+				_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
+				return nil
 			}
 
 			apiErr = responsesWSUpstreamAPIError(resp.StatusCode, errBody)
@@ -749,6 +769,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	}
 	ttftGuard.Stop()
 	var responseFailedDecision codex429Decision
+	promptPolicyIncidentID := ""
 	if len(terminalFailurePayload) > 0 {
 		outcome = classifyResponseFailedOutcome(terminalFailurePayload)
 		responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
@@ -757,16 +778,36 @@ func (h *Handler) streamResponsesWSUpstream(
 		}
 		// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 		// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
-		h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload))
+		promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload), upstreamCyberPolicyAttempt{
+			Transport: upstreamPromptPolicyTransport(true, viaWebsocket), StatusCode: outcome.logStatusCode,
+			AccountID: account.ID(), AttemptIndex: fallbackAttempt,
+		}))
+		if isExplicitUpstreamCyberPolicy(terminalFailurePayload) {
+			outcome.failureMessage = upstreamCyberPolicyResponseMessage(c)
+		}
 	}
 	if fallbackLog != nil {
 		fallbackLog.LogHTTPAttemptCompletion("/v1/responses", account.ID(), fallbackAttempt, totalDuration, firstTokenMs, outcome.logStatusCode)
+	}
+	if metadata, delegated := newAPIUpstreamCyberPolicyDecision(c); delegated && metadata.EventID != "" {
+		// WebSocket response headers were committed during the upgrade. Carry the
+		// signed CYB decision in a per-turn error frame so NewAPI can count it and
+		// decide whether this is the first warning or a ban-worthy recurrence.
+		_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
+		return nil
 	}
 	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, viaWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 		resp.Body.Close()
 		return &responsesWSRetryableStreamError{outcome: outcome}
 	}
 	if silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+		h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
+			AccountID: account.ID(), Endpoint: "/v1/responses", Model: model, EffectiveModel: logEffectiveModel,
+			StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
+			InboundEndpoint: "/v1/responses", UpstreamEndpoint: "/v1/responses", Stream: true, ViaWebsocket: viaWebsocket,
+			AttemptIndex: fallbackAttempt, UpstreamErrorKind: outcome.failureKind,
+			ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+		}, promptPolicyIncidentID)
 		resp.Body.Close()
 		if !isFirstTokenTimeoutOutcome(outcome) {
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -793,22 +834,24 @@ func (h *Handler) streamResponsesWSUpstream(
 	usageTiers := resolveUsageServiceTiers(actualServiceTier, serviceTier)
 	c.Set("x-service-tier", usageTiers.ServiceTier)
 	logInput := &database.UsageLogInput{
-		AccountID:            account.ID(),
-		Endpoint:             "/v1/responses",
-		Model:                model,
-		EffectiveModel:       logEffectiveModel,
-		StatusCode:           outcome.logStatusCode,
-		DurationMs:           totalDuration,
-		FirstTokenMs:         firstTokenMs,
-		ReasoningEffort:      reasoningEffort,
-		InboundEndpoint:      "/v1/responses",
-		UpstreamEndpoint:     "/v1/responses",
-		Stream:               true,
-		ViaWebsocket:         viaWebsocket,
-		ServiceTier:          usageTiers.ServiceTier,
-		RequestedServiceTier: usageTiers.RequestedServiceTier,
-		ActualServiceTier:    usageTiers.ActualServiceTier,
-		BillingServiceTier:   usageTiers.BillingServiceTier,
+		AccountID:              account.ID(),
+		Endpoint:               "/v1/responses",
+		Model:                  model,
+		EffectiveModel:         logEffectiveModel,
+		StatusCode:             outcome.logStatusCode,
+		DurationMs:             totalDuration,
+		FirstTokenMs:           firstTokenMs,
+		ReasoningEffort:        reasoningEffort,
+		InboundEndpoint:        "/v1/responses",
+		UpstreamEndpoint:       "/v1/responses",
+		Stream:                 true,
+		ViaWebsocket:           viaWebsocket,
+		ServiceTier:            usageTiers.ServiceTier,
+		RequestedServiceTier:   usageTiers.RequestedServiceTier,
+		ActualServiceTier:      usageTiers.ActualServiceTier,
+		BillingServiceTier:     usageTiers.BillingServiceTier,
+		PromptPolicyIncidentID: promptPolicyIncidentID,
+		AttemptIndex:           fallbackAttempt,
 	}
 	if outcome.logStatusCode != http.StatusOK {
 		logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
@@ -861,7 +904,13 @@ func (h *Handler) streamResponsesWSUpstream(
 		return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 	}
 	if outcome.logStatusCode != http.StatusOK && len(terminalFailurePayload) == 0 {
-		apiErr := api.NewAPIError(api.ErrCodeUpstreamError, outcome.failureMessage, api.ErrorTypeUpstream)
+		errCode := api.ErrCodeUpstreamError
+		if outcome.logStatusCode == logStatusUpstreamStreamBreak {
+			// 断流(598)用稳定错误码 upstream_stream_break，下游可编程识别并重试
+			// (issue #473)；其余上游异常保持通用 upstream_error。
+			errCode = api.ErrorCode(ErrorCodeUpstreamStreamBreak)
+		}
+		apiErr := api.NewAPIError(errCode, outcome.failureMessage, api.ErrorTypeUpstream)
 		clientErr := responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
 		_ = writeResponsesWSError(conn, clientErr)
 		return newResponsesWSCloseError(websocket.CloseInternalServerErr, clientErr.Message, apiErr)
@@ -915,6 +964,24 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 		return false, false
 	}
 	cfg := h.promptFilterConfigForRequest(c)
+	if _, locked := h.activePromptConversationLock(c, cfg, nil); locked {
+		profile := strings.ToLower(strings.TrimSpace(cfg.Advanced.Guard.DefaultProfile))
+		switch profile {
+		case promptfilter.GuardProfileBalanced, promptfilter.GuardProfileStrict, promptfilter.GuardProfileResearch:
+		default:
+			profile = promptfilter.GuardProfileBalanced
+		}
+		decision := promptfilter.Decision{Action: promptfilter.ActionBlock, Profile: profile, ReasonCode: promptConversationLockedReasonCode, Terminal: true}
+		verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: promptConversationLockedMessage, FullText: promptConversationLockedReasonCode}
+		if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, nil); verified {
+			metadata := buildNewAPIPolicyDecisionMetadataWithSecret(policyContext.Identity, decision, verdict, cfg, rawBody, endpoint, model, policyEventID, policyContext.VerificationSecret)
+			writeNewAPIPolicyDecisionHeaders(c, metadata)
+			_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
+			return true, true
+		}
+		_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrorCode(promptConversationLockedReasonCode), promptConversationLockedMessage, api.ErrorTypeInvalidRequest))
+		return true, false
+	}
 	// Keep disabled filters off the WebSocket request-body hot path too.
 	if !promptfilter.RequiresRequestText(cfg) {
 		return false, false
@@ -928,7 +995,7 @@ func (h *Handler) inspectPromptFilterOpenAIForWebSocket(c *gin.Context, conn *we
 	errorCode := api.ErrorCode("prompt_blocked")
 	errorMessage := "Request contains content blocked by prompt filter"
 	if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, nil); verified {
-		metadata := buildNewAPIPolicyDecisionMetadataForEvent(policyContext.Identity, evaluation.Decision, verdict, cfg, rawBody, endpoint, model, policyEventID)
+		metadata := buildNewAPIPolicyDecisionMetadataWithSecret(policyContext.Identity, evaluation.Decision, verdict, cfg, rawBody, endpoint, model, policyEventID, policyContext.VerificationSecret)
 		writeNewAPIPolicyDecisionHeaders(c, metadata)
 		_ = writeResponsesWSError(conn, newAPIPolicyDecisionAPIError(metadata))
 		return true, true
@@ -1018,6 +1085,9 @@ func responsesWSCloseCodeForStatus(statusCode int) int {
 }
 
 func responsesWSUpstreamAPIError(statusCode int, body []byte) *api.APIError {
+	if isExplicitUpstreamCyberPolicy(body) {
+		return api.NewAPIError(api.ErrCodeInvalidRequest, upstreamCyberPolicyUserMessage, api.ErrorTypeInvalidRequest)
+	}
 	message := usageLogErrorMessage(statusCode, body)
 	if strings.TrimSpace(message) == "" {
 		message = fmt.Sprintf("upstream returned HTTP %d", statusCode)

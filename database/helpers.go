@@ -294,6 +294,40 @@ func credentialString(raw interface{}, key string) string {
 	}
 }
 
+func credentialStringMap(raw interface{}, key string) map[string]string {
+	credentials := decodeCredentials(raw)
+	if credentials == nil {
+		return nil
+	}
+	value, ok := credentials[key]
+	if !ok || value == nil {
+		return nil
+	}
+	switch typed := value.(type) {
+	case map[string]string:
+		return cloneTrimmedStringMap(typed)
+	case map[string]interface{}:
+		out := make(map[string]string, len(typed))
+		for name, rawValue := range typed {
+			name = strings.TrimSpace(name)
+			if name == "" || rawValue == nil {
+				continue
+			}
+			value, ok := rawValue.(string)
+			if !ok {
+				continue
+			}
+			out[name] = strings.TrimSpace(value)
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
 func credentialInt64Slice(raw interface{}, key string) []int64 {
 	credentials := decodeCredentials(raw)
 	if credentials == nil {

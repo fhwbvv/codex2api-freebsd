@@ -53,13 +53,16 @@ func TestStage0DisabledGuardDoesNotRetainIngressBodyOrComputeDigest(t *testing.T
 
 func TestStage0NewAPIPolicyComputesBodyDigestOncePerRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	t.Setenv("PROMPT_FILTER_NEWAPI_SECRET", "integration-secret")
 	cfg := promptGuardTestConfig()
 	cfg.Advanced.NewAPI.Enabled = true
 	cfg.Advanced.NewAPI.MaxClockSkewSeconds = 120
 	handler := newPromptGuardTestHandler(cfg)
 	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
 	c, _ := signedNewAPIPolicyContext(t, "stage0-digest-once", newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, "/v1/responses", body)
+	addSignedNewAPIPolicyMeta(t, c, newAPIPolicyMeta{
+		Profile: promptfilter.GuardProfileBalanced, Mode: promptfilter.GuardModeEnforce,
+		Provider: string(promptfilter.ModelFamilyOpenAI), Protocol: string(promptfilter.ProtocolResponses),
+	}, true)
 
 	for attempt := 0; attempt < 5; attempt++ {
 		if _, verified := handler.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, body); !verified {

@@ -83,6 +83,44 @@ func DoUpscale(src []byte, scale string) ([]byte, string, error) {
 	}
 
 	dw, dh := scaledDimensions(sw, sh, target)
+	return encodeUpscaled(srcImg, bounds, dw, dh)
+}
+
+// DoUpscaleTo resamples to an explicit target box instead of a tier long side,
+// so a caller that knows the size the user actually requested (for example
+// 2048x2048 rather than the 2K tier's 2560 long side) gets exactly that.
+//
+// When exact is false, or when the source aspect ratio does not match the box,
+// the result is fitted inside the box with its aspect ratio preserved: this
+// path never crops, so a mismatched upstream aspect yields a smaller image
+// rather than silently losing content.
+func DoUpscaleTo(src []byte, targetWidth, targetHeight int, exact bool) ([]byte, string, error) {
+	if len(src) == 0 || targetWidth <= 0 || targetHeight <= 0 {
+		return src, "", nil
+	}
+
+	srcImg, _, err := stdimage.Decode(bytes.NewReader(src))
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrUpscaleDecode, err)
+	}
+
+	bounds := srcImg.Bounds()
+	sw, sh := bounds.Dx(), bounds.Dy()
+	if sw <= 0 || sh <= 0 {
+		return nil, "", ErrUpscaleDecode
+	}
+	if sw >= targetWidth && sh >= targetHeight {
+		return src, "", nil
+	}
+
+	dw, dh := targetWidth, targetHeight
+	if !exact || !sameAspectRatio(sw, sh, targetWidth, targetHeight) {
+		dw, dh = fitInsideDimensions(sw, sh, targetWidth, targetHeight)
+	}
+	return encodeUpscaled(srcImg, bounds, dw, dh)
+}
+
+func encodeUpscaled(srcImg stdimage.Image, bounds stdimage.Rectangle, dw, dh int) ([]byte, string, error) {
 	dst := stdimage.NewRGBA(stdimage.Rect(0, 0, dw, dh))
 	draw.CatmullRom.Scale(dst, dst.Bounds(), srcImg, bounds, draw.Src, nil)
 
@@ -92,6 +130,35 @@ func DoUpscale(src []byte, scale string) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("image upscale: png encode: %w", err)
 	}
 	return buf.Bytes(), "image/png", nil
+}
+
+// sameAspectRatio tolerates the rounding that upstream sizes introduce, so a
+// 1536x864 source still counts as 16:9 against a 2560x1440 target.
+func sameAspectRatio(sw, sh, tw, th int) bool {
+	const tolerance = 0.01
+	source := float64(sw) / float64(sh)
+	target := float64(tw) / float64(th)
+	if target == 0 {
+		return false
+	}
+	delta := source/target - 1
+	return delta > -tolerance && delta < tolerance
+}
+
+func fitInsideDimensions(sw, sh, boxW, boxH int) (int, int) {
+	scale := float64(boxW) / float64(sw)
+	if heightScale := float64(boxH) / float64(sh); heightScale < scale {
+		scale = heightScale
+	}
+	dw := int(float64(sw)*scale + 0.5)
+	dh := int(float64(sh)*scale + 0.5)
+	if dw < 1 {
+		dw = 1
+	}
+	if dh < 1 {
+		dh = 1
+	}
+	return dw, dh
 }
 
 func scaledDimensions(sw, sh, targetLongSide int) (int, int) {

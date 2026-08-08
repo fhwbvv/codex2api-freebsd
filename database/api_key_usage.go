@@ -138,6 +138,65 @@ func (db *DB) GetAPIKeyAccountWindowUsage(ctx context.Context, apiKeyID int64, w
 	return out, nil
 }
 
+// GetAPIKeyAccountWindowsUsage aggregates all supported scope windows in one
+// index range scan. The previous caller issued one GROUP BY query per window,
+// making the 30-day view scan the same rows up to four times.
+func (db *DB) GetAPIKeyAccountWindowsUsage(ctx context.Context, apiKeyID int64) (map[string]map[int64]APIKeyWindowUsage, error) {
+	out := make(map[string]map[int64]APIKeyWindowUsage, len(APIKeyScopeWindows))
+	for _, window := range APIKeyScopeWindows {
+		out[window.Label] = make(map[int64]APIKeyWindowUsage)
+	}
+	if apiKeyID <= 0 {
+		return out, nil
+	}
+
+	now := time.Now()
+	since5h := db.timeArg(now.Add(-5 * time.Hour))
+	since1d := db.timeArg(now.Add(-24 * time.Hour))
+	since7d := db.timeArg(now.Add(-7 * 24 * time.Hour))
+	since30d := db.timeArg(now.Add(-30 * 24 * time.Hour))
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT COALESCE(account_id, 0),
+			COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN created_at >= $2 THEN user_billed ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN created_at >= $3 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN created_at >= $3 THEN total_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN created_at >= $3 THEN user_billed ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN created_at >= $4 THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN created_at >= $4 THEN total_tokens ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN created_at >= $4 THEN user_billed ELSE 0 END), 0),
+			COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(user_billed), 0)
+		FROM usage_logs
+		WHERE api_key_id = $1 AND created_at >= $5 AND status_code <> 499
+		GROUP BY account_id
+	`, apiKeyID, since5h, since1d, since7d, since30d)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var accountID int64
+		var fiveHours, oneDay, sevenDays, thirtyDays APIKeyWindowUsage
+		if err := rows.Scan(&accountID,
+			&fiveHours.Requests, &fiveHours.Tokens, &fiveHours.UserBilled,
+			&oneDay.Requests, &oneDay.Tokens, &oneDay.UserBilled,
+			&sevenDays.Requests, &sevenDays.Tokens, &sevenDays.UserBilled,
+			&thirtyDays.Requests, &thirtyDays.Tokens, &thirtyDays.UserBilled,
+		); err != nil {
+			return nil, err
+		}
+		if accountID <= 0 {
+			continue
+		}
+		out["5h"][accountID] = fiveHours
+		out["1d"][accountID] = oneDay
+		out["7d"][accountID] = sevenDays
+		out["30d"][accountID] = thirtyDays
+	}
+	return out, rows.Err()
+}
+
 // GetAPIKeysAccountWindowUsage 是 GetAPIKeyAccountWindowUsage 的批量版本:一次查询拿到
 // 多个 API Key 在同一窗口内、按账号拆分的用量,供列表页展示 scope 预算进度(issue #439)。
 // apiKeyIDs 为空时返回空表(刻意不退化成全表聚合,避免列表页误触发大查询)。
@@ -296,18 +355,19 @@ type APIKeyAccountGroup struct {
 // APIKeyAccountStat 是单个 API Key 在某时间区间内、按上游账号拆分的用量项。
 // 与 AccountKeyStat（账号 → 各 Key）互为转置：这里是 Key → 各账号。
 type APIKeyAccountStat struct {
-	AccountID     int64                `json:"account_id"`
-	AccountName   string               `json:"account_name"`
-	AccountEmail  string               `json:"account_email"`
-	Groups        []APIKeyAccountGroup `json:"groups,omitempty"`
-	Requests      int64                `json:"requests"`
-	InputTokens   int64                `json:"input_tokens"`
-	OutputTokens  int64                `json:"output_tokens"`
-	CachedTokens  int64                `json:"cached_tokens"`
-	TotalTokens   int64                `json:"total_tokens"`
-	ErrorCount    int64                `json:"error_count"`
-	AccountBilled float64              `json:"account_billed"`
-	UserBilled    float64              `json:"user_billed"`
+	AccountID      int64                `json:"account_id"`
+	AccountName    string               `json:"account_name"`
+	AccountEmail   string               `json:"account_email"`
+	AccountDeleted bool                 `json:"account_deleted"`
+	Groups         []APIKeyAccountGroup `json:"groups,omitempty"`
+	Requests       int64                `json:"requests"`
+	InputTokens    int64                `json:"input_tokens"`
+	OutputTokens   int64                `json:"output_tokens"`
+	CachedTokens   int64                `json:"cached_tokens"`
+	TotalTokens    int64                `json:"total_tokens"`
+	ErrorCount     int64                `json:"error_count"`
+	AccountBilled  float64              `json:"account_billed"`
+	UserBilled     float64              `json:"user_billed"`
 }
 
 // ListAPIKeyAccountStats 返回某个 API Key 在 [rangeStart, rangeEnd) 内按上游账号聚合的用量。
@@ -320,30 +380,40 @@ func (db *DB) ListAPIKeyAccountStats(ctx context.Context, apiKeyID int64, rangeS
 	}
 
 	query := `
+		WITH aggregated AS (
+			SELECT
+				account_id,
+				COUNT(*) AS requests,
+				COALESCE(SUM(input_tokens), 0) AS input_tokens,
+				COALESCE(SUM(output_tokens), 0) AS output_tokens,
+				COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+				COALESCE(SUM(total_tokens), 0) AS total_tokens,
+				COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
+				COALESCE(SUM(account_billed), 0) AS account_billed,
+				COALESCE(SUM(user_billed), 0) AS user_billed
+			FROM usage_logs
+			WHERE api_key_id = $1 AND status_code <> 499 AND created_at >= $2
+	`
+	args := []interface{}{apiKeyID, db.timeArg(rangeStart)}
+	if !rangeEnd.IsZero() {
+		query += " AND created_at < $3"
+		args = append(args, db.timeArg(rangeEnd))
+	}
+	query += `
+			GROUP BY account_id
+		)
 		SELECT
 			u.account_id,
 			COALESCE(a.name, '') AS account_name,
 			COALESCE(CAST(a.credentials AS TEXT), '{}') AS credentials,
-			COUNT(*) AS requests,
-			COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
-			COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
-			COALESCE(SUM(u.cached_tokens), 0) AS cached_tokens,
-			COALESCE(SUM(u.total_tokens), 0) AS total_tokens,
-			COALESCE(SUM(CASE WHEN u.status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
-			COALESCE(SUM(u.account_billed), 0) AS account_billed,
-			COALESCE(SUM(u.user_billed), 0) AS user_billed
-		FROM usage_logs u
+			COALESCE(a.status, '') AS account_status,
+			COALESCE(a.error_message, '') AS account_error,
+			u.requests, u.input_tokens, u.output_tokens, u.cached_tokens,
+			u.total_tokens, u.error_count, u.account_billed, u.user_billed
+		FROM aggregated u
 		LEFT JOIN accounts a ON u.account_id = a.id
-		WHERE u.api_key_id = $1
-		  AND u.status_code <> 499
-		  AND u.created_at >= $2
 	`
-	args := []interface{}{apiKeyID, db.timeArg(rangeStart)}
-	if !rangeEnd.IsZero() {
-		query += " AND u.created_at < $3"
-		args = append(args, db.timeArg(rangeEnd))
-	}
-	query += " GROUP BY u.account_id, a.name, a.credentials ORDER BY requests DESC, total_tokens DESC"
+	query += " ORDER BY u.requests DESC, u.total_tokens DESC"
 
 	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -355,10 +425,14 @@ func (db *DB) ListAPIKeyAccountStats(ctx context.Context, apiKeyID int64, rangeS
 	for rows.Next() {
 		var item APIKeyAccountStat
 		var credentials string
+		var accountStatus string
+		var accountError string
 		if err := rows.Scan(
 			&item.AccountID,
 			&item.AccountName,
 			&credentials,
+			&accountStatus,
+			&accountError,
 			&item.Requests,
 			&item.InputTokens,
 			&item.OutputTokens,
@@ -371,6 +445,8 @@ func (db *DB) ListAPIKeyAccountStats(ctx context.Context, apiKeyID int64, rangeS
 			return nil, err
 		}
 		item.AccountEmail = emailFromCredentialsJSON(credentials)
+		item.AccountDeleted = strings.EqualFold(strings.TrimSpace(accountStatus), "deleted") ||
+			strings.EqualFold(strings.TrimSpace(accountError), "deleted")
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -383,6 +459,8 @@ func (db *DB) ListAPIKeyAccountStats(ctx context.Context, apiKeyID int64, rangeS
 }
 
 // attachAPIKeyAccountGroups 批量补齐上游账号的分组标签，避免 N+1。
+// account_group_members 保留回收站账号软删除前的最后归属，因此这里不按
+// accounts.status 过滤；统计历史用量时必须能看见该快照。
 func (db *DB) attachAPIKeyAccountGroups(ctx context.Context, items []APIKeyAccountStat) error {
 	if len(items) == 0 {
 		return nil

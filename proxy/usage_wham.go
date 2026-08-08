@@ -469,12 +469,17 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 
 	// 记录 credits 积分余额快照（wham 的 credits 对象，零额度成本）。
 	if usage.Credits != nil {
-		account.SetCreditBalance(
+		// 走 store 落库版本：积分只有 wham 能刷，只留在内存的话重启后就归零。
+		store.PersistCreditBalance(
+			account,
 			usage.Credits.Balance,
 			usage.Credits.HasCredits,
 			usage.Credits.Unlimited,
 			usage.Credits.OverageLimitReached,
 		)
+		// 余额刚被充上（此前为 0 而账号已背着用量窗口判罚）时立刻放回调度，
+		// 不必等窗口重置。非本地用量判罚的冷却不受影响。
+		store.ReleaseUsageWindowCooldownForCredits(account)
 	}
 
 	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow, usage.PlanType, observedAt)

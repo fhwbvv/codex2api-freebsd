@@ -1,7 +1,6 @@
 package database
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 )
@@ -84,7 +83,11 @@ func (a *AccountRow) GetCredentialStringMap(key string) map[string]string {
 			if name == "" || raw == nil {
 				continue
 			}
-			out[name] = strings.TrimSpace(fmt.Sprint(raw))
+			value, ok := raw.(string)
+			if !ok {
+				continue
+			}
+			out[name] = strings.TrimSpace(value)
 		}
 		if len(out) == 0 {
 			return nil

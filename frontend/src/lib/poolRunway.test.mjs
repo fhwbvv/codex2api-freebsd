@@ -7,6 +7,7 @@ import {
   getAccountWindowMs,
   hasBurnPrediction,
   selectPoolRunway,
+  selectPoolRunwayFromAnalysis,
 } from "./poolRunway.ts";
 
 const HOUR = 60 * 60_000;
@@ -148,4 +149,32 @@ test("selectPoolRunway picks earlier pressure between 5h and 7d", () => {
   // Prefer window that has a nearer pressure if any
   assert.ok(runway.windowKey === "5h" || runway.windowKey === "7d");
   assert.ok(["critical", "hours", "day_plus", "stable", "unknown"].includes(runway.kind));
+});
+
+test("selectPoolRunwayFromAnalysis consumes fixed-size server forecasts", () => {
+  const now = Date.now();
+  const forecast = (predictedAt) => ({
+    sampled: 40000,
+    threshold: 100,
+    predicted_at: predictedAt,
+    predicted_count: 100,
+    unknown: 0,
+    rpm: 120,
+    effective_rpm_limit: 500,
+    rpm_pressure: 0.24,
+    active_pressure: 0.1,
+    rate_limit_pressure: 0,
+    dispatchable_accounts: 39900,
+    avg_concurrency: 2,
+    high_pressure_at: null,
+    supply_shortage_at: null,
+    risk_level: "medium",
+    confidence: 1,
+  });
+  const runway = selectPoolRunwayFromAnalysis({
+    "5h": forecast(now + 2 * HOUR),
+    "7d": forecast(now + 2 * DAY),
+  }, now);
+  assert.equal(runway.windowKey, "5h");
+  assert.equal(runway.forecast.dispatchableAccounts, 39900);
 });

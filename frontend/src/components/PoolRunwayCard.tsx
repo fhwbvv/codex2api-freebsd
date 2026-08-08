@@ -3,23 +3,17 @@ import { useTranslation } from 'react-i18next'
 import { CircleHelp } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
-import type { AccountRow } from '../types'
-import { selectPoolRunway, type PoolRunway } from '../lib/poolRunway'
+import type { AccountAnalysisResponse } from '../types'
+import { selectPoolRunwayFromAnalysis, type PoolRunway } from '../lib/poolRunway'
 import { formatBeijingTime } from '../utils/time'
 
 interface PoolRunwayCardProps {
-  accounts: AccountRow[]
-  currentRpm?: number
-  rpmLimit?: number
-  avgDurationMs?: number
+  analysis: AccountAnalysisResponse
   className?: string
 }
 
 export default function PoolRunwayCard({
-  accounts,
-  currentRpm = 0,
-  rpmLimit = 0,
-  avgDurationMs = 0,
+  analysis,
   className = '',
 }: PoolRunwayCardProps) {
   const { t } = useTranslation()
@@ -28,11 +22,11 @@ export default function PoolRunwayCard({
     setNowMs(Date.now())
     const timer = window.setInterval(() => setNowMs(Date.now()), 60_000)
     return () => window.clearInterval(timer)
-  }, [accounts, currentRpm, rpmLimit, avgDurationMs])
+  }, [analysis.snapshot_at])
 
   const runway = useMemo(
-    () => selectPoolRunway(accounts, nowMs, currentRpm, rpmLimit, avgDurationMs),
-    [accounts, avgDurationMs, currentRpm, nowMs, rpmLimit],
+    () => selectPoolRunwayFromAnalysis(analysis.forecasts, nowMs),
+    [analysis.forecasts, nowMs],
   )
 
   const display = formatRunwayDisplay(runway, t)

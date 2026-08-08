@@ -5,8 +5,10 @@ import { useTranslation } from 'react-i18next'
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from 'recharts'
 import {
   Activity,
+  AlertTriangle,
   BarChart3,
   Clock3,
+  Coins,
   Gauge,
   KeyRound,
   Package,
@@ -114,19 +116,27 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
     navigate(`/usage?${params.toString()}`)
   }
 
-  const handleCreditToggle = async (field: 'credit_enabled' | 'credit_skip_usage_window', value: boolean) => {
+  // 单开关同时写两列：后端门控是 CreditEnabled && CreditSkipUsageWindow，保持不动，
+  // 只是界面不再暴露那个自身无行为的中间开关。
+  const handleCreditToggle = async (value: boolean) => {
     setCreditError(null)
-    const newEnabled = field === 'credit_enabled' ? value : creditEnabled
-    const newSkip = field === 'credit_skip_usage_window' ? value : creditSkipWindow
     setSavingCredit(true)
+    // 乐观更新：开关立刻滑过去，不等请求往返（后端这一步可能顺带释放冷却、耗时可观）。
+    // 失败再回滚到原值并显示错误。
+    const prevEnabled = creditEnabled
+    const prevSkipWindow = creditSkipWindow
+    setCreditEnabled(value)
+    setCreditSkipWindow(value)
     try {
       await api.updateAccountCredit(account.id, {
-        credit_enabled: newEnabled,
-        credit_skip_usage_window: newSkip,
+        credit_enabled: value,
+        credit_skip_usage_window: value,
       })
-      if (field === 'credit_enabled') setCreditEnabled(value)
-      if (field === 'credit_skip_usage_window') setCreditSkipWindow(value)
+      // 后端在积分门打开时可能释放了用量窗口冷却，让外层刷新以更新状态与徽章。
+      onCreditsReset?.()
     } catch (err) {
+      setCreditEnabled(prevEnabled)
+      setCreditSkipWindow(prevSkipWindow)
       setCreditError(getErrorMessage(err))
     } finally {
       setSavingCredit(false)
@@ -170,6 +180,7 @@ export default function AccountUsageModal({ account, onClose, onCreditsReset, sh
       {showCreditSettings && (
         <>
           <CreditSettings
+            account={account}
             creditEnabled={creditEnabled}
             creditSkipWindow={creditSkipWindow}
             savingCredit={savingCredit}
@@ -732,20 +743,54 @@ function KeyRow({
   )
 }
 
+// CreditSettings 只暴露一个开关：「使用积分顶替限流」。
+//
+// 历史上这里是两级开关，外层「启用信用」是 commit c72e267 加的前置保险栓
+// （把原本单独生效的 CreditSkipUsageWindow 改成两者同真才生效）。但它自身不产生
+// 任何行为，只是把真正干活的开关藏了起来，反而让人找不到功能。
+//
+// 后端 `CreditEnabled && CreditSkipUsageWindow` 的门控**保持不动**：线上可能存在
+// 只开了其中一列的历史数据，拆掉门控会让它们突然开始绕过限流。这里改为一个开关
+// 同时写两列，行为零变化，只是界面上不再暴露那个没有意义的中间态。
 function CreditSettings({
+  account,
   creditEnabled,
   creditSkipWindow,
   savingCredit,
   creditError,
   onToggle,
 }: {
+  account: AccountRow
   creditEnabled: boolean
   creditSkipWindow: boolean
   savingCredit: boolean
   creditError: string | null
-  onToggle: (field: 'credit_enabled' | 'credit_skip_usage_window', value: boolean) => Promise<void>
+  onToggle: (value: boolean) => Promise<void>
 }) {
   const { t } = useTranslation()
+  // 积分门的几种状态，用来告诉用户这个开关此刻到底生不生效：
+  // unlimited / 有余额 → 顶替限流；余额 0 或上游报超额 → 已恢复限流；未探测 → 按没积分处理。
+  const balance = Number.parseFloat((account.credits_balance ?? '').trim())
+  const unlimited = account.credits_unlimited === true
+  const probed = account.credits_balance != null || unlimited
+  const overageReached = account.credits_overage_limit_reached === true
+  const hasCredits =
+    !overageReached &&
+    (unlimited || (account.credits_has_credits === true && Number.isFinite(balance) && balance > 0))
+
+  const skipHint = !probed
+    ? t('accounts.creditSkipWindowHintUnprobed')
+    : unlimited
+      ? t('accounts.creditSkipWindowHintUnlimited')
+      : hasCredits
+        ? t('accounts.creditSkipWindowHintActive', { balance: formatCreditsBalance(balance) })
+        : overageReached
+          ? t('accounts.creditSkipWindowHintOverage')
+          : t('accounts.creditSkipWindowHintDrained')
+
+  // 两列同真才算开。历史数据里只开了一列的组合在后端本就不生效，显示为关是准确的。
+  const skipActive = creditEnabled && creditSkipWindow
+
   return (
     <div className="mt-5 rounded-2xl border bg-card p-4">
       <h4 className="mb-3 text-base font-semibold">{t('accounts.creditSettings')}</h4>
@@ -754,24 +799,35 @@ function CreditSettings({
       )}
       <div className="space-y-3">
         <CreditToggle
-          label={t('accounts.creditEnabled')}
-          hint={t('accounts.creditEnabledHint')}
-          checked={creditEnabled}
+          label={t('accounts.creditSkipWindow')}
+          hint={skipHint}
+          checked={skipActive}
           disabled={savingCredit}
-          onClick={() => void onToggle('credit_enabled', !creditEnabled)}
+          onClick={() => void onToggle(!skipActive)}
         />
-        {creditEnabled && (
-          <CreditToggle
-            label={t('accounts.creditSkipWindow')}
-            hint={t('accounts.creditSkipWindowHint')}
-            checked={creditSkipWindow}
-            disabled={savingCredit}
-            onClick={() => void onToggle('credit_skip_usage_window', !creditSkipWindow)}
-          />
+        {/* 开关开着但当下没积分可花时明确说清：调度不会放行，状态仍是限流。 */}
+        {skipActive && !hasCredits && (
+          <p className="flex items-start gap-1.5 rounded-lg bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700 dark:text-amber-300">
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+            <span>{t('accounts.creditSkipWindowInactive')}</span>
+          </p>
+        )}
+        {/* 开着且有积分时给出正向确认，避免"开了但不知道有没有用"。 */}
+        {skipActive && hasCredits && (
+          <p className="flex items-start gap-1.5 rounded-lg bg-teal-500/10 px-2.5 py-2 text-xs text-teal-700 dark:text-teal-300">
+            <Coins className="mt-0.5 size-3.5 shrink-0" />
+            <span>{t('accounts.creditSkipWindowActiveNote')}</span>
+          </p>
         )}
       </div>
     </div>
   )
+}
+
+// formatCreditsBalance 把 "1000.0000000000" 这类长小数收敛到 2 位，避免开关说明被撑长。
+function formatCreditsBalance(balance: number): string {
+  if (!Number.isFinite(balance)) return '-'
+  return balance.toFixed(2)
 }
 
 function ResetCreditsSection({
@@ -831,7 +887,12 @@ function ResetCreditsSection({
       setCount(next)
       setDone(true)
       setConfirming(false)
+      // 后端已等过用量探针，此时刷新拿到的是新的用量与状态。
       onResetDone?.()
+      // 探针超时未落地（usage_refreshed=false）时补刷一次，否则进度条会停在旧值。
+      if (res.usage_refreshed === false) {
+        window.setTimeout(() => onResetDone?.(), 5000)
+      }
       // 重置消耗了一张券,重新拉取明细同步有效期列表。
       void loadDetail()
     } catch (err) {

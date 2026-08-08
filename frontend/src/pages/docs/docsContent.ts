@@ -374,13 +374,16 @@ export function buildAdminSpecs(
       ),
       description: copy(
         locale,
-        "通过 Refresh Token 添加账号，系统会自动刷新 Access Token 并加入号池。",
-        "Add an account via Refresh Token. The system refreshes its Access Token and adds it to the pool automatically.",
+        "通过 Refresh Token 添加账号，系统会自动刷新 Access Token 并加入号池。可在 custom_headers 中指定 Chatgpt-Account-Id，把同一登录身份的不同工作区作为独立路由保存。",
+        "Add an account via Refresh Token. The system refreshes its Access Token and adds it to the pool automatically. Set Chatgpt-Account-Id in custom_headers to keep separate workspace routes for the same login.",
       ),
       defaultBody: `{
   "name": "my-account",
-  "refresh_token": "rt_XPqsKO3Ld...",
-  "proxy_url": ""
+  "refresh_token": "<refresh-token>",
+  "proxy_url": "",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "workspace-id"
+  }
 }`,
       curl: `curl --request POST \\
   --url ${baseUrl}/api/admin/accounts \\
@@ -388,8 +391,11 @@ export function buildAdminSpecs(
   --header 'Content-Type: application/json' \\
   --data '{
   "name": "my-account",
-  "refresh_token": "rt_XPqsKO3Ld...\\nrt_H2qdhY",
-  "proxy_url": ""
+  "refresh_token": "<refresh-token>\\n<another-refresh-token>",
+  "proxy_url": "",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "workspace-id"
+  }
 }'`,
       responses: [
         {
@@ -415,13 +421,16 @@ export function buildAdminSpecs(
       ),
       description: copy(
         locale,
-        "添加 AT-only 账号；access_token 字段支持用换行分隔多个 Token。",
-        "Add AT-only accounts; the access_token field can contain multiple tokens separated by newlines.",
+        "添加 AT-only 账号；access_token 字段支持用换行分隔多个 Token。可通过 custom_headers.Chatgpt-Account-Id 指定目标工作区。",
+        "Add AT-only accounts; the access_token field can contain multiple tokens separated by newlines. Use custom_headers.Chatgpt-Account-Id to select the target workspace.",
       ),
       defaultBody: `{
   "name": "at-account",
   "access_token": "eyJhbGciOi...",
-  "proxy_url": ""
+  "proxy_url": "",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "workspace-id"
+  }
 }`,
       curl: `curl --request POST \\
   --url ${baseUrl}/api/admin/accounts/at \\
@@ -430,7 +439,10 @@ export function buildAdminSpecs(
   --data '{
   "name": "at-account",
   "access_token": "eyJhbGciOi...",
-  "proxy_url": ""
+  "proxy_url": "",
+  "custom_headers": {
+    "Chatgpt-Account-Id": "workspace-id"
+  }
 }'`,
       responses: [
         {

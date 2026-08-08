@@ -45,6 +45,12 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 		), http.StatusUpgradeRequired)
 		return
 	}
+	if h != nil && h.store != nil {
+		cfg := h.promptFilterConfigForRequest(c)
+		if h.rejectRequiredNewAPIIdentity(c, cfg.Advanced.NewAPI, nil) {
+			return
+		}
+	}
 
 	conn, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, newAPIPolicyWebSocketUpgradeHeaders())
 	if err != nil {

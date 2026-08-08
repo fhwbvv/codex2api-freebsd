@@ -162,7 +162,7 @@ const FORMAT_OPTIONS = [
   { label: 'JPEG', value: 'jpeg' },
 ]
 
-const UPSCALE_VALUES = ['', '2k', '4k'] as const
+const UPSCALE_VALUES = ['', 'none', '2k', '4k'] as const
 
 const STYLE_PRESETS = [
   {
@@ -1149,7 +1149,8 @@ export default function ImageStudio() {
     { label: t('images.backgroundOptions.transparent'), value: 'transparent' },
   ], [t])
   const upscaleOptions = useMemo(() => [
-    { label: t('images.upscaleOptions.none'), value: '' },
+    { label: t('images.upscaleOptions.auto'), value: '' },
+    { label: t('images.upscaleOptions.none'), value: 'none' },
     { label: t('images.upscaleOptions.2k'), value: '2k' },
     { label: t('images.upscaleOptions.4k'), value: '4k' },
   ], [t])
@@ -2421,9 +2422,13 @@ function HistoryJobCard({
             <HistoryMeta label={t('images.assetsCount')} value={t('images.imageCount', { count: assets.length })} />
           </div>
 
-          {job.error_message && (
-            <div className="line-clamp-3 rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm leading-6 text-red-700 dark:text-red-200">
-              {job.error_message}
+          {(job.error_message || job.warning) && (
+            <div className={`line-clamp-3 rounded-lg border p-3 text-sm leading-6 ${
+              job.status === 'failed'
+                ? 'border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-200'
+                : 'border-amber-500/25 bg-amber-500/10 text-amber-800 dark:text-amber-200'
+            }`}>
+              {job.error_message || job.warning}
             </div>
           )}
         </div>

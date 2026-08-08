@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -118,6 +119,13 @@ func (h *Handler) verifyImportGroupIDs(ctx context.Context, groupIDs []int64) ([
 func (h *Handler) bindImportedAccountGroups(ctx context.Context, accountIDs []int64, groupIDs []int64) error {
 	if len(accountIDs) == 0 || len(groupIDs) == 0 {
 		return nil
+	}
+	// 分组渠道校验(issue #487):同一次导入的账号平台一致,取首个账号判定渠道。
+	if row, err := h.db.GetAccountByID(ctx, accountIDs[0]); err == nil {
+		if err := h.validateGroupChannelForRows(ctx, []*database.AccountRow{row}, groupIDs); err != nil {
+			log.Printf("导入: 分组渠道校验失败 (accounts=%v, groups=%v): %v", accountIDs, groupIDs, err)
+			return err
+		}
 	}
 	if err := h.db.BatchSetAccountGroups(ctx, accountIDs, groupIDs); err != nil {
 		log.Printf("导入: 绑定账号分组失败 (accounts=%v, groups=%v): %v", accountIDs, groupIDs, err)

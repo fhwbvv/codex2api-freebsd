@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -29,8 +28,6 @@ const (
 	promptGuardSessionReadTimeout      = 50 * time.Millisecond
 	promptGuardPolicyEventIDContextKey = "prompt_filter_policy_event_id"
 )
-
-var promptSessionContinuationPattern = regexp.MustCompile(`(?i)^(?:(?:(?:请|麻烦)\s*)?继续(?:一下|吧|做|处理|执行|完成|生成|写)?(?:它|这个|上面(?:的)?内容|之前(?:的)?内容)?|接着(?:做|处理|执行)?|照做|按(?:上面|之前|刚才)(?:的)?(?:要求|内容|方案)?(?:继续)?(?:做|执行|处理)?|就这样做|continue(?:\s+(?:please|with\s+(?:that|it)))?|go\s+ahead|do\s+it|proceed(?:\s+with\s+it)?|carry\s+on|same\s+as\s+above)[。.!！\s]*$`)
 
 type promptSessionCorrelationRecord struct {
 	Fragments     []string  `json:"fragments"`
@@ -92,8 +89,10 @@ type promptSessionCorrelationPending struct {
 }
 
 // enrichPromptGuardSession links only an explicitly continued prompt from a
-// verified user/session pair. Arbitrary historical risk never blocks a later
-// request by itself, and short-fragment linking remains an administrator opt-in.
+// verified user/session pair. Explicit continuations inherit the preceding
+// accepted user intent as linked history and therefore use the current-user
+// guard policy. Heuristic short-fragment linking remains administrator opt-in
+// and shadow-only session context.
 func (h *Handler) enrichPromptGuardSession(c *gin.Context, cfg promptfilter.Config, signedBody []byte, envelope *promptfilter.RequestEnvelope) (*promptSessionCorrelationPending, error) {
 	if h == nil || h.cache == nil || c == nil || envelope == nil || !cfg.Enabled || !cfg.Advanced.Session.Enabled {
 		return nil, nil
@@ -103,11 +102,13 @@ func (h *Handler) enrichPromptGuardSession(c *gin.Context, cfg promptfilter.Conf
 	identityKey := ""
 	sessionFingerprint := ""
 	requestID := ""
+	runtimeScope := ""
 	trust := promptfilter.SegmentTrustClientSupplied
 	if verified && policyContext.MetaVerified {
 		identityKey = policyContext.Identity.UserID
 		sessionFingerprint = policyContext.Meta.SessionFingerprint
 		requestID = policyContext.Identity.RequestID
+		runtimeScope = newAPIRuntimeScope(policyContext.APIKeyID, policyContext.Platform)
 		trust = promptfilter.SegmentTrustGatewaySigned
 	}
 	if identityKey == "" && !sessionCfg.RequireSignedIdentity {
@@ -122,12 +123,13 @@ func (h *Handler) enrichPromptGuardSession(c *gin.Context, cfg promptfilter.Conf
 		return nil, nil
 	}
 	currentText = truncatePromptRunes(currentText, sessionCfg.MaxTextLength)
-	key := hashRiskIdentity(identityKey + "\x00" + sessionFingerprint)
+	key := hashRiskIdentity(runtimeScope + "\x00" + identityKey + "\x00" + sessionFingerprint)
 	if eventID := promptGuardPolicyEventID(c); requestID != "" && eventID != "" {
 		requestID += "\x00" + eventID
 	}
 	pending := &promptSessionCorrelationPending{Key: key, CurrentText: currentText, RequestID: requestID}
-	linkPrevious := promptSessionContinuationPattern.MatchString(strings.Join(strings.Fields(currentText), " "))
+	explicitContinuation := promptfilter.IsContinuationOnly(currentText)
+	linkPrevious := explicitContinuation
 	readForShortFragment := sessionCfg.CombineShortFragments && utf8.RuneCountInString(currentText) <= sessionCfg.ShortFragmentMaxChars
 	if !linkPrevious && !readForShortFragment {
 		// Ordinary requests only schedule the bounded post-decision write. They do
@@ -151,6 +153,14 @@ func (h *Handler) enrichPromptGuardSession(c *gin.Context, cfg promptfilter.Conf
 	if linkPrevious && len(record.Fragments) > 0 {
 		linkedText := truncatePromptRunes(strings.Join(record.Fragments, "\n"), sessionCfg.MaxTextLength)
 		if linkedText != "" {
+			origin := promptfilter.OriginSessionContext
+			role := "session"
+			linked := false
+			if explicitContinuation {
+				origin = promptfilter.OriginHistory
+				role = "user"
+				linked = true
+			}
 			minimumSequence := 0
 			for _, segment := range envelope.Segments {
 				if segment.Sequence < minimumSequence {
@@ -158,10 +168,11 @@ func (h *Handler) enrichPromptGuardSession(c *gin.Context, cfg promptfilter.Conf
 				}
 			}
 			envelope.Segments = append(envelope.Segments, promptfilter.Segment{
-				Origin:   promptfilter.OriginSessionContext,
-				Role:     "session",
+				Origin:   origin,
+				Role:     role,
 				Text:     linkedText,
 				Sequence: minimumSequence - 1,
+				Linked:   linked,
 				Trust:    trust,
 			})
 		}

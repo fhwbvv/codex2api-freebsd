@@ -133,6 +133,23 @@ func TestValidateResponsesAPIRequestAllowsOfficialContentInputTypes(t *testing.T
 	}
 }
 
+func TestValidateResponsesAPIRequestAcceptsEncryptedContentInput(t *testing.T) {
+	result := ValidateResponsesAPIRequest(
+		[]byte(`{
+			"model":"gpt-5.6",
+			"input":[
+				{"type":"encrypted_content","content":"opaque-ciphertext"},
+				{"type":"input_text","text":"hello"}
+			]
+		}`),
+		[]string{"gpt-5.6"},
+	)
+
+	if !result.Valid {
+		t.Fatalf("expected encrypted_content input type to be valid, got %#v", result.Errors)
+	}
+}
+
 func TestValidateResponsesAPIRequestMaxOutputTokensCap(t *testing.T) {
 	tests := []struct {
 		name  string

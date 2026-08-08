@@ -48,19 +48,25 @@ type ImagePromptTemplateInput struct {
 }
 
 type ImageGenerationJob struct {
-	ID           int64        `json:"id"`
-	Status       string       `json:"status"`
-	Prompt       string       `json:"prompt"`
-	ParamsJSON   string       `json:"params_json"`
-	APIKeyID     int64        `json:"api_key_id"`
-	APIKeyName   string       `json:"api_key_name"`
-	APIKeyMasked string       `json:"api_key_masked"`
-	ErrorMessage string       `json:"error_message"`
-	DurationMs   int          `json:"duration_ms"`
-	CreatedAt    time.Time    `json:"created_at"`
-	StartedAt    *time.Time   `json:"started_at,omitempty"`
-	CompletedAt  *time.Time   `json:"completed_at,omitempty"`
-	Assets       []ImageAsset `json:"assets,omitempty"`
+	ID           int64  `json:"id"`
+	Status       string `json:"status"`
+	Prompt       string `json:"prompt"`
+	ParamsJSON   string `json:"params_json"`
+	APIKeyID     int64  `json:"api_key_id"`
+	APIKeyName   string `json:"api_key_name"`
+	APIKeyMasked string `json:"api_key_masked"`
+	ErrorMessage string `json:"error_message"`
+	// Warning carries the notice attached to a job that finished successfully,
+	// for example a batch where one output could not be upscaled. It is not a
+	// separate column: the notice shares error_message on disk and is split out
+	// on read so a caller polling this API can keep treating a non-empty
+	// error_message as a failure.
+	Warning     string       `json:"warning,omitempty"`
+	DurationMs  int          `json:"duration_ms"`
+	CreatedAt   time.Time    `json:"created_at"`
+	StartedAt   *time.Time   `json:"started_at,omitempty"`
+	CompletedAt *time.Time   `json:"completed_at,omitempty"`
+	Assets      []ImageAsset `json:"assets,omitempty"`
 }
 
 type ImageGenerationJobInput struct {
@@ -318,6 +324,18 @@ func (db *DB) MarkImageJobSucceeded(ctx context.Context, id int64, durationMs in
 	return err
 }
 
+func (db *DB) MarkImageJobSucceededWithWarning(ctx context.Context, id int64, message string, durationMs int) error {
+	if len([]rune(message)) > 2000 {
+		message = string([]rune(message)[:2000])
+	}
+	_, err := db.conn.ExecContext(ctx, `
+		UPDATE image_generation_jobs
+		SET status=$1, duration_ms=$2, completed_at=CURRENT_TIMESTAMP, error_message=$3
+		WHERE id=$4
+	`, ImageJobSucceeded, durationMs, message, id)
+	return err
+}
+
 func (db *DB) MarkImageJobFailed(ctx context.Context, id int64, message string, durationMs int) error {
 	if len([]rune(message)) > 2000 {
 		message = string([]rune(message)[:2000])
@@ -460,6 +478,10 @@ func scanImageGenerationJob(scanner interface {
 		&job.ErrorMessage, &job.DurationMs, &createdRaw, &startedRaw, &completedRaw,
 	); err != nil {
 		return nil, err
+	}
+	if job.Status == ImageJobSucceeded && job.ErrorMessage != "" {
+		job.Warning = job.ErrorMessage
+		job.ErrorMessage = ""
 	}
 	var err error
 	job.CreatedAt, err = parseDBTimeValue(createdRaw)

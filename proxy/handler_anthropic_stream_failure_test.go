@@ -2,10 +2,12 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,6 +15,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
 
@@ -117,6 +120,37 @@ func TestMessagesStreamResponseFailedAfterContentEmitsErrorEvent(t *testing.T) {
 	}
 	if strings.Contains(body, "message_stop") {
 		t.Fatalf("post-content response.failed must not fabricate a clean message_stop; body=%q", body)
+	}
+}
+
+func TestMessagesResponseFailedCyberPolicyEntersUnifiedAuditAndCandidateQueue(t *testing.T) {
+	handler, _ := newAnthropicStreamFailureTestHandler(t, func(call int32, w http.ResponseWriter) {
+		writeCodexSSE(w,
+			`{"type":"response.created","response":{"id":"resp_cyber"}}`,
+			`{"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"cyber security risk detected"}}}`,
+		)
+	})
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "messages-cyber.db"))
+	if err != nil {
+		t.Fatalf("database.New(sqlite): %v", err)
+	}
+	defer db.Close()
+	handler.db = db
+	cfg := promptfilter.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Mode = promptfilter.ModeBlock
+	handler.store.SetPromptFilterConfig(cfg)
+
+	_ = invokeAnthropicMessagesStream(t, handler)
+	waitPromptFilterAuditIdle(t, db)
+	incidents, incidentTotal, err := db.ListPromptPolicyIncidentsPage(context.Background(), database.PromptPolicyIncidentQuery{Page: 1, PageSize: 10})
+	if err != nil || incidentTotal == 0 || len(incidents) == 0 || incidents[0].Endpoint != "/v1/messages" || incidents[0].Transport != "sse" {
+		t.Fatalf("messages cyber_policy incident total=%d items=%#v err=%v", incidentTotal, incidents, err)
+	}
+	assertCyberUsageIncidentLinks(t, db, "/v1/messages")
+	candidates, total, err := db.ListPromptRuleCandidates(context.Background(), database.PromptRuleCandidateQuery{Status: database.PromptRuleCandidateStatusPending})
+	if err != nil || total != 1 || len(candidates) != 1 || candidates[0].Kind != database.PromptRuleCandidateKindEvidence {
+		t.Fatalf("messages candidate total=%d items=%#v err=%v", total, candidates, err)
 	}
 }
 

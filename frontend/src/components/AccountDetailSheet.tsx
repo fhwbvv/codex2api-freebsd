@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   BarChart3,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Copy,
   ExternalLink,
   FileJson,
   FlaskConical,
@@ -17,6 +19,7 @@ import {
   Timer,
   Trash2,
   Unlock,
+  X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
@@ -25,6 +28,9 @@ import ChannelLogo from "./ChannelLogo";
 import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Sheet,
   SheetBody,
@@ -59,6 +65,59 @@ function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
       return "7d";
   }
   return null;
+}
+
+// 复制邮箱按钮。navigator.clipboard 在非安全上下文（局域网 http 访问）下不存在，
+// 回退到隐藏 textarea + execCommand，否则内网部署里这个按钮会静默失效。
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  document.body.removeChild(ta);
+}
+
+function CopyValueButton({ value, label }: { value: string; label: string }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const handleCopy = async () => {
+    try {
+      await copyTextToClipboard(value);
+      setCopied(true);
+    } catch {
+      // 剪贴板权限被拒时不打断查看详情，保持静默。
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={() => void handleCopy()}
+      title={copied ? t("common.copied") : label}
+      aria-label={label}
+      className="inline-flex size-6 shrink-0 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:border-border hover:bg-muted hover:text-foreground"
+    >
+      {copied ? (
+        <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+      ) : (
+        <Copy className="size-3.5" />
+      )}
+    </button>
+  );
 }
 
 function Section({
@@ -121,6 +180,13 @@ export interface AccountDetailSheetProps {
   onToggleEnabled: () => void;
   onToggleLock: () => void;
   onResetStatus: () => void;
+  onSaveModelCooldownPolicy: (data: {
+    mode: "off" | "fixed" | "adaptive" | null;
+    seconds: number | null;
+    backoff_enabled: boolean | null;
+  }) => void;
+  onClearModelCooldown: (model: string) => void;
+  onClearAllModelCooldowns: () => void;
   onResetCredits: () => void;
   onDelete: () => void;
 }
@@ -146,11 +212,32 @@ export default function AccountDetailSheet({
   onToggleEnabled,
   onToggleLock,
   onResetStatus,
+  onSaveModelCooldownPolicy,
+  onClearModelCooldown,
+  onClearAllModelCooldowns,
   onResetCredits,
   onDelete,
 }: AccountDetailSheetProps) {
   const { t } = useTranslation();
   const open = Boolean(account);
+  const [cooldownMode, setCooldownMode] = useState<string>("inherit");
+  const [cooldownSeconds, setCooldownSeconds] = useState(300);
+  const [cooldownBackoff, setCooldownBackoff] = useState(true);
+
+  useEffect(() => {
+    if (!account) return;
+    setCooldownMode(account.model_cooldown_mode_override ?? "inherit");
+    setCooldownSeconds(
+      account.model_cooldown_seconds_override ??
+        account.model_cooldown_seconds_effective ??
+        300,
+    );
+    setCooldownBackoff(
+      account.model_cooldown_backoff_override ??
+        account.model_cooldown_backoff_effective ??
+        true,
+    );
+  }, [account]);
 
   useEffect(() => {
     if (!open) return;
@@ -172,6 +259,10 @@ export default function AccountDetailSheet({
       ? account.name || account.email || `#${account.id}`
       : account.email || account.name || `#${account.id}`
     : "";
+  // 标题退化成 "#12" 这种 id 兜底时没有复制价值（旁边就有 ID 徽章），不显示按钮。
+  const copyableName = Boolean(
+    account && displayName && displayName !== `#${account.id}`,
+  );
   const rateWindow = account ? getRateLimitWindow(account) : null;
   const isGrok = Boolean(account?.grok_api);
   // Grok API Key 无 refresh_token；Codex AT-only / Responses 也不走 AT 刷新。
@@ -256,13 +347,41 @@ export default function AccountDetailSheet({
                     </span>
                   )}
                 </div>
-                <SheetTitle className="break-all text-[17px] leading-snug">
-                  {displayName}
-                </SheetTitle>
-                {account.chatgpt_account_id ? (
-                  <SheetDescription className="mt-1 break-all font-mono text-[11px]">
-                    {account.chatgpt_account_id}
-                  </SheetDescription>
+                <div className="flex items-start gap-1.5">
+                  <SheetTitle className="break-all text-[17px] leading-snug">
+                    {displayName}
+                  </SheetTitle>
+                  {copyableName && (
+                    <span className="mt-0.5">
+                      <CopyValueButton
+                        value={displayName}
+                        label={
+                          displayName.includes("@")
+                            ? t("accounts.detailCopyEmail")
+                            : t("common.copy")
+                        }
+                      />
+                    </span>
+                  )}
+                </div>
+                {account.effective_workspace_id ? (
+                  <div className="mt-1 space-y-0.5">
+                    <SheetDescription className="break-all font-mono text-[11px]">
+                      {account.workspace_id_override
+                        ? `${t("accounts.workspaceRouteBadge")}: `
+                        : ""}
+                      {account.effective_workspace_id}
+                    </SheetDescription>
+                    {account.workspace_id_override &&
+                    account.token_workspace_id &&
+                    account.token_workspace_id !==
+                      account.effective_workspace_id ? (
+                      <SheetDescription className="break-all font-mono text-[10px] text-muted-foreground/70">
+                        {t("accounts.tokenWorkspaceLabel")}:{" "}
+                        {account.token_workspace_id}
+                      </SheetDescription>
+                    ) : null}
+                  </div>
                 ) : isGrok && account.email && account.name && account.email !== account.name ? (
                   <SheetDescription className="mt-1 break-all text-[12px]">
                     {account.email}
@@ -368,6 +487,138 @@ export default function AccountDetailSheet({
                 ) : null}
               </div>
             </Section>
+
+            {!isGrok ? <Section
+              title={t("accounts.modelCooldownPolicy")}
+              action={
+                (account.model_cooldowns?.length ?? 0) > 0 ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    onClick={onClearAllModelCooldowns}
+                    className="h-7 text-[11px] text-amber-700 dark:text-amber-300"
+                  >
+                    <X className="size-3" />
+                    {t("accounts.clearAllModelCooldowns")}
+                  </Button>
+                ) : null
+              }
+            >
+              <div className="space-y-3 rounded-xl border border-border bg-card p-3">
+                <div className="rounded-lg bg-muted/40 px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground">
+                  {t("accounts.modelCooldownEffective", {
+                    mode: t(
+                      `settings.modelCooldownMode${(
+                        account.model_cooldown_mode_effective ?? "adaptive"
+                      )
+                        .charAt(0)
+                        .toUpperCase()}${(
+                        account.model_cooldown_mode_effective ?? "adaptive"
+                      ).slice(1)}`,
+                    ),
+                    seconds: account.model_cooldown_seconds_effective ?? 0,
+                    backoff: account.model_cooldown_backoff_effective
+                      ? t("common.enabled")
+                      : t("common.disabled"),
+                  })}
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="col-span-2">
+                    <label className="mb-1 block text-[11px] font-medium text-muted-foreground">
+                      {t("accounts.modelCooldownModeOverride")}
+                    </label>
+                    <Select
+                      value={cooldownMode}
+                      onValueChange={setCooldownMode}
+                      options={[
+                        { label: t("accounts.modelCooldownInherit"), value: "inherit" },
+                        { label: t("settings.modelCooldownModeOff"), value: "off" },
+                        { label: t("settings.modelCooldownModeFixed"), value: "fixed" },
+                        { label: t("settings.modelCooldownModeAdaptive"), value: "adaptive" },
+                      ]}
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] font-medium text-muted-foreground">
+                      {t("settings.modelCooldownSeconds")}
+                    </label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={1800}
+                      value={cooldownSeconds}
+                      disabled={cooldownMode === "off"}
+                      onChange={(event) =>
+                        setCooldownSeconds(
+                          Math.max(1, Math.min(1800, Number(event.target.value) || 1)),
+                        )
+                      }
+                    />
+                  </div>
+                  <div className="flex items-end">
+                    <div className="flex h-10 w-full items-center justify-between rounded-md border border-input px-3">
+                      <span className="text-xs text-muted-foreground">
+                        {t("settings.modelCooldownBackoff")}
+                      </span>
+                      <Switch
+                        checked={cooldownBackoff}
+                        disabled={cooldownMode !== "adaptive"}
+                        onCheckedChange={setCooldownBackoff}
+                      />
+                    </div>
+                  </div>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
+                  onClick={() =>
+                    onSaveModelCooldownPolicy({
+                      mode:
+                        cooldownMode === "inherit"
+                          ? null
+                          : (cooldownMode as "off" | "fixed" | "adaptive"),
+                      seconds:
+                        cooldownMode === "inherit" ? null : cooldownSeconds,
+                      backoff_enabled:
+                        cooldownMode === "inherit" ? null : cooldownBackoff,
+                    })
+                  }
+                >
+                  {t("accounts.saveModelCooldownPolicy")}
+                </Button>
+                {(account.model_cooldowns?.length ?? 0) > 0 ? (
+                  <div className="space-y-1.5 border-t border-border pt-3">
+                    {account.model_cooldowns?.map((cooldown) => (
+                      <div
+                        key={cooldown.model}
+                        className="flex items-center justify-between gap-2 rounded-lg bg-amber-500/10 px-2.5 py-2 text-xs"
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-amber-800 dark:text-amber-200">
+                            {cooldown.model}
+                          </div>
+                          <div className="text-[10px] text-muted-foreground">
+                            {cooldown.reason} · {cooldown.remaining_seconds}s
+                          </div>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          onClick={() => onClearModelCooldown(cooldown.model)}
+                          title={t("accounts.clearModelCooldown")}
+                        >
+                          <X className="size-3.5" />
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            </Section> : null}
 
             <Section
               title={t("accounts.usage")}

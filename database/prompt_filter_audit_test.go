@@ -91,6 +91,111 @@ func TestPromptFilterAuditQueueOwnsQueuedStrings(t *testing.T) {
 	}
 }
 
+func TestPromptPolicyIncidentQueueOwnsStringsAndRejectsOversizedJobs(t *testing.T) {
+	queue := newPromptFilterAuditQueue(&DB{})
+	backing := strings.Repeat("i", 4*1024*1024)
+	preview := backing[:64]
+	incident, candidate, evidence := promptPolicyTestInputs("incident-owned")
+	incident.PromptPreview = preview
+	incident.PromptText = preview
+	candidate.SamplePreview = preview
+	evidence.SamplePreview = preview
+	if !queue.enqueueIncident(incident, candidate, evidence) {
+		t.Fatal("incident enqueue failed")
+	}
+	job := <-queue.high
+	queue.pending.Add(-1)
+	queue.releaseBytes(PromptFilterLogPriorityHigh, job.bytes)
+	if unsafe.StringData(job.incident.PromptPreview) == unsafe.StringData(preview) ||
+		unsafe.StringData(job.incident.PromptText) == unsafe.StringData(preview) ||
+		unsafe.StringData(job.candidate.SamplePreview) == unsafe.StringData(preview) ||
+		unsafe.StringData(job.candidateEvidence.SamplePreview) == unsafe.StringData(preview) {
+		t.Fatal("queued incident retained the caller's backing allocation")
+	}
+
+	incident.IncidentID = "incident-oversized"
+	incident.PromptText = strings.Repeat("x", promptFilterAuditMaxJobBytes+1)
+	if queue.enqueueIncident(incident, candidate, evidence) {
+		t.Fatal("oversized incident entered the queue")
+	}
+	if got := queue.droppedHigh.Load(); got != 1 {
+		t.Fatalf("dropped high = %d, want 1", got)
+	}
+}
+
+func TestEnqueuePromptPolicyIncidentPersistsCompositeAndDrains(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	incident, candidate, evidence := promptPolicyTestInputs("incident-queued")
+	if !db.EnqueuePromptPolicyIncident(&incident, &candidate, &evidence) {
+		t.Fatal("incident audit enqueue failed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if !db.WaitPromptFilterAuditIdle(ctx) {
+		t.Fatal("incident audit queue did not become idle")
+	}
+	got, err := db.GetPromptPolicyIncident(ctx, incident.IncidentID)
+	if err != nil {
+		t.Fatalf("GetPromptPolicyIncident: %v", err)
+	}
+	if got.CandidateID == 0 || got.CandidateEvidenceID == 0 {
+		t.Fatalf("composite associations were not persisted: %#v", got)
+	}
+	evidenceItems, err := db.ListPromptRuleCandidateEvidence(ctx, got.CandidateID, 10)
+	if err != nil || len(evidenceItems) != 1 || evidenceItems[0].PromptPolicyIncidentID != incident.IncidentID {
+		t.Fatalf("incident evidence items=%#v err=%v", evidenceItems, err)
+	}
+}
+
+func TestPromptPolicyIncidentQueueRejectsAfterClose(t *testing.T) {
+	queue := newPromptFilterAuditQueue(&DB{})
+	queue.closed.Store(true)
+	incident, candidate, evidence := promptPolicyTestInputs("incident-closed")
+	if queue.enqueueIncident(incident, candidate, evidence) {
+		t.Fatal("closed queue accepted an incident")
+	}
+	if got := queue.droppedHigh.Load(); got != 1 {
+		t.Fatalf("dropped high = %d, want 1", got)
+	}
+}
+
+func TestPromptRuleCandidateQueueSaturationIsNonBlockingAndOwnsStrings(t *testing.T) {
+	queue := newPromptFilterAuditQueue(&DB{})
+	backing := strings.Repeat("z", 4*1024*1024)
+	preview := backing[:64]
+	candidate := PromptRuleCandidateInput{Fingerprint: strings.Repeat("a", 64), Kind: PromptRuleCandidateKindEvidence, SamplePreview: preview}
+	evidence := PromptRuleCandidateEvidenceInput{SourceKind: PromptRuleCandidateSourceUpstreamCyberPolicy, SourceRefHash: strings.Repeat("b", 64), SamplePreview: preview}
+	if !queue.enqueueCandidate(candidate, evidence, PromptFilterLogPriorityHigh) {
+		t.Fatal("candidate enqueue failed")
+	}
+	job := <-queue.high
+	queue.pending.Add(-1)
+	queue.releaseBytes(PromptFilterLogPriorityHigh, job.bytes)
+	if unsafe.StringData(job.candidate.SamplePreview) == unsafe.StringData(preview) || unsafe.StringData(job.candidateEvidence.SamplePreview) == unsafe.StringData(preview) {
+		t.Fatal("queued candidate retained the caller's backing allocation")
+	}
+	for index := 0; index < promptFilterAuditHighCapacity; index++ {
+		if !queue.enqueueCandidate(candidate, evidence, PromptFilterLogPriorityHigh) {
+			t.Fatalf("candidate enqueue %d failed before dedicated capacity", index)
+		}
+	}
+	started := time.Now()
+	if queue.enqueueCandidate(candidate, evidence, PromptFilterLogPriorityHigh) {
+		t.Fatal("saturated candidate queue accepted another job")
+	}
+	if elapsed := time.Since(started); elapsed > 50*time.Millisecond {
+		t.Fatalf("saturated enqueue blocked for %s", elapsed)
+	}
+	if queue.droppedHigh.Load() != 1 {
+		t.Fatalf("dropped high=%d, want 1", queue.droppedHigh.Load())
+	}
+}
+
 func TestPromptFilterAuditQueueCloseRejectsConcurrentEnqueue(t *testing.T) {
 	db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
 	if err != nil {

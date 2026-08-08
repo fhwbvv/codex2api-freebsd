@@ -89,13 +89,6 @@
 
 <table>
 <tr>
-<td width="180" align="center" valign="middle"><a href="https://aihub.top/register?aff=42WZVXN9KS4S"><img src="assets/aihub-logo.jpg" width="160" alt="AIHub"></a></td>
-<td valign="middle"><b><a href="https://aihub.top/register?aff=42WZVXN9KS4S">AIHub</a></b> 是一家面向个人开发者和企业团队的高可用 AI 模型 API 中转平台。支持 Codex/Claude Code，价格大约是官方的 1 折不到！通过链接注册，使用优惠码 <code>CODEX2API</code> 即可获得 3$ 测试额度。</td>
-</tr>
-</table>
-
-<table>
-<tr>
 <td width="180" align="center" valign="middle"><a href="https://ai.centos.hk"><b>星辰·AI</b></a></td>
 <td valign="middle"><b><a href="https://ai.centos.hk">星辰·AI</a></b> 提供稳定、高速的 Claude Code / Codex / Gemini 中转服务，面向个人开发者与团队均适用。</td>
 </tr>

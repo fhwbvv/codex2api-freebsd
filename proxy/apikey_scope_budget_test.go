@@ -330,9 +330,12 @@ func TestDeltaWithSharedBucketsAvoidsDoubleCounting(t *testing.T) {
 	tracker := newAPIKeyScopeUsageTracker()
 	tracker.markTracked(7)
 
-	now := time.Now()
-	snapshotAt := now.Add(-90 * time.Second)
-	sharedReadAt := now.Add(-10 * time.Second)
+	// Anchor the fixture away from minute boundaries. Deriving both timestamps
+	// directly from time.Now made this test flaky whenever snapshotAt landed at
+	// xx:xx:59 and snapshotAt+1s crossed into the next minute.
+	baseMinute := time.Now().Add(-3 * time.Minute).Truncate(time.Minute)
+	snapshotAt := baseMinute.Add(30 * time.Second)
+	sharedReadAt := baseMinute.Add(90 * time.Second)
 	snapshotMinute := snapshotAt.Unix() / 60
 
 	tracker.events[7] = []apiKeyScopeUsageEvent{

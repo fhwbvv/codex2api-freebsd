@@ -2,6 +2,8 @@ export interface AccountOperationEvent {
   type: "start" | "progress" | "complete";
   action: string;
   account_id?: number;
+  account_name?: string;
+  account_email?: string;
   status?: string;
   http_status?: number;
   message?: string;
@@ -10,6 +12,8 @@ export interface AccountOperationEvent {
 
 export interface AccountOperationResult {
   accountId: number;
+  accountName?: string;
+  accountEmail?: string;
   status: string;
   httpStatus?: number;
   message: string;
@@ -72,8 +76,12 @@ export function collectAccountOperationResult(
 
   const status =
     event.status?.trim() || (event.error?.trim() ? "failed" : "success");
+  const accountName = event.account_name?.trim();
+  const accountEmail = event.account_email?.trim();
   results.set(event.account_id, {
     accountId: event.account_id,
+    ...(accountName ? { accountName } : {}),
+    ...(accountEmail ? { accountEmail } : {}),
     status,
     httpStatus:
       event.http_status && event.http_status > 0

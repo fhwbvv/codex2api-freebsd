@@ -143,3 +143,27 @@ func TestCooldownCacheWritesAndDeletes(t *testing.T) {
 		t.Fatalf("model cooldown runtime cache after clear ok=%v err=%v, want miss", ok, err)
 	}
 }
+
+func TestModelCooldownFixedModeDoesNotBackoff(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{DBID: 11}
+
+	first := store.MarkModelCooldownWithBackoff(acc, "gpt-5.6-sol", 2*time.Second, "rate_limited_model", false)
+	second := store.MarkModelCooldownWithBackoff(acc, "gpt-5.6-sol", 2*time.Second, "rate_limited_model", false)
+
+	if first.Model == "" || second.Model == "" {
+		t.Fatal("expected cooldown records")
+	}
+	if second.BackoffLevel != 0 {
+		t.Fatalf("BackoffLevel = %d, want 0", second.BackoffLevel)
+	}
+	if remaining := time.Until(second.ResetAt); remaining < time.Second || remaining > 3*time.Second {
+		t.Fatalf("remaining = %v, want fixed ~2s", remaining)
+	}
+	if cleared := store.ClearAllModelCooldowns(acc); cleared != 1 {
+		t.Fatalf("ClearAllModelCooldowns() = %d, want 1", cleared)
+	}
+	if acc.IsModelRateLimited("gpt-5.6-sol") {
+		t.Fatal("model cooldown should be cleared")
+	}
+}

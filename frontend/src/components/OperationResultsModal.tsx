@@ -250,8 +250,13 @@ export default function OperationResultsModal({
                           <div className="font-medium">
                             {account
                               ? formatResultAccountName(account)
-                              : `#${result.accountId}`}
+                              : result.accountName || result.accountEmail || `#${result.accountId}`}
                           </div>
+                          {!account && result.accountName && result.accountEmail && result.accountName !== result.accountEmail ? (
+                            <div className="text-xs text-muted-foreground">
+                              {result.accountEmail}
+                            </div>
+                          ) : null}
                           <div className="text-xs text-muted-foreground">
                             ID {result.accountId}
                           </div>

@@ -19,7 +19,7 @@ type tokenCredentialSeed struct {
 	workspaceID     string
 	// userID 是 OpenAI 用户 ID（user-...），仅作为账号元数据保存。
 	userID string
-	// allowDuplicate 仅允许 workspace_id 为空的账号重复。
+	// allowDuplicate 仅允许有效工作区（Token workspace 或请求头覆盖）为空的账号重复。
 	allowDuplicate        bool
 	email                 string
 	planType              string
@@ -117,6 +117,11 @@ func normalizeTokenCredentialSeed(seed tokenCredentialSeed) tokenCredentialSeed 
 	return seed
 }
 
+func effectiveWorkspaceIDFromSeed(seed tokenCredentialSeed) string {
+	seed = normalizeTokenCredentialSeed(seed)
+	return openaiidentity.EffectiveWorkspaceID(seed.workspaceID, seed.customHeaders)
+}
+
 const accessTokenTypeCodexAT = "codex_at"
 
 func accessTokenTypeForToken(accessToken string) string {
@@ -181,7 +186,7 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	if seed.userID != "" {
 		credentials["user_id"] = seed.userID
 	}
-	if seed.allowDuplicate && seed.workspaceID == "" {
+	if seed.allowDuplicate && effectiveWorkspaceIDFromSeed(seed) == "" {
 		credentials["allow_duplicate"] = "true"
 	}
 	if seed.email != "" {

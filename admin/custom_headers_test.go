@@ -47,3 +47,28 @@ func TestParseCustomHeadersFormRejectsInvalidJSON(t *testing.T) {
 		t.Fatal("expected non-object custom_headers error")
 	}
 }
+
+func TestParseCustomHeadersFormRejectsConflictingCaseVariants(t *testing.T) {
+	if _, err := parseCustomHeadersForm(`{
+		"Chatgpt-Account-Id":"team-a",
+		"chatgpt-account-id":"team-b"
+	}`); err == nil {
+		t.Fatal("expected conflicting workspace header error")
+	}
+}
+
+func TestParseCustomHeadersFormCanonicalizesMatchingCaseVariants(t *testing.T) {
+	headers, err := parseCustomHeadersForm(`{
+		"Chatgpt-Account-Id":"team-a",
+		"chatgpt-account-id":"team-a"
+	}`)
+	if err != nil {
+		t.Fatalf("parseCustomHeadersForm() error = %v", err)
+	}
+	if got := headers["Chatgpt-Account-Id"]; got != "team-a" {
+		t.Fatalf("Chatgpt-Account-Id = %q, want team-a", got)
+	}
+	if len(headers) != 1 {
+		t.Fatalf("normalized headers = %#v, want one canonical entry", headers)
+	}
+}

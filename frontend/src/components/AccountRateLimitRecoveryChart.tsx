@@ -14,33 +14,19 @@ import {
 import { CircleHelp, TimerReset } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Tooltip as UITooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import type { AccountRow } from '../types'
+import type { AccountAnalysisResponse, AccountAnalysisTimeBucket } from '../types'
 import { formatBeijingTime } from '../utils/time'
 import {
   buildPoolRunway,
-  estimatePressureForecast,
-  hasBurnPrediction,
-  isPremiumUsagePlan,
-  isWindowRateLimitLike,
+  pressureForecastFromAnalysis,
   type PressureForecast,
   type RecoveryWindow,
 } from '../lib/poolRunway'
 
 interface AccountRateLimitRecoveryChartProps {
-  accounts: AccountRow[]
-  currentRpm?: number
-  rpmLimit?: number
-  avgDurationMs?: number
+  analysis: AccountAnalysisResponse
   className?: string
   compact?: boolean
-}
-
-interface RecoveryCandidate {
-  id: number
-  label: string
-  recoveryAt: number
-  secondsUntil: number
-  reason: RecoveryReason
 }
 
 type RecoveryReason = '5h' | '7d' | 'cooldown'
@@ -56,17 +42,12 @@ interface RecoveryGroup {
   fill: string
 }
 
-interface ResetCandidate {
-  id: number
-  label: string
-  resetAt: number
-}
-
 interface ResetStats {
-  candidates: ResetCandidate[]
   points: RecoveryGroup[]
   total: number
+  known: number
   unknown: number
+  nextAt: number | null
 }
 
 const recoveryWindows: RecoveryWindow[] = ['5h', '7d']
@@ -90,7 +71,7 @@ const tooltipContentStyle = {
 const tooltipLabelStyle = { color: 'var(--color-foreground)', fontWeight: 600 }
 const tooltipItemStyle = { color: 'var(--color-foreground)' }
 
-export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0, rpmLimit = 0, avgDurationMs = 0, className = '', compact = false }: AccountRateLimitRecoveryChartProps) {
+export default function AccountRateLimitRecoveryChart({ analysis, className = '', compact = false }: AccountRateLimitRecoveryChartProps) {
   const { t } = useTranslation()
   const [nowMs, setNowMs] = useState(() => Date.now())
   const [windowKey, setWindowKey] = useState<RecoveryWindow>('5h')
@@ -102,42 +83,37 @@ export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0
   }, [])
 
   const recovery = useMemo(() => {
-    const candidates: RecoveryCandidate[] = []
-    let unknown = 0
-
-    for (const account of accounts) {
-      const candidate = getAccountRecoveryCandidate(account, nowMs, windowKey)
-      if (candidate) {
-        candidates.push(candidate)
-      } else if (isWindowRateLimitLike(account, windowKey)) {
-        unknown += 1
-      }
-    }
-
-    candidates.sort((a, b) => a.recoveryAt - b.recoveryAt)
-
+    const source = analysis.recovery[windowKey]
     return {
-      candidates,
-      points: createRecoveryPoints(candidates, windowKey, nowMs),
-      unknown,
-      forecast: estimatePressureForecast(accounts, windowKey, nowMs, currentRpm, rpmLimit, avgDurationMs),
+      recoverable: source.recoverable,
+      points: source.buckets.map((bucket, index) => analysisBucketToPoint(bucket, `${windowKey}-${index}`, windowKey)),
+      unknown: source.unknown,
+      nextAt: source.next_at,
+      total: source.total,
+      forecast: pressureForecastFromAnalysis(analysis.forecasts[windowKey]),
     }
-  }, [accounts, avgDurationMs, currentRpm, nowMs, rpmLimit, windowKey])
+  }, [analysis, windowKey])
 
-  const resetStats = useMemo(() => createResetStats(accounts, nowMs), [accounts, nowMs])
-  const limitedTotal = recovery.candidates.length + recovery.unknown
-  const nextRecovery = recovery.candidates[0]
-  const nextReset = resetStats.candidates[0]
+  const resetStats = useMemo(() => ({
+    points: analysis.reset.buckets.map((bucket, index) => analysisBucketToPoint(bucket, `7d-reset-${index}`, '7d')),
+    total: analysis.reset.total,
+    known: analysis.reset.known,
+    unknown: analysis.reset.unknown,
+    nextAt: analysis.reset.next_at,
+  }), [analysis.reset])
+  const limitedTotal = recovery.total
+  const nextRecovery = recovery.nextAt
+  const nextReset = resetStats.nextAt
   const chartPoints = viewMode === 'recovery' ? recovery.points : resetStats.points
   const yAxisConfig = getCountAxisConfig(chartPoints)
   const currentTitle = viewMode === 'recovery' ? t('accounts.recoveryDistributionTitle') : t('accounts.quotaResetDistributionTitle')
   const currentDescription = viewMode === 'recovery'
     ? t('accounts.recoveryDistributionDesc', {
-      recoverable: recovery.candidates.length,
+      recoverable: recovery.recoverable,
       limited: limitedTotal,
     })
     : t('accounts.quotaResetDistributionDesc', {
-      known: resetStats.candidates.length,
+      known: resetStats.known,
       total: resetStats.total,
     })
 
@@ -202,15 +178,15 @@ export default function AccountRateLimitRecoveryChart({ accounts, currentRpm = 0
           {viewMode === 'recovery' ? (
             <>
               <RecoveryMetric label={t('accounts.recoveryLimitedTotal')} value={limitedTotal} tone={limitedTotal > 0 ? 'warning' : 'success'} compact={compact} />
-              <RecoveryMetric label={t('accounts.recoveryRecoverable')} value={recovery.candidates.length} compact={compact} />
-              <RecoveryMetric label={t('accounts.recoveryNext')} value={nextRecovery ? formatChartTime(nextRecovery.recoveryAt) : '-'} tone={nextRecovery ? 'success' : 'neutral'} compact={compact} />
+              <RecoveryMetric label={t('accounts.recoveryRecoverable')} value={recovery.recoverable} compact={compact} />
+              <RecoveryMetric label={t('accounts.recoveryNext')} value={nextRecovery ? formatChartTime(nextRecovery) : '-'} tone={nextRecovery ? 'success' : 'neutral'} compact={compact} />
               <RecoveryMetric label={t('accounts.recoveryUnknown')} value={recovery.unknown} tone={recovery.unknown > 0 ? 'warning' : 'neutral'} compact={compact} />
             </>
           ) : (
             <>
               <RecoveryMetric label={t('accounts.quotaResetTotal')} value={resetStats.total} compact={compact} />
-              <RecoveryMetric label={t('accounts.quotaResetKnown')} value={resetStats.candidates.length} compact={compact} />
-              <RecoveryMetric label={t('accounts.quotaResetNext')} value={nextReset ? formatChartTime(nextReset.resetAt) : '-'} tone={nextReset ? 'success' : 'neutral'} compact={compact} />
+              <RecoveryMetric label={t('accounts.quotaResetKnown')} value={resetStats.known} compact={compact} />
+              <RecoveryMetric label={t('accounts.quotaResetNext')} value={nextReset ? formatChartTime(nextReset) : '-'} tone={nextReset ? 'success' : 'neutral'} compact={compact} />
               <RecoveryMetric label={t('accounts.quotaResetUnknown')} value={resetStats.unknown} tone={resetStats.unknown > 0 ? 'warning' : 'neutral'} compact={compact} />
             </>
           )}
@@ -447,15 +423,14 @@ function formatRunwayAdvice(
 }
 
 function QuotaResetSummaryCard({ stats, t }: { stats: ResetStats; t: (key: string, options?: Record<string, unknown>) => string }) {
-  const nextReset = stats.candidates[0]
-  const nextText = nextReset
-    ? formatChartTime(nextReset.resetAt)
+  const nextText = stats.nextAt
+    ? formatChartTime(stats.nextAt)
     : t('accounts.quotaResetSummaryNone')
   const futureCount = stats.points.reduce((sum, point) => sum + point.count, 0)
-  const tone = nextReset ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'
+  const tone = stats.nextAt ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'
   const descText = t('accounts.quotaResetSummaryDesc', {
     count: futureCount,
-    known: stats.candidates.length,
+    known: stats.known,
     total: stats.total,
     unknown: stats.unknown,
   })
@@ -476,7 +451,7 @@ function QuotaResetSummaryCard({ stats, t }: { stats: ResetStats; t: (key: strin
       </div>
       <div className="mt-1 truncate text-[11px] text-muted-foreground">
         {t('accounts.quotaResetSummaryKnown', {
-          known: stats.candidates.length,
+          known: stats.known,
           total: stats.total,
           unknown: stats.unknown,
         })}
@@ -485,143 +460,22 @@ function QuotaResetSummaryCard({ stats, t }: { stats: ResetStats; t: (key: strin
   )
 }
 
-function getAccountRecoveryCandidate(account: AccountRow, nowMs: number, windowKey: RecoveryWindow): RecoveryCandidate | null {
-  const reset5h = futureTimestamp(account.reset_5h_at, nowMs)
-  const reset7d = futureTimestamp(account.reset_7d_at, nowMs)
-  const cooldownUntil = futureTimestamp(account.cooldown_until, nowMs)
-
-  if (windowKey === '5h') {
-    if (isPremiumUsagePlan(account.plan_type) && isUsageExhausted(account.usage_percent_5h) && reset5h) {
-      return buildRecoveryCandidate(account, reset5h, nowMs, '5h')
-    }
-    if (cooldownUntil && isShortRateLimitLike(account)) {
-      return buildRecoveryCandidate(account, cooldownUntil, nowMs, 'cooldown')
-    }
-    return null
-  }
-
-  if (isUsageExhausted(account.usage_percent_7d) && reset7d) {
-    return buildRecoveryCandidate(account, reset7d, nowMs, '7d')
-  }
-  return null
-}
-
-function buildRecoveryCandidate(account: AccountRow, recoveryAt: number, nowMs: number, reason: RecoveryReason): RecoveryCandidate {
+function analysisBucketToPoint(
+  bucket: AccountAnalysisTimeBucket,
+  key: string,
+  windowKey: RecoveryWindow,
+): RecoveryGroup {
   return {
-    id: account.id,
-    label: account.email || account.name || `ID ${account.id}`,
-    recoveryAt,
-    secondsUntil: Math.max(0, Math.ceil((recoveryAt - nowMs) / 1000)),
-    reason,
+    key,
+    startAt: bucket.start_at,
+    endAt: bucket.end_at,
+    label: formatRecoveryPointLabel(windowKey === '5h' ? bucket.end_at : bucket.start_at, windowKey),
+    fullLabel: formatRecoveryPointRange(bucket.start_at, bucket.end_at, windowKey),
+    count: bucket.count,
+    fill: (bucket.cooldown_count ?? 0) > 0
+      ? recoveryReasonFill.cooldown
+      : recoveryReasonFill[windowKey],
   }
-}
-
-function isShortRateLimitLike(account: AccountRow): boolean {
-  const status = (account.status || '').toLowerCase()
-  const reason = (account.cooldown_reason || '').toLowerCase()
-  if (status === 'rate_limited' || status === 'rate_limited_5h' || status === 'cooldown') {
-    return true
-  }
-  if (reason === 'rate_limited' || reason === 'rate_limited_5h') {
-    return true
-  }
-  return false
-}
-
-function createResetStats(accounts: AccountRow[], nowMs: number): ResetStats {
-  const candidates: ResetCandidate[] = []
-  let total = 0
-  let unknown = 0
-
-  for (const account of accounts) {
-    if (!hasBurnPrediction(account, '7d')) {
-      continue
-    }
-    total += 1
-    const resetAt = futureTimestamp(account.reset_7d_at, nowMs)
-    if (!resetAt) {
-      unknown += 1
-      continue
-    }
-    candidates.push({
-      id: account.id,
-      label: account.email || account.name || `ID ${account.id}`,
-      resetAt,
-    })
-  }
-
-  candidates.sort((a, b) => a.resetAt - b.resetAt)
-
-  return {
-    candidates,
-    points: createResetPoints(candidates, nowMs),
-    total,
-    unknown,
-  }
-}
-
-function createResetPoints(candidates: ResetCandidate[], nowMs: number): RecoveryGroup[] {
-  const bucketCount = 7
-  const startOfToday = startOfBeijingDay(nowMs)
-  const points: RecoveryGroup[] = Array.from({ length: bucketCount }, (_, index) => {
-    const startAt = startOfToday + index * 24 * 60 * 60_000
-    const endAt = startAt + 24 * 60 * 60_000
-    return {
-      key: `7d-reset-${index}`,
-      startAt,
-      endAt,
-      label: formatRecoveryPointLabel(startAt, '7d'),
-      fullLabel: formatRecoveryPointRange(startAt, endAt, '7d'),
-      count: 0,
-      fill: recoveryReasonFill['7d'],
-    }
-  })
-
-  for (const candidate of candidates) {
-    const point = points.find((item) => candidate.resetAt >= item.startAt && candidate.resetAt < item.endAt)
-    if (!point) {
-      continue
-    }
-    point.count += 1
-  }
-
-  return points
-}
-
-function startOfBeijingDay(timestamp: number): number {
-  const day = formatBeijingTime(new Date(timestamp).toISOString()).slice(0, 10)
-  return new Date(`${day}T00:00:00+08:00`).getTime()
-}
-
-function createRecoveryPoints(candidates: RecoveryCandidate[], windowKey: RecoveryWindow, nowMs: number): RecoveryGroup[] {
-  const bucketCount = windowKey === '5h' ? 5 : 7
-  const bucketMs = windowKey === '5h' ? 60 * 60_000 : 24 * 60 * 60_000
-  const points: RecoveryGroup[] = Array.from({ length: bucketCount }, (_, index) => {
-    const startAt = nowMs + index * bucketMs
-    const endAt = startAt + bucketMs
-    return {
-      key: `${windowKey}-${index}`,
-      startAt,
-      endAt,
-      label: formatRecoveryPointLabel(endAt, windowKey),
-      fullLabel: formatRecoveryPointRange(startAt, endAt, windowKey),
-      count: 0,
-      fill: recoveryReasonFill[windowKey],
-    }
-  })
-
-  for (const candidate of candidates) {
-    const point = points.find((item) => candidate.recoveryAt >= item.startAt && candidate.recoveryAt < item.endAt)
-    if (!point) {
-      continue
-    }
-    point.count += 1
-    if (candidate.reason === 'cooldown') {
-      point.fill = recoveryReasonFill.cooldown
-    }
-  }
-
-  return points
 }
 
 function getCountAxisConfig(points: RecoveryGroup[]): { domain: [number, number]; ticks: number[] } {
@@ -652,19 +506,6 @@ function getNiceTickStep(rawStep: number): number {
   if (normalized <= 3) return 2 * magnitude
   if (normalized <= 7) return 5 * magnitude
   return 10 * magnitude
-}
-
-function futureTimestamp(value: string | undefined, nowMs: number): number | null {
-  if (!value) return null
-  const timestamp = new Date(value).getTime()
-  if (!Number.isFinite(timestamp) || timestamp <= nowMs) {
-    return null
-  }
-  return timestamp
-}
-
-function isUsageExhausted(value?: number | null): boolean {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 100
 }
 
 function formatWholeNumber(value: number): string {

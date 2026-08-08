@@ -21,6 +21,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/openaiidentity"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
@@ -120,6 +121,44 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 
 	if got.total != 7 || got.normal != 3 || got.rateLimited != 2 || got.abnormal != 2 || got.disabled != 1 {
 		t.Fatalf("counts = %+v, want total=7 normal=3 rateLimited=2 abnormal=2 disabled=1", got)
+	}
+}
+
+// 积分顶着限流的账号 RuntimeStatus 仍是 rate_limited（用量窗口客观上打满了），
+// 但它照常参与调度，仪表盘该把它算进「可用」而不是「限流」。
+func TestSummarizeDashboardAccountsCountsCreditBackedAsNormal(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true}, // 积分顶替限流
+		{ID: 2, Status: "active", Enabled: true}, // 真限流
+	}
+
+	usingCredits := &auth.Account{
+		DBID:                  1,
+		AccessToken:           "at-1",
+		Status:                auth.StatusReady,
+		PlanType:              "plus",
+		UsagePercent5h:        100,
+		UsagePercent5hValid:   true,
+		Reset5hAt:             time.Now().Add(2 * time.Hour),
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+		CreditsValid:          true,
+		CreditsHasCredits:     true,
+		CreditsBalance:        "1000.0000000000",
+	}
+	if !usingCredits.UsingCredits() {
+		t.Fatalf("fixture is not using credits; RuntimeStatus=%q", usingCredits.RuntimeStatus())
+	}
+	if got := usingCredits.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus = %q, want rate_limited", got)
+	}
+
+	rateLimited := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
+	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
+
+	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{usingCredits, rateLimited})
+	if got.total != 2 || got.normal != 1 || got.rateLimited != 1 {
+		t.Fatalf("counts = %+v, want total=2 normal=1 rateLimited=1", got)
 	}
 }
 
@@ -871,6 +910,167 @@ func TestGetUsageLogsRejectsInvalidCompactionFilters(t *testing.T) {
 	}
 }
 
+func TestGetUsageLogsRejectsInvalidDiagnosticFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{
+			name:      "status",
+			query:     "status=6xx",
+			wantError: "status/status_code 参数无效",
+		},
+		{
+			name:      "retry",
+			query:     "retry=maybe",
+			wantError: "retry 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "websocket",
+			query:     "via_websocket=1",
+			wantError: "via_websocket 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "error only",
+			query:     "error_only=yes",
+			wantError: "error_only 参数无效，需要 true 或 false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&page=1&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			assertErrorMessage(t, recorder, test.wantError)
+		})
+	}
+}
+
+func TestGetUsageLogsAppliesDiagnosticFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	for _, input := range []*database.UsageLogInput{
+		{
+			AccountID:         accountID,
+			Endpoint:          "/v1/responses",
+			Model:             "matching",
+			StatusCode:        http.StatusBadGateway,
+			UpstreamErrorKind: "server",
+			ErrorMessage:      "boom from upstream",
+			IsRetryAttempt:    true,
+			AttemptIndex:      1,
+			ViaWebsocket:      true,
+		},
+		{
+			AccountID:         accountID,
+			Endpoint:          "/v1/responses",
+			Model:             "wrong-kind",
+			StatusCode:        http.StatusBadGateway,
+			UpstreamErrorKind: "transport",
+			ErrorMessage:      "boom from transport",
+			IsRetryAttempt:    true,
+			ViaWebsocket:      true,
+		},
+		{
+			AccountID:    accountID,
+			Endpoint:     "/v1/responses",
+			Model:        "canceled",
+			StatusCode:   499,
+			ErrorMessage: "client canceled",
+		},
+		{
+			AccountID:  accountID,
+			Endpoint:   "/v1/responses",
+			Model:      "success",
+			StatusCode: http.StatusOK,
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, input); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", input.Model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	handler := &Handler{db: db}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&status=5xx&error_kind=server&retry=true&via_websocket=true&q=boom",
+		nil,
+	)
+	handler.GetUsageLogs(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var page database.UsageLogPage
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].Model != "matching" {
+		t.Fatalf("filtered page = total %d logs %+v, want matching only", page.Total, page.Logs)
+	}
+
+	recorder = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&status=499",
+		nil,
+	)
+	handler.GetUsageLogs(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("499 status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode 499 response: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 || page.Logs[0].StatusCode != 499 {
+		t.Fatalf("499 page = total %d logs %+v", page.Total, page.Logs)
+	}
+
+	recorder = httptest.NewRecorder()
+	ginCtx, _ = gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodGet,
+		"/api/admin/usage/logs/error-summary?start="+start+"&end="+end,
+		nil,
+	)
+	handler.GetUsageLogsErrorSummary(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var summary database.UsageErrorSummary
+	if err := json.Unmarshal(recorder.Body.Bytes(), &summary); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if summary.TotalErrors != 3 || summary.Status5xx != 2 || summary.Canceled != 1 || summary.RetryAttempts != 2 {
+		t.Fatalf("summary = %+v, want total=3 5xx=2 canceled=1 retries=2", summary)
+	}
+}
+
 func TestGetUsageLogsAppliesCompactionFilters(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1272,10 +1472,6 @@ func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.
 	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
 		t.Fatalf("seed settings: %v", err)
 	}
-	newAPISecret := strings.Repeat("s", 32)
-	if err := db.SetPromptFilterNewAPISecret(context.Background(), newAPISecret); err != nil {
-		t.Fatalf("seed NewAPI secret: %v", err)
-	}
 	store := auth.NewStore(db, tc, settings)
 	t.Cleanup(store.Stop)
 	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
@@ -1331,13 +1527,6 @@ func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.
 	if got := store.GetPromptFilterConfig().Advanced.Guard.Mode; got != "enforce" {
 		t.Fatalf("runtime guard.mode = %q, want enforce", got)
 	}
-	if got := store.GetPromptFilterConfig().Advanced.NewAPI.Secret; got != newAPISecret {
-		t.Fatalf("runtime NewAPI secret changed during advanced update")
-	}
-	if strings.Contains(updateResponse.PromptFilterAdvancedConfig, newAPISecret) {
-		t.Fatal("NewAPI secret leaked into prompt_filter_advanced_config")
-	}
-
 	// An unrelated partial update must not reserialize the typed runtime config
 	// and erase fields unknown to this binary.
 	unrelated := httptest.NewRecorder()
@@ -1739,6 +1928,143 @@ func TestUpdateAccountSchedulerPersistsOverrides(t *testing.T) {
 	}
 	if !rows[0].SkipWarmTier {
 		t.Fatal("skip_warm_tier = false, want true")
+	}
+}
+
+func TestUpdateAccountSchedulerPersistsWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID, err := db.InsertAccountWithCredentials(context.Background(), "workspace-route", map[string]interface{}{
+		"refresh_token": "rt-workspace-route",
+		"email":         "route@example.com",
+		"workspace_id":  "personal-workspace",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID),
+		strings.NewReader(`{"custom_headers":{"chatgpt-account-id":"team-workspace"}}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers")); got != "team-workspace" {
+		t.Fatalf("workspace override = %q, want team-workspace", got)
+	}
+}
+
+func TestUpdateAccountSchedulerRejectsDuplicateWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	if _, err := db.InsertAccountWithCredentials(context.Background(), "personal", map[string]interface{}{
+		"refresh_token": "rt-shared-route",
+		"email":         "route@example.com",
+		"workspace_id":  "personal-workspace",
+	}, ""); err != nil {
+		t.Fatalf("Insert personal: %v", err)
+	}
+	teamID, err := db.InsertAccountWithCredentials(context.Background(), "team", map[string]interface{}{
+		"refresh_token": "rt-shared-route",
+		"email":         "route@example.com",
+		"workspace_id":  "personal-workspace",
+		"custom_headers": map[string]string{
+			"Chatgpt-Account-Id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert team: %v", err)
+	}
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", teamID)}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf("/api/admin/accounts/%d/scheduler", teamID),
+		strings.NewReader(`{"custom_headers":{}}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusConflict, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), teamID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(row.GetCredentialStringMap("custom_headers")); got != "team-workspace" {
+		t.Fatalf("workspace override changed to %q after rejected update", got)
+	}
+}
+
+func TestUpdateAccountSchedulerAllowsUnchangedWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	for i := 0; i < 2; i++ {
+		if _, err := db.InsertAccountWithCredentials(context.Background(), fmt.Sprintf("team-%d", i+1), map[string]interface{}{
+			"refresh_token": "rt-shared-route",
+			"email":         "route@example.com",
+			"workspace_id":  "personal-workspace",
+			"custom_headers": map[string]string{
+				"Chatgpt-Account-Id": "team-workspace",
+			},
+		}, ""); err != nil {
+			t.Fatalf("Insert team %d: %v", i+1, err)
+		}
+	}
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	teamID := rows[1].ID
+	handler := &Handler{db: db}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", teamID)}}
+	ctx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf("/api/admin/accounts/%d/scheduler", teamID),
+		strings.NewReader(`{"custom_headers":{"chatgpt-account-id":"team-workspace","x-route-note":"kept"}}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), teamID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	headers := row.GetCredentialStringMap("custom_headers")
+	if got := openaiidentity.WorkspaceOverrideFromHeaders(headers); got != "team-workspace" {
+		t.Fatalf("workspace override = %q, want team-workspace", got)
+	}
+	if got := headers["X-Route-Note"]; got != "kept" {
+		t.Fatalf("X-Route-Note = %q, want kept", got)
 	}
 }
 
@@ -2414,6 +2740,69 @@ func TestExportAccountsIncludesATOnly(t *testing.T) {
 	}
 }
 
+// TestExportAccountsChannelScoped Codex 账号页导出必须能按渠道过滤:不带 channel
+// 时 Grok 账号会混进 codex 命名的导出文件(issue: 选 3 个 codex 导出得到 5 个)。
+func TestExportAccountsChannelScoped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+
+	codexID, err := db.InsertAccount(context.Background(), "codex-account", "rt_codex", "")
+	if err != nil {
+		t.Fatalf("insert codex account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), codexID, map[string]interface{}{
+		"email":        "codex@example.com",
+		"access_token": "at_codex",
+	}); err != nil {
+		t.Fatalf("update codex credentials: %v", err)
+	}
+
+	grokID, err := db.InsertAccount(context.Background(), "grok-account", "", "")
+	if err != nil {
+		t.Fatalf("insert grok account: %v", err)
+	}
+	if err := db.UpdateCredentials(context.Background(), grokID, map[string]interface{}{
+		"email":         "grok@example.com",
+		"upstream_type": "grok",
+		"api_key":       "xai-test-key",
+	}); err != nil {
+		t.Fatalf("update grok credentials: %v", err)
+	}
+
+	handler := &Handler{db: db}
+	export := func(query string) []map[string]any {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts/export?"+query, nil)
+		handler.ExportAccounts(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d for %q: %s", recorder.Code, query, recorder.Body.String())
+		}
+		var entries []map[string]any
+		if err := json.Unmarshal(recorder.Body.Bytes(), &entries); err != nil {
+			t.Fatalf("decode response for %q: %v", query, err)
+		}
+		return entries
+	}
+
+	codexOnly := export("filter=all&channel=codex")
+	if len(codexOnly) != 1 || codexOnly[0]["email"] != "codex@example.com" {
+		t.Fatalf("channel=codex entries = %v, want only the codex account", codexOnly)
+	}
+
+	grokOnly := export("filter=all&channel=grok")
+	if len(grokOnly) != 1 || grokOnly[0]["email"] != "grok@example.com" {
+		t.Fatalf("channel=grok entries = %v, want only the grok account", grokOnly)
+	}
+
+	// 缺省仍导出全部渠道:远程迁移依赖全量语义。
+	if all := export("filter=all"); len(all) != 2 {
+		t.Fatalf("default export entries = %d, want 2", len(all))
+	}
+}
+
 func TestExportAccountsSkipsAccountsWithoutCredentials(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2594,6 +2983,52 @@ func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
 		"email":         "Restore@Example.com",
 		"account_id":    "acc-restore",
 		"workspace_id":  "workspace-restore",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert deleted: %v", err)
+	}
+	if err := db.SoftDeleteAccount(context.Background(), deletedID); err != nil {
+		t.Fatalf("SoftDeleteAccount: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", deletedID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, fmt.Sprintf("/api/admin/accounts/%d/restore", deletedID), nil)
+
+	handler.RestoreAccount(ctx)
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusConflict, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), fmt.Sprintf("%d", activeID)) {
+		t.Fatalf("response = %s, want active duplicate id %d", recorder.Body.String(), activeID)
+	}
+	if _, err := db.GetAccountByID(context.Background(), deletedID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("deleted account should remain outside active pool, err=%v", err)
+	}
+}
+
+func TestRestoreAccountRejectsDuplicateCredentialWorkspaceRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	handler := &Handler{db: db}
+
+	activeID, err := db.InsertAccountWithCredentials(context.Background(), "active", map[string]interface{}{
+		"access_token": "opaque-shared-token",
+		"custom_headers": map[string]string{
+			"Chatgpt-Account-Id": "team-workspace",
+		},
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert active: %v", err)
+	}
+	deletedID, err := db.InsertAccountWithCredentials(context.Background(), "deleted", map[string]interface{}{
+		"access_token": "opaque-shared-token",
+		"custom_headers": map[string]string{
+			"chatgpt-account-id": "team-workspace",
+		},
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert deleted: %v", err)

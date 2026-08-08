@@ -3,6 +3,7 @@ package imageproc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -55,6 +56,54 @@ func TestDoUpscale(t *testing.T) {
 	}
 	if got := img.Bounds().Dx(); got != 2560 {
 		t.Fatalf("upscaled width = %d, want 2560", got)
+	}
+}
+
+func TestDoUpscaleToHitsExactTargetWhenAspectMatches(t *testing.T) {
+	out, contentType, err := DoUpscaleTo(testPNG(t, 1024, 1024), 2048, 2048, true)
+	if err != nil {
+		t.Fatalf("DoUpscaleTo returned error: %v", err)
+	}
+	if contentType != "image/png" {
+		t.Fatalf("contentType = %q, want image/png", contentType)
+	}
+	img, _, err := image.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode upscaled image: %v", err)
+	}
+	if got := img.Bounds(); got.Dx() != 2048 || got.Dy() != 2048 {
+		t.Fatalf("upscaled size = %dx%d, want 2048x2048", got.Dx(), got.Dy())
+	}
+}
+
+func TestDoUpscaleToFitsInsideWithoutCroppingMismatchedAspect(t *testing.T) {
+	out, _, err := DoUpscaleTo(testPNG(t, 1024, 1024), 2560, 1440, true)
+	if err != nil {
+		t.Fatalf("DoUpscaleTo returned error: %v", err)
+	}
+	img, _, err := image.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode upscaled image: %v", err)
+	}
+	if got := img.Bounds(); got.Dx() != 1440 || got.Dy() != 1440 {
+		t.Fatalf("upscaled size = %dx%d, want 1440x1440 fitted inside the box", got.Dx(), got.Dy())
+	}
+}
+
+func TestDoUpscaleToKeepsSourceThatAlreadyFillsTarget(t *testing.T) {
+	src := testPNG(t, 2048, 2048)
+	out, contentType, err := DoUpscaleTo(src, 2048, 2048, true)
+	if err != nil {
+		t.Fatalf("DoUpscaleTo returned error: %v", err)
+	}
+	if contentType != "" || !bytes.Equal(out, src) {
+		t.Fatalf("contentType = %q, resampled = %v; want the source returned untouched", contentType, !bytes.Equal(out, src))
+	}
+}
+
+func TestDoUpscaleToRejectsInvalidImage(t *testing.T) {
+	if _, _, err := DoUpscaleTo([]byte("not-an-image"), 2048, 2048, true); !errors.Is(err, ErrUpscaleDecode) {
+		t.Fatalf("error = %v, want ErrUpscaleDecode", err)
 	}
 }
 

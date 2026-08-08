@@ -154,13 +154,19 @@ func (h *Handler) ResetCredits(c *gin.Context) {
 	}
 	log.Printf("[账号 %d] 主动重置额度成功，windows_reset=%d，剩余次数=%d", account.DBID, outcome.WindowsReset, outcome.Remaining)
 
-	payload := gin.H{"message": "已重置额度"}
+	// 等用量探针落地再响应：重置已经改变了上游的窗口，但本地快照与冷却状态要等这次
+	// 探针才会更新。抢先返回会让前端刷到旧数据，表现为「点了重置但状态和进度条没变」。
+	refreshed := waitUsageRefreshAfterReset(outcome.UsageRefreshed)
+
+	payload := gin.H{"message": "已重置额度", "usage_refreshed": refreshed}
 	if outcome.Remaining >= 0 {
 		payload["rate_limit_reset_credits"] = outcome.Remaining
 	}
 	if outcome.WindowsReset > 0 {
 		payload["windows_reset"] = outcome.WindowsReset
 	}
+	// 探针没能在超时内跑完时，把最新状态一并回给前端做兜底提示。
+	payload["status"] = account.RuntimeStatus()
 	c.JSON(http.StatusOK, payload)
 }
 
@@ -169,6 +175,9 @@ type resetCreditConsumeOutcome struct {
 	Remaining      int
 	AlreadyHandled bool
 	InProgress     bool
+	// UsageRefreshed 在重置后的用量探针跑完时关闭。手动路径等它，
+	// 确保响应返回时账号的用量快照与状态已经是新的。
+	UsageRefreshed <-chan struct{}
 }
 
 type resetCreditConsumeFailure struct {
@@ -240,7 +249,7 @@ func (h *Handler) consumeResetCreditLocked(ctx context.Context, account *auth.Ac
 	}
 	h.markResetCreditSuccess(account)
 	h.recordResetCreditEvent(account.DBID, source)
-	h.refreshUsageAfterReset(account)
+	outcome.UsageRefreshed = h.refreshUsageAfterReset(account)
 	return outcome, nil
 }
 
@@ -403,15 +412,19 @@ func (h *Handler) applyOptimisticResetDecrement(account *auth.Account) int {
 
 // refreshUsageAfterReset 在后台刷新账号用量（窗口快照、精确剩余次数、冷却状态）。
 // 使用独立 context，避免随 HTTP 请求结束被取消；失败仅记录，不影响已成功的重置。
-func (h *Handler) refreshUsageAfterReset(account *auth.Account) {
+//
+// 返回的通道在探针跑完后关闭。手动重置需要等它——否则响应先于探针返回，前端立刻
+// 刷新拿到的还是旧的用量与状态，表现为「点了重置但进度条和状态没变」。
+// probe 不可用时返回 nil，调用方需按「无需等待」处理。
+func (h *Handler) refreshUsageAfterReset(account *auth.Account) <-chan struct{} {
 	probe := h.usageProbeFunc()
 	if probe == nil {
-		return
+		return nil
 	}
 	h.resetCreditPostMu.Lock()
 	if h.resetCreditPostClosed {
 		h.resetCreditPostMu.Unlock()
-		return
+		return nil
 	}
 	parentCtx := h.resetCreditPostCtx
 	if parentCtx == nil {
@@ -419,14 +432,34 @@ func (h *Handler) refreshUsageAfterReset(account *auth.Account) {
 	}
 	h.resetCreditPostWG.Add(1)
 	h.resetCreditPostMu.Unlock()
+	done := make(chan struct{})
 	go func() {
 		defer h.resetCreditPostWG.Done()
+		defer close(done)
 		ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
 		defer cancel()
 		if err := probe(ctx, account); err != nil {
 			log.Printf("[账号 %d] 重置后后台刷新用量失败: %v", account.DBID, err)
 		}
 	}()
+	return done
+}
+
+// resetUsageRefreshWait 是手动重置等待用量探针的上限。探针本身是一次 wham 调用，
+// 正常 1~3 秒；超时就先返回，让前端按 usage_refreshed=false 稍后补刷一次。
+const resetUsageRefreshWait = 15 * time.Second
+
+// waitUsageRefreshAfterReset 等待重置后的用量刷新落地，返回是否在超时前完成。
+func waitUsageRefreshAfterReset(done <-chan struct{}) bool {
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return true
+	case <-time.After(resetUsageRefreshWait):
+		return false
+	}
 }
 
 // resetCreditLock 返回有效工作区级别的重置互斥锁（按需创建）。同一工作区

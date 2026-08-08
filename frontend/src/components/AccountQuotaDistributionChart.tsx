@@ -16,12 +16,12 @@ import { BarChart3, RefreshCw } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { api } from '../api'
 import { getErrorMessage } from '../utils/error'
-import type { AccountRow } from '../types'
+import type { AccountQuotaAnalysis } from '../types'
 
 type QuotaWindow = '5h' | '7d'
 
 interface AccountQuotaDistributionChartProps {
-  accounts: AccountRow[]
+  analysis: Record<QuotaWindow, AccountQuotaAnalysis>
   className?: string
   compact?: boolean
   onProbeStarted?: () => void
@@ -34,10 +34,6 @@ interface DistributionBucket {
   count: number
   bucketPercent: number
   fill: string
-}
-
-interface SampledAccountQuota {
-  used: number
 }
 
 const quotaWindows: QuotaWindow[] = ['5h', '7d']
@@ -69,7 +65,7 @@ const tooltipItemStyle = { color: 'var(--color-foreground)' }
 const legendWrapperStyle = { paddingTop: 4, fontSize: 12, color: axisColor }
 
 export default function AccountQuotaDistributionChart({
-  accounts,
+  analysis,
   className = '',
   compact = false,
   onProbeStarted,
@@ -93,51 +89,27 @@ export default function AccountQuotaDistributionChart({
   }
 
   const distribution = useMemo(() => {
-    const eligibleAccounts = accounts.filter((account) => isEligibleForQuotaWindow(account, windowKey))
-    const sampledQuotas: SampledAccountQuota[] = []
-
-    for (const account of eligibleAccounts) {
-      const value = windowKey === '5h' ? account.usage_percent_5h : account.usage_percent_7d
-      if (typeof value !== 'number' || !Number.isFinite(value)) {
-        continue
-      }
-      const used = clamp(value, 0, 100)
-      sampledQuotas.push({ used })
-    }
-
-    const buckets: DistributionBucket[] = quotaBuckets.map((bucket) => ({
-      key: bucket.key,
+    const source = analysis[windowKey]
+    const buckets: DistributionBucket[] = source.buckets.map((bucket, index) => ({
+      key: quotaBuckets[index]?.key ?? `${bucket.min}-${bucket.max}`,
       label: `${bucket.min}-${bucket.max}%`,
-      count: 0,
-      bucketPercent: 0,
-      fill: bucket.fill,
+      count: bucket.count,
+      bucketPercent: source.sampled > 0
+        ? Number(((bucket.count / source.sampled) * 100).toFixed(1))
+        : 0,
+      fill: quotaBuckets[index]?.fill ?? 'var(--color-primary)',
     }))
-
-    for (const quota of sampledQuotas) {
-      const bucketIndex = findBucketIndex(quota.used)
-      buckets[bucketIndex].count += 1
-    }
-
-    for (const bucket of buckets) {
-      bucket.bucketPercent = sampledQuotas.length > 0
-        ? Number(((bucket.count / sampledQuotas.length) * 100).toFixed(1))
-        : 0
-    }
-
-    const averageUsed = sampledQuotas.length > 0
-      ? sampledQuotas.reduce((sum, quota) => sum + quota.used, 0) / sampledQuotas.length
-      : null
 
     return {
       buckets,
-      total: eligibleAccounts.length,
-      sampled: sampledQuotas.length,
-      unsampled: eligibleAccounts.length - sampledQuotas.length,
-      highUsage: sampledQuotas.filter((quota) => quota.used >= 90).length,
-      exhausted: sampledQuotas.filter((quota) => quota.used >= 100).length,
-      averageUsed,
+      total: source.total,
+      sampled: source.sampled,
+      unsampled: source.unsampled,
+      highUsage: source.high_usage,
+      exhausted: source.exhausted,
+      averageUsed: source.average_used,
     }
-  }, [accounts, windowKey])
+  }, [analysis, windowKey])
 
   const hasChartData = distribution.sampled > 0
 
@@ -306,47 +278,10 @@ function QuotaMetric({ label, value, tone = 'neutral', compact = false }: { labe
   )
 }
 
-function normalizePlanType(planType?: string): string {
-  const raw = (planType || '').toLowerCase().trim()
-  if (raw === 'prolite' || raw === 'pro_lite' || raw === 'pro-lite') return 'pro'
-  return raw
-}
-
-// Plans that carry a rolling 5h usage window (mirrors Go isPremium5hPlan).
-function isPremiumUsagePlan(planType?: string): boolean {
-  return ['plus', 'pro', 'team', 'teamplus', 'k12', 'edu', 'education', 'go'].includes(normalizePlanType(planType))
-}
-
-function isEligibleForQuotaWindow(account: AccountRow, windowKey: QuotaWindow): boolean {
-  const status = (account.status || '').toLowerCase()
-  if (status === 'unauthorized' || account.openai_responses_api) {
-    return false
-  }
-  if (windowKey === '5h') {
-    return isPremiumUsagePlan(account.plan_type)
-  }
-  return true
-}
-
-function findBucketIndex(used: number): number {
-  const value = clamp(used, 0, 100)
-  const index = quotaBuckets.findIndex((bucket) => {
-    if (bucket.max === 100) {
-      return value >= bucket.min && value <= bucket.max
-    }
-    return value >= bucket.min && value < bucket.max
-  })
-  return index >= 0 ? index : 0
-}
-
 function getAverageUsedTone(value: number | null): 'neutral' | 'warning' | 'danger' | 'success' {
   if (value === null) return 'neutral'
   if (value >= 90) return 'danger'
   if (value >= 70) return 'warning'
   if (value < 30) return 'success'
   return 'neutral'
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value))
 }

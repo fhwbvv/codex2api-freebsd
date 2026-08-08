@@ -82,6 +82,10 @@ type RequestEnvelope struct {
 	ModelFamily          ModelFamily `json:"model_family"`
 	Segments             []Segment   `json:"segments"`
 	AdapterUnclassified  bool        `json:"adapter_unclassified,omitempty"`
+	// AdapterUnclassifiedTypes records the offending typed-payload names (bounded,
+	// deduped) so the non-punitive adapter audit can surface which future block or
+	// item type went unrecognized, instead of only flagging that one did.
+	AdapterUnclassifiedTypes []string `json:"adapter_unclassified_types,omitempty"`
 	Truncated            bool        `json:"truncated,omitempty"`
 	CurrentUserTruncated bool        `json:"current_user_truncated,omitempty"`
 	AuxiliaryTruncated   bool        `json:"auxiliary_truncated,omitempty"`
@@ -857,12 +861,17 @@ func (b *envelopeBuilder) appendResult(origin SegmentOrigin, role string, result
 			b.appendResult(OriginToolOutput, "tool", firstExistingResult(result, "output", "content", "text"))
 		case "tool_use", "function_call", "computer_call", "mcp_call":
 			b.appendToolArguments(result, role)
+		case "encrypted_content":
+			// Opaque server-side encrypted continuation payload (gpt-5.6 store=false
+			// reasoning). It carries no scannable plaintext, so it is recognized and
+			// skipped rather than flagged as an unclassified block.
+			return
 		default:
 			if blockType != "" && !recognizedEnvelopeContentBlockType(blockType) {
 				// A future typed block has no proven provenance contract. Do not
 				// reinterpret its generic text/content fields as the caller-provided
 				// origin; record an adapter audit marker and fail open for this block.
-				b.markAdapterUnclassified()
+				b.markAdapterUnclassified(blockType)
 				return
 			}
 			if text := result.Get("text"); text.Type == gjson.String {
@@ -1140,6 +1149,10 @@ func (b *envelopeBuilder) appendTypedInputItem(item gjson.Result, currentUser bo
 	case "compaction_trigger", "item_reference":
 		// Control/reference items carry no end-user prompt text.
 		b.appendAttachmentReferences(item, "context")
+	case "encrypted_content":
+		// Opaque server-side encrypted continuation payload (gpt-5.6 store=false
+		// reasoning). No end-user prompt text; recognized and skipped.
+		return
 	case "input_text", "message":
 		origin := OriginHistory
 		if currentUser {
@@ -1160,15 +1173,27 @@ func (b *envelopeBuilder) appendTypedInputItem(item gjson.Result, currentUser bo
 			b.appendResult(origin, "user", item)
 			return
 		}
-		b.markAdapterUnclassified()
+		b.markAdapterUnclassified(itemType)
 	}
 }
 
-func (b *envelopeBuilder) markAdapterUnclassified() {
+const maxAdapterUnclassifiedTypes = 8
+
+func (b *envelopeBuilder) markAdapterUnclassified(blockType string) {
 	if b == nil || b.envelope == nil {
 		return
 	}
 	b.envelope.AdapterUnclassified = true
+	blockType = strings.ToLower(strings.TrimSpace(blockType))
+	if blockType == "" || len(b.envelope.AdapterUnclassifiedTypes) >= maxAdapterUnclassifiedTypes {
+		return
+	}
+	for _, existing := range b.envelope.AdapterUnclassifiedTypes {
+		if existing == blockType {
+			return
+		}
+	}
+	b.envelope.AdapterUnclassifiedTypes = append(b.envelope.AdapterUnclassifiedTypes, blockType)
 }
 
 func recognizedEnvelopeContentBlockType(blockType string) bool {
@@ -1184,7 +1209,7 @@ func recognizedEnvelopeContentBlockType(blockType string) bool {
 		"tool_search_call", "custom_tool_call", "mcp_tool_call", "mcp_call", "mcp_list_tools",
 		"mcp_approval_request", "mcp_approval_response", "additional_tools", "code_interpreter_call",
 		"computer_call", "file_search_call", "image_generation_call", "web_search_call", "tool_use", "agent_message",
-		"compaction_trigger", "item_reference":
+		"compaction_trigger", "item_reference", "encrypted_content":
 		return true
 	default:
 		return false

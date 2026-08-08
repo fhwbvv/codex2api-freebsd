@@ -16,7 +16,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
-import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog } from '../types'
+import type { APIKeyRow, OpsErrorSummary, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog, PromptPolicyIncidentDetailResponse } from '../types'
 import { cn, formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
@@ -32,7 +32,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -122,6 +122,9 @@ function getStatusBadgeClassName(statusCode: number): string {
 type UsagePresetRangeKey = 'today' | TimeRangeKey
 const USAGE_TIME_RANGE_OPTIONS: UsagePresetRangeKey[] = ['today', '1h', '6h', '24h', '7d', '30d']
 type UsageTypeFilter = '' | 'stream' | 'sync' | 'compact' | 'history'
+type UsageStatusFilter = '' | '2xx' | 'error' | '4xx' | '5xx' | `${number}`
+type UsageRetryFilter = '' | 'false' | 'true'
+type UsageTransportFilter = '' | 'http' | 'ws'
 
 // 本页面局部的"自定义"区间标记。不污染全局 TimeRangeKey 类型 (Dashboard 等仍只识别预设档)。
 type UsageTimeRangeKey = UsagePresetRangeKey | 'custom'
@@ -932,6 +935,50 @@ function StatusCodeBadge({ log }: { log: UsageLog }) {
   )
 }
 
+function UsageErrorSummaryCell({ log, mobile = false }: { log: UsageLog; mobile?: boolean }) {
+  const { t } = useTranslation()
+  const errorKind = log.upstream_error_kind?.trim() || ''
+  const message = log.error_message?.trim() || ''
+  const hasError = log.status_code >= 400 || Boolean(errorKind || message)
+
+  if (!hasError) {
+    return mobile ? null : <span className="text-muted-foreground">-</span>
+  }
+
+  return (
+    <div
+      className={cn(
+        'min-w-0',
+        mobile
+          ? 'mt-2.5 rounded-lg border border-red-500/15 bg-red-500/5 px-3 py-2.5'
+          : 'w-[260px] max-w-[24vw]',
+      )}
+    >
+      <div className="flex min-w-0 items-center gap-1.5">
+        <AlertTriangle className="size-3.5 shrink-0 text-amber-500" />
+        <span className="truncate text-[11px] font-semibold text-foreground" title={errorKind || t('usage.unknownErrorKind')}>
+          {errorKind || t('usage.unknownErrorKind')}
+        </span>
+        {log.is_retry_attempt ? (
+          <Badge variant="outline" className="ml-auto shrink-0 gap-0.5 border-transparent bg-blue-500/12 px-1.5 py-0 text-[10px] text-blue-600 dark:bg-blue-500/20 dark:text-blue-300">
+            <RotateCcw className="size-2.5" />
+            #{Math.max(1, log.attempt_index)}
+          </Badge>
+        ) : null}
+      </div>
+      <div
+        className={cn(
+          'mt-1 break-words text-[11px] leading-relaxed text-muted-foreground',
+          mobile ? 'line-clamp-3' : 'line-clamp-2',
+        )}
+        title={message || t('usage.statusErrorEmpty')}
+      >
+        {message || t('usage.statusErrorEmpty')}
+      </div>
+    </div>
+  )
+}
+
 function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolean }) {
   const { t } = useTranslation()
   const clientUserAgent = log.client_user_agent?.trim() || ''
@@ -1000,13 +1047,15 @@ function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolea
   )
 }
 
-// CyberPolicyDetailButton: 对 cyber_policy 报错的请求，点击关联到提示词过滤日志，
-// 展示触发拦截的完整请求内容（为什么 & 是什么）。
+// New usage rows resolve by immutable incident ID. Only historical rows without
+// an ID fall back to the legacy nearest-timestamp inference endpoint.
 function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [detail, setDetail] = useState<PromptFilterLog | null>(null)
+  const [detail, setDetail] = useState<PromptPolicyIncidentDetailResponse | null>(null)
+  const [legacyDetail, setLegacyDetail] = useState<PromptFilterLog | null>(null)
+  const [legacyInferred, setLegacyInferred] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
 
@@ -1016,12 +1065,17 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
     setLoading(true)
     setError(null)
     try {
-      const res = await api.matchPromptFilterLog({
-        at: log.created_at,
-        endpoint: log.endpoint,
-        apiKeyId: log.api_key_id || undefined,
-      })
-      setDetail(res.log)
+      if (log.prompt_policy_incident_id) {
+        setDetail(await api.getPromptPolicyIncident(log.prompt_policy_incident_id))
+      } else {
+        const res = await api.matchPromptFilterLog({
+          at: log.created_at,
+          endpoint: log.endpoint,
+          apiKeyId: log.api_key_id || undefined,
+        })
+        setLegacyDetail(res.log)
+        setLegacyInferred(res.legacy_inferred)
+      }
       setLoaded(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -1030,7 +1084,9 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
     }
   }
 
-  const content = (detail?.full_text || detail?.text_preview || '').trim()
+  const incident = detail?.incident
+  const content = (incident?.prompt_text || incident?.prompt_preview || legacyDetail?.full_text || legacyDetail?.text_preview || '').trim()
+  const score = (value: number | null | undefined) => value === null || value === undefined ? t('usage.cyberPolicyUnscored') : String(value)
 
   return (
     <>
@@ -1059,8 +1115,49 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
             <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
           ) : error ? (
             <div className="py-4 text-sm text-red-500">{error}</div>
+          ) : incident ? (
+            <div className="space-y-3">
+              <div className="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
+                <CyberPolicyField label={t('usage.cyberPolicyUpstreamResult')} value={`${incident.status_code || '-'} · ${incident.upstream_error_code || 'cyber_policy'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyLocalResult')} value={`${t(`usage.cyberPolicyState.${incident.local_evaluation_state}`)} · ${t(`usage.cyberPolicyOutcome.${incident.local_outcome}`)}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyLocalMiss')} value={incident.local_miss ? t('promptFilter.testResultYes') : t('promptFilter.testResultNo')} danger={incident.local_miss} />
+                <CyberPolicyField label={t('usage.cyberPolicyExecutionScore')} value={score(incident.local_score)} />
+                <CyberPolicyField label={t('usage.cyberPolicyAuditScore')} value={score(incident.local_audit_score)} />
+                <CyberPolicyField label={t('usage.cyberPolicyTransport')} value={`${incident.protocol || '-'} · ${incident.transport || '-'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyAccountAttempt')} value={`${incident.account_id || '-'} · #${incident.attempt_index || '-'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyReview')} value={incident.local_review_model ? `${incident.local_review_model} · ${incident.local_review_flagged ? t('promptFilter.testReviewFlagged') : t('promptFilter.testReviewCleared')}` : t('promptFilter.testReviewSkipped')} />
+                <CyberPolicyField label={t('usage.cyberPolicyCandidate')} value={detail.candidate ? `${detail.candidate.status} · #${detail.candidate.id}` : '-'} />
+              </div>
+              {incident.local_evaluation_state === 'legacy_unknown' ? (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{t('usage.cyberPolicyLegacyUnknown')}</div>
+              ) : null}
+              {(incident.local_reason || incident.local_reason_code) ? (
+                <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+                  <div className="font-semibold text-muted-foreground">{t('usage.cyberPolicyReason')}</div>
+                  <div className="mt-1 break-words">{incident.local_reason || incident.local_reason_code}</div>
+                </div>
+              ) : null}
+              {detail.matches.length > 0 ? (
+                <div>
+                  <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyMatches')}</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {detail.matches.map((match, index) => <Badge key={`${match.name}-${index}`} variant="secondary">{match.name} · {match.weight}</Badge>)}
+                  </div>
+                </div>
+              ) : null}
+              {content ? (
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyRequestContent')}</span>
+                    <button type="button" onClick={() => void navigator.clipboard?.writeText(content)} className="text-xs font-medium text-primary hover:underline">{t('common.copy')}</button>
+                  </div>
+                  <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground">{content}</pre>
+                </div>
+              ) : null}
+            </div>
           ) : content ? (
-            <div>
+            <div className="space-y-2">
+              {legacyInferred ? <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{t('usage.cyberPolicyLegacyInferred')}</div> : null}
               <div className="mb-1.5 flex items-center justify-between">
                 <span className="text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyRequestContent')}</span>
                 <button type="button" onClick={() => void navigator.clipboard?.writeText(content)} className="text-xs font-medium text-primary hover:underline">{t('common.copy')}</button>
@@ -1073,6 +1170,15 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
         </div>
       </Modal>
     </>
+  )
+}
+
+function CyberPolicyField({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
+  return (
+    <div className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
+      <div className="font-semibold text-muted-foreground">{label}</div>
+      <div className={cn('mt-1 break-words font-mono text-foreground', danger && 'text-red-600 dark:text-red-300')}>{value}</div>
+    </div>
   )
 }
 
@@ -1249,10 +1355,11 @@ function EmptyPanel({ accent, icon, text }: { accent: PanelAccentKey; icon: Reac
   )
 }
 
-type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'userAgent' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'wsAcquire' | 'tokensPerSec' | 'timing' | 'time'
+type UsageTableColumn = 'status' | 'error' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'userAgent' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'wsAcquire' | 'tokensPerSec' | 'timing' | 'time'
 
 const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string }> = [
   { key: 'status', labelKey: 'usage.tableStatus' },
+  { key: 'error', labelKey: 'usage.tableError' },
   { key: 'model', labelKey: 'usage.tableModel' },
   { key: 'account', labelKey: 'usage.tableAccount' },
   { key: 'apiKey', labelKey: 'usage.tableApiKey' },
@@ -1272,6 +1379,7 @@ const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string 
 const USAGE_VISIBLE_COLUMNS_KEY = 'codex2api:usage:visible-columns'
 const DEFAULT_USAGE_VISIBLE_COLUMNS: Record<UsageTableColumn, boolean> = {
   status: true,
+  error: true,
   model: true,
   account: true,
   apiKey: true,
@@ -1555,14 +1663,20 @@ export default function Usage() {
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
+  const [errorSummary, setErrorSummary] = useState<OpsErrorSummary | null>(null)
   const [searchInput, setSearchInput] = useState('')
-  const [searchEmail, setSearchEmail] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [filterStatus, setFilterStatus] = useState<UsageStatusFilter>('')
   const [filterModel, setFilterModel] = useState('')
   const [filterEndpoint, setFilterEndpoint] = useState('')
   const [filterApiKeyId, setFilterApiKeyId] = useState('')
   const [filterAccountId, setFilterAccountId] = useState(getInitialUsageAccountID)
   const [filterFast, setFilterFast] = useState('')
   const [filterType, setFilterType] = useState<UsageTypeFilter>('')
+  const [filterErrorKind, setFilterErrorKind] = useState('')
+  const [filterRetry, setFilterRetry] = useState<UsageRetryFilter>('')
+  const [filterTransport, setFilterTransport] = useState<UsageTransportFilter>('')
+  const [showAdvancedFilters, setShowAdvancedFilters] = useState(false)
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [grokModelOptions, setGrokModelOptions] = useState<string[]>([])
@@ -1580,9 +1694,13 @@ export default function Usage() {
     setSearchInput(value)
     if (searchTimer.current) clearTimeout(searchTimer.current)
     searchTimer.current = setTimeout(() => {
-      setSearchEmail(value)
+      setSearchQuery(value.trim())
       setPage(1)
     }, 400)
+  }, [])
+
+  useEffect(() => () => {
+    if (searchTimer.current) clearTimeout(searchTimer.current)
   }, [])
 
   // 仅加载轻量统计（秒级）—— 联动同页 timeRange,与下方请求记录的范围保持一致
@@ -1614,23 +1732,37 @@ export default function Usage() {
     }
   }, [])
 
+  const buildLogFilterParams = useCallback(() => {
+    const { start, end } = resolveRangeISO(timeRange, customRange)
+    return {
+      start,
+      end,
+      q: searchQuery || undefined,
+      model: filterModel || undefined,
+      endpoint: filterEndpoint || undefined,
+      apiKeyId: filterApiKeyId || undefined,
+      accountId: filterAccountId || undefined,
+      fast: filterFast || undefined,
+      stream: filterType === 'stream' ? 'true' : filterType === 'sync' ? 'false' : undefined,
+      compact: filterType === 'compact' ? 'true' : undefined,
+      hasCompactionHistory: filterType === 'history' ? 'true' : undefined,
+      channel: channel || undefined,
+      status: filterStatus && filterStatus !== 'error' ? filterStatus : undefined,
+      errorOnly: filterStatus === 'error' ? 'true' : undefined,
+      errorKind: filterErrorKind || undefined,
+      retry: filterRetry || undefined,
+      viaWebsocket: filterTransport === 'ws' ? 'true' : filterTransport === 'http' ? 'false' : undefined,
+    }
+  }, [timeRange, customRange, searchQuery, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterType, channel, filterStatus, filterErrorKind, filterRetry, filterTransport])
+
   // 服务端分页加载日志
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
     try {
-      const { start, end } = resolveRangeISO(timeRange, customRange)
       const res = await api.getUsageLogsPaged({
-        start, end, page, pageSize,
-        email: searchEmail || undefined,
-        model: filterModel || undefined,
-        endpoint: filterEndpoint || undefined,
-        apiKeyId: filterApiKeyId || undefined,
-        accountId: filterAccountId || undefined,
-        fast: filterFast || undefined,
-        stream: filterType === 'stream' ? 'true' : filterType === 'sync' ? 'false' : undefined,
-        compact: filterType === 'compact' ? 'true' : undefined,
-        hasCompactionHistory: filterType === 'history' ? 'true' : undefined,
-        channel: channel || undefined,
+        ...buildLogFilterParams(),
+        page,
+        pageSize,
       })
       setLogs(res.logs ?? [])
       setLogsTotal(res.total ?? 0)
@@ -1639,12 +1771,30 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterType, channel])
+  }, [buildLogFilterParams, page, pageSize])
+
+  const loadErrorSummary = useCallback(async () => {
+    try {
+      const params = buildLogFilterParams()
+      const summary = await api.getUsageLogsErrorSummary({
+        ...params,
+        status: undefined,
+        errorOnly: undefined,
+      })
+      setErrorSummary(summary)
+    } catch {
+      setErrorSummary(null)
+    }
+  }, [buildLogFilterParams])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
     void loadLogs()
   }, [loadLogs])
+
+  useEffect(() => {
+    void loadErrorSummary()
+  }, [loadErrorSummary])
 
   useEffect(() => {
     void loadAPIKeys()
@@ -1740,7 +1890,37 @@ export default function Usage() {
   const avgDurationMs = stats?.avg_duration_ms ?? 0
   const successRequests = rangeRequests - Math.round(rangeRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
-  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterAccountId || filterType || filterFast)
+  const advancedFilterCount = [
+    filterEndpoint,
+    filterType,
+    filterFast,
+    filterErrorKind,
+    filterRetry,
+    filterTransport,
+  ].filter(Boolean).length
+  const hasActiveFilters = Boolean(
+    searchInput
+    || filterStatus
+    || filterModel
+    || filterEndpoint
+    || filterApiKeyId
+    || filterAccountId
+    || filterType
+    || filterFast
+    || filterErrorKind
+    || filterRetry
+    || filterTransport,
+  )
+  const statusFilterOptions: Array<{ value: UsageStatusFilter; label: string; tone?: string }> = [
+    { value: '', label: t('usage.statusAll') },
+    { value: '2xx', label: t('usage.statusSuccess'), tone: 'text-emerald-600 dark:text-emerald-300' },
+    { value: 'error', label: t('usage.statusErrors'), tone: 'text-red-600 dark:text-red-300' },
+    { value: '4xx', label: '4xx', tone: 'text-amber-600 dark:text-amber-300' },
+    { value: '5xx', label: '5xx', tone: 'text-red-600 dark:text-red-300' },
+    { value: '401', label: '401', tone: 'text-red-600 dark:text-red-300' },
+    { value: '429', label: '429', tone: 'text-amber-600 dark:text-amber-300' },
+    { value: '499', label: '499', tone: 'text-slate-600 dark:text-slate-300' },
+  ]
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -1754,6 +1934,21 @@ export default function Usage() {
   const rangeRequestsLabel = t('usage.rangeRequestsCard', { range: rangeLabel })
   const rangeTokensLabel = t('usage.rangeTokensCard', { range: rangeLabel })
   const rangeCostLabel = t('usage.rangeCostCard', { range: rangeLabel })
+  const resetLogFilters = () => {
+    setSearchInput('')
+    setSearchQuery('')
+    setFilterStatus('')
+    setFilterModel('')
+    setFilterEndpoint('')
+    setFilterApiKeyId('')
+    setFilterAccountId('')
+    setFilterType('')
+    setFilterFast('')
+    setFilterErrorKind('')
+    setFilterRetry('')
+    setFilterTransport('')
+    setPage(1)
+  }
 
   return (
     <StateShell
@@ -2004,130 +2199,248 @@ export default function Usage() {
               </div>
             </div>
 
-            {/* 筛选栏 */}
-            <div className="toolbar-surface mb-4 flex flex-wrap items-center gap-2 overflow-visible max-lg:gap-1.5">
-              {/* 搜索框 */}
-              <div className="relative w-60 shrink-0 max-sm:w-full">
-                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground pointer-events-none" />
-                <Input
-                  className="pl-8 h-8 rounded-lg text-[13px]"
-                  placeholder={t('usage.searchEmail')}
-                  value={searchInput}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleSearchChange(e.target.value)}
+            {/* 状态快速筛选 */}
+            <div className="mb-3 flex flex-wrap items-center gap-1.5">
+              {statusFilterOptions.map((option) => (
+                <button
+                  key={option.value || 'all'}
+                  type="button"
+                  onClick={() => { setFilterStatus(option.value); setPage(1) }}
+                  className={cn(
+                    'h-8 rounded-lg border px-3 text-[13px] font-medium transition-colors',
+                    filterStatus === option.value
+                      ? 'border-primary/35 bg-primary/10 text-primary shadow-sm'
+                      : 'border-border bg-background text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+                    filterStatus !== option.value && option.tone,
+                  )}
+                >
+                  {option.label}
+                </button>
+              ))}
+              {filterStatus && !statusFilterOptions.some((option) => option.value === filterStatus) ? (
+                <button
+                  type="button"
+                  onClick={() => { setFilterStatus(''); setPage(1) }}
+                  className="inline-flex h-8 items-center gap-1 rounded-lg border border-primary/35 bg-primary/10 px-3 text-[13px] font-medium text-primary shadow-sm"
+                  title={t('usage.clearStatusFilter')}
+                >
+                  HTTP {filterStatus}
+                  <X className="size-3.5" />
+                </button>
+              ) : null}
+            </div>
+
+            {/* 错误摘要：不受上方状态按钮影响，便于在各错误类别之间快速切换 */}
+            {errorSummary && errorSummary.total_errors > 0 ? (
+              <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-7">
+                {[
+                  { label: t('usage.errorTotal'), value: errorSummary.total_errors, status: 'error' as UsageStatusFilter },
+                  { label: '4xx', value: errorSummary.status_4xx, status: '4xx' as UsageStatusFilter },
+                  { label: '5xx', value: errorSummary.status_5xx, status: '5xx' as UsageStatusFilter },
+                  { label: '401', value: errorSummary.unauthorized, status: '401' as UsageStatusFilter },
+                  { label: '429', value: errorSummary.rate_limited, status: '429' as UsageStatusFilter },
+                  { label: '499', value: errorSummary.canceled, status: '499' as UsageStatusFilter },
+                  { label: t('usage.retryRequests'), value: errorSummary.retry_attempts, retry: 'true' as UsageRetryFilter },
+                ].map((item) => (
+                  <button
+                    key={item.label}
+                    type="button"
+                    onClick={() => {
+                      if (item.status) setFilterStatus(item.status)
+                      if (item.retry) {
+                        setFilterRetry(item.retry)
+                        setFilterStatus('error')
+                      }
+                      setPage(1)
+                    }}
+                    className="flex min-w-0 items-center justify-between gap-2 rounded-lg border border-border/80 bg-muted/25 px-3 py-2 text-left transition-colors hover:border-primary/30 hover:bg-primary/5"
+                  >
+                    <span className="truncate text-[11px] font-medium text-muted-foreground">{item.label}</span>
+                    <span className="font-geist-mono text-[13px] font-semibold tabular-nums text-foreground">
+                      {item.value.toLocaleString()}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
+            {/* 主筛选栏 */}
+            <div className="toolbar-surface mb-4 overflow-visible">
+              <div className="flex flex-wrap items-center gap-2 max-lg:gap-1.5">
+                <div className="relative min-w-60 flex-1 max-sm:w-full">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    className="h-8 rounded-lg pl-8 text-[13px]"
+                    placeholder={t('usage.searchLogs')}
+                    value={searchInput}
+                    onChange={(e: React.ChangeEvent<HTMLInputElement>) => handleSearchChange(e.target.value)}
+                  />
+                </div>
+
+                <Select
+                  className="w-40 shrink-0"
+                  compact
+                  value={filterModel}
+                  onValueChange={(value) => { setFilterModel(value); setPage(1) }}
+                  placeholder={t('usage.allModels')}
+                  options={[
+                    { label: t('usage.allModels'), value: '' },
+                    ...modelFilterOptions.map((model) => ({ label: model, value: model })),
+                  ]}
                 />
+
+                {showAPIKeyFilter ? (
+                  <Select
+                    className="w-52 shrink-0"
+                    compact
+                    value={filterApiKeyId}
+                    onValueChange={(value) => { setFilterApiKeyId(value); setPage(1) }}
+                    placeholder={t('usage.allApiKeys')}
+                    options={apiKeyOptions}
+                  />
+                ) : null}
+
+                <button
+                  type="button"
+                  onClick={() => setShowAdvancedFilters((current) => !current)}
+                  aria-expanded={showAdvancedFilters}
+                  className={cn(
+                    'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors',
+                    showAdvancedFilters || advancedFilterCount > 0
+                      ? 'border-primary/30 bg-primary/8 text-primary'
+                      : 'border-border bg-background text-muted-foreground hover:bg-muted/50 hover:text-foreground',
+                  )}
+                >
+                  <SlidersHorizontal className="size-3.5" />
+                  {t('usage.moreFilters')}
+                  {advancedFilterCount > 0 ? (
+                    <span className="rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-4 text-primary-foreground">
+                      {advancedFilterCount}
+                    </span>
+                  ) : null}
+                  <ChevronDown className={cn('size-3.5 transition-transform', showAdvancedFilters && 'rotate-180')} />
+                </button>
+
+                {hasActiveFilters ? (
+                  <button
+                    type="button"
+                    onClick={resetLogFilters}
+                    className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg border border-border bg-background px-2.5 text-[13px] text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+                  >
+                    <X className="size-3.5" />
+                    {t('usage.clearFilters')}
+                  </button>
+                ) : null}
+
+                <div className="ml-auto shrink-0">
+                  <ColumnSettingsDropdown
+                    open={columnSettingsOpen}
+                    columns={visibleColumns}
+                    onOpenChange={setColumnSettingsOpen}
+                    onToggle={(key) => setVisibleColumns((current) => ({ ...current, [key]: !current[key] }))}
+                  />
+                </div>
               </div>
 
-              {filterAccountId && (
+              {filterAccountId ? (
                 <button
                   type="button"
                   onClick={() => { setFilterAccountId(''); setPage(1) }}
-                  className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg border border-primary/30 bg-primary/10 px-2.5 text-[13px] font-medium text-primary transition-colors hover:bg-primary/15"
+                  className="mt-2 inline-flex h-8 items-center gap-1 rounded-lg border border-primary/30 bg-primary/10 px-2.5 text-[13px] font-medium text-primary transition-colors hover:bg-primary/15"
                   title={t('usage.accountIdFilterTitle', { id: filterAccountId })}
                 >
                   {t('usage.accountIdFilter', { id: filterAccountId })}
                   <X className="size-3.5" />
                 </button>
-              )}
+              ) : null}
 
-              {/* 模型下拉 */}
-              <Select
-                className="w-36 shrink-0"
-                compact
-                value={filterModel}
-                onValueChange={(v) => { setFilterModel(v); setPage(1) }}
-                placeholder={t('usage.allModels')}
-                options={[
-                  { label: t('usage.allModels'), value: '' },
-                  ...modelFilterOptions.map((m) => ({ label: m, value: m })),
-                ]}
-              />
-
-              {/* 端点下拉 */}
-              <Select
-                className="w-44 shrink-0"
-                compact
-                value={filterEndpoint}
-                onValueChange={(v) => { setFilterEndpoint(v); setPage(1) }}
-                placeholder={t('usage.allEndpoints')}
-                options={[
-                  { label: t('usage.allEndpoints'), value: '' },
-                  { label: '/v1/chat/completions', value: '/v1/chat/completions' },
-                  { label: '/v1/responses', value: '/v1/responses' },
-                  { label: '/v1/images/generations', value: '/v1/images/generations' },
-                  { label: '/v1/images/edits', value: '/v1/images/edits' },
-                  { label: '/v1/messages', value: '/v1/messages' },
-                ]}
-              />
-
-              {showAPIKeyFilter && (
-                <Select
-                  className="w-48 shrink-0"
-                  compact
-                  value={filterApiKeyId}
-                  onValueChange={(v) => { setFilterApiKeyId(v); setPage(1) }}
-                  placeholder={t('usage.allApiKeys')}
-                  options={apiKeyOptions}
-                />
-              )}
-
-              {/* 类型下拉 */}
-              <Select
-                className="w-40 shrink-0"
-                compact
-                value={filterType}
-                onValueChange={(v) => { setFilterType(v as UsageTypeFilter); setPage(1) }}
-                placeholder={t('usage.allTypes')}
-                options={[
-                  { label: t('usage.allTypes'), value: '' },
-                  { label: 'Stream', value: 'stream' },
-                  { label: 'Sync', value: 'sync' },
-                  { label: t('usage.compactionTrigger'), value: 'compact' },
-                  { label: t('usage.compactionHistory'), value: 'history' },
-                ]}
-              />
-
-              {showFastFilter && (
-                <button
-                  type="button"
-                  onClick={() => { setFilterFast(filterFast === 'true' ? '' : 'true'); setPage(1) }}
-                  className={`h-8 shrink-0 px-2.5 rounded-lg border text-[13px] font-medium transition-colors inline-flex items-center gap-1 whitespace-nowrap ${
-                    filterFast === 'true'
-                      ? 'border-blue-500/40 bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400'
-                      : 'border-border bg-background text-muted-foreground hover:text-foreground hover:bg-muted/50'
-                  }`}
-                >
-                  <Zap className="size-3.5" />
-                  Fast
-                </button>
-              )}
-
-              {/* 清除筛选 */}
-              {hasActiveFilters && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSearchInput(''); setSearchEmail('')
-                    setFilterModel(''); setFilterEndpoint('')
-                    setFilterApiKeyId('')
-                    setFilterAccountId('')
-                    setFilterType(''); setFilterFast('')
-                    setPage(1)
-                  }}
-                  className="h-8 shrink-0 px-2.5 rounded-lg border border-border bg-background text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors inline-flex items-center gap-1 whitespace-nowrap"
-                >
-                  <X className="size-3.5" />
-                  {t('usage.clearFilters')}
-                </button>
-              )}
-
-              <div className="ml-auto shrink-0">
-                <ColumnSettingsDropdown
-                  open={columnSettingsOpen}
-                  columns={visibleColumns}
-                  onOpenChange={setColumnSettingsOpen}
-                  onToggle={(key) => setVisibleColumns((current) => ({ ...current, [key]: !current[key] }))}
-                />
-              </div>
+              {showAdvancedFilters ? (
+                <div className="mt-3 grid grid-cols-1 gap-2 border-t border-border/70 pt-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+                  <Select
+                    compact
+                    value={filterEndpoint}
+                    onValueChange={(value) => { setFilterEndpoint(value); setPage(1) }}
+                    placeholder={t('usage.allEndpoints')}
+                    options={[
+                      { label: t('usage.allEndpoints'), value: '' },
+                      { label: '/v1/chat/completions', value: '/v1/chat/completions' },
+                      { label: '/v1/responses', value: '/v1/responses' },
+                      { label: '/v1/images/generations', value: '/v1/images/generations' },
+                      { label: '/v1/images/edits', value: '/v1/images/edits' },
+                      { label: '/v1/messages', value: '/v1/messages' },
+                    ]}
+                  />
+                  <Select
+                    compact
+                    value={filterType}
+                    onValueChange={(value) => { setFilterType(value as UsageTypeFilter); setPage(1) }}
+                    placeholder={t('usage.allTypes')}
+                    options={[
+                      { label: t('usage.allTypes'), value: '' },
+                      { label: 'Stream', value: 'stream' },
+                      { label: 'Sync', value: 'sync' },
+                      { label: t('usage.compactionTrigger'), value: 'compact' },
+                      { label: t('usage.compactionHistory'), value: 'history' },
+                    ]}
+                  />
+                  <Select
+                    compact
+                    value={filterErrorKind}
+                    onValueChange={(value) => { setFilterErrorKind(value); setPage(1) }}
+                    placeholder={t('usage.allErrorKinds')}
+                    options={[
+                      { label: t('usage.allErrorKinds'), value: '' },
+                      { label: 'rate_limited_model', value: 'rate_limited_model' },
+                      { label: 'client', value: 'client' },
+                      { label: 'server', value: 'server' },
+                      { label: 'unauthorized', value: 'unauthorized' },
+                      { label: 'transport', value: 'transport' },
+                      { label: 'usage_limit', value: 'usage_limit' },
+                      { label: 'payment_required', value: 'payment_required' },
+                      { label: 'cyber_policy', value: 'cyber_policy' },
+                      { label: 'upstream_error', value: 'upstream_error' },
+                      { label: 'upstream_timeout', value: 'upstream_timeout' },
+                    ]}
+                  />
+                  <Select
+                    compact
+                    value={filterRetry}
+                    onValueChange={(value) => { setFilterRetry(value as UsageRetryFilter); setPage(1) }}
+                    placeholder={t('usage.allAttempts')}
+                    options={[
+                      { label: t('usage.allAttempts'), value: '' },
+                      { label: t('usage.initialRequests'), value: 'false' },
+                      { label: t('usage.retryRequests'), value: 'true' },
+                    ]}
+                  />
+                  <Select
+                    compact
+                    value={filterTransport}
+                    onValueChange={(value) => { setFilterTransport(value as UsageTransportFilter); setPage(1) }}
+                    placeholder={t('usage.allTransports')}
+                    options={[
+                      { label: t('usage.allTransports'), value: '' },
+                      { label: 'HTTP', value: 'http' },
+                      { label: 'WebSocket', value: 'ws' },
+                    ]}
+                  />
+                  {showFastFilter ? (
+                    <button
+                      type="button"
+                      onClick={() => { setFilterFast(filterFast === 'true' ? '' : 'true'); setPage(1) }}
+                      className={cn(
+                        'inline-flex h-8 items-center justify-center gap-1 rounded-lg border px-2.5 text-[13px] font-medium transition-colors',
+                        filterFast === 'true'
+                          ? 'border-blue-500/40 bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400'
+                          : 'border-border bg-background text-muted-foreground hover:bg-muted/50 hover:text-foreground',
+                      )}
+                    >
+                      <Zap className="size-3.5" />
+                      Fast
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
 
             <StateShell
@@ -2147,7 +2460,14 @@ export default function Usage() {
                     >
                       <div className="flex items-start justify-between gap-2">
                         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                          <StatusCodeBadge log={log} />
+                          <button
+                            type="button"
+                            onClick={() => { setFilterStatus(String(log.status_code) as UsageStatusFilter); setPage(1) }}
+                            className="rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                            title={t('usage.filterByStatus', { status: log.status_code })}
+                          >
+                            <StatusCodeBadge log={log} />
+                          </button>
                           {log.upstream_error_kind === 'cyber_policy' ? <CyberPolicyDetailButton log={log} /> : null}
                           {log.via_websocket ? (
                             <Badge
@@ -2193,6 +2513,8 @@ export default function Usage() {
                           {formatBeijingTime(log.created_at)}
                         </div>
                       </div>
+
+                      <UsageErrorSummaryCell log={log} mobile />
 
                       <div className="mt-2.5 space-y-1 text-xs text-muted-foreground">
                         <div className="truncate" title={formatUsageAccountTitle(log)}>
@@ -2265,6 +2587,7 @@ export default function Usage() {
                   <TableHeader>
                     <TableRow>
                       {visibleColumns.status && <TableHead className={usageTableHeadClass}>{t('usage.tableStatus')}</TableHead>}
+                      {visibleColumns.error && <TableHead className={usageTableHeadClass}>{t('usage.tableError')}</TableHead>}
                       {visibleColumns.model && <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>}
                       {visibleColumns.account && <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>}
                       {visibleColumns.apiKey && <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>}
@@ -2305,9 +2628,19 @@ export default function Usage() {
                       <TableRow key={log.id}>
                         {visibleColumns.status && <TableCell>
                           <div className="flex items-center gap-1.5">
-                            <StatusCodeBadge log={log} />
+                            <button
+                              type="button"
+                              onClick={() => { setFilterStatus(String(log.status_code) as UsageStatusFilter); setPage(1) }}
+                              className="rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                              title={t('usage.filterByStatus', { status: log.status_code })}
+                            >
+                              <StatusCodeBadge log={log} />
+                            </button>
                             {log.upstream_error_kind === 'cyber_policy' ? <CyberPolicyDetailButton log={log} /> : null}
                           </div>
+                        </TableCell>}
+                        {visibleColumns.error && <TableCell>
+                          <UsageErrorSummaryCell log={log} />
                         </TableCell>}
                         {visibleColumns.model && <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">

@@ -140,6 +140,8 @@ func TestSyncCodexUsageStateCreditAccountSkipsPremium5hWindowLimit(t *testing.T)
 		CreditEnabled:         true,
 		CreditSkipUsageWindow: true,
 	}
+	// 信用开关现在还要求当下确实有积分可花，快照缺失会按「没有积分」处理。
+	acc.SetCreditBalance("1000.0000000000", true, false, false)
 	resp := &http.Response{Header: make(http.Header)}
 	resp.Header.Set("x-codex-primary-used-percent", "100")
 	resp.Header.Set("x-codex-primary-window-minutes", "300")

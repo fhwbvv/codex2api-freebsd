@@ -20,8 +20,6 @@ func TestEngineCacheIgnoresOperationalGuardPerformanceChanges(t *testing.T) {
 	operational.Advanced.Guard.Performance.MaxAuxiliaryBytes = 16384
 	operational.Advanced.Guard.Performance.ScanChunkBytes = 4096
 	operational.Advanced.Guard.Performance.ScanOverlapBytes = 256
-	operational.Advanced.Guard.Rollout.Enabled = true
-	operational.Advanced.Guard.Rollout.Percent = 25
 	second, err := engineForConfig(operational)
 	if err != nil {
 		t.Fatal(err)
@@ -49,15 +47,14 @@ func TestEngineCacheChangesWhenDetectionSemanticsChange(t *testing.T) {
 	}
 }
 
-func TestEngineCacheDoesNotRetainOperationalSecrets(t *testing.T) {
+func TestEngineCacheDoesNotRetainReviewSecret(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Review.APIKey = "sk-review-sensitive"
-	cfg.Advanced.NewAPI.Secret = "newapi-sensitive"
 	engine, err := engineForConfig(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if engine.cfg.Review.APIKey != "" || engine.cfg.Advanced.NewAPI.Secret != "" {
-		t.Fatalf("engine retained operational secrets: review=%q newapi=%q", engine.cfg.Review.APIKey, engine.cfg.Advanced.NewAPI.Secret)
+	if engine.cfg.Review.APIKey != "" {
+		t.Fatalf("engine retained review secret %q", engine.cfg.Review.APIKey)
 	}
 }

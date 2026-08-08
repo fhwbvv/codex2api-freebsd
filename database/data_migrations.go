@@ -23,7 +23,10 @@ const (
 	// 账号已删的历史行默认 codex（Grok 上线前的流量全部是 codex）。
 	dataMigrationUsageLogChannelV1   = "20260721_usage_log_channel_backfill_v1"
 	dataMigrationWorkspaceIdentityV3 = "20260722_workspace_identity_v3"
-	dataMigrationTimeout             = 5 * time.Minute
+	// account_groups.channel 归类:成员全为 Grok 账号的存量分组标记为 grok 渠道,
+	// 其余(含空组/混合组)保持 codex。此后分组按渠道隔离,写入路径强校验。
+	dataMigrationGroupChannelV1 = "20260807_account_group_channel_v1"
+	dataMigrationTimeout        = 5 * time.Minute
 )
 
 type oauthIdentityDedupeAccount struct {
@@ -48,7 +51,36 @@ func (db *DB) runDataMigrations(ctx context.Context) error {
 	if err := db.runDataMigrationOnce(ctx, dataMigrationUsageLogChannelV1, db.backfillUsageLogChannel); err != nil {
 		return err
 	}
-	return db.runDataMigrationOnce(ctx, dataMigrationWorkspaceIdentityV3, db.migrateWorkspaceIdentityV3)
+	if err := db.runDataMigrationOnce(ctx, dataMigrationWorkspaceIdentityV3, db.migrateWorkspaceIdentityV3); err != nil {
+		return err
+	}
+	return db.runDataMigrationOnce(ctx, dataMigrationGroupChannelV1, db.classifyAccountGroupChannels)
+}
+
+// classifyAccountGroupChannels 把成员清一色是 Grok 账号的存量分组归到 grok 渠道。
+// 混合组保持 codex 且成员不动(只在后续写入时强校验),避免迁移悄悄拆散生产分组。
+func (db *DB) classifyAccountGroupChannels(ctx context.Context, tx *sql.Tx) error {
+	upstreamTypeExpr := `LOWER(COALESCE(a.credentials->>'upstream_type', ''))`
+	if db.isSQLite() {
+		upstreamTypeExpr = `LOWER(COALESCE(json_extract(a.credentials, '$.upstream_type'), ''))`
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE account_groups SET channel = 'grok'
+		WHERE COALESCE(channel, 'codex') <> 'grok' AND id IN (
+			SELECT m.group_id
+			FROM account_group_members m
+			JOIN accounts a ON a.id = m.account_id
+			WHERE a.status <> 'deleted' AND COALESCE(a.error_message, '') <> 'deleted'
+			GROUP BY m.group_id
+			HAVING COUNT(*) = SUM(CASE WHEN `+upstreamTypeExpr+` = 'grok' THEN 1 ELSE 0 END)
+		)`)
+	if err != nil {
+		return fmt.Errorf("归类 grok 分组: %w", err)
+	}
+	if affected, err := res.RowsAffected(); err == nil && affected > 0 {
+		log.Printf("[data_migration] %s: %d 个存量分组归类为 grok 渠道", dataMigrationGroupChannelV1, affected)
+	}
+	return nil
 }
 
 // backfillUsageLogChannel 给存量 usage_logs 回填 channel：先按现存账号的 platform
@@ -450,10 +482,8 @@ func softDeleteAccountsTx(ctx context.Context, tx *sql.Tx, ids []int64) error {
 			return fmt.Errorf("软删除重复账号失败: %w", err)
 		}
 
-		query = fmt.Sprintf(`DELETE FROM account_group_members WHERE account_id IN (%s)`, strings.Join(placeholders, ","))
-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("清理重复账号分组关系失败: %w", err)
-		}
+		// Keep the duplicate account's last group snapshot for historical usage
+		// attribution. The account is already excluded from the active pool.
 	}
 	return nil
 }

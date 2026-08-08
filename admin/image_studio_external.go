@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/codex2api/database"
-	"github.com/codex2api/internal/imageproc"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -86,11 +85,12 @@ func (h *Handler) CreateExternalImageJob(c *gin.Context) {
 		return
 	}
 
-	// The in-process image handler intentionally does not run the /v1 auth
-	// middleware again. Enforce API-key limits and hold the concurrency slot here
-	// from enqueue through background completion so async jobs match /v1 policy
-	// without double-counting the same request.
-	if status, msg := imageProxy.EnforceAPIKeyLimits(c, req.Model); status != 0 {
+	// Preflight the whole batch so one accepted job cannot cross an RPM/RPD
+	// boundary, then reserve the concurrency slot for the job before accepting
+	// it. Holding the slot from enqueue through background completion is what
+	// makes MaxConcurrency admission control: without it every request is
+	// accepted and the ones that cannot run just become failed job rows.
+	if status, msg := imageProxy.EnforceAPIKeyLimitsForRequests(c, req.Model, req.N); status != 0 {
 		proxy.SendAPIKeyLimitError(c, status, msg)
 		return
 	}
@@ -142,11 +142,12 @@ func (h *Handler) CreateExternalImageJob(c *gin.Context) {
 		if releaseAPIKeyConcurrency != nil {
 			defer releaseAPIKeyConcurrency()
 		}
+		opts := imageJobRunOptions{sharedAPIKeyConcurrency: true}
 		if editMode {
-			h.runImageEditJob(jobID, req, apiKey)
+			h.runImageEditJob(jobID, req, apiKey, opts)
 			return
 		}
-		h.runImageGenerationJob(jobID, req, apiKey)
+		h.runImageGenerationJob(jobID, req, apiKey, opts)
 	}()
 	c.JSON(http.StatusAccepted, externalImageJobResponse{Job: job})
 }
@@ -207,7 +208,16 @@ func normalizeExternalImageJobFields(req *imageGenerationJobPayload) (bool, erro
 	}
 	req.Background = normalizeOptionalImageParam(req.Background)
 	req.Style = normalizeOptionalImageParam(req.Style)
-	req.Upscale = imageproc.NormalizeUpscale(req.Upscale)
+	normalizedUpscale, err := normalizeImageJobUpscale(req.Model, req.Size, req.Upscale)
+	if err != nil {
+		return false, err
+	}
+	req.Upscale = normalizedUpscale
+	count, err := normalizeImageJobOutputCount(req.N)
+	if err != nil {
+		return false, err
+	}
+	req.N = count
 
 	images := make([]string, 0, len(req.InputImages))
 	for _, imageURL := range req.InputImages {

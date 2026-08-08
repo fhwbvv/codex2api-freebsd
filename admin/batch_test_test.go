@@ -341,7 +341,7 @@ func TestRunSingleBatchTestResponseFailedMarksReadyAccountError(t *testing.T) {
 	}
 }
 
-func TestRunSingleBatchTestUsageLimitResponseFailedMarksRateLimited(t *testing.T) {
+func TestRunSingleBatchTestRelayUsageLimitDoesNotPersistAccountCooldown(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -366,8 +366,8 @@ func TestRunSingleBatchTestUsageLimitResponseFailedMarksRateLimited(t *testing.T
 	if status != "rate_limited" {
 		t.Fatalf("status = %q, message = %q, want rate_limited", status, msg)
 	}
-	if got := account.RuntimeStatus(); got != "rate_limited" {
-		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active for direct API upstream", got)
 	}
 }
 

@@ -1668,6 +1668,37 @@ func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 	}
 }
 
+func TestResponsesEndpointAllowsEncryptedContentInputType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := NewHandler(auth.NewStore(nil, nil, nil), nil, nil, nil)
+	body := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"encrypted_content","content":"opaque-ciphertext"},
+			{"type":"input_text","text":"hello"}
+		]
+	}`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = req
+
+	handler.Responses(ginCtx)
+
+	if recorder.Code == http.StatusBadRequest && strings.Contains(recorder.Body.String(), "invalid_input_type") {
+		t.Fatalf("encrypted_content input type was rejected by local validation: %s", recorder.Body.String())
+	}
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d after validation passes; body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
+	}
+	assertNoAvailableAccountResponse(t, recorder.Body.Bytes())
+}
+
 func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -3061,8 +3092,8 @@ func TestSendFinalUpstreamError_FallsBackForNonUsageLimit(t *testing.T) {
 	if recorder.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
 	}
-	if got := recorder.Header().Get("Retry-After"); got != "" {
-		t.Fatalf("Retry-After = %q, want empty", got)
+	if got := recorder.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q, want 1", got)
 	}
 }
 
@@ -3537,6 +3568,35 @@ func TestApply429CooldownUnknown429UsesModelCooldown(t *testing.T) {
 	}
 }
 
+func TestApply429CooldownRelayDefaultDoesNotPersistCooldown(t *testing.T) {
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         103,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://api.example.test",
+		APIKey:       "test-key",
+		PlanType:     "api",
+	}
+
+	decision := Apply429Cooldown(
+		store,
+		account,
+		[]byte(`{"detail":"Rate limit exceeded"}`),
+		&http.Response{Header: make(http.Header)},
+		"gpt-5.6-sol",
+	)
+
+	if decision.Scope != rateLimitScopeModel || decision.Reason != "rate_limited_model" {
+		t.Fatalf("decision = %#v, want non-persistent model rate limit", decision)
+	}
+	if !decision.ResetAt.IsZero() || decision.Cooldown != 0 {
+		t.Fatalf("decision cooldown = %v reset=%v, want no persistent cooldown", decision.Cooldown, decision.ResetAt)
+	}
+	if account.IsModelRateLimited("gpt-5.6-sol") {
+		t.Fatal("relay account should remain schedulable after a transient 429")
+	}
+}
+
 func TestSyncCodexUsageStateTriggersPremium5hLimitWith5hHeadersOnly(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	account := &auth.Account{DBID: 103, PlanType: "team"}
@@ -3668,6 +3728,8 @@ func TestSyncCodexUsageStateCreditAccountSkips7dUsageLimit(t *testing.T) {
 		CreditEnabled:         true,
 		CreditSkipUsageWindow: true,
 	}
+	// 信用开关现在还要求当下确实有积分可花，快照缺失会按「没有积分」处理。
+	account.SetCreditBalance("1000.0000000000", true, false, false)
 	resp := &http.Response{Header: make(http.Header)}
 	resp.Header.Set("x-codex-primary-used-percent", "20")
 	resp.Header.Set("x-codex-primary-window-minutes", "300")
@@ -3684,8 +3746,16 @@ func TestSyncCodexUsageStateCreditAccountSkips7dUsageLimit(t *testing.T) {
 	if result.Usage7dRateLimited {
 		t.Fatalf("Usage7dRateLimited = true, want false for credit account")
 	}
-	if got := account.RuntimeStatus(); got != "active" {
-		t.Fatalf("RuntimeStatus() = %q, want active for credit account", got)
+	// 窗口打满但积分顶着：显示仍是限流，调度侧不受影响，
+	// 前端据 UsingCredits 在限流徽章后面挂一个积分徽章。
+	if got := account.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited for credit account", got)
+	}
+	if !account.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true while credits cover the window")
+	}
+	if !account.UsingCredits() {
+		t.Fatal("UsingCredits() = false, want true while credits cover the window")
 	}
 	row, err := db.GetAccountByID(ctx, id)
 	if err != nil {

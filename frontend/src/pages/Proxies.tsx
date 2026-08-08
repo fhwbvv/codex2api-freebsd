@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, memo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, memo } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Globe,
@@ -45,10 +45,6 @@ import { getErrorMessage } from "../utils/error";
 
 const PROXY_SCHEMES = ["http:", "https:", "socks5:", "socks5h:"];
 
-// 绑定弹窗一次最多渲染的账号行数。大号池下全量渲染会卡死页面,
-// 超出部分提示用搜索/筛选缩小范围(选择集不受渲染上限影响)。
-const BIND_LIST_RENDER_CAP = 100;
-
 type BindFilter = "all" | "unbound" | "this" | "other";
 // 账号池大类：Codex 池（含 AT / Agent / OpenAI Responses）与 Grok 池
 type BindKindFilter = "all" | "codex" | "grok";
@@ -66,13 +62,6 @@ function accountKindKey(account: AccountRow): string {
   if (account.agent_identity) return "agent";
   if (account.at_only) return "at";
   return "codex";
-}
-
-function matchesBindKind(account: AccountRow, kind: BindKindFilter): boolean {
-  if (kind === "all") return true;
-  if (kind === "grok") return Boolean(account.grok_api);
-  // Codex 池：非 Grok 的账号（OAuth / AT / Agent / OpenAI Responses）
-  return !account.grok_api;
 }
 
 function normalizeProxyUrl(url: string | null | undefined): string {
@@ -291,6 +280,11 @@ export default function Proxies() {
   const [bindFilter, setBindFilter] = useState<BindFilter>("all");
   const [bindKindFilter, setBindKindFilter] = useState<BindKindFilter>("all");
   const [bindQuery, setBindQuery] = useState("");
+  const [debouncedBindQuery, setDebouncedBindQuery] = useState("");
+  const [bindPage, setBindPage] = useState(1);
+  const [bindTotal, setBindTotal] = useState(0);
+  const bindPageSize = 50;
+  const bindAbortRef = useRef<AbortController | null>(null);
   const [bindSubmitting, setBindSubmitting] = useState(false);
 
   // 一键均衡绑定(把账号按最少绑定优先摊到可用代理上)
@@ -307,11 +301,31 @@ export default function Proxies() {
   // 账号列表只在绑定弹窗打开时按需加载 lite 视图(只含身份/绑定字段)。
   // 页面本身的绑定计数用服务端聚合的 bound_count,大号池下不再拉全量账号。
   const reloadAccounts = useCallback(async () => {
+    if (!bindingProxy) return;
+    bindAbortRef.current?.abort();
+    const controller = new AbortController();
+    bindAbortRef.current = controller;
     setAccountsLoading(true);
     try {
-      const res = await api.getAccounts({ view: "lite" });
+      const res = await api.getAccountsPage({
+        channel: bindKindFilter === "all" ? undefined : bindKindFilter,
+        page: bindPage,
+        pageSize: bindPageSize,
+        search: debouncedBindQuery,
+        proxyUrl: bindingProxy.url,
+        proxyFilter: bindFilter,
+      }, controller.signal);
       setAccounts(res.accounts ?? []);
+      setBindTotal(res.total ?? 0);
+      setBindSelected((current) => {
+        const next = new Set(current);
+        for (const account of res.accounts ?? []) {
+          if (isAccountBoundToProxy(account, bindingProxy.url)) next.add(account.id);
+        }
+        return next;
+      });
     } catch (error) {
+      if (controller.signal.aborted) return;
       showToast(
         t("proxies.bindLoadAccountsFailed", {
           error: getErrorMessage(error),
@@ -319,9 +333,24 @@ export default function Proxies() {
         "error",
       );
     } finally {
-      setAccountsLoading(false);
+      if (!controller.signal.aborted) setAccountsLoading(false);
     }
-  }, [showToast, t]);
+  }, [bindFilter, bindKindFilter, bindPage, bindingProxy, debouncedBindQuery, showToast, t]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedBindQuery(bindQuery), 250);
+    return () => window.clearTimeout(timer);
+  }, [bindQuery]);
+
+  useEffect(() => {
+    if (!bindingProxy) return;
+    void reloadAccounts();
+    return () => bindAbortRef.current?.abort();
+  }, [bindingProxy, reloadAccounts]);
+
+  useEffect(() => {
+    setBindPage(1);
+  }, [bindFilter, bindKindFilter, debouncedBindQuery]);
 
   const reload = useCallback(async () => {
     try {
@@ -351,26 +380,9 @@ export default function Proxies() {
     currentPage * pageSize,
   );
 
-  // 绑定计数以服务端聚合的 bound_count 为准;弹窗内已加载账号时用本地
-  // 数据实时刷新(绑定/解绑后不用等代理列表重拉)。
-  const boundCountByProxyUrl = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const account of accounts) {
-      const url = normalizeProxyUrl(account.proxy_url);
-      if (!url) continue;
-      map.set(url, (map.get(url) ?? 0) + 1);
-    }
-    return map;
-  }, [accounts]);
-
   const boundCountForProxy = useCallback(
-    (proxy: ProxyRow): number => {
-      if (accounts.length > 0) {
-        return boundCountByProxyUrl.get(normalizeProxyUrl(proxy.url)) ?? 0;
-      }
-      return proxy.bound_count ?? 0;
-    },
-    [accounts.length, boundCountByProxyUrl],
+    (proxy: ProxyRow): number => proxy.bound_count ?? 0,
+    [],
   );
 
   const totalBoundAccounts = useMemo(
@@ -378,40 +390,9 @@ export default function Proxies() {
     [proxies],
   );
 
-  const bindFilteredAccounts = useMemo(() => {
-    if (!bindingProxy) return [];
-    const q = bindQuery.trim().toLowerCase();
-    const proxyUrl = bindingProxy.url;
-    return accounts.filter((account) => {
-      if (!matchesBindKind(account, bindKindFilter)) return false;
-      const bound = normalizeProxyUrl(account.proxy_url);
-      const isThis = isAccountBoundToProxy(account, proxyUrl);
-      if (bindFilter === "unbound" && bound) return false;
-      if (bindFilter === "this" && !isThis) return false;
-      if (bindFilter === "other" && (!bound || isThis)) return false;
-      if (!q) return true;
-      const haystack = [
-        String(account.id),
-        account.email,
-        account.name,
-        account.status,
-        account.plan_type,
-        account.proxy_url,
-        accountKindKey(account),
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(q);
-    });
-  }, [accounts, bindingProxy, bindFilter, bindKindFilter, bindQuery]);
-
-  // 只渲染前 N 条,选择/全选仍作用于全部筛选结果。
-  const bindRenderedAccounts = useMemo(
-    () => bindFilteredAccounts.slice(0, BIND_LIST_RENDER_CAP),
-    [bindFilteredAccounts],
-  );
-  const bindHiddenCount = bindFilteredAccounts.length - bindRenderedAccounts.length;
+  const bindFilteredAccounts = accounts;
+  const bindRenderedAccounts = accounts;
+  const bindHiddenCount = 0;
 
   const bindVisibleAllSelected =
     bindFilteredAccounts.length > 0 &&
@@ -431,17 +412,9 @@ export default function Proxies() {
     setBindFilter("all");
     setBindKindFilter("all");
     setBindQuery("");
-    // 预选已绑定到该代理的账号，方便查看/解绑
-    const pre = new Set<number>();
-    for (const account of accounts) {
-      if (isAccountBoundToProxy(account, proxy.url)) {
-        pre.add(account.id);
-      }
-    }
-    setBindSelected(pre);
-    if (accounts.length === 0) {
-      void reloadAccounts();
-    }
+    setDebouncedBindQuery("");
+    setBindPage(1);
+    setBindSelected(new Set());
   };
 
   const closeBindModal = () => {
@@ -451,6 +424,8 @@ export default function Proxies() {
     setBindQuery("");
     setBindFilter("all");
     setBindKindFilter("all");
+    setBindTotal(0);
+    setAccounts([]);
   };
 
   const toggleBindSelectAll = () => {
@@ -752,7 +727,7 @@ export default function Proxies() {
       setShowBalance(false);
       await Promise.all([
         reload(),
-        accounts.length > 0 ? reloadAccounts() : Promise.resolve(),
+        bindingProxy ? reloadAccounts() : Promise.resolve(),
       ]);
     } catch (error) {
       showToast(
@@ -1720,7 +1695,7 @@ export default function Proxies() {
                   {t("proxies.bindSelectionSummary", {
                     selected: bindSelected.size,
                     shown: bindFilteredAccounts.length,
-                    total: accounts.length,
+                    total: bindTotal,
                   })}
                 </span>
               </div>
@@ -1761,6 +1736,17 @@ export default function Proxies() {
                         hidden: bindHiddenCount,
                         shown: bindRenderedAccounts.length,
                       })}
+                    </div>
+                  ) : null}
+                  {bindTotal > bindPageSize ? (
+                    <div className="border-t border-border/60 px-5 py-3 sm:px-6">
+                      <Pagination
+                        page={bindPage}
+                        totalPages={Math.max(1, Math.ceil(bindTotal / bindPageSize))}
+                        totalItems={bindTotal}
+                        pageSize={bindPageSize}
+                        onPageChange={setBindPage}
+                      />
                     </div>
                   ) : null}
                 </>

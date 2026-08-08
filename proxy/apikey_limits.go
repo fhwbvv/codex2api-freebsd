@@ -78,6 +78,45 @@ func (h *Handler) EnforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	return h.enforceAPIKeyLimits(c, model)
 }
 
+// EnforceAPIKeyLimitsForRequests performs the normal API-key checks and also
+// verifies that a batched request cannot cross the RPM/RPD boundary by issuing
+// multiple upstream calls after a single admission check. Each upstream call
+// still runs the normal handler checks and records its own usage entry.
+func (h *Handler) EnforceAPIKeyLimitsForRequests(c *gin.Context, model string, requests int) (int, string) {
+	if status, msg := h.enforceAPIKeyLimits(c, model); status != 0 {
+		return status, msg
+	}
+	if requests <= 1 {
+		return 0, ""
+	}
+	row := apiKeyRowFromContext(c)
+	if row == nil || row.ID <= 0 {
+		return 0, ""
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	if row.Limits.RPM > 0 {
+		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpm", apiKeyRPMWindow)
+		if err == nil && apiKeyBatchWouldExceed(count, row.Limits.RPM, requests) {
+			return http.StatusTooManyRequests,
+				fmt.Sprintf("API key rate limit exceeded: batch of %d would exceed %d requests per minute", requests, row.Limits.RPM)
+		}
+	}
+	if row.Limits.RPD > 0 {
+		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpd", apiKeyRPDWindow)
+		if err == nil && apiKeyBatchWouldExceed(count, row.Limits.RPD, requests) {
+			return http.StatusTooManyRequests,
+				fmt.Sprintf("API key rate limit exceeded: batch of %d would exceed %d requests per day", requests, row.Limits.RPD)
+		}
+	}
+	return 0, ""
+}
+
+func apiKeyBatchWouldExceed(current int64, limit, requests int) bool {
+	return limit > 0 && requests > 0 && current+int64(requests) > int64(limit)
+}
+
 // enforceAPIKeyLimits 检查 API Key 的所有限制条件。
 // 命中限制时返回 (status, errorMessage),handler 应立即以该响应短路;
 // 全部通过返回 (0, "")。

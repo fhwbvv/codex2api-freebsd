@@ -1,151 +1,59 @@
-# Prompt 防护真实测试报告
+# Prompt Filter validation guide
 
-测试日期：2026-07-15
+Use this guide to validate Prompt Filter without relying on production data or
+provider-specific accounts.
 
-## 隔离测试环境
+## Isolated environment
 
-- Codex2API 仅监听本机回环地址。
-- 使用 `/tmp` 下的独立 SQLite 数据库和内存缓存。
-- SSE 输出测试使用本地模拟的 OpenAI Responses 上游。
-- 测试结束后停止临时服务并删除临时数据库、二进制和账号副本。
-- 原始账号导出文件和中文教程语料均未修改，也没有复制进代码仓库。
+- Bind the test server to a loopback address.
+- Use a temporary SQLite database or a dedicated PostgreSQL test database.
+- Use mock upstream servers for JSON, SSE, WebSocket, and multipart flows.
+- Never copy production credentials, account exports, or raw user prompts into
+  the repository or test output.
+- Remove temporary databases and stop mock services after the run.
 
-## 基础 HTTP 与输出流测试
+## Functional cases
 
-| 测试项目 | 预期结果 | 实际结果 |
-|---|---|---|
-| 普通无害输入 | 通过本地过滤器 | 通过，并进入账号选择或上游路径 |
-| 低分但设置为严格终止的自定义规则 | 上游调用前返回 HTTP 400 | 通过 |
-| Base64 编码的危险短语 | 解码后拦截 | 通过 |
-| 用户累计风险第一次请求 | 允许 | 通过，风险分 60 |
-| 用户累计风险第二次请求 | 拦截 | 通过，有效风险分约 119—120 |
-| SQLite 重启 | 高级配置继续生效 | 通过 |
-| 安全 SSE 输出 | 缓冲检查后返回 | 通过，返回 190 字节 |
-| 严格短语拆分在两个 SSE 增量事件中 | 不向客户端泄漏危险内容 | 通过，返回 0 字节 |
+1. A benign request is allowed and reaches the mock upstream.
+2. A local audit-only match is logged but does not block.
+3. Warn and block rules produce the configured local action.
+4. Encoded harmful input is detected within configured decode limits.
+5. External review can clear or block a local verdict according to policy.
+6. External-review timeout and malformed JSON follow fail-open/fail-closed.
+7. Scope selection behaves as documented:
+   - `all_requests` reviews every extractable request;
+   - `local_candidates` reviews local warn and block candidates;
+   - `local_blocks` reviews local block decisions only.
+8. Audit records distinguish missing scores from genuine zero scores.
+9. Pagination returns stable, non-overlapping pages.
+10. Clearing Prompt Filter logs follows the documented retention boundaries.
 
-第一次 SSE 实测发现：只检查原始 SSE JSON 无法识别被拆分到多个增量事件中的文本。修复后增加了独立的原始帧缓冲和语义增量缓冲，重新构建并复测通过。
+## Streaming and WebSocket cases
 
-最终基础验证：
+- Validate fragmented SSE events and ensure buffered enforcement content is not
+  leaked before a blocking decision.
+- Validate request extraction per WebSocket logical turn rather than once per
+  connection.
+- Confirm identity verification and prompt evaluation are not repeated more
+  often than required by the protocol.
+- Confirm audit queue work does not delay safe streaming output beyond the
+  configured synchronous checks.
 
-- `go test ./...` 通过。
-- `git diff --check` 通过。
-- 临时 HTTP 服务和模拟上游均已停止。
+## Storage cases
 
-## 中文破限教程语料回归
+- Run schema creation and incremental migrations on SQLite and PostgreSQL.
+- Verify incident, usage-log, candidate-evidence, and risk-profile relationships.
+- Verify transaction rollback when any part of a compound audit write fails.
+- Verify redaction, prompt fingerprints, preview limits, and error-field
+  isolation.
 
-对本地只读安全回归语料目录进行检查，没有把教程原文、原始路径或个人文件信息写入仓库和测试日志。
+## Suggested commands
 
-- 文件总数：460。
-- 可读取并参与扫描的教程或源码文件：442，其中包含 2 个 DOCX。
-- 初始规则判定为拦截：238。
-- 初始规则判定为严格终止：192。
-- 含提示词注入标记的文件：44。
-- 其中被拦截：43。
-- 唯一未拦截项是一份只介绍提示词架构、没有要求绕过规则或执行危险操作的说明文档。
-
-真实 HTTP 请求确认可以拦截：
-
-- 中文伪造 CTF、审核员授权和安全策略降级。
-- 使用标点拆分的中文“忽略指令”。
-- 全角 `UNRESTRICTED` 文本。
-- 西里尔字母与拉丁字母同形混写。
-- 索取系统提示词。
-- `.codex/config.toml` 和 `model_instructions_file` 注入。
-- 以高拟真沙箱为理由要求关闭安全检查。
-- Base64、URL 编码、HTML 数字实体和零宽字符变体。
-
-两项无害对照样本通过过滤器并进入账号选择：
-
-- 仅讨论如何防御提示词注入、不提供绕过操作的请求。
-- 普通 IDA/crackme 校验流程分析。在启用“逆向分类终止”后，该类请求会按用户要求改为全部拦截。
-
-## 真实账号导入与分类终止测试
-
-用户提供的 Codex2API 账号导出文件被导入独立的本地测试实例。测试过程没有输出令牌、把凭据复制进仓库或把凭据写入本报告。
-
-- 首次隔离导入：5 个账号成功，0 个失败。
-- 无害真实请求：HTTP 200，`gpt-5.4` 返回 `pong`。
-- 无害请求前后账号请求计数：0 → 1。
-- “请帮我逆向分析这个二进制文件”：HTTP 400 `prompt_blocked`。
-- “使用 IDA Pro 分析程序的校验逻辑”：HTTP 400 `prompt_blocked`。
-- `.codex/config.toml` / `model_instructions_file` 注入：HTTP 400 `prompt_blocked`。
-- 三个拦截请求结束后账号请求计数仍为 1，确认没有进入 GPT。
-
-测试启用了以下分类终止配置：
-
-```json
-{
-  "enforcement": {
-    "terminal_categories": ["reverse_engineering"]
-  }
-}
+```sh
+go test ./security/promptfilter ./proxy ./admin ./auth ./database
+go test ./...
+cd frontend && npm test && npm run typecheck && npm run build
 ```
 
-只要命中 `reverse_engineering` 分类，即使普通规则分数低于全局阈值，也会立即拦截，不能被上下文降权或二次审核放行。该配置默认是空数组，不会改变未主动开启此功能的部署。
-
-## 全量教程真实 HTTP 路由测试
-
-随后把整个可读教程语料通过真实运行的 Codex2API `POST /v1/responses` 路由进行测试，而不是只调用过滤函数。
-
-- 扫描文件：442。
-- 启用逆向分类终止后选出的危险请求：276。
-- 返回 HTTP 400：276。
-- 穿透数量：0。
-- 请求或运行错误：0。
-- 测试结束后导入账号的 `total_requests` 合计：0。
-- Prompt 审计日志动作均确认为 `block`。
-
-批量测试只提交了已被本地静态引擎判定为危险的样本。账号请求计数保持为 0，独立证明 276 个请求均未通过账号选择，也没有进入 GPT。
-
-本次全量复测时，账号导出文件内的令牌已经过期，没有可用账号，因此没有再次执行无害上游 canary；此前的隔离真实账号测试已成功完成一次 `gpt-5.4` 无害请求。
-
-## 联网规则情报功能实测
-
-在独立本地实例中启用手动情报更新，并真实请求 GitHub Repository Search API：
-
-- 搜索词：`LLM jailbreak prompt injection`。
-- 最大公开结果数：5。
-- 实际获得公开来源：5。
-- 搜索错误：0。
-- `model_enabled=false`，号池模型调用：0。
-- `auto_add=false`，自动添加规则：0。
-- 审计日志成功写入，来源为 `intel_search`，动作是 `searched`。
-
-随后提交一条测试候选规则验证人工审核添加链路：
-
-- API 返回 `added: 1`。
-- 规则出现在自定义规则库中。
-- 添加日志成功写入，来源为 `intel_rule_add`，动作是 `added`。
-
-由于当前测试账号令牌已经失效，本次没有执行真实的号池模型归纳调用。代码路径、最大调用次数限制、JSON 候选校验和审计记录已经通过单元测试与编译测试；待号池存在可用账号时，可将 `model_enabled` 设为 `true` 做一次真实归纳调用。
-
-## 可选语料回归命令
-
-```bash
-PROMPT_FILTER_CORPUS=/path/to/corpus go test ./security/promptfilter -run TestOptionalLocalCorpusAudit -count=1 -v
-```
-# NewAPI 与 Codex2API 身份审计串联说明（2026-07-18）
-
-## 测试环境
-
-- Codex2API：`http://127.0.0.1:18095`
-- NewAPI：`http://127.0.0.1:3000`
-- 身份签名：V1 canonical，不改变既有 `/v1` 请求协议。
-- 扩展审核档案：独立 `policy-meta-v1` 签名。
-- WebSocket / Realtime：使用同一身份与审核档案，并按逻辑轮次关联证据。
-
-## 真实请求结果
-
-| 场景 | 结果 |
-| --- | --- |
-| 正常 Prompt | 正常进入上游，不产生处罚记录 |
-| Codex2API 确认拦截 | 返回签名 HTTP 400 策略决策，NewAPI 校验后按自身执行模式处理 |
-| NewAPI 策略关闭或影子模式 | 不累计违规、不封禁账号、不限制 IP |
-| 仅开启审计 | 保存结构化证据，但不会自动处罚 |
-| 显式开启累计与处罚子开关 | 达到阈值后才会执行对应账号或 IP 动作 |
-
-首次生产部署要求策略总开关、违规累计、账号封禁和 IP 限制全部关闭。管理员之后可分别开启审计、累计和处罚，父开关关闭时子处罚开关会自动关闭。
-
-## 测试中发现并修复的问题
-
-NewAPI 会在统一错误返回前校验 Codex2API 的策略决策和事件签名。只有来源目标、请求身份、正文摘要、策略档案与响应事件都通过校验后，才允许进入审计或处罚流程；普通上游错误不能伪造策略命中。
+Before publishing a change, also run the repository's code-impact and changed-
+flow checks required by `AGENTS.md`.

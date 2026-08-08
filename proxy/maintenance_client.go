@@ -33,6 +33,7 @@ import (
 const (
 	maintenancePurposeCodex        = "codex"        // wham / models / alpha search，Codex CLI UA
 	maintenancePurposeSubscription = "subscription" // 网页端订阅端点，浏览器 UA
+	maintenancePurposeInvite       = "invite"       // 网页端推荐邀请端点，浏览器 UA
 )
 
 // maintenanceClientKey 构造维护 Client 的池键。与 clientPoolKey 前缀不同，

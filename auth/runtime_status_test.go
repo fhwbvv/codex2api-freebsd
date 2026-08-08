@@ -154,7 +154,63 @@ func TestMarkUsage7dRateLimitedUsesActiveResetWindow(t *testing.T) {
 	}
 }
 
+// 信用账号只有在「当下真有积分可花」时才跳过 7d 用量窗口判罚。
 func TestMarkUsage7dRateLimitedSkipsCreditUsageWindow(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{
+		DBID:                  1,
+		AccessToken:           "at-test",
+		PlanType:              "team",
+		Status:                StatusReady,
+		HealthTier:            HealthTierHealthy,
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+	}
+	acc.SetCreditBalance("1000.0000000000", true, false, false)
+	acc.SetUsagePercent7d(100)
+	acc.SetReset7dAt(time.Now().Add(time.Hour))
+
+	if store.MarkUsage7dRateLimited(acc) {
+		t.Fatal("MarkUsage7dRateLimited() = true, want false for credit account with balance")
+	}
+	// 显示仍是限流，但账号照常参与调度（下面的 IsAvailable 断言）。
+	if got := acc.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited for credit account with balance", got)
+	}
+	if !acc.UsingCredits() {
+		t.Fatal("UsingCredits() = false, want true for credit account with balance")
+	}
+	if !acc.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true for credit account with balance")
+	}
+}
+
+// 积分归零后信用开关不再豁免 7d 判罚——否则调度会一直喂给必然 429 的账号。
+func TestMarkUsage7dRateLimitedAppliesWhenCreditsDrained(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{
+		DBID:                  1,
+		AccessToken:           "at-test",
+		PlanType:              "team",
+		Status:                StatusReady,
+		HealthTier:            HealthTierHealthy,
+		CreditEnabled:         true,
+		CreditSkipUsageWindow: true,
+	}
+	acc.SetCreditBalance("0", true, false, false)
+	acc.SetUsagePercent7d(100)
+	acc.SetReset7dAt(time.Now().Add(time.Hour))
+
+	if !store.MarkUsage7dRateLimited(acc) {
+		t.Fatal("MarkUsage7dRateLimited() = false, want true once credits are drained")
+	}
+	if got := acc.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited once credits are drained", got)
+	}
+}
+
+// 余额未探测（credits_valid=false）同样不豁免：未知按没有处理。
+func TestMarkUsage7dRateLimitedAppliesWhenBalanceUnprobed(t *testing.T) {
 	store := NewStore(nil, nil, nil)
 	acc := &Account{
 		DBID:                  1,
@@ -168,14 +224,8 @@ func TestMarkUsage7dRateLimitedSkipsCreditUsageWindow(t *testing.T) {
 	acc.SetUsagePercent7d(100)
 	acc.SetReset7dAt(time.Now().Add(time.Hour))
 
-	if store.MarkUsage7dRateLimited(acc) {
-		t.Fatal("MarkUsage7dRateLimited() = true, want false for credit account")
-	}
-	if got := acc.RuntimeStatus(); got != "active" {
-		t.Fatalf("RuntimeStatus() = %q, want active for credit account", got)
-	}
-	if !acc.IsAvailable() {
-		t.Fatal("IsAvailable() = false, want true for credit account")
+	if !store.MarkUsage7dRateLimited(acc) {
+		t.Fatal("MarkUsage7dRateLimited() = false, want true when the balance was never probed")
 	}
 }
 

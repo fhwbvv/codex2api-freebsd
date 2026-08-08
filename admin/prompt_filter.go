@@ -2,93 +2,42 @@ package admin
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
 
 const promptFilterAuditContextMaxRunes = 2000
 
-type promptFilterSecretRequest struct {
-	Secret string `json:"secret"`
-}
-
-func maskPromptFilterSecret(secret string) string {
-	if secret == "" {
-		return ""
-	}
-	if len(secret) < 12 {
-		return "********"
-	}
-	return secret[:6] + "…" + secret[len(secret)-6:]
-}
-
-func (h *Handler) promptFilterSecretStatus(c *gin.Context, reveal string) {
-	dbSecret, _ := h.db.GetPromptFilterNewAPISecret(c.Request.Context())
-	envSecret := strings.TrimSpace(os.Getenv("PROMPT_FILTER_NEWAPI_SECRET"))
-	effective, source := dbSecret, "database"
-	if envSecret != "" {
-		effective, source = envSecret, "environment"
-	}
-	if effective == "" {
-		source = "none"
-	}
-	c.JSON(http.StatusOK, gin.H{"configured": effective != "", "source": source, "masked": maskPromptFilterSecret(effective), "secret": reveal})
-}
-
-func (h *Handler) GetPromptFilterNewAPISecretStatus(c *gin.Context) {
-	h.promptFilterSecretStatus(c, "")
-}
-
-func (h *Handler) GeneratePromptFilterNewAPISecret(c *gin.Context) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		writeError(c, http.StatusInternalServerError, "生成随机密钥失败")
-		return
-	}
-	h.savePromptFilterNewAPISecret(c, hex.EncodeToString(buf))
-}
-
-func (h *Handler) ReplacePromptFilterNewAPISecret(c *gin.Context) {
-	var req promptFilterSecretRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeError(c, http.StatusBadRequest, "请求格式无效")
-		return
-	}
-	h.savePromptFilterNewAPISecret(c, strings.TrimSpace(req.Secret))
-}
-
-func (h *Handler) savePromptFilterNewAPISecret(c *gin.Context, secret string) {
-	if len(secret) < 32 {
-		writeError(c, http.StatusBadRequest, "共享密钥至少需要 32 个字符")
-		return
-	}
-	h.settingsUpdateMu.Lock()
-	defer h.settingsUpdateMu.Unlock()
-	if err := h.db.SetPromptFilterNewAPISecret(c.Request.Context(), secret); err != nil {
-		writeError(c, http.StatusInternalServerError, "保存共享密钥失败")
-		return
-	}
-	cfg := h.store.GetPromptFilterConfig()
-	cfg.Advanced.NewAPI.Secret = secret
-	h.store.SetPromptFilterConfig(cfg)
-	h.promptFilterSecretStatus(c, secret)
-}
-
 type promptFilterLogsResponse struct {
 	Logs     []*database.PromptFilterLog `json:"logs"`
 	Total    int                         `json:"total"`
 	Page     int                         `json:"page"`
 	PageSize int                         `json:"page_size"`
+}
+
+type promptPolicyIncidentsResponse struct {
+	Incidents []*database.PromptPolicyIncident `json:"incidents"`
+	Total     int                              `json:"total"`
+	Page      int                              `json:"page"`
+	PageSize  int                              `json:"page_size"`
+}
+
+type promptPolicyIncidentDetailResponse struct {
+	Incident  *database.PromptPolicyIncident        `json:"incident"`
+	Matches   json.RawMessage                       `json:"matches"`
+	Candidate *database.PromptRuleCandidate         `json:"candidate,omitempty"`
+	Evidence  *database.PromptRuleCandidateEvidence `json:"evidence,omitempty"`
 }
 
 type promptFilterTestRequest struct {
@@ -98,7 +47,66 @@ type promptFilterTestRequest struct {
 }
 
 type promptFilterTestResponse struct {
-	Verdict promptfilter.Verdict `json:"verdict"`
+	Verdict  promptfilter.Verdict     `json:"verdict"`
+	Decision promptfilter.Decision    `json:"decision"`
+	Protocol promptfilter.Protocol    `json:"protocol"`
+	Provider promptfilter.ModelFamily `json:"provider"`
+	Endpoint string                   `json:"endpoint"`
+	Model    string                   `json:"model"`
+}
+
+type promptReviewTestRequest struct {
+	Text                 string             `json:"text"`
+	APIKey               string             `json:"api_key"`
+	BaseURL              string             `json:"base_url"`
+	Model                string             `json:"model"`
+	RequestMode          string             `json:"request_mode"`
+	SystemPrompt         string             `json:"system_prompt"`
+	UserPromptTemplate   string             `json:"user_prompt_template"`
+	PayloadTemplate      string             `json:"payload_template"`
+	ConfidenceThreshold  float64            `json:"confidence_threshold"`
+	ModerationThresholds map[string]float64 `json:"moderation_thresholds"`
+	TimeoutSeconds       int                `json:"timeout_seconds"`
+	MaxConcurrent        int                `json:"max_concurrent"`
+	MaxTextLength        int                `json:"max_text_length"`
+	TestAllKeys          bool               `json:"test_all_keys"`
+}
+
+type promptReviewKeyTestResult struct {
+	KeyIndex             int                `json:"key_index"`
+	OK                   bool               `json:"ok"`
+	Endpoint             string             `json:"endpoint,omitempty"`
+	Model                string             `json:"model,omitempty"`
+	Flagged              bool               `json:"flagged"`
+	Confidence           float64            `json:"confidence"`
+	Reason               string             `json:"reason,omitempty"`
+	HighestCategory      string             `json:"highest_category,omitempty"`
+	DecisionCategory     string             `json:"decision_category,omitempty"`
+	DecisionScore        float64            `json:"decision_score"`
+	DecisionThreshold    float64            `json:"decision_threshold"`
+	CategoryScores       map[string]float64 `json:"category_scores,omitempty"`
+	ModerationThresholds map[string]float64 `json:"moderation_thresholds,omitempty"`
+	LatencyMS            int64              `json:"latency_ms"`
+	Error                string             `json:"error,omitempty"`
+}
+
+type promptReviewTestResponse struct {
+	OK                   bool                        `json:"ok"`
+	Endpoint             string                      `json:"endpoint"`
+	Model                string                      `json:"model"`
+	Flagged              bool                        `json:"flagged"`
+	Confidence           float64                     `json:"confidence"`
+	ConfidenceThreshold  float64                     `json:"confidence_threshold"`
+	Reason               string                      `json:"reason,omitempty"`
+	HighestCategory      string                      `json:"highest_category,omitempty"`
+	DecisionCategory     string                      `json:"decision_category,omitempty"`
+	DecisionScore        float64                     `json:"decision_score"`
+	DecisionThreshold    float64                     `json:"decision_threshold"`
+	CategoryScores       map[string]float64          `json:"category_scores,omitempty"`
+	ModerationThresholds map[string]float64          `json:"moderation_thresholds,omitempty"`
+	LatencyMS            int64                       `json:"latency_ms"`
+	KeyCount             int                         `json:"key_count,omitempty"`
+	Results              []promptReviewKeyTestResult `json:"results,omitempty"`
 }
 
 type promptFilterRulePatternTestRequest struct {
@@ -139,6 +147,7 @@ func (h *Handler) inspectImagePromptFilter(c *gin.Context, text string, model st
 	verdict := promptfilter.InspectText(text, cfg)
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
 		verdict = reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
+		verdict = promptfilter.ApplyReviewMode(verdict, cfg.Mode)
 	}
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
@@ -201,14 +210,17 @@ func (h *Handler) ListPromptFilterLogs(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 	logs, total, err := h.db.ListPromptFilterLogsPage(ctx, database.PromptFilterLogQuery{
-		Page:     page,
-		PageSize: pageSize,
-		Source:   c.Query("source"),
-		Action:   c.Query("action"),
-		Endpoint: c.Query("endpoint"),
-		Model:    c.Query("model"),
-		APIKeyID: apiKeyID,
-		Query:    c.Query("q"),
+		Page:                page,
+		PageSize:            pageSize,
+		Source:              c.Query("source"),
+		Action:              c.Query("action"),
+		Endpoint:            c.Query("endpoint"),
+		Model:               c.Query("model"),
+		APIKeyID:            apiKeyID,
+		Query:               c.Query("q"),
+		ReviewState:         c.Query("reviewed"),
+		ReviewResult:        c.Query("review_result"),
+		ExcludeIntelligence: true,
 	})
 	if err != nil {
 		writeInternalError(c, err)
@@ -223,11 +235,162 @@ func (h *Handler) ListPromptFilterLogs(c *gin.Context) {
 func (h *Handler) ClearPromptFilterLogs(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
-	if err := h.db.ClearPromptFilterLogs(ctx); err != nil {
+	var err error
+	message := "Prompt 检查日志已清空；风险画像和上游 CY 事件已保留"
+	switch strings.ToLower(strings.TrimSpace(c.Query("reviewed"))) {
+	case "":
+		err = h.db.ClearPromptFilterLogs(ctx)
+	case "true", "reviewed":
+		err = h.db.ClearPromptFilterLogsByReviewStatus(ctx, true)
+		message = "外部模型复核历史已清空；风险画像已保留"
+	case "false", "not_reviewed":
+		err = h.db.ClearPromptFilterLogsByReviewStatus(ctx, false)
+		message = "本地过滤与异步审计日志已清空；风险画像已保留"
+	default:
+		writeError(c, http.StatusBadRequest, "reviewed 必须为 true 或 false")
+		return
+	}
+	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
-	writeMessage(c, http.StatusOK, "Prompt 检查日志已清空")
+	writeMessage(c, http.StatusOK, message)
+}
+
+func (h *Handler) ClearPromptPolicyIncidents(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.db.ClearPromptPolicyIncidents(ctx); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	writeMessage(c, http.StatusOK, "上游 CY 事件已清空；风险画像已保留")
+}
+
+func (h *Handler) ListPromptPolicyIncidents(c *gin.Context) {
+	page := positiveQueryInt(c, "page", 1)
+	pageSize := positiveQueryInt(c, "page_size", positiveQueryInt(c, "limit", 20))
+	apiKeyID := int64(0)
+	if raw := strings.TrimSpace(c.Query("api_key_id")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			apiKeyID = parsed
+		}
+	}
+	accountID := int64(0)
+	if raw := strings.TrimSpace(c.Query("account_id")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			accountID = parsed
+		}
+	}
+	var localMiss *bool
+	if raw := strings.TrimSpace(c.Query("local_miss")); raw != "" {
+		if parsed, err := strconv.ParseBool(raw); err == nil {
+			localMiss = &parsed
+		}
+	}
+	evaluationState := strings.TrimSpace(c.Query("evaluation_state"))
+	if evaluationState == "" {
+		evaluationState = strings.TrimSpace(c.Query("status"))
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	incidents, total, err := h.db.ListPromptPolicyIncidentsPage(ctx, database.PromptPolicyIncidentQuery{
+		Page: page, PageSize: pageSize, Endpoint: c.Query("endpoint"), Model: c.Query("model"), APIKeyID: apiKeyID, AccountID: accountID,
+		EvaluationState: evaluationState, Outcome: c.Query("outcome"), LocalComparison: c.Query("local_comparison"), LocalMiss: localMiss, Query: c.Query("q"),
+	})
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if incidents == nil {
+		incidents = []*database.PromptPolicyIncident{}
+	}
+	for _, incident := range incidents {
+		h.enrichPromptPolicyIncidentRouting(incident)
+	}
+	c.JSON(http.StatusOK, promptPolicyIncidentsResponse{Incidents: incidents, Total: total, Page: page, PageSize: pageSize})
+}
+
+func (h *Handler) GetPromptPolicyIncident(c *gin.Context) {
+	incidentID := strings.TrimSpace(c.Param("incident_id"))
+	if incidentID == "" {
+		writeError(c, http.StatusBadRequest, "缺少 incident_id")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	incident, err := h.db.GetPromptPolicyIncident(ctx, incidentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(c, http.StatusNotFound, "CY 事件不存在")
+		return
+	}
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.enrichPromptPolicyIncidentRouting(incident)
+	matches := json.RawMessage(incident.LocalMatchedPatterns)
+	if !json.Valid(matches) {
+		matches = json.RawMessage("[]")
+	}
+	response := promptPolicyIncidentDetailResponse{Incident: incident, Matches: matches}
+	if incident.CandidateID > 0 {
+		if candidate, candidateErr := h.db.GetPromptRuleCandidate(ctx, incident.CandidateID); candidateErr == nil {
+			response.Candidate = candidate
+		}
+		if incident.CandidateEvidenceID > 0 {
+			if item, evidenceErr := h.db.GetPromptRuleCandidateEvidence(ctx, incident.CandidateEvidenceID); evidenceErr == nil && item.CandidateID == incident.CandidateID {
+				response.Evidence = item
+			}
+		}
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *Handler) enrichPromptPolicyIncidentRouting(incident *database.PromptPolicyIncident) {
+	if incident == nil {
+		return
+	}
+	hasEventSnapshot := strings.TrimSpace(incident.AccountName) != "" ||
+		strings.TrimSpace(incident.AccountPlatform) != "" ||
+		len(incident.AccountGroupIDs) > 0 || len(incident.AccountGroupNames) > 0 ||
+		len(incident.APIKeyAllowedGroupIDs) > 0 || len(incident.APIKeyAllowedGroupNames) > 0
+	if hasEventSnapshot {
+		incident.RoutingSnapshotState = "event_snapshot"
+		return
+	}
+	if h == nil || h.store == nil {
+		incident.RoutingSnapshotState = "unavailable"
+		return
+	}
+
+	inferred := false
+	if incident.AccountID > 0 {
+		if account := h.store.FindByID(incident.AccountID); account != nil {
+			account.Mu().RLock()
+			incident.AccountName = strings.TrimSpace(account.Email)
+			incident.AccountPlatform = strings.TrimSpace(account.UpstreamType)
+			account.Mu().RUnlock()
+			if incident.AccountPlatform == "" {
+				incident.AccountPlatform = database.UpstreamChannelCodex
+			}
+			incident.AccountGroupIDs = account.GroupIDSnapshot()
+			incident.AccountGroupNames = h.store.ResolveGroupNames(incident.AccountGroupIDs)
+			inferred = true
+		}
+	}
+	if incident.APIKeyID > 0 {
+		incident.APIKeyAllowedGroupIDs = h.store.GetAPIKeyAllowedGroups(incident.APIKeyID)
+		incident.APIKeyAllowedGroupNames = h.store.ResolveGroupNames(incident.APIKeyAllowedGroupIDs)
+		if len(incident.APIKeyAllowedGroupIDs) > 0 {
+			inferred = true
+		}
+	}
+	if inferred {
+		incident.RoutingSnapshotState = "current_inferred"
+		return
+	}
+	incident.RoutingSnapshotState = "unavailable"
 }
 
 // MatchPromptFilterLog 按时间/端点/APIKey 找到与某次请求最接近的一条提示词过滤日志，
@@ -263,7 +426,7 @@ func (h *Handler) MatchPromptFilterLog(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"found": log != nil, "log": log})
+	c.JSON(http.StatusOK, gin.H{"found": log != nil, "log": log, "legacy_inferred": log != nil})
 }
 
 func (h *Handler) TestPromptFilter(c *gin.Context) {
@@ -282,12 +445,152 @@ func (h *Handler) TestPromptFilter(c *gin.Context) {
 		return
 	}
 	cfg := h.store.GetPromptFilterConfig()
-	cfg.Enabled = true
-	verdict := promptfilter.InspectText(req.Text, cfg)
-	if shouldReviewPromptFilterVerdict(verdict, cfg) {
-		verdict = reviewPromptFilterVerdict(c.Request.Context(), req.Text, verdict, cfg)
+	evaluator := h.imageProxy
+	if evaluator == nil {
+		evaluator = proxy.NewHandler(nil, nil, nil, nil)
 	}
-	c.JSON(http.StatusOK, promptFilterTestResponse{Verdict: verdict})
+	result := evaluator.EvaluatePromptGuardTextForTest(c, cfg, req.Text, req.Endpoint, req.Model)
+	c.JSON(http.StatusOK, promptFilterTestResponse{
+		Verdict:  result.Verdict,
+		Decision: result.Decision,
+		Protocol: result.Protocol,
+		Provider: result.Provider,
+		Endpoint: result.Endpoint,
+		Model:    result.Model,
+	})
+}
+
+func (h *Handler) TestPromptReviewConnection(c *gin.Context) {
+	var req promptReviewTestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	req.Text = strings.TrimSpace(req.Text)
+	if req.Text == "" {
+		writeError(c, http.StatusBadRequest, "text 不能为空")
+		return
+	}
+	if len([]rune(req.Text)) > 20000 {
+		writeError(c, http.StatusBadRequest, "text 不能超过 20000 个字符")
+		return
+	}
+	if h == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	reviewCfg := h.store.GetPromptFilterConfig().Review
+	reviewCfg.Enabled = true
+	if key := strings.TrimSpace(req.APIKey); key != "" {
+		reviewCfg.APIKey = key
+	}
+	if baseURL := strings.TrimSpace(req.BaseURL); baseURL != "" {
+		reviewCfg.BaseURL = baseURL
+	}
+	if model := strings.TrimSpace(req.Model); model != "" {
+		reviewCfg.Model = model
+	}
+	if req.TimeoutSeconds > 0 {
+		reviewCfg.TimeoutSeconds = req.TimeoutSeconds
+	}
+	reviewCfg.Adapter = promptfilter.ReviewAdapterConfig{
+		RequestMode:          req.RequestMode,
+		SystemPrompt:         req.SystemPrompt,
+		UserPromptTemplate:   req.UserPromptTemplate,
+		PayloadTemplate:      req.PayloadTemplate,
+		ConfidenceThreshold:  req.ConfidenceThreshold,
+		ModerationThresholds: req.ModerationThresholds,
+		MaxConcurrent:        req.MaxConcurrent,
+		MaxTextLength:        req.MaxTextLength,
+	}
+	reviewCfg = promptfilter.NormalizeReviewConfig(reviewCfg)
+	if err := promptfilter.ValidateReviewConfig(reviewCfg); err != nil {
+		writeError(c, http.StatusBadRequest, "Prompt 审核配置无效: "+err.Error())
+		return
+	}
+	keys := reviewCfg.APIKeyList()
+	if req.TestAllKeys && len(keys) > 1 {
+		type indexedResult struct {
+			index   int
+			outcome promptfilter.ReviewOutcome
+			latency int64
+			err     error
+		}
+		resultCh := make(chan indexedResult, len(keys))
+		started := time.Now()
+		limit := reviewCfg.Adapter.MaxConcurrent
+		if limit <= 0 || limit > len(keys) {
+			limit = len(keys)
+		}
+		slots := make(chan struct{}, limit)
+		for index, key := range keys {
+			go func(index int, key string) {
+				slots <- struct{}{}
+				defer func() { <-slots }()
+				keyCfg := reviewCfg
+				keyCfg.APIKey = key
+				keyStarted := time.Now()
+				outcome, testErr := promptfilter.DefaultReviewClient.ReviewTextDetailed(c.Request.Context(), req.Text, keyCfg)
+				resultCh <- indexedResult{index: index, outcome: outcome, latency: time.Since(keyStarted).Milliseconds(), err: testErr}
+			}(index, key)
+		}
+		results := make([]promptReviewKeyTestResult, len(keys))
+		allOK := true
+		var first promptfilter.ReviewOutcome
+		for range keys {
+			item := <-resultCh
+			if item.index == 0 {
+				first = item.outcome
+			}
+			result := promptReviewKeyTestResult{
+				KeyIndex: item.index + 1, OK: item.err == nil, Flagged: item.outcome.Flagged,
+				Endpoint: item.outcome.Endpoint, Model: item.outcome.Model, Confidence: item.outcome.Confidence,
+				Reason: item.outcome.Reason, HighestCategory: item.outcome.HighestCategory,
+				DecisionCategory: item.outcome.DecisionCategory, DecisionScore: item.outcome.DecisionScore,
+				DecisionThreshold: item.outcome.DecisionThreshold,
+				CategoryScores:    item.outcome.CategoryScores, ModerationThresholds: item.outcome.ModerationThresholds,
+				LatencyMS: item.latency,
+			}
+			if item.err != nil {
+				allOK = false
+				result.Error = item.err.Error()
+			}
+			results[item.index] = result
+		}
+		c.JSON(http.StatusOK, promptReviewTestResponse{
+			OK: allOK, Endpoint: first.Endpoint, Model: reviewCfg.Model, Flagged: first.Flagged,
+			Confidence: first.Confidence, ConfidenceThreshold: reviewCfg.Adapter.ConfidenceThreshold,
+			Reason: first.Reason, HighestCategory: first.HighestCategory,
+			DecisionCategory: first.DecisionCategory, DecisionScore: first.DecisionScore,
+			DecisionThreshold: first.DecisionThreshold,
+			CategoryScores:    first.CategoryScores, ModerationThresholds: first.ModerationThresholds,
+			LatencyMS: time.Since(started).Milliseconds(), KeyCount: len(keys), Results: results,
+		})
+		return
+	}
+	started := time.Now()
+	outcome, err := promptfilter.DefaultReviewClient.ReviewTextDetailed(c.Request.Context(), req.Text, reviewCfg)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, "Prompt 审核连接测试失败: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, promptReviewTestResponse{
+		OK:                   true,
+		Endpoint:             outcome.Endpoint,
+		Model:                outcome.Model,
+		Flagged:              outcome.Flagged,
+		Confidence:           outcome.Confidence,
+		ConfidenceThreshold:  reviewCfg.Adapter.ConfidenceThreshold,
+		Reason:               outcome.Reason,
+		HighestCategory:      outcome.HighestCategory,
+		DecisionCategory:     outcome.DecisionCategory,
+		DecisionScore:        outcome.DecisionScore,
+		DecisionThreshold:    outcome.DecisionThreshold,
+		CategoryScores:       outcome.CategoryScores,
+		ModerationThresholds: outcome.ModerationThresholds,
+		LatencyMS:            time.Since(started).Milliseconds(),
+		KeyCount:             len(keys),
+	})
 }
 
 func (h *Handler) TestPromptFilterRulePattern(c *gin.Context) {
@@ -360,13 +663,13 @@ func positiveQueryInt(c *gin.Context, key string, fallback int) int {
 }
 
 func shouldReviewPromptFilterVerdict(verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
-	if verdict.Action != promptfilter.ActionWarn && verdict.Action != promptfilter.ActionBlock {
-		return false
-	}
-	return promptfilter.NormalizeReviewConfig(cfg.Review).Ready()
+	return cfg.Enabled && promptfilter.ShouldReviewVerdict(verdict, cfg.Review)
 }
 
 func reviewPromptFilterVerdict(ctx context.Context, text string, verdict promptfilter.Verdict, cfg promptfilter.Config) promptfilter.Verdict {
-	flagged, model, err := promptfilter.DefaultReviewClient.ReviewText(ctx, text, cfg.Review)
-	return promptfilter.ApplyReviewResult(verdict, flagged, model, err, cfg.Review)
+	if strings.TrimSpace(text) == "" {
+		return verdict
+	}
+	outcome, err := promptfilter.DefaultReviewClient.ReviewTextDetailed(ctx, text, cfg.Review)
+	return promptfilter.ApplyReviewOutcome(verdict, outcome, err, cfg.Review)
 }

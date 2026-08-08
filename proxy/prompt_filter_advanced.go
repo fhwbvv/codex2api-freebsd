@@ -118,12 +118,13 @@ func (h *Handler) applyPromptRisk(c *gin.Context, verdict promptfilter.Verdict, 
 	keys := make([]weightedRiskKey, 0, 3)
 	policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, ingressRequestBody(c, nil))
 	if verified {
+		runtimeScope := newAPIRuntimeScope(policyContext.APIKeyID, policyContext.Platform)
 		keys = append(keys,
-			weightedRiskKey{"newapi-user:" + hashRiskIdentity(policyContext.Identity.UserID), risk.UserWeightPercent},
-			weightedRiskKey{"newapi-ip:" + hashRiskIdentity(policyContext.Identity.ClientIP), risk.IPWeightPercent},
+			weightedRiskKey{runtimeScope + ":newapi-user:" + hashRiskIdentity(policyContext.Identity.UserID), risk.UserWeightPercent},
+			weightedRiskKey{runtimeScope + ":newapi-ip:" + hashRiskIdentity(policyContext.Identity.ClientIP), risk.IPWeightPercent},
 		)
 		if policyContext.MetaVerified {
-			keys = append(keys, weightedRiskKey{"newapi-session:" + hashRiskIdentity(policyContext.Meta.SessionFingerprint), risk.SessionWeightPercent})
+			keys = append(keys, weightedRiskKey{runtimeScope + ":newapi-session:" + hashRiskIdentity(policyContext.Meta.SessionFingerprint), risk.SessionWeightPercent})
 		}
 	} else if cfg.Advanced.NewAPI.Enabled {
 		// A shared NewAPI channel key must never combine unrelated users when the

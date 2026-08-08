@@ -73,8 +73,7 @@ All advanced layers are disabled by default and are stored in `prompt_filter_adv
     "max_search_results": 20,
     "model_enabled": false,
     "model": "gpt-5.4",
-    "max_model_calls": 1,
-    "auto_add": false
+    "max_model_calls": 1
   }
 }
 ```
@@ -87,7 +86,9 @@ The optional sidecar receives `POST /v1/guard/check`. Set its bearer token throu
 
 SSE output goes through the shared stream writer. Responses WebSocket messages use a message-preserving output buffer so JSON frames are not merged. With `strict_only=true`, output is stopped only on terminal strict rules; setting it to false applies the normal blocking verdict.
 
-Prompt intelligence is also disabled by default. When enabled, it searches recently updated public GitHub repositories using the configured queries. `model_enabled` permits at most `max_model_calls` bounded internal Responses calls through the existing account pool to turn public metadata into reviewed RE2-compatible rule candidates. Keep `auto_add=false` unless unattended additions are explicitly desired. Search, model analysis, and rule additions are written to the normal audit table with sources `intel_search`, `intel_model`, and `intel_rule_add`.
+Prompt intelligence is also disabled by default. When enabled, it searches recently updated public GitHub repositories using the configured queries. `model_enabled` permits at most `max_model_calls` bounded internal Responses calls through the existing account pool to turn public metadata into reviewed RE2-compatible rule candidates. Public intelligence and upstream `cyber_policy` feedback are persisted in the same review queue and never affect runtime scoring by themselves. Candidate fingerprints are global, while each upstream observation retains its API-key/platform provenance for audit. Only an explicit administrator publish writes a validated candidate to the existing custom-pattern setting; search, staging, evidence, publish, and dismiss operations remain auditable. Publishing validates and commits the complete rule snapshot atomically. Manual custom-rule edits use the same reviewed snapshot as a narrow compare-and-swap operation, so a stale browser or replica receives a conflict instead of overwriting newer rules or unrelated system settings. Custom-rule names must be unique without regard to letter case. Replicas refresh only the published settings snapshot in the background and never read candidate/evidence rows into the runtime engine.
+
+Historical unattended intelligence rules are migrated out of the runtime setting only when their complete semantics still match the legacy `intel_rule_add` evidence. Migration completion is keyed to the latest legacy-log generation and checked periodically, allowing a new replica to remove rules reintroduced by an older replica during a blue-green transition while preserving later manual administrator changes.
 
 Composite custom rules retain compatibility with the original `pattern` field:
 

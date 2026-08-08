@@ -18,8 +18,27 @@ type AccountGroup struct {
 	MemberCount             int64
 	AutoPause5hThreshold    float64
 	AutoPause7dThreshold    float64
-	CreatedAt               time.Time
-	UpdatedAt               time.Time
+	// ProxyURLs 是组级代理列表(issue #479):组内账号未配置自身代理时按
+	// 账号 ID 粘性使用其中一条;空列表表示不设置,回退到全局代理链。
+	ProxyURLs []string
+	// Channel 是分组渠道(codex/grok,issue #487):分组按渠道隔离,
+	// 成员写入路径会校验账号平台与组渠道一致。
+	Channel   string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+const (
+	AccountGroupChannelCodex = "codex"
+	AccountGroupChannelGrok  = "grok"
+)
+
+// NormalizeAccountGroupChannel 归一分组渠道,空/非法一律按 codex。
+func NormalizeAccountGroupChannel(channel string) string {
+	if strings.EqualFold(strings.TrimSpace(channel), AccountGroupChannelGrok) {
+		return AccountGroupChannelGrok
+	}
+	return AccountGroupChannelCodex
 }
 
 func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
@@ -27,6 +46,8 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 		SELECT g.id, g.name, g.description, g.color, g.sort_order, g.base_concurrency_override,
 			COALESCE(COUNT(a.id), 0),
 			COALESCE(g.auto_pause_5h_threshold, 0), COALESCE(g.auto_pause_7d_threshold, 0),
+			COALESCE(g.proxy_urls, '[]'),
+			COALESCE(g.channel, 'codex'),
 			g.created_at, g.updated_at
 		FROM account_groups g
 		LEFT JOIN account_group_members m ON m.group_id = g.id
@@ -34,7 +55,7 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 			AND a.status <> 'deleted'
 			AND COALESCE(a.error_message, '') <> 'deleted'
 		GROUP BY g.id, g.name, g.description, g.color, g.sort_order, g.base_concurrency_override,
-			g.auto_pause_5h_threshold, g.auto_pause_7d_threshold, g.created_at, g.updated_at
+			g.auto_pause_5h_threshold, g.auto_pause_7d_threshold, g.proxy_urls, g.channel, g.created_at, g.updated_at
 		ORDER BY g.sort_order, g.name`)
 	if err != nil {
 		return nil, err
@@ -43,10 +64,12 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 	groups := make([]AccountGroup, 0)
 	for rows.Next() {
 		var g AccountGroup
-		var createdRaw, updatedRaw interface{}
-		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.Color, &g.SortOrder, &g.BaseConcurrencyOverride, &g.MemberCount, &g.AutoPause5hThreshold, &g.AutoPause7dThreshold, &createdRaw, &updatedRaw); err != nil {
+		var createdRaw, updatedRaw, proxyRaw interface{}
+		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.Color, &g.SortOrder, &g.BaseConcurrencyOverride, &g.MemberCount, &g.AutoPause5hThreshold, &g.AutoPause7dThreshold, &proxyRaw, &g.Channel, &createdRaw, &updatedRaw); err != nil {
 			return nil, err
 		}
+		g.ProxyURLs = decodeTagsValue(proxyRaw)
+		g.Channel = NormalizeAccountGroupChannel(g.Channel)
 		var parseErr error
 		g.CreatedAt, parseErr = parseDBTimeValue(createdRaw)
 		if parseErr != nil {
@@ -95,6 +118,10 @@ type UpdateAccountGroupOpts struct {
 	AutoPause5hThreshold    *float64
 	AutoPause7dThreshold    *float64
 	BaseConcurrencyOverride OptionalNullInt64
+	// ProxyURLs 为 nil 表示不修改;空切片表示清空组代理。
+	ProxyURLs *[]string
+	// Channel 为 nil 表示不修改;handler 层保证仅空组可改渠道。
+	Channel *string
 }
 
 func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, description, color *string, opts *UpdateAccountGroupOpts, sortOrder ...*int64) error {
@@ -133,6 +160,12 @@ func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, descriptio
 		}
 		if opts.BaseConcurrencyOverride.Set {
 			add("base_concurrency_override", nullableInt64Value(opts.BaseConcurrencyOverride.Value))
+		}
+		if opts.ProxyURLs != nil {
+			add("proxy_urls", encodeTagsJSON(*opts.ProxyURLs))
+		}
+		if opts.Channel != nil {
+			add("channel", NormalizeAccountGroupChannel(*opts.Channel))
 		}
 	}
 	if len(sets) == 0 {

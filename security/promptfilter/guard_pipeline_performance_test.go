@@ -149,3 +149,46 @@ func BenchmarkGuardPipelineCachedSynchronousAuxiliaryContextParallel(b *testing.
 		}
 	})
 }
+
+func BenchmarkNegatedPolicyActionRepeatedClauses(b *testing.B) {
+	cfg := RecommendedConfig()
+	cfg.Enabled = true
+	cfg.Mode = ModeBlock
+	cfg.StrictTerminalEnabled = true
+	cfg.MaxTextLength = 81920
+	cfg = NormalizeConfig(cfg)
+	prompt := strings.Repeat("Do not bypass the safety policy, ", cfg.MaxTextLength/34+1)
+	prompt = safeUTF8Prefix(prompt, cfg.MaxTextLength)
+	if verdict := InspectText(prompt, cfg); verdict.Action != ActionAllow {
+		b.Fatalf("unexpected warmup decision: %+v", verdict)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(prompt)))
+	b.ResetTimer()
+	for range b.N {
+		if verdict := InspectText(prompt, cfg); verdict.Action != ActionAllow {
+			b.Fatalf("unexpected decision: %+v", verdict)
+		}
+	}
+}
+
+func BenchmarkOrdinaryLargePrompt(b *testing.B) {
+	cfg := RecommendedConfig()
+	cfg.Enabled = true
+	cfg.Mode = ModeBlock
+	cfg.StrictTerminalEnabled = true
+	cfg.MaxTextLength = 81920
+	cfg = NormalizeConfig(cfg)
+	prompt := safeUTF8Prefix(strings.Repeat("ordinary software development request, ", cfg.MaxTextLength/39+1), cfg.MaxTextLength)
+	if verdict := InspectText(prompt, cfg); verdict.Action != ActionAllow {
+		b.Fatalf("unexpected warmup decision: %+v", verdict)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(prompt)))
+	b.ResetTimer()
+	for range b.N {
+		if verdict := InspectText(prompt, cfg); verdict.Action != ActionAllow {
+			b.Fatalf("unexpected decision: %+v", verdict)
+		}
+	}
+}

@@ -31,6 +31,8 @@ export interface BatchOperationEvent {
   rate_limited?: number;
   deleted?: number;
   account_id?: number;
+  account_name?: string;
+  account_email?: string;
   message?: string;
   error?: string;
 }

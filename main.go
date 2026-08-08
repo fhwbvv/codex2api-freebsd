@@ -173,6 +173,19 @@ func main() {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
 	}
+	modelCooldownCtx, modelCooldownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	modelCooldownSettings, modelCooldownErr := db.GetModelCooldownSettings(modelCooldownCtx)
+	modelCooldownCancel()
+	if modelCooldownErr != nil {
+		log.Printf("警告: 读取模型冷却设置失败，将采用安全默认值: %v", modelCooldownErr)
+		modelCooldownSettings = database.DefaultModelCooldownSettings()
+	}
+	settings.RelayModelCooldownMode = modelCooldownSettings.RelayMode
+	settings.RelayModelCooldownSeconds = modelCooldownSettings.RelaySeconds
+	settings.RelayModelCooldownBackoffEnabled = modelCooldownSettings.RelayBackoffEnabled
+	settings.OAuthModelCooldownMode = modelCooldownSettings.OAuthMode
+	settings.OAuthModelCooldownSeconds = modelCooldownSettings.OAuthSeconds
+	settings.OAuthModelCooldownBackoffEnabled = modelCooldownSettings.OAuthBackoffEnabled
 	if envPolicy := strings.TrimSpace(os.Getenv("CODEX_BILLING_TIER_POLICY")); envPolicy != "" {
 		settings.BillingTierPolicy = proxy.NormalizeBillingTierPolicy(envPolicy)
 	}

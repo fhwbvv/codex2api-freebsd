@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -590,7 +592,7 @@ func TestBuildImagesResponsesRequestIncludesEditImages(t *testing.T) {
 func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 	upstream := `data: {"type":"response.completed","response":{"created_at":1710000000,"usage":{"input_tokens":5,"output_tokens":9},"tool_usage":{"image_gen":{"images":1,"input_tokens":34,"output_tokens":1756}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","quality":"high","size":"1024x1024"}],"output":[{"type":"image_generation_call","result":"` + tinyPNGBase64 + `","revised_prompt":"draw a cat","output_format":"png"}]}}` + "\n\n"
 
-	out, usage, imageCount, imageLogInfo, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
+	out, usage, imageCount, imageLogInfo, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil, imageUpscalePlan{})
 	if err != nil {
 		t.Fatalf("collectImagesResponse returned error: %v", err)
 	}
@@ -626,12 +628,62 @@ func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
 	upstream := `data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"An error occurred while processing your request. Please include the request ID req-123."}}}` + "\n\n"
 
-	_, _, _, _, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
+	_, _, _, _, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil, imageUpscalePlan{})
 	if err == nil {
 		t.Fatal("collectImagesResponse returned nil error")
 	}
 	if got := err.Error(); !strings.Contains(got, "server_error") || !strings.Contains(got, "req-123") {
 		t.Fatalf("error = %q, want upstream code and request id", got)
+	}
+}
+
+func TestForwardImagesResponseFailedCyberPolicyEntersUnifiedAuditAndCandidateQueue(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"cyber security risk detected"}}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "image-cyber-test"})
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "images-cyber.db"))
+	if err != nil {
+		t.Fatalf("database.New(sqlite): %v", err)
+	}
+	defer db.Close()
+	settings := &database.SystemSettings{
+		MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 0,
+		PromptFilterEnabled: true, PromptFilterMode: promptfilter.ModeBlock, PromptFilterThreshold: 50,
+		PromptFilterMaxTextLength: promptfilter.DefaultMaxTextLength, PromptFilterCustomPatterns: "[]", PromptFilterDisabledPatterns: "[]",
+	}
+	store := auth.NewStore(nil, nil, settings)
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-image", PlanType: "plus", AccountID: "acct-image"})
+	handler := NewHandler(store, db, &config.Config{AllowAnonymousV1: true}, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"prompt":"draw a harmless landscape"}`))
+	evaluation := promptGuardEvaluation{
+		Envelope: promptfilter.RequestEnvelope{
+			Endpoint: "/v1/images/generations", Protocol: promptfilter.ProtocolResponses, ModelFamily: promptfilter.ModelFamilyOpenAI,
+			Segments: []promptfilter.Segment{{Origin: promptfilter.OriginCurrentUser, Role: "user", Text: "draw a harmless landscape"}},
+		},
+		Decision: promptfilter.Decision{Action: promptfilter.ActionAllow},
+		Verdict:  promptfilter.Verdict{Enabled: true, Action: promptfilter.ActionAllow},
+	}
+	handler.capturePromptRuleLearningEvidence(c, "/v1/images/generations", "gpt-image-2", evaluation)
+	responsesBody := []byte(`{"model":"gpt-5.4","input":"draw a harmless landscape","tools":[{"type":"image_generation","model":"gpt-image-2","size":"1024x1024"}],"stream":true}`)
+	handler.forwardImagesRequest(c, "/v1/images/generations", "gpt-image-2", "gpt-image-2", "gpt-image-2", responsesBody, "b64_json", "image_generation", false)
+	waitPromptFilterAuditIdle(t, db)
+	incidents, incidentTotal, err := db.ListPromptPolicyIncidentsPage(context.Background(), database.PromptPolicyIncidentQuery{Page: 1, PageSize: 20})
+	if err != nil || incidentTotal != 1 || len(incidents) != 1 || incidents[0].Endpoint != "/v1/images/generations" || incidents[0].Transport != "http" {
+		t.Fatalf("image cyber_policy incident total=%d items=%#v err=%v", incidentTotal, incidents, err)
+	}
+	assertCyberUsageIncidentLinks(t, db, "/v1/images/generations")
+	candidates, total, err := db.ListPromptRuleCandidates(context.Background(), database.PromptRuleCandidateQuery{Status: database.PromptRuleCandidateStatusPending})
+	if err != nil || total != 1 || len(candidates) != 1 || candidates[0].Kind != database.PromptRuleCandidateKindEvidence {
+		t.Fatalf("image candidate total=%d items=%#v err=%v", total, candidates, err)
 	}
 }
 
@@ -707,7 +759,7 @@ func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/v1/images/generations", nil)
 	handler := &Handler{}
 
-	usage, imageCount, _, imageLogInfo, err := handler.streamImagesResponse(c, strings.NewReader(upstream), "b64_json", "image_generation", "gpt-image-2", time.Now())
+	usage, imageCount, _, imageLogInfo, err := handler.streamImagesResponse(c, strings.NewReader(upstream), "b64_json", "image_generation", "gpt-image-2", time.Now(), imageUpscalePlan{})
 
 	if err != nil {
 		t.Fatalf("streamImagesResponse returned error: %v", err)
@@ -730,6 +782,31 @@ func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: image_generation.completed\n") {
 		t.Fatalf("stream body missing completed event: %q", body)
+	}
+}
+
+// TestNextImageAccountSkipsNonCodexAccounts 生图上游目前只有 Codex 官方账号支持:
+// Grok/中转账号被调度到会对上游 401,还把自己误标 unauthorized(issue #477 实测发现)。
+func TestNextImageAccountSkipsNonCodexAccounts(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "grok-token", UpstreamType: auth.UpstreamGrok, PlanType: "plus"})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "codex-token", PlanType: "free"})
+	handler := &Handler{store: store}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+
+	// Grok 账号是 plus、Codex 账号只是 free:preferred 档也不许把 plus 的 Grok 号放进来。
+	account, _ := handler.nextImageAccount(c, 0, nil, "gpt-image-2-2k", requestSessionIdentity{})
+	if account == nil || account.DBID != 2 {
+		t.Fatalf("nextImageAccount should pick the codex account, got %+v", account)
+	}
+	store.Release(account)
+
+	// 池里只有 Grok 账号时宁可拿不到账号,也不能把生图请求派给 Grok。
+	grokOnly := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	grokOnly.AddAccount(&auth.Account{DBID: 3, AccessToken: "grok-token", UpstreamType: auth.UpstreamGrok, PlanType: "plus"})
+	handler = &Handler{store: grokOnly}
+	if account, _ := handler.nextImageAccount(c, 0, nil, "gpt-image-2-2k", requestSessionIdentity{}); account != nil {
+		t.Fatalf("nextImageAccount must not return a Grok account, got DBID=%d", account.DBID)
 	}
 }
 

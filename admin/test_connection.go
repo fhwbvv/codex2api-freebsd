@@ -570,7 +570,8 @@ func isTextConnectionModel(model string) bool {
 }
 
 type batchTestRequest struct {
-	IDs *[]int64 `json:"ids"`
+	IDs      *[]int64                  `json:"ids"`
+	Selector *accountOperationSelector `json:"selector,omitempty"`
 	// RestoreOnSuccess 仅回收站批量测试使用：测试通过的账号自动恢复到账号池。
 	RestoreOnSuccess bool `json:"restore_on_success"`
 }
@@ -588,20 +589,32 @@ func (h *Handler) persistRecycleBinTestResult(id int64, status string) {
 }
 
 type batchOperationEvent struct {
-	Type        string `json:"type"` // start | progress | complete
-	Action      string `json:"action"`
-	Status      string `json:"status,omitempty"`
-	HTTPStatus  int    `json:"http_status,omitempty"`
-	Current     int    `json:"current"`
-	Total       int    `json:"total"`
-	Success     int64  `json:"success"`
-	Failed      int64  `json:"failed"`
-	Banned      int64  `json:"banned,omitempty"`
-	RateLimited int64  `json:"rate_limited,omitempty"`
-	Deleted     int64  `json:"deleted,omitempty"`
-	AccountID   int64  `json:"account_id,omitempty"`
-	Message     string `json:"message,omitempty"`
-	Error       string `json:"error,omitempty"`
+	Type         string `json:"type"` // start | progress | complete
+	Action       string `json:"action"`
+	Status       string `json:"status,omitempty"`
+	HTTPStatus   int    `json:"http_status,omitempty"`
+	Current      int    `json:"current"`
+	Total        int    `json:"total"`
+	Success      int64  `json:"success"`
+	Failed       int64  `json:"failed"`
+	Banned       int64  `json:"banned,omitempty"`
+	RateLimited  int64  `json:"rate_limited,omitempty"`
+	Deleted      int64  `json:"deleted,omitempty"`
+	AccountID    int64  `json:"account_id,omitempty"`
+	AccountName  string `json:"account_name,omitempty"`
+	AccountEmail string `json:"account_email,omitempty"`
+	Message      string `json:"message,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+func runtimeAccountOperationIdentity(account *auth.Account) (string, string) {
+	if account == nil {
+		return "", ""
+	}
+	account.Mu().RLock()
+	email := strings.TrimSpace(account.Email)
+	account.Mu().RUnlock()
+	return "", email
 }
 
 func batchOperationHTTPStatus(status, message string) int {
@@ -679,6 +692,20 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			return
 		}
 	}
+	if req.IDs != nil && req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "ids 与 selector 不能同时提供")
+		return
+	}
+	if req.Selector != nil {
+		selectorCtx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		ids, err := h.resolveAccountOperationSelector(selectorCtx, req.Selector)
+		cancel()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.IDs = &ids
+	}
 	if req.IDs != nil && len(*req.IDs) == 0 {
 		writeError(c, http.StatusBadRequest, "请提供要测试的账号 ID 列表")
 		return
@@ -701,6 +728,10 @@ func (h *Handler) RecycleBinBatchTest(c *gin.Context) {
 	}
 	if req.IDs != nil && len(*req.IDs) == 0 {
 		writeError(c, http.StatusBadRequest, "请提供要测试的账号 ID 列表")
+		return
+	}
+	if req.Selector != nil {
+		writeError(c, http.StatusBadRequest, "回收站批量测试不支持 selector")
 		return
 	}
 
@@ -910,20 +941,23 @@ func (h *Handler) emitBatchTestProgress(
 	if onProgress == nil {
 		return
 	}
+	accountName, accountEmail := h.accountOperationIdentity(accountID)
 	current := int(atomic.AddInt64(completedCount, 1))
 	event := batchOperationEvent{
-		Type:        "progress",
-		Action:      "batch_test",
-		Status:      status,
-		HTTPStatus:  batchOperationHTTPStatus(status, message),
-		Current:     current,
-		Total:       total,
-		Success:     atomic.LoadInt64(successCount),
-		Failed:      atomic.LoadInt64(failedCount),
-		Banned:      atomic.LoadInt64(bannedCount),
-		RateLimited: atomic.LoadInt64(rateLimitCount),
-		AccountID:   accountID,
-		Message:     message,
+		Type:         "progress",
+		Action:       "batch_test",
+		Status:       status,
+		HTTPStatus:   batchOperationHTTPStatus(status, message),
+		Current:      current,
+		Total:        total,
+		Success:      atomic.LoadInt64(successCount),
+		Failed:       atomic.LoadInt64(failedCount),
+		Banned:       atomic.LoadInt64(bannedCount),
+		RateLimited:  atomic.LoadInt64(rateLimitCount),
+		AccountID:    accountID,
+		AccountName:  accountName,
+		AccountEmail: accountEmail,
+		Message:      message,
 	}
 	if status == "failed" {
 		event.Error = message

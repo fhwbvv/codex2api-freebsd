@@ -140,6 +140,72 @@ func makeOAuthTestIDToken(email, accountID, planType string) string {
 	return "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(payload) + ".fake_signature"
 }
 
+func TestUpsertOAuthIdentitySeparatesEffectiveWorkspaceRoutes(t *testing.T) {
+	db := newTestAdminDB(t)
+	handler := &Handler{db: db}
+	ctx := context.Background()
+	idToken := makeOAuthTestIDToken("user@example.com", "personal-workspace", "team")
+
+	personalID, updated, err := handler.upsertOAuthIdentityAccount(ctx, "personal", "", tokenCredentialSeed{
+		accessToken: "personal-token",
+		idToken:     idToken,
+	}, "test")
+	if err != nil {
+		t.Fatalf("upsert personal: %v", err)
+	}
+	if updated {
+		t.Fatal("personal route unexpectedly updated an existing account")
+	}
+
+	teamSeed := tokenCredentialSeed{
+		accessToken: "shared-team-token",
+		idToken:     idToken,
+		customHeaders: map[string]string{
+			"Chatgpt-Account-Id": "team-workspace",
+		},
+	}
+	teamID, updated, err := handler.upsertOAuthIdentityAccount(ctx, "team", "", teamSeed, "test")
+	if err != nil {
+		t.Fatalf("upsert team: %v", err)
+	}
+	if updated {
+		t.Fatal("team route unexpectedly updated the personal route")
+	}
+	if teamID == personalID {
+		t.Fatalf("team route id = personal route id = %d", teamID)
+	}
+
+	teamSeed.accessToken = "rotated-team-token"
+	gotID, updated, err := handler.upsertOAuthIdentityAccount(ctx, "team-again", "", teamSeed, "test")
+	if err != nil {
+		t.Fatalf("upsert same team route: %v", err)
+	}
+	if !updated || gotID != teamID {
+		t.Fatalf("same team route = id:%d updated:%t, want id:%d updated:true", gotID, updated, teamID)
+	}
+
+	personalRow, err := db.GetAccountByID(ctx, personalID)
+	if err != nil {
+		t.Fatalf("GetAccountByID personal: %v", err)
+	}
+	if got := personalRow.GetCredentialStringMap("custom_headers")["Chatgpt-Account-Id"]; got != "" {
+		t.Fatalf("personal route override = %q, want empty", got)
+	}
+	if got := personalRow.GetCredential("access_token"); got != "personal-token" {
+		t.Fatalf("personal access token = %q, want personal-token", got)
+	}
+	teamRow, err := db.GetAccountByID(ctx, teamID)
+	if err != nil {
+		t.Fatalf("GetAccountByID team: %v", err)
+	}
+	if got := teamRow.GetCredentialStringMap("custom_headers")["Chatgpt-Account-Id"]; got != "team-workspace" {
+		t.Fatalf("team route override = %q, want team-workspace", got)
+	}
+	if got := teamRow.GetCredential("access_token"); got != "rotated-team-token" {
+		t.Fatalf("team access token = %q, want rotated-team-token", got)
+	}
+}
+
 func TestExchangeOAuthCodeTriggersUsageProbe(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

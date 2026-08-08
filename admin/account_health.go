@@ -20,12 +20,19 @@ const (
 // 「健康状态」条。GET /api/accounts/health-bars
 //
 // 返回结构：{ buckets: { "<accountId>": [{success,failed}, ...20], ... },
-//            block_count: 20, block_minutes: 10 }
+//
+//	block_count: 20, block_minutes: 10 }
 func (h *Handler) GetAccountHealthBars(c *gin.Context) {
 	ctx := c.Request.Context()
+	ids, err := parseAccountListIDs(c.Query("ids"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "ids 参数无效")
+		return
+	}
 
-	buckets, err := h.db.GetAccountsHealthBuckets(
+	buckets, err := h.db.GetAccountsHealthBucketsByIDs(
 		ctx,
+		ids,
 		time.Now(),
 		accountHealthBlockCount,
 		accountHealthBlockMinutes*time.Minute,

@@ -67,6 +67,115 @@ func TestGetAPIKeyAccountWindowUsageSplitsByAccount(t *testing.T) {
 	if got := usage[1]; got.Requests != 3 || got.Tokens != 850 {
 		t.Fatalf("account 1 usage over 1d = %+v, want 3 requests / 850 tokens", got)
 	}
+
+	allWindows, err := db.GetAPIKeyAccountWindowsUsage(ctx, keyID)
+	if err != nil {
+		t.Fatalf("GetAPIKeyAccountWindowsUsage 返回错误: %v", err)
+	}
+	if got := allWindows["5h"][1]; got.Requests != 2 || got.Tokens != 150 {
+		t.Fatalf("5h account 1 usage = %+v, want 2 requests / 150 tokens", got)
+	}
+	if got := allWindows["1d"][1]; got.Requests != 3 || got.Tokens != 850 {
+		t.Fatalf("1d account 1 usage = %+v, want 3 requests / 850 tokens", got)
+	}
+	if got := allWindows["30d"][2]; got.Requests != 1 || got.Tokens != 300 {
+		t.Fatalf("30d account 2 usage = %+v, want 1 request / 300 tokens", got)
+	}
+
+	accounts, err := db.ListAPIKeyAccountStats(ctx, keyID, now.Add(-24*time.Hour), now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ListAPIKeyAccountStats 返回错误: %v", err)
+	}
+	if len(accounts) != 2 || accounts[0].AccountID != 1 || accounts[0].Requests != 3 || accounts[0].TotalTokens != 850 {
+		t.Fatalf("account stats = %+v, want account 1 first with 3 requests / 850 tokens", accounts)
+	}
+}
+
+func TestAPIKeyAccountStatsKeepsDeletedAccountLastGroup(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	groupID, err := db.CreateAccountGroup(ctx, "historical", "", "#123456", 0, 0, sql.NullInt64{})
+	if err != nil {
+		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
+	}
+	accountResult, err := db.conn.ExecContext(ctx, `
+		INSERT INTO accounts (name, credentials, status) VALUES ('deleted-account', '{}', 'active')
+	`)
+	if err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	accountID, err := accountResult.LastInsertId()
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	if err := db.SetAccountGroups(ctx, accountID, []int64{groupID}); err != nil {
+		t.Fatalf("SetAccountGroups: %v", err)
+	}
+	keyID, err := db.InsertAPIKey(ctx, "historical-key", "sk-historical-deleted-account-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey: %v", err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `
+		INSERT INTO usage_logs (api_key_id, account_id, endpoint, model, status_code, total_tokens, user_billed, created_at)
+		VALUES (?, ?, '/v1/responses', 'gpt-5.4', 200, 321, 1.25, ?)
+	`, keyID, accountID, sqliteTimeParam(time.Now())); err != nil {
+		t.Fatalf("insert usage log: %v", err)
+	}
+	if err := db.PurgeAccount(ctx, accountID); err == nil {
+		t.Fatal("PurgeAccount unexpectedly removed an active account")
+	}
+	groups, err := db.GetAccountGroupIDs(ctx, accountID)
+	if err != nil || len(groups) != 1 || groups[0] != groupID {
+		t.Fatalf("failed purge changed active account groups: %v / %v", err, groups)
+	}
+
+	if err := db.SoftDeleteAccount(ctx, accountID); err != nil {
+		t.Fatalf("SoftDeleteAccount: %v", err)
+	}
+	groups, err = db.GetAccountGroupIDs(ctx, accountID)
+	if err != nil {
+		t.Fatalf("GetAccountGroupIDs: %v", err)
+	}
+	if len(groups) != 1 || groups[0] != groupID {
+		t.Fatalf("deleted account groups = %v, want retained group %d", groups, groupID)
+	}
+
+	items, err := db.ListAPIKeyAccountStats(ctx, keyID, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("ListAPIKeyAccountStats: %v", err)
+	}
+	if len(items) != 1 || len(items[0].Groups) != 1 || items[0].Groups[0].ID != groupID {
+		t.Fatalf("deleted account usage groups = %+v, want group %d", items, groupID)
+	}
+	if !items[0].AccountDeleted {
+		t.Fatalf("deleted account marker = false, want true: %+v", items[0])
+	}
+	if items[0].TotalTokens != 321 || math.Abs(items[0].UserBilled-1.25) > 1e-9 {
+		t.Fatalf("deleted account usage = %+v, want 321 tokens / $1.25", items[0])
+	}
+	listed, err := db.ListAccountGroups(ctx)
+	if err != nil {
+		t.Fatalf("ListAccountGroups: %v", err)
+	}
+	if len(listed) != 1 || listed[0].MemberCount != 0 {
+		t.Fatalf("active group member count = %+v, deleted account should not count", listed)
+	}
+	if err := db.PurgeAccount(ctx, accountID); err != nil {
+		t.Fatalf("PurgeAccount: %v", err)
+	}
+	groups, err = db.GetAccountGroupIDs(ctx, accountID)
+	if err != nil {
+		t.Fatalf("GetAccountGroupIDs after purge: %v", err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("purged account group rows = %v, want none", groups)
+	}
 }
 
 func TestDeleteAccountGroupPrunesScopeLimits(t *testing.T) {

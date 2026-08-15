@@ -1561,6 +1561,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				// matching the chat completions error path.
 				failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
 				failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
+				if promptPolicyIncidentID != "" {
+					failedLog.UpstreamErrorKind = "cyber_policy"
+				}
 				h.logUsageForRequest(c, failedLog)
 				if willRetry {
 					lastStatusCode = http.StatusBadGateway
@@ -1586,6 +1589,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			// Always record the failed attempt so it appears in usage stats.
 			failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
 			failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
+			if promptPolicyIncidentID != "" {
+				failedLog.UpstreamErrorKind = "cyber_policy"
+			}
 			h.logUsageForRequest(c, failedLog)
 			if willRetry {
 				lastStatusCode = statusCode
@@ -1659,7 +1665,7 @@ func buildImageErrorUsageLog(account *auth.Account, inboundEndpoint, logModel, l
 		Stream:           stream,
 		IsRetryAttempt:   willRetry,
 		AttemptIndex:     attempt + 1,
-		ErrorMessage:     usageLogErrorMessage(http.StatusBadGateway, []byte(readErr.Error())),
+		ErrorMessage:     usageLogFailureMessage(http.StatusBadGateway, readErr.Error()),
 	}
 	if usage != nil {
 		logInput.PromptTokens = usage.PromptTokens

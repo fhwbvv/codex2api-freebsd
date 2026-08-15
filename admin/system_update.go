@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/codex2api/internal/version"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -149,14 +150,26 @@ func newDefaultSystemReleaseClient() *defaultSystemReleaseClient {
 	redirectPolicy := func(req *http.Request, _ []*http.Request) error {
 		return validateSystemUpdateURL(req.URL.String())
 	}
+	// GitHub 专用代理（issue #522）：配置了则优先，否则维持原行为（环境变量代理）。
+	// 每请求动态解析，设置热更新即时生效。
+	proxyFunc := func(req *http.Request) (*url.URL, error) {
+		if req != nil && req.URL != nil {
+			if dedicated := proxy.GithubProxyOrDefault(req.URL.String(), ""); dedicated != "" {
+				return url.Parse(dedicated)
+			}
+		}
+		return http.ProxyFromEnvironment(req)
+	}
 	return &defaultSystemReleaseClient{
 		apiClient: &http.Client{
 			Timeout:       30 * time.Second,
 			CheckRedirect: redirectPolicy,
+			Transport:     &http.Transport{Proxy: proxyFunc},
 		},
 		downloadClient: &http.Client{
 			Timeout:       10 * time.Minute,
 			CheckRedirect: redirectPolicy,
+			Transport:     &http.Transport{Proxy: proxyFunc},
 		},
 	}
 }
@@ -436,6 +449,7 @@ func (c *defaultSystemReleaseClient) FetchLatestRelease(ctx context.Context) (*s
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	req.Header.Set("User-Agent", systemUpdateUserAgent)
+	proxy.ApplyGithubAuth(req)
 
 	resp, err := c.apiClient.Do(req)
 	if err != nil {

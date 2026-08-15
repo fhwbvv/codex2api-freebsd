@@ -36,10 +36,34 @@ import (
 //
 // 仅作用于 HTTP/2 直连（标准 transport 与 uTLS transport）；WebSocket
 // relay 链路已有完整的 Ping/Pong 保活与复用前探活，不走这里。
+// 默认值对直连是合适的；经高延迟代理或弱网出口时 15s 偏激进——一次 PING 未按时
+// 应答就会拆掉整条连接及其上全部复用中的流（表现为 "http2: client connection
+// lost"）。故允许用 CODEX_HTTP2_READ_IDLE_TIMEOUT / CODEX_HTTP2_PING_TIMEOUT
+// 覆盖（Go duration 写法，如 "45s"；填 0 关闭主动 PING，退回标准库默认）。
 const (
-	codexHTTP2ReadIdleTimeout = 15 * time.Second
-	codexHTTP2PingTimeout     = 15 * time.Second
+	defaultCodexHTTP2ReadIdleTimeout = 15 * time.Second
+	defaultCodexHTTP2PingTimeout     = 15 * time.Second
 )
+
+var (
+	codexHTTP2ReadIdleTimeout = durationFromEnv("CODEX_HTTP2_READ_IDLE_TIMEOUT", defaultCodexHTTP2ReadIdleTimeout)
+	codexHTTP2PingTimeout     = durationFromEnv("CODEX_HTTP2_PING_TIMEOUT", defaultCodexHTTP2PingTimeout)
+)
+
+// durationFromEnv 读取 Go duration 格式的环境变量；缺省或非法值回退默认值，
+// 显式的 "0" 是合法输入（用于关闭对应机制）。
+func durationFromEnv(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		log.Printf("[CodexTransport] %s=%q 非法，沿用默认 %s", key, raw, fallback)
+		return fallback
+	}
+	return d
+}
 
 // enableCodexHTTP2KeepAlive 在标准 *http.Transport 上显式配置 HTTP/2 并
 // 开启连接健康探测（ReadIdleTimeout/PingTimeout），返回底层 *http2.Transport
@@ -67,12 +91,25 @@ func enableCodexHTTP2KeepAlive(transport *http.Transport) *http2.Transport {
 
 // poolEntry 包装 http.Client，追踪最后使用时间用于 TTL 淘汰
 type poolEntry struct {
-	client   *http.Client
-	lastUsed atomic.Int64 // UnixNano 时间戳
+	client    *http.Client
+	lastUsed  atomic.Int64 // UnixNano 时间戳
+	createdAt int64        // UnixNano，用于最大寿命轮转
+	// rotatable 标记该 entry 可按寿命轮转。仅标准 transport 置位：轮转靠
+	// “移出池 + 关空闲连接”实现，在途请求继续跑在旧连接上直到自然结束；
+	// uTLS transport 自管连接池，释放路径会对在途连接发 GOAWAY 并在超时后
+	// 强制关闭，按寿命定期触发反而可能截断长回答，故不参与轮转。
+	rotatable bool
 }
 
 func (e *poolEntry) touch() {
 	e.lastUsed.Store(time.Now().UnixNano())
+}
+
+func (e *poolEntry) expiredByAge(now int64, maxAge time.Duration) bool {
+	if e == nil || !e.rotatable || maxAge <= 0 || e.createdAt == 0 {
+		return false
+	}
+	return now-e.createdAt > int64(maxAge)
 }
 
 var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL|transportMode
@@ -84,6 +121,14 @@ var openAIResponsesCodexMetadataRequired sync.Map // map[accountID|baseURL]struc
 
 // clientPoolTTL 未使用超过此时间的 Client 将被淘汰
 const clientPoolTTL = 5 * time.Minute
+
+// clientPoolMaxAge 是池化 Client 的最大寿命：持续繁忙的账号其连接永远不会
+// 空闲到触发 TTL 淘汰，一条 HTTP/2 连接可以承载上千个请求（issue #491 报告里
+// 出现过 stream ID 539，即同一条连接已复用约 270 次）。上游边缘对超长寿命连接
+// 有自己的回收策略，赶上回收窗口时在途流会被 RST。到点主动换新连接即可错开：
+// 轮转只是把 entry 移出池并关闭其空闲连接，新请求走新连接，在途请求不受影响。
+// WS 链路已有同类机制（50 分钟主动轮转，issue #346）。设为 0 关闭本机制。
+var clientPoolMaxAge = durationFromEnv("CODEX_HTTP_CLIENT_MAX_AGE", 30*time.Minute)
 
 // clientPoolCleanupInterval 清理协程执行间隔
 const clientPoolCleanupInterval = 60 * time.Second
@@ -100,12 +145,24 @@ func init() {
 }
 
 func evictExpiredClients() {
-	cutoff := time.Now().Add(-clientPoolTTL).UnixNano()
+	now := time.Now()
+	cutoff := now.Add(-clientPoolTTL).UnixNano()
+	nowNanos := now.UnixNano()
 	clientPool.Range(func(key, value any) bool {
 		entry := value.(*poolEntry)
-		if entry.lastUsed.Load() < cutoff {
-			clientPool.Delete(key)
-			releaseEvictedClient(entry.client)
+		idle := entry.lastUsed.Load() < cutoff
+		aged := entry.expiredByAge(nowNanos, clientPoolMaxAge)
+		if !idle && !aged {
+			return true
+		}
+		// LoadAndDelete 保证只有一个清理者真正释放这个 entry；被并发的
+		// getPooledClient 换上的新 entry 不会被误删。
+		if actual, ok := clientPool.LoadAndDelete(key); ok {
+			released := actual.(*poolEntry)
+			releaseEvictedClient(released.client)
+			if aged && !idle {
+				log.Printf("[CodexTransport] 连接寿命到期轮转: key=%s age=%s", key, time.Duration(nowNanos-released.createdAt).Truncate(time.Second))
+			}
 		}
 		return true
 	})
@@ -271,6 +328,8 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 	transport := newCodexTransport(proxyURL)
 
 	entry := &poolEntry{
+		createdAt: time.Now().UnixNano(),
+		rotatable: transportMode == codexTransportModeStandard,
 		client: &http.Client{
 			Transport: transport,
 			// 不设整体超时：http.Client.Timeout 覆盖包括读响应体在内的完整
@@ -337,6 +396,10 @@ func prepareCodexResponsesLiteTransport(requestBody []byte, headers http.Header,
 			if err == nil {
 				requestBody = updated
 			}
+		} else if updated, err := sjson.DeleteBytes(requestBody, codexResponsesLiteWSMetadataPath); err == nil {
+			// 信号被模型门禁剥离（或下游标记非 true）时，清掉体内残留标记，
+			// 避免不支持 lite 的模型把标记带上 WS 上游触发 400。
+			requestBody = updated
 		}
 		return requestBody, forwardHeaders
 	}
@@ -445,7 +508,6 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 	resetUpstreamUserAgentAudit(ctx)
 	resetWsAcquireAudit(ctx)
-	responsesLite := codexResponsesLiteRequested(requestBody, headers)
 
 	// Payload 规则改写：在 WS/HTTP 分叉前统一应用，两条上游路径共享改写结果。
 	// 生图请求跳过——其 instructions/工具由网关自行构造，改写会破坏桥接协议。
@@ -457,6 +519,13 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		// requested tier 归因走 EffectiveRequestedServiceTier（净化前取值），不受影响。
 		requestBody = sanitizeServiceTierForUpstream(requestBody)
 	}
+	// 指纹收敛在 WS/HTTP 分叉前统一改写请求体，两条上游路径共享结果；请求头侧的
+	// 收敛（ApplyCodexFingerprintHeaders）从同一份「账号 + 下游头」推导，取值一致。
+	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)
+	// lite 信号收敛：签名在 payload 规则改写后采集（规则可注入/删除 WS 标记，改写
+	// 前采集会让注入失效、删除被回填），模型也已被入口映射/规则定稿——已知不支持
+	// lite 的模型带信号上游必 400，发出前剥离。
+	responsesLite := gateResponsesLiteForModel(codexResponsesLiteRequested(requestBody, headers), requestBody)
 	wantWebsocket := CurrentRuntimeSettings().CodexForceWebsocket
 	if len(useWebsocket) > 0 {
 		wantWebsocket = useWebsocket[0]
@@ -577,6 +646,8 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 		// ==================== 请求头（伪装 Codex CLI） ====================
 		applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
+		// routing hint 由网关按最终出站 body 合成，须在账号自定义头之后设置。
+		ApplyCodexRoutingHint(req.Header, account, requestBody)
 
 		// Resin 反代：注入账号身份头
 		if IsResinEnabled() {
@@ -621,7 +692,7 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	}
 	resetUpstreamUserAgentAudit(ctx)
 	resetWsAcquireAudit(ctx)
-	responsesLite := codexResponsesLiteRequested(requestBody, headers)
+	responsesLite := gateResponsesLiteForModel(codexResponsesLiteRequested(requestBody, headers), requestBody)
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 
 	baseURL, apiKey := account.OpenAIResponsesCredentials()
@@ -761,7 +832,7 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 	}
 	resetUpstreamUserAgentAudit(ctx)
 	resetWsAcquireAudit(ctx)
-	responsesLite := codexResponsesLiteRequested(requestBody, headers)
+	responsesLite := gateResponsesLiteForModel(codexResponsesLiteRequested(requestBody, headers), requestBody)
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 
 	baseURL, apiKey := account.OpenAIResponsesCredentials()
@@ -799,7 +870,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	}
 	resetUpstreamUserAgentAudit(ctx)
 	resetWsAcquireAudit(ctx)
-	responsesLite := codexResponsesLiteRequested(requestBody, headers)
+	responsesLite := gateResponsesLiteForModel(codexResponsesLiteRequested(requestBody, headers), requestBody)
 
 	account.Mu().RLock()
 	accessToken := account.AccessToken
@@ -850,6 +921,8 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	}
 
 	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
+	// routing hint 由网关按最终出站 body 合成，须在账号自定义头之后设置。
+	ApplyCodexRoutingHint(req.Header, account, requestBody)
 
 	if IsResinEnabled() {
 		req.Header.Set("X-Resin-Account", ResinAccountID(account))
@@ -1038,6 +1111,9 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		req.Header.Set("Originator", Originator)
 	}
 	applyCodexAllowedForwardHeaders(req, downstreamHeaders)
+	// 指纹收敛必须在白名单透传之后（覆盖客户端原值）、账号自定义头之前（运维显式
+	// 配置保持最终优先）。off 档为空操作。
+	ApplyCodexFingerprintHeaders(req.Header, account, downstreamHeaders)
 	if accountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", accountID)
 	}

@@ -1,7 +1,9 @@
 package database
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync/atomic"
 )
@@ -32,13 +34,25 @@ type ModelPricingOverride struct {
 	InputLong       float64 `json:"input_long,omitempty"`
 	CachedInputLong float64 `json:"cached_input_long,omitempty"`
 	OutputLong      float64 `json:"output_long,omitempty"`
+
+	// 长上下文 + priority/fast 档。OpenAI 官方价目表会独立发布这组价格，
+	// 不能再用短上下文 priority 或长上下文 standard 的倍率推算。
+	InputLongPriority       float64 `json:"input_long_priority,omitempty"`
+	CachedInputLongPriority float64 `json:"cached_input_long_priority,omitempty"`
+	OutputLongPriority      float64 `json:"output_long_priority,omitempty"`
+
+	// 官方长上下文分档线。OpenAI 当前为 272K，xAI 当前为 200K；同步保存该值，
+	// 避免新模型在只有价格覆盖时错误继承全局默认阈值。
+	LongContextThresholdTokens int `json:"long_context_threshold_tokens,omitempty"`
 }
 
 // IsEmpty 判断覆盖是否不含任何价格（全 0）。
 func (o ModelPricingOverride) IsEmpty() bool {
 	return o.Input == 0 && o.CachedInput == 0 && o.Output == 0 &&
 		o.InputPriority == 0 && o.CachedInputPriority == 0 && o.OutputPriority == 0 &&
-		o.InputLong == 0 && o.CachedInputLong == 0 && o.OutputLong == 0
+		o.InputLong == 0 && o.CachedInputLong == 0 && o.OutputLong == 0 &&
+		o.InputLongPriority == 0 && o.CachedInputLongPriority == 0 && o.OutputLongPriority == 0 &&
+		o.LongContextThresholdTokens == 0
 }
 
 // applyNonZero 把覆盖里非 0 的价格字段写入 p（就地）。0 字段保持 p 原值（代码默认）。
@@ -70,6 +84,18 @@ func (o ModelPricingOverride) applyNonZero(p *ModelPricing) {
 	if o.OutputLong > 0 {
 		p.LongOutputPricePerMToken = o.OutputLong
 	}
+	if o.InputLongPriority > 0 {
+		p.LongInputPricePerMTokenPriority = o.InputLongPriority
+	}
+	if o.CachedInputLongPriority > 0 {
+		p.LongCacheReadPricePerMTokenPriority = o.CachedInputLongPriority
+	}
+	if o.OutputLongPriority > 0 {
+		p.LongOutputPricePerMTokenPriority = o.OutputLongPriority
+	}
+	if o.LongContextThresholdTokens > 0 {
+		p.LongContextThresholdTokens = o.LongContextThresholdTokens
+	}
 }
 
 // ModelPricingOverrideFromPricing 把一份完整 ModelPricing 投影为覆盖 JSON 形态，
@@ -79,21 +105,76 @@ func ModelPricingOverrideFromPricing(p *ModelPricing, source string) ModelPricin
 		return ModelPricingOverride{Source: source}
 	}
 	return ModelPricingOverride{
-		Source:              source,
-		Input:               p.InputPricePerMToken,
-		CachedInput:         p.CacheReadPricePerMToken,
-		Output:              p.OutputPricePerMToken,
-		InputPriority:       p.InputPricePerMTokenPriority,
-		CachedInputPriority: p.CacheReadPricePerMTokenPriority,
-		OutputPriority:      p.OutputPricePerMTokenPriority,
-		InputLong:           p.LongInputPricePerMToken,
-		CachedInputLong:     p.LongCacheReadPricePerMToken,
-		OutputLong:          p.LongOutputPricePerMToken,
+		Source:                     source,
+		Input:                      p.InputPricePerMToken,
+		CachedInput:                p.CacheReadPricePerMToken,
+		Output:                     p.OutputPricePerMToken,
+		InputPriority:              p.InputPricePerMTokenPriority,
+		CachedInputPriority:        p.CacheReadPricePerMTokenPriority,
+		OutputPriority:             p.OutputPricePerMTokenPriority,
+		InputLong:                  p.LongInputPricePerMToken,
+		CachedInputLong:            p.LongCacheReadPricePerMToken,
+		OutputLong:                 p.LongOutputPricePerMToken,
+		InputLongPriority:          p.LongInputPricePerMTokenPriority,
+		CachedInputLongPriority:    p.LongCacheReadPricePerMTokenPriority,
+		OutputLongPriority:         p.LongOutputPricePerMTokenPriority,
+		LongContextThresholdTokens: p.LongContextThresholdTokens,
 	}
 }
 
 // pricingOverrides 存 map[string]ModelPricingOverride（key 为规范化模型名，小写）。
 var pricingOverrides atomic.Value
+
+// modelPricingMutationSlot serializes the very short read/merge/write phase of
+// manual, JSON-reference, and official pricing updates. Network fetching must
+// always finish before entering this slot.
+var modelPricingMutationSlot = func() chan struct{} {
+	ch := make(chan struct{}, 1)
+	ch <- struct{}{}
+	return ch
+}()
+
+// MutateModelPricingSettings applies one in-process atomic read/merge/write.
+// syncURL=nil preserves the current manual JSON source; a non-nil value replaces
+// it (including an empty string). The callback must not perform network I/O.
+func (db *DB) MutateModelPricingSettings(ctx context.Context, syncURL *string, mutate func(map[string]ModelPricingOverride) error) (map[string]ModelPricingOverride, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-modelPricingMutationSlot:
+	}
+	defer func() { modelPricingMutationSlot <- struct{}{} }()
+
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if settings == nil {
+		settings = &SystemSettings{}
+	}
+	overrides, err := ParseModelPricingOverridesJSON(settings.ModelPricingOverrides)
+	if err != nil {
+		return nil, fmt.Errorf("解析模型定价覆盖失败，已中止写入以免清空现有价格: %w", err)
+	}
+	if mutate != nil {
+		if err := mutate(overrides); err != nil {
+			return nil, err
+		}
+	}
+	blob, err := MarshalModelPricingOverridesJSON(overrides)
+	if err != nil {
+		return nil, err
+	}
+	effectiveSyncURL := settings.ModelPricingSyncURL
+	if syncURL != nil {
+		effectiveSyncURL = *syncURL
+	}
+	if err := db.UpdateModelPricingSettings(ctx, blob, effectiveSyncURL); err != nil {
+		return nil, err
+	}
+	SetModelPricingOverrides(overrides)
+	return overrides, nil
+}
 
 // SetModelPricingOverrides 刷新运行时定价覆盖表（key 归一为小写去空白）。
 func SetModelPricingOverrides(m map[string]ModelPricingOverride) {

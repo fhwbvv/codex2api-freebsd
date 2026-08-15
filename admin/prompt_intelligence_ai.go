@@ -72,10 +72,34 @@ type promptIntelligenceAIAnalysisMetadata struct {
 	APIKeyName              string                       `json:"api_key_name,omitempty"`
 	ReviewSystemPromptHash  string                       `json:"review_system_prompt_hash"`
 	UpstreamEvidenceCount   int                          `json:"upstream_evidence_count"`
+	LearnableEvidenceCount  int                          `json:"learnable_evidence_count"`
 	Result                  promptIntelligenceAIDecision `json:"result"`
 	RuleValidationError     string                       `json:"rule_validation_error,omitempty"`
 	IdentityValidationError string                       `json:"identity_validation_error,omitempty"`
 	RawOutputPreview        string                       `json:"raw_output_preview,omitempty"`
+}
+
+type promptIntelligenceLearningContext struct {
+	Origin    string `json:"origin"`
+	Role      string `json:"role,omitempty"`
+	Text      string `json:"text"`
+	Linked    bool   `json:"linked,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+	Trust     string `json:"trust,omitempty"`
+}
+
+type promptIntelligenceLearningEvidence struct {
+	Version       int                                 `json:"version"`
+	Quality       string                              `json:"quality"`
+	PromptText    string                              `json:"prompt_text,omitempty"`
+	Context       []promptIntelligenceLearningContext `json:"context,omitempty"`
+	UpstreamError string                              `json:"upstream_error,omitempty"`
+	Transport     string                              `json:"transport,omitempty"`
+	StatusCode    int                                 `json:"status_code,omitempty"`
+	AttemptIndex  int                                 `json:"attempt_index,omitempty"`
+	ReviewModel   string                              `json:"review_model,omitempty"`
+	ReviewFlagged bool                                `json:"review_flagged,omitempty"`
+	ReviewError   string                              `json:"review_error,omitempty"`
 }
 
 type promptIdentityUpdateResult struct {
@@ -271,12 +295,18 @@ func (h *Handler) AnalyzePromptIntelligenceCandidate(c *gin.Context) {
 		writeError(c, http.StatusConflict, "该候选没有可供分析的上游 CY 证据")
 		return
 	}
+	learnableEvidence := selectPromptIntelligenceLearnableEvidence(upstreamEvidence, 20)
+	if len(learnableEvidence) == 0 {
+		writeError(c, http.StatusConflict, "该候选只有证据不足的 CY 记录，尚未提取到可学习的 Prompt 或关联上下文；已停止调用外部模型")
+		return
+	}
+	learnableEvidenceCount := countPromptIntelligenceLearnableEvidence(upstreamEvidence)
 
 	cfg := h.store.GetPromptFilterConfig()
 	reviewCfg := promptfilter.NormalizeReviewConfig(cfg.Review)
 	reviewSystemPrompt := promptfilter.NormalizeReviewAdapterConfig(reviewCfg.Adapter).SystemPrompt
 	analysisSystemPrompt := buildPromptIntelligenceAIIdentity(reviewSystemPrompt)
-	analysisInput := buildPromptIntelligenceAIEvidenceInput(candidate, upstreamEvidence)
+	analysisInput := buildPromptIntelligenceAIEvidenceInput(candidate, learnableEvidence)
 	rawOutput, attribution, err := h.callPromptIntelligenceAI(c.Request.Context(), request, reviewCfg, analysisSystemPrompt, analysisInput)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
@@ -287,7 +317,7 @@ func (h *Handler) AnalyzePromptIntelligenceCandidate(c *gin.Context) {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
 	}
-	coverage := summarizePromptIntelligenceCoverage(upstreamEvidence)
+	coverage := summarizePromptIntelligenceCoverage(learnableEvidence)
 	if err := validatePromptIntelligenceAICoverageDecision(decision, coverage); err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -297,7 +327,7 @@ func (h *Handler) AnalyzePromptIntelligenceCandidate(c *gin.Context) {
 		Version: 1, Provider: attribution.Provider, Model: attribution.Model,
 		APIKeyID: attribution.APIKeyID, APIKeyName: attribution.APIKeyName,
 		ReviewSystemPromptHash: promptfilter.StableEvidenceFingerprint("review-system-prompt", reviewSystemPrompt),
-		UpstreamEvidenceCount:  len(upstreamEvidence), Result: decision,
+		UpstreamEvidenceCount:  len(upstreamEvidence), LearnableEvidenceCount: learnableEvidenceCount, Result: decision,
 		RawOutputPreview: promptfilter.RedactedPreview(promptfilter.RedactSensitive(rawOutput), 4000),
 	}
 	if decision.Rule != nil {
@@ -341,9 +371,10 @@ func (h *Handler) AnalyzePromptIntelligenceCandidate(c *gin.Context) {
 		if metadata.IdentityValidationError != "" {
 			response.IdentityUpdate.BlockReason = metadata.IdentityValidationError
 		} else if request.IdentityUpdateMode == promptIdentityUpdateModeGuardedAuto {
-			response.IdentityUpdate.Eligible = decision.Confidence >= promptIdentityAutoMinConfidence && len(upstreamEvidence) >= promptIdentityAutoMinUpstreamEvidence
+			directEvidenceCount := countPromptIntelligenceDirectEvidence(upstreamEvidence)
+			response.IdentityUpdate.Eligible = decision.Confidence >= promptIdentityAutoMinConfidence && directEvidenceCount >= promptIdentityAutoMinUpstreamEvidence
 			if !response.IdentityUpdate.Eligible {
-				response.IdentityUpdate.BlockReason = fmt.Sprintf("受控自动应用要求置信度至少 %.2f 且同类上游证据至少 %d 条", promptIdentityAutoMinConfidence, promptIdentityAutoMinUpstreamEvidence)
+				response.IdentityUpdate.BlockReason = fmt.Sprintf("受控自动应用要求置信度至少 %.2f 且同类完整 Prompt 证据至少 %d 条", promptIdentityAutoMinConfidence, promptIdentityAutoMinUpstreamEvidence)
 			} else {
 				applied, applyErr := h.applyPromptIntelligenceIdentityPatch(c.Request.Context(), candidateID, analysisEvidence.ID, "guarded_auto")
 				if applyErr != nil {
@@ -446,13 +477,23 @@ unsafe to generalize.`
 
 func buildPromptIntelligenceAIEvidenceInput(candidate *database.PromptRuleCandidate, evidence []*database.PromptRuleCandidateEvidence) string {
 	type safeEvidence struct {
-		SourceKind    string         `json:"source_kind"`
-		SamplePreview string         `json:"sample_preview"`
-		Protocol      string         `json:"protocol,omitempty"`
-		Provider      string         `json:"provider,omitempty"`
-		Model         string         `json:"model,omitempty"`
-		ObservedAt    time.Time      `json:"observed_at"`
-		Context       map[string]any `json:"context,omitempty"`
+		SourceKind      string                              `json:"source_kind"`
+		EvidenceQuality string                              `json:"evidence_quality"`
+		SamplePreview   string                              `json:"sample_preview,omitempty"`
+		PromptText      string                              `json:"prompt_text,omitempty"`
+		RelatedContext  []promptIntelligenceLearningContext `json:"related_context,omitempty"`
+		UpstreamError   string                              `json:"upstream_error,omitempty"`
+		Transport       string                              `json:"transport,omitempty"`
+		StatusCode      int                                 `json:"status_code,omitempty"`
+		AttemptIndex    int                                 `json:"attempt_index,omitempty"`
+		ReviewModel     string                              `json:"review_model,omitempty"`
+		ReviewFlagged   bool                                `json:"review_flagged,omitempty"`
+		ReviewError     string                              `json:"review_error,omitempty"`
+		Protocol        string                              `json:"protocol,omitempty"`
+		Provider        string                              `json:"provider,omitempty"`
+		Model           string                              `json:"model,omitempty"`
+		ObservedAt      time.Time                           `json:"observed_at"`
+		DecisionContext map[string]any                      `json:"decision_context,omitempty"`
 	}
 	items := make([]safeEvidence, 0, len(evidence))
 	for _, row := range evidence {
@@ -468,20 +509,154 @@ func buildPromptIntelligenceAIEvidenceInput(candidate *database.PromptRuleCandid
 				}
 			}
 		}
+		learning := promptIntelligenceLearningEvidenceFromMetadata(row.MetadataJSON, row.SamplePreview)
 		items = append(items, safeEvidence{
-			SourceKind: row.SourceKind, SamplePreview: promptfilter.RedactedPreview(row.SamplePreview, 2000),
-			Protocol: row.Protocol, Provider: row.Provider, Model: row.Model, ObservedAt: row.ObservedAt,
-			Context: contextFields,
+			SourceKind: row.SourceKind, EvidenceQuality: learning.Quality,
+			SamplePreview:  promptfilter.RedactedPreview(row.SamplePreview, 2000),
+			PromptText:     promptfilter.RedactedPreview(learning.PromptText, 8000),
+			RelatedContext: boundPromptIntelligenceLearningContext(learning.Context, 6000),
+			UpstreamError:  promptfilter.RedactedPreview(learning.UpstreamError, 2000),
+			Transport:      learning.Transport, StatusCode: learning.StatusCode, AttemptIndex: learning.AttemptIndex,
+			ReviewModel: learning.ReviewModel, ReviewFlagged: learning.ReviewFlagged,
+			ReviewError: promptfilter.RedactedPreview(learning.ReviewError, 500),
+			Protocol:    row.Protocol, Provider: row.Provider, Model: row.Model, ObservedAt: row.ObservedAt,
+			DecisionContext: contextFields,
 		})
 	}
 	payload := map[string]any{
 		"candidate_id": candidate.ID, "fingerprint": candidate.Fingerprint,
-		"evidence_count": candidate.EvidenceCount, "sample_preview": promptfilter.RedactedPreview(candidate.SamplePreview, 2000),
+		"evidence_count": candidate.EvidenceCount, "learnable_evidence_count": len(evidence),
+		"sample_preview":   promptfilter.RedactedPreview(candidate.SamplePreview, 2000),
 		"coverage_summary": summarizePromptIntelligenceCoverage(evidence),
 		"evidence":         items,
 	}
 	encoded, _ := json.Marshal(payload)
 	return "Analyze the following <user_input> evidence data.\n<user_input>\n" + string(encoded) + "\n</user_input>"
+}
+
+func promptIntelligenceLearningEvidenceFromMetadata(raw, fallbackPreview string) promptIntelligenceLearningEvidence {
+	result := promptIntelligenceLearningEvidence{}
+	var metadata struct {
+		EvidenceQuality string                             `json:"evidence_quality"`
+		Learning        promptIntelligenceLearningEvidence `json:"learning_evidence"`
+	}
+	hasQualityVerdict := false
+	if json.Unmarshal([]byte(raw), &metadata) == nil {
+		result = metadata.Learning
+		if result.Quality == "" {
+			result.Quality = metadata.EvidenceQuality
+		}
+		// 采集侧已对这条证据给出质量裁决(包括 insufficient 隔离与
+		// context_only 的出处标注),预览回退仅适用于裁决产生之前的存量行:
+		// 把 insufficient 行升格为可学习、或把 context_only 的预览冒充直接
+		// Prompt,都会绕过采集侧的隔离语义。
+		hasQualityVerdict = result.Quality != "" || metadata.Learning.Version > 0
+	}
+	if !hasQualityVerdict && strings.TrimSpace(result.PromptText) == "" && strings.TrimSpace(fallbackPreview) != "" {
+		result.PromptText = fallbackPreview
+		result.Quality = "legacy_preview"
+	}
+	if result.Quality == "" {
+		result.Quality = "insufficient"
+	}
+	return result
+}
+
+func selectPromptIntelligenceLearnableEvidence(evidence []*database.PromptRuleCandidateEvidence, limit int) []*database.PromptRuleCandidateEvidence {
+	if limit <= 0 {
+		limit = 20
+	}
+	selected := make([]*database.PromptRuleCandidateEvidence, 0, min(limit, len(evidence)))
+	seen := make(map[string]struct{}, limit)
+	for _, row := range evidence {
+		learning := promptIntelligenceLearningEvidenceFromMetadata(row.MetadataJSON, row.SamplePreview)
+		text := strings.TrimSpace(learning.PromptText)
+		if text == "" {
+			parts := make([]string, 0, len(learning.Context))
+			for _, segment := range learning.Context {
+				if value := strings.TrimSpace(segment.Text); value != "" {
+					parts = append(parts, segment.Origin+": "+value)
+				}
+			}
+			text = strings.Join(parts, "\n")
+		}
+		if text == "" || learning.Quality == "insufficient" {
+			continue
+		}
+		fingerprint := promptfilter.PromptEvidenceFingerprint(text)
+		if fingerprint == "" {
+			fingerprint = row.SourceRefHash
+		}
+		if _, exists := seen[fingerprint]; exists {
+			continue
+		}
+		seen[fingerprint] = struct{}{}
+		selected = append(selected, row)
+		if len(selected) >= limit {
+			break
+		}
+	}
+	return selected
+}
+
+func countPromptIntelligenceDirectEvidence(evidence []*database.PromptRuleCandidateEvidence) int {
+	// 受控自动应用的证据门槛按去重后的独立 Prompt 计数:同一条攻击文本被
+	// 重放多次只算一条,否则重复注入即可凑满门槛。
+	seen := make(map[string]struct{}, len(evidence))
+	for _, row := range evidence {
+		learning := promptIntelligenceLearningEvidenceFromMetadata(row.MetadataJSON, row.SamplePreview)
+		text := strings.TrimSpace(learning.PromptText)
+		if text == "" || learning.Quality == "context_only" || learning.Quality == "insufficient" {
+			continue
+		}
+		fingerprint := promptfilter.PromptEvidenceFingerprint(text)
+		if fingerprint == "" {
+			fingerprint = row.SourceRefHash
+		}
+		seen[fingerprint] = struct{}{}
+	}
+	return len(seen)
+}
+
+func countPromptIntelligenceLearnableEvidence(evidence []*database.PromptRuleCandidateEvidence) int {
+	count := 0
+	for _, row := range evidence {
+		learning := promptIntelligenceLearningEvidenceFromMetadata(row.MetadataJSON, row.SamplePreview)
+		if learning.Quality == "insufficient" {
+			continue
+		}
+		if strings.TrimSpace(learning.PromptText) != "" {
+			count++
+			continue
+		}
+		for _, context := range learning.Context {
+			if strings.TrimSpace(context.Text) != "" {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+func boundPromptIntelligenceLearningContext(contexts []promptIntelligenceLearningContext, maxRunes int) []promptIntelligenceLearningContext {
+	if maxRunes <= 0 {
+		return nil
+	}
+	result := make([]promptIntelligenceLearningContext, 0, min(len(contexts), 8))
+	remaining := maxRunes
+	for _, context := range contexts {
+		if remaining <= 0 || len(result) >= 8 {
+			break
+		}
+		context.Text = promptfilter.RedactedPreview(context.Text, remaining)
+		if strings.TrimSpace(context.Text) == "" {
+			continue
+		}
+		remaining -= len([]rune(context.Text))
+		result = append(result, context)
+	}
+	return result
 }
 
 func summarizePromptIntelligenceCoverage(evidence []*database.PromptRuleCandidateEvidence) promptIntelligenceCoverageSummary {

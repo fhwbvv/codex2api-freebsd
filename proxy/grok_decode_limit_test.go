@@ -61,18 +61,25 @@ func TestDecodeGrokResponseEncodingNormalBody(t *testing.T) {
 	}
 }
 
-func TestDecodeGrokResponseEncodingSkipsEventStream(t *testing.T) {
-	compressed := gzipBytes(t, []byte("event: response.created\n"))
+func TestDecodeGrokResponseEncodingStreamsEventStream(t *testing.T) {
+	plain := []byte("event: response.created\ndata: {\"type\":\"response.created\"}\n\n")
+	compressed := gzipBytes(t, plain)
 	resp := responseWithBody(compressed, "gzip", "text/event-stream")
 
 	decodeGrokResponseEncoding(resp)
 
-	if resp.Header.Get("Content-Encoding") != "gzip" {
-		t.Fatalf("流式响应不应被解压")
+	if resp.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("流式响应 Content-Encoding 应在安装流式解码器后清除")
 	}
-	got, _ := io.ReadAll(resp.Body)
-	if !bytes.Equal(got, compressed) {
-		t.Fatalf("流式响应体应原样保留")
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读取流式解码响应失败: %v", err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatalf("流式解码结果 = %q, want %q", got, plain)
+	}
+	if resp.ContentLength != -1 {
+		t.Fatalf("流式解码后 ContentLength = %d, want -1", resp.ContentLength)
 	}
 }
 

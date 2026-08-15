@@ -102,21 +102,21 @@ function InternalRequestBadge({ log }: { log: UsageLog }) {
 
 function getStatusBadgeClassName(statusCode: number): string {
   if (statusCode === 200) {
-    return 'border-transparent bg-emerald-500/14 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300'
+    return 'border-emerald-500/20 bg-emerald-500/12 text-emerald-700 dark:text-emerald-300'
   }
   if (statusCode === 401) {
-    return 'border-transparent bg-red-500/14 text-red-600 dark:bg-red-500/20 dark:text-red-300'
+    return 'border-rose-500/20 bg-rose-500/12 text-rose-700 dark:text-rose-300'
   }
   if (statusCode === 429) {
-    return 'border-transparent bg-amber-500/14 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300'
+    return 'border-amber-500/20 bg-amber-500/12 text-amber-700 dark:text-amber-300'
   }
   if (statusCode >= 500) {
-    return 'border-transparent bg-red-500/14 text-red-600 dark:bg-red-500/20 dark:text-red-300'
+    return 'border-rose-500/20 bg-rose-500/12 text-rose-700 dark:text-rose-300'
   }
   if (statusCode >= 400) {
-    return 'border-transparent bg-amber-500/14 text-amber-600 dark:bg-amber-500/20 dark:text-amber-300'
+    return 'border-amber-500/20 bg-amber-500/12 text-amber-700 dark:text-amber-300'
   }
-  return 'border-transparent bg-slate-500/14 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
+  return 'border-slate-500/20 bg-slate-500/12 text-slate-700 dark:text-slate-300'
 }
 
 type UsagePresetRangeKey = 'today' | TimeRangeKey
@@ -342,7 +342,9 @@ function UsageCostCell({ log }: { log: UsageLog }) {
   const displayCost = userBilled > 0 ? userBilled : accountBilled
   const longContextThreshold = safeNumber(log.long_context_threshold)
   const requestedTier = log.requested_service_tier || ''
-  const actualTier = log.actual_service_tier || log.service_tier || ''
+  // legacy 行（三字段拆分前）只有 service_tier 可用；新行 actual 为空表示上游未回传，
+  // 不能回退到偏好请求意图的 legacy 列冒充“上游回传 Tier”。
+  const actualTier = log.actual_service_tier || (requestedTier ? '' : log.service_tier || '')
   const billingTier = log.billing_service_tier || log.service_tier || ''
   const hasCostContext = log.status_code < 400 && (
     accountBilled > 0 ||
@@ -901,12 +903,24 @@ function ImageUsageBadge({ log }: { log: UsageLog }) {
 
 function StatusCodeBadge({ log }: { log: UsageLog }) {
   const { t } = useTranslation()
+  const dotColor = log.status_code === 200
+    ? 'bg-emerald-500'
+    : log.status_code === 429
+      ? 'bg-amber-500 animate-pulse'
+      : 'bg-rose-500 animate-pulse'
+
   const badge = (
     <Badge
       variant="outline"
-      className={`${usageTableBadgeClass} ${getStatusBadgeClassName(log.status_code)} ${log.status_code !== 200 ? 'cursor-help ring-1 ring-inset ring-current/10' : ''}`}
+      className={cn(
+        usageTableBadgeClass,
+        'gap-1.5',
+        getStatusBadgeClassName(log.status_code),
+        log.status_code !== 200 ? 'cursor-help ring-1 ring-inset ring-current/10' : ''
+      )}
     >
-      {log.status_code}
+      <span className={cn('size-1.5 rounded-full', dotColor)} />
+      <span>{log.status_code}</span>
     </Badge>
   )
 
@@ -924,10 +938,10 @@ function StatusCodeBadge({ log }: { log: UsageLog }) {
           {badge}
         </span>
       </TooltipTrigger>
-      <TooltipContent side="right" sideOffset={8} className="max-w-[360px] rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-xs text-slate-50 shadow-xl">
+      <TooltipContent side="right" sideOffset={8} className="max-w-[360px] rounded-xl border border-slate-700 bg-slate-950 px-3.5 py-3 text-xs text-slate-50 shadow-xl backdrop-blur-md">
         <div className="space-y-1.5">
           <div className="font-semibold text-slate-300">{title}</div>
-          <div className="font-geist-mono text-[11px] tabular-nums text-slate-400">HTTP {log.status_code}</div>
+          <div className="font-mono text-[11px] tabular-nums text-slate-400">HTTP {log.status_code}</div>
           <div className="whitespace-pre-wrap break-words leading-relaxed text-slate-50">{message}</div>
         </div>
       </TooltipContent>
@@ -991,13 +1005,21 @@ function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolea
       ? t('usage.userAgentOverridden')
       : t('usage.userAgentPreserved')
 
+  if (!hasAudit) {
+    return (
+      <div className="font-mono text-[11px] text-muted-foreground" title={t('usage.userAgentNotRecorded')}>
+        UA: -
+      </div>
+    )
+  }
+
   const content = (
     <div className={`${mobile ? 'w-full' : 'w-[260px] max-w-[28vw]'} space-y-1 font-mono text-[11px] leading-relaxed`}>
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-0 items-center gap-1.5" title={t('usage.clientUserAgent')}>
         <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">C</span>
         <span className="min-w-0 truncate text-foreground/80">{clientUserAgent || '-'}</span>
       </div>
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-0 items-center gap-1.5" title={t('usage.upstreamUserAgent')}>
         <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">U</span>
         <span className="min-w-0 truncate text-foreground/80">{upstreamLabel}</span>
         {hasAudit ? (
@@ -1186,6 +1208,23 @@ const usageTableHeadClass = 'text-[12px] font-semibold'
 const usageTableTextClass = 'text-[14px]'
 const usageTableMonoClass = 'font-mono text-[13px] tabular-nums'
 const usageTableBadgeClass = 'text-[13px]'
+
+function StreamBadge({ stream }: { stream: boolean }) {
+  return (
+    <Badge
+      variant="outline"
+      className={cn(
+        usageTableBadgeClass,
+        'border-transparent',
+        stream
+          ? 'bg-indigo-500/12 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400'
+          : 'bg-muted/60 text-muted-foreground',
+      )}
+    >
+      {stream ? 'stream' : 'sync'}
+    </Badge>
+  )
+}
 // Premium Minimal: a single-accent (primary) ramp. Instead of 20 competing hues,
 // the donut + legend read as one calm material with descending opacity, so it is
 // automatically correct under every theme-* palette (it only ever uses --color-primary).
@@ -1359,7 +1398,6 @@ type UsageTableColumn = 'status' | 'error' | 'model' | 'account' | 'apiKey' | 'c
 
 const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string }> = [
   { key: 'status', labelKey: 'usage.tableStatus' },
-  { key: 'error', labelKey: 'usage.tableError' },
   { key: 'model', labelKey: 'usage.tableModel' },
   { key: 'account', labelKey: 'usage.tableAccount' },
   { key: 'apiKey', labelKey: 'usage.tableApiKey' },
@@ -1373,6 +1411,8 @@ const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string 
   { key: 'timing', labelKey: 'usage.tableTiming' },
   { key: 'tokensPerSec', labelKey: 'usage.tableTokensPerSec' },
   { key: 'cost', labelKey: 'usage.tableCost' },
+  // 错误摘要宽度随内容波动，放倒数第二列避免撑开中段（issue #522）
+  { key: 'error', labelKey: 'usage.tableError' },
   { key: 'time', labelKey: 'usage.tableTime' },
 ]
 
@@ -1624,7 +1664,7 @@ function ColumnSettingsDropdown({
       {open ? (
         <div
           role="menu"
-          className="absolute right-0 z-20 mt-2 w-56 rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-lg"
+          className="absolute right-0 z-20 mt-2 w-56 max-w-[calc(100vw-2.5rem)] rounded-lg border border-border bg-popover p-2 text-popover-foreground shadow-lg"
         >
           <div className="mb-1 px-2 py-1 text-[11px] font-semibold uppercase text-muted-foreground">
             {t('accounts.columnSettings', { defaultValue: 'Columns' })}
@@ -1980,7 +2020,7 @@ export default function Usage() {
 
         <div key={channel || 'all'} className="space-y-6 animate-channel-switch-in">
         {/* Stat overview: 6 metrics in a single row */}
-        <div className="grid grid-cols-1 gap-3 min-[560px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
+        <div className="grid grid-cols-2 gap-2.5 sm:gap-3 md:grid-cols-3 xl:grid-cols-6">
           <Card className="min-w-0 py-0">
             <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
@@ -2071,7 +2111,7 @@ export default function Usage() {
             <CardContent className={usageStatCardContentClass}>
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.errorRateCard')}</span>
-                <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(36_72%_40%/0.12)] text-[hsl(36,72%,40%)]">
+                <div className="flex size-9 items-center justify-center rounded-lg bg-[hsl(var(--warning-bg))] text-[hsl(var(--warning))]">
                   <AlertTriangle className="size-4" />
                 </div>
               </div>
@@ -2085,7 +2125,7 @@ export default function Usage() {
 
         {showAnalysis && (
           <>
-            <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(360px,0.5fr)] gap-3 max-lg:grid-cols-1">
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
               <ModelStatsPanel stats={modelStats} showFullUsageNumbers={showFullUsageNumbers} />
               <FeatureStatsPanel stats={featureStats} totalRequests={rangeRequests} showFullUsageNumbers={showFullUsageNumbers} />
             </div>
@@ -2103,34 +2143,39 @@ export default function Usage() {
             <div className="mb-4 flex items-center justify-between gap-3 overflow-visible max-lg:flex-col max-lg:items-stretch max-lg:overflow-visible">
               <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
                 <h3 className="shrink-0 whitespace-nowrap text-base font-semibold text-foreground">{t('usage.requestLogs')}</h3>
-                <div className="inline-flex max-w-full flex-wrap rounded-xl border border-border bg-muted/50 p-0.5">
-                  {USAGE_TIME_RANGE_OPTIONS.map((key) => (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => {
-                        setTimeRange(key)
-                        setPage(1)
-                        setShowCustomPopover(false)
-                      }}
-                      className={`whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-lg transition-all duration-200 ${
-                        timeRange === key
-                          ? 'bg-background text-foreground shadow-sm border border-border'
-                          : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      {key === 'today' ? t('usage.today') : t(`dashboard.timeRange${key.toUpperCase()}`)}
-                    </button>
-                  ))}
+                <div className="inline-flex max-w-full flex-wrap rounded-xl border border-border/70 bg-muted/40 p-1 shadow-2xs">
+                  {USAGE_TIME_RANGE_OPTIONS.map((key) => {
+                    const active = timeRange === key
+                    return (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => {
+                          setTimeRange(key)
+                          setPage(1)
+                          setShowCustomPopover(false)
+                        }}
+                        className={cn(
+                          'whitespace-nowrap px-3 py-1.5 text-xs font-semibold rounded-lg transition-all duration-150',
+                          active
+                            ? 'bg-background text-foreground shadow-xs ring-1 ring-border/50 font-bold'
+                            : 'text-muted-foreground hover:bg-background/40 hover:text-foreground'
+                        )}
+                      >
+                        {key === 'today' ? t('usage.today') : t(`dashboard.timeRange${key.toUpperCase()}`)}
+                      </button>
+                    )
+                  })}
                   <button
                     ref={customChipRef}
                     type="button"
                     onClick={() => setShowCustomPopover((v) => !v)}
-                    className={`whitespace-nowrap px-2.5 py-1.5 text-xs font-medium rounded-lg transition-all duration-200 ${
+                    className={cn(
+                      'whitespace-nowrap px-3 py-1.5 text-xs font-semibold rounded-lg transition-all duration-150',
                       timeRange === 'custom'
-                        ? 'bg-background text-foreground shadow-sm border border-border'
-                        : 'text-muted-foreground hover:text-foreground'
-                    }`}
+                        ? 'bg-background text-foreground shadow-xs ring-1 ring-border/50 font-bold'
+                        : 'text-muted-foreground hover:bg-background/40 hover:text-foreground'
+                    )}
                   >
                     {timeRange === 'custom' && customRange
                       ? t('usage.customRangeChipApplied')
@@ -2278,7 +2323,7 @@ export default function Usage() {
                 </div>
 
                 <Select
-                  className="w-40 shrink-0"
+                  className="w-full min-w-0 sm:w-40 shrink-0"
                   compact
                   value={filterModel}
                   onValueChange={(value) => { setFilterModel(value); setPage(1) }}
@@ -2291,7 +2336,7 @@ export default function Usage() {
 
                 {showAPIKeyFilter ? (
                   <Select
-                    className="w-52 shrink-0"
+                    className="w-full min-w-0 sm:w-52 shrink-0"
                     compact
                     value={filterApiKeyId}
                     onValueChange={(value) => { setFilterApiKeyId(value); setPage(1) }}
@@ -2305,7 +2350,7 @@ export default function Usage() {
                   onClick={() => setShowAdvancedFilters((current) => !current)}
                   aria-expanded={showAdvancedFilters}
                   className={cn(
-                    'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors',
+                    'inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border px-2.5 text-[13px] font-medium transition-colors max-sm:w-full',
                     showAdvancedFilters || advancedFilterCount > 0
                       ? 'border-primary/30 bg-primary/8 text-primary'
                       : 'border-border bg-background text-muted-foreground hover:bg-muted/50 hover:text-foreground',
@@ -2453,23 +2498,28 @@ export default function Usage() {
               <TooltipProvider>
               <div className="grid gap-3 lg:hidden">
                 {logs.map((log: UsageLog) => {
+                  const hasDetails = visibleColumns.account || visibleColumns.apiKey || visibleColumns.clientIp || visibleColumns.endpoint || visibleColumns.userAgent
+                  const hasMetrics = visibleColumns.token || visibleColumns.timing || visibleColumns.tokensPerSec || visibleColumns.cost
                   return (
                     <div
                       key={log.id}
                       className="rounded-xl border border-border bg-background/70 p-3.5 shadow-sm"
                     >
-                      <div className="flex items-start justify-between gap-2">
+                      {/* flex-wrap + nowrap 时间：徽标再多也只会把时间挤到下一行，不会挤出视口（issue #522） */}
+                      <div className="flex flex-wrap items-start justify-between gap-2">
                         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => { setFilterStatus(String(log.status_code) as UsageStatusFilter); setPage(1) }}
-                            className="rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                            title={t('usage.filterByStatus', { status: log.status_code })}
-                          >
-                            <StatusCodeBadge log={log} />
-                          </button>
+                          {visibleColumns.status && (
+                            <button
+                              type="button"
+                              onClick={() => { setFilterStatus(String(log.status_code) as UsageStatusFilter); setPage(1) }}
+                              className="rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                              title={t('usage.filterByStatus', { status: log.status_code })}
+                            >
+                              <StatusCodeBadge log={log} />
+                            </button>
+                          )}
                           {log.upstream_error_kind === 'cyber_policy' ? <CyberPolicyDetailButton log={log} /> : null}
-                          {log.via_websocket ? (
+                          {visibleColumns.type && log.via_websocket ? (
                             <Badge
                               variant="outline"
                               className="border-transparent bg-cyan-500/12 text-[11px] font-semibold uppercase text-cyan-600 dark:bg-cyan-500/20 dark:text-cyan-400"
@@ -2477,13 +2527,15 @@ export default function Usage() {
                               ws
                             </Badge>
                           ) : null}
-                          <Badge variant="outline" className={usageTableBadgeClass}>
-                            {log.model || '-'}
-                          </Badge>
+                          {visibleColumns.model && (
+                            <Badge variant="outline" className={usageTableBadgeClass}>
+                              {log.model || '-'}
+                            </Badge>
+                          )}
                           {log.reasoning_effort ? (
                             <ReasoningEffortBadge effort={log.reasoning_effort} />
                           ) : null}
-                          {isFastTier(log.billing_service_tier || log.service_tier) ? (
+                          {visibleColumns.type && isFastTier(log.billing_service_tier || log.service_tier) ? (
                             <Badge
                               variant="outline"
                               className="gap-0.5 border-transparent bg-blue-500/12 text-[11px] font-semibold text-blue-600 dark:bg-blue-500/20 dark:text-blue-400"
@@ -2492,88 +2544,110 @@ export default function Usage() {
                               Fast
                             </Badge>
                           ) : null}
-                          <Badge
-                            variant="outline"
-                            className={usageTableBadgeClass}
-                            style={{
-                              background: log.stream ? 'rgba(99, 102, 241, 0.12)' : 'rgba(107, 114, 128, 0.12)',
-                              color: log.stream ? '#6366f1' : '#6b7280',
-                              borderColor: 'transparent',
-                            }}
-                          >
-                            {log.stream ? 'stream' : 'sync'}
-                          </Badge>
+                          {visibleColumns.type && <StreamBadge stream={log.stream} />}
                           <CompactionBadges
                             compact={log.compact}
                             hasCompactionHistory={log.has_compaction_history}
                           />
                           <InternalRequestBadge log={log} />
                         </div>
-                        <div className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
-                          {formatBeijingTime(log.created_at)}
-                        </div>
+                        {visibleColumns.time && (
+                          <div className="shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
+                            {formatBeijingTime(log.created_at)}
+                          </div>
+                        )}
                       </div>
 
-                      <UsageErrorSummaryCell log={log} mobile />
+                      {visibleColumns.error && <UsageErrorSummaryCell log={log} mobile />}
 
-                      <div className="mt-2.5 space-y-1 text-xs text-muted-foreground">
-                        <div className="truncate" title={formatUsageAccountTitle(log)}>
-                          <span className="font-semibold text-foreground/80">{t('usage.tableAccount')}: </span>
-                          {formatUsageAccountLabel(log)}
+                      {hasDetails && (
+                        <div className="mt-2.5 space-y-1 text-xs text-muted-foreground">
+                          {visibleColumns.account && (
+                            <div className="truncate" title={formatUsageAccountTitle(log)}>
+                              <span className="font-semibold text-foreground/80">{t('usage.tableAccount')}: </span>
+                              {formatUsageAccountLabel(log)}
+                            </div>
+                          )}
+                          {visibleColumns.apiKey && (
+                            <div className="truncate font-mono" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>
+                              <span className="font-sans font-semibold text-foreground/80">{t('usage.tableApiKey')}: </span>
+                              {formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}
+                            </div>
+                          )}
+                          {visibleColumns.clientIp && (
+                            <div className="truncate font-mono" title={log.client_ip || '-'}>
+                              <span className="font-sans font-semibold text-foreground/80">{t('usage.tableClientIP')}: </span>
+                              {log.client_ip || '-'}
+                            </div>
+                          )}
+                          {visibleColumns.endpoint && (
+                            <div className="truncate font-mono">
+                              <span className="font-sans font-semibold text-foreground/80">{t('usage.tableEndpoint')}: </span>
+                              {log.inbound_endpoint || log.endpoint || '-'}
+                            </div>
+                          )}
+                          {visibleColumns.userAgent && (
+                            <div className="border-t border-border/60 pt-2">
+                              <UserAgentCell log={log} mobile />
+                            </div>
+                          )}
                         </div>
-                        <div className="truncate font-mono">
-                          <span className="font-sans font-semibold text-foreground/80">{t('usage.tableEndpoint')}: </span>
-                          {log.inbound_endpoint || log.endpoint || '-'}
-                        </div>
-                        <div className="border-t border-border/60 pt-2">
-                          <UserAgentCell log={log} mobile />
-                        </div>
-                      </div>
+                      )}
 
-                      <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableToken')}</div>
-                          <div className="mt-1 font-mono tabular-nums">
-                            {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
-                              <>
-                                <span className="text-blue-500">↓{formatTokens(log.input_tokens, true)}</span>
-                                <span className="mx-0.5 text-border">/</span>
-                                <span className="text-emerald-500">↑{formatTokens(log.output_tokens, true)}</span>
-                              </>
-                            ) : (
-                              <span className="text-muted-foreground">-</span>
-                            )}
-                          </div>
+                      {hasMetrics && (
+                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
+                          {visibleColumns.token && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableToken')}</div>
+                              <div className="mt-1 font-mono tabular-nums">
+                                {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
+                                  <>
+                                    <span className="text-blue-500">↓{formatTokens(log.input_tokens, true)}</span>
+                                    <span className="mx-0.5 text-border">/</span>
+                                    <span className="text-emerald-500">↑{formatTokens(log.output_tokens, true)}</span>
+                                  </>
+                                ) : (
+                                  <span className="text-muted-foreground">-</span>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                          {visibleColumns.timing && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div
+                                className="text-[11px] font-semibold text-muted-foreground"
+                                title={t('usage.tableTimingHint')}
+                              >
+                                {t('usage.tableTiming')}
+                              </div>
+                              <div className="mt-1.5">
+                                <TimingCell log={log} />
+                              </div>
+                            </div>
+                          )}
+                          {visibleColumns.tokensPerSec && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div
+                                className="text-[11px] font-semibold text-muted-foreground"
+                                title={t('usage.tableTokensPerSecHint')}
+                              >
+                                {t('usage.tableTokensPerSec')}
+                              </div>
+                              <div className="mt-1">
+                                <TokensPerSecCell log={log} />
+                              </div>
+                            </div>
+                          )}
+                          {visibleColumns.cost && (
+                            <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                              <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCost')}</div>
+                              <div className="mt-1">
+                                <UsageCostCell log={log} />
+                              </div>
+                            </div>
+                          )}
                         </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div
-                            className="text-[11px] font-semibold text-muted-foreground"
-                            title={t('usage.tableTimingHint')}
-                          >
-                            {t('usage.tableTiming')}
-                          </div>
-                          <div className="mt-1.5">
-                            <TimingCell log={log} />
-                          </div>
-                        </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div
-                            className="text-[11px] font-semibold text-muted-foreground"
-                            title={t('usage.tableTokensPerSecHint')}
-                          >
-                            {t('usage.tableTokensPerSec')}
-                          </div>
-                          <div className="mt-1">
-                            <TokensPerSecCell log={log} />
-                          </div>
-                        </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCost')}</div>
-                          <div className="mt-1">
-                            <UsageCostCell log={log} />
-                          </div>
-                        </div>
-                      </div>
+                      )}
                     </div>
                   )
                 })}
@@ -2587,7 +2661,6 @@ export default function Usage() {
                   <TableHeader>
                     <TableRow>
                       {visibleColumns.status && <TableHead className={usageTableHeadClass}>{t('usage.tableStatus')}</TableHead>}
-                      {visibleColumns.error && <TableHead className={usageTableHeadClass}>{t('usage.tableError')}</TableHead>}
                       {visibleColumns.model && <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>}
                       {visibleColumns.account && <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>}
                       {visibleColumns.apiKey && <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>}
@@ -2595,11 +2668,11 @@ export default function Usage() {
                       {visibleColumns.userAgent && <TableHead className={usageTableHeadClass}>{t('usage.tableUserAgent')}</TableHead>}
                       {visibleColumns.endpoint && <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>}
                       {visibleColumns.type && <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>}
-                      {visibleColumns.token && <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>}
-                      {visibleColumns.cached && <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>}
-                      {visibleColumns.wsAcquire && <TableHead className={usageTableHeadClass}><span title={t('usage.wsAcquireTooltip')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableWsAcquire')}</span></TableHead>}
+                      {visibleColumns.token && <TableHead className={`${usageTableHeadClass} text-right`}>{t('usage.tableToken')}</TableHead>}
+                      {visibleColumns.cached && <TableHead className={`${usageTableHeadClass} text-right`}>{t('usage.tableCached')}</TableHead>}
+                      {visibleColumns.wsAcquire && <TableHead className={`${usageTableHeadClass} text-right`}><span title={t('usage.wsAcquireTooltip')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableWsAcquire')}</span></TableHead>}
                       {visibleColumns.timing && (
-                        <TableHead className={usageTableHeadClass}>
+                        <TableHead className={`${usageTableHeadClass} text-right`}>
                           <span
                             title={t('usage.tableTimingHint')}
                             className="cursor-help underline decoration-dotted underline-offset-2"
@@ -2609,7 +2682,7 @@ export default function Usage() {
                         </TableHead>
                       )}
                       {visibleColumns.tokensPerSec && (
-                        <TableHead className={usageTableHeadClass}>
+                        <TableHead className={`${usageTableHeadClass} text-right`}>
                           <span
                             title={t('usage.tableTokensPerSecHint')}
                             className="cursor-help underline decoration-dotted underline-offset-2"
@@ -2618,8 +2691,9 @@ export default function Usage() {
                           </span>
                         </TableHead>
                       )}
-                      {visibleColumns.cost && <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>}
-                      {visibleColumns.time && <TableHead className={usageTableHeadClass}>{t('usage.tableTime')}</TableHead>}
+                      {visibleColumns.cost && <TableHead className={`${usageTableHeadClass} text-right`}>{t('usage.tableCost')}</TableHead>}
+                      {visibleColumns.error && <TableHead className={usageTableHeadClass}>{t('usage.tableError')}</TableHead>}
+                      {visibleColumns.time && <TableHead className={`${usageTableHeadClass} text-right`}>{t('usage.tableTime')}</TableHead>}
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -2638,9 +2712,6 @@ export default function Usage() {
                             </button>
                             {log.upstream_error_kind === 'cyber_policy' ? <CyberPolicyDetailButton log={log} /> : null}
                           </div>
-                        </TableCell>}
-                        {visibleColumns.error && <TableCell>
-                          <UsageErrorSummaryCell log={log} />
                         </TableCell>}
                         {visibleColumns.model && <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">
@@ -2722,17 +2793,7 @@ export default function Usage() {
                         </TableCell>}
                         {visibleColumns.type && <TableCell>
                           <div className="flex flex-wrap items-center gap-1.5">
-                            <Badge
-                              variant="outline"
-                              className={usageTableBadgeClass}
-                              style={{
-                                background: log.stream ? 'rgba(99, 102, 241, 0.12)' : 'rgba(107, 114, 128, 0.12)',
-                                color: log.stream ? '#6366f1' : '#6b7280',
-                                borderColor: 'transparent',
-                              }}
-                            >
-                              {log.stream ? 'stream' : 'sync'}
-                            </Badge>
+                            <StreamBadge stream={log.stream} />
                             <CompactionBadges
                               compact={log.compact}
                               hasCompactionHistory={log.has_compaction_history}
@@ -2740,7 +2801,7 @@ export default function Usage() {
                             <InternalRequestBadge log={log} />
                           </div>
                         </TableCell>}
-                        {visibleColumns.token && <TableCell>
+                        {visibleColumns.token && <TableCell className="text-right">
                           {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
                             <div className={`${usageTableMonoClass} leading-relaxed`}>
                               <span className="text-blue-500">↓{formatTokens(log.input_tokens, true)}</span>
@@ -2757,7 +2818,7 @@ export default function Usage() {
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
                         </TableCell>}
-                        {visibleColumns.cached && <TableCell>
+                        {visibleColumns.cached && <TableCell className="text-right">
                           {log.cached_tokens > 0 ? (
                             <Badge variant="outline" className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
                               <DatabaseZap className="size-3.5" />
@@ -2767,7 +2828,7 @@ export default function Usage() {
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
                         </TableCell>}
-                        {visibleColumns.wsAcquire && <TableCell>
+                        {visibleColumns.wsAcquire && <TableCell className="text-right">
                           {(log.ws_acquire_ms ?? 0) > 0 ? (
                             <span
                               className={`${usageTableMonoClass} ${(log.ws_acquire_ms as number) > 5000 ? 'text-red-500' : (log.ws_acquire_ms as number) > 1000 ? 'text-amber-500' : 'text-muted-foreground'}`}
@@ -2778,19 +2839,22 @@ export default function Usage() {
                           ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
                         </TableCell>}
                         {visibleColumns.timing && (
-                          <TableCell>
+                          <TableCell className="text-right">
                             <TimingCell log={log} />
                           </TableCell>
                         )}
                         {visibleColumns.tokensPerSec && (
-                          <TableCell>
+                          <TableCell className="text-right">
                             <TokensPerSecCell log={log} />
                           </TableCell>
                         )}
-                        {visibleColumns.cost && <TableCell>
+                        {visibleColumns.cost && <TableCell className="text-right">
                           <UsageCostCell log={log} />
                         </TableCell>}
-                        {visibleColumns.time && <TableCell className={`${usageTableMonoClass} text-muted-foreground whitespace-nowrap`}>
+                        {visibleColumns.error && <TableCell>
+                          <UsageErrorSummaryCell log={log} />
+                        </TableCell>}
+                        {visibleColumns.time && <TableCell className={`${usageTableMonoClass} text-right text-muted-foreground whitespace-nowrap`}>
                           {formatBeijingTime(log.created_at)}
                         </TableCell>}
                       </TableRow>

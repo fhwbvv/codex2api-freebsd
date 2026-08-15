@@ -543,6 +543,45 @@ func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
 	}
 }
 
+func TestResetAccountStatusKeepsUsageWhenOverloadPaused(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{DBID: 42, AccessToken: "at", PlanType: "free"}
+	account.SetUsageSnapshot(12, time.Now())
+	account.SetCooldownUntil(time.Now().Add(time.Hour), "overload_paused")
+	store.AddAccount(account)
+
+	synced := make(chan struct{}, 1)
+	handler := &Handler{
+		store: store,
+		syncAccountPlanOnReset: func(_ context.Context, _ *auth.Account) error {
+			synced <- struct{}{}
+			return nil
+		},
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: "42"}}
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/42/reset-status", nil)
+
+	handler.ResetAccountStatus(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	pct, ok := account.GetUsagePercent7d()
+	if !ok || pct != 12 {
+		t.Fatalf("usage_percent_7d = (%v, %v), want (12, true)", pct, ok)
+	}
+	select {
+	case <-synced:
+		t.Fatal("overload resume should not re-probe plan or clear usage")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestBatchResetStatusSyncsEachResolvedAccount(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

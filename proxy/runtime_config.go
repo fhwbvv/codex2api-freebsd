@@ -51,6 +51,8 @@ const (
 	defaultCodexWSBusyMaxWaitSec  = 30
 	defaultCodexWSBusyPatienceSec = 2
 	maxCodexWSBusyWaitSec         = 300
+	defaultCodexWSStatelessSlots  = 8
+	maxCodexWSStatelessSlots      = 32
 
 	defaultCodexContinueMaxRounds = 8
 	minCodexContinueMaxRounds     = 1
@@ -77,9 +79,28 @@ type RuntimeSettings struct {
 	CodexWSBusyMaxWaitSec  int  // busy session/容量等待的累计上限秒数（默认 30，issue #413）
 	CodexWSBusyOverflow    bool // busy session 溢出到同账号兄弟连接（默认 false）
 	CodexWSBusyPatienceSec int  // 触发溢出前的短等待秒数（默认 2）
+	// CodexWSStatelessSlots 无状态请求每 (账号, cacheKey) 维度的持久连接槽位数
+	// （默认 8，范围 1-32，issue #522）。调大→单账号挂更多空闲连接；调小→握手更频繁，
+	// 高 RPM 下可能触发上游握手限流。实际生效值仍受账号动态并发上限钳制。
+	CodexWSStatelessSlots int
+	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升 API 限流配额；
+	// 只发给 api.github.com，绝不发给镜像或其他主机；空表示未配置，issue #522）。
+	GithubToken string
+	// GithubProxyURL GitHub 域名专用出站代理；空表示回落调用方的默认代理（issue #522）。
+	GithubProxyURL string
+	// Codex 过载熔断：单账号滑动窗口内 server_is_overloaded 错误占比达到阈值且样本数
+	// 足够时，自动暂停该账号调度一段时间（默认关闭）。
+	CodexOverloadPauseEnabled     bool
+	CodexOverloadThresholdPercent int // 触发比例（%），默认 20
+	CodexOverloadPauseMinutes     int // 暂停时长（分钟），默认 30
+	CodexOverloadWindowMinutes    int // 统计窗口（分钟），默认 5
 	// OverflowAutoCompact 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）。
 	// 全局开关与 per-key limits.auto_compact_overflow 为「或」关系。
 	OverflowAutoCompact bool
+	// CompactViaResponses 把 /v1/responses/compact 对官方 Codex OAuth 账号的透传
+	// 改写为 /responses + compaction_trigger 的 body-signal 形态并聚合为一次性 JSON
+	// （上游已下线专用 compact 端点，默认 false）。中转账号不受影响。
+	CompactViaResponses bool
 	// CodexPreflightSSEPassthrough 将前置元数据事件（codex.rate_limits /
 	// codex.response.metadata / response.metadata）立即透传下游而不缓冲到首个内容
 	// 事件（旧版兼容，默认 false，issue #425）。开启后首内容前会提前提交 200，
@@ -147,6 +168,10 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSSizeRouter:                defaultCodexWSSizeRouter,
 		CodexWSBusyMaxWaitSec:            defaultCodexWSBusyMaxWaitSec,
 		CodexWSBusyPatienceSec:           defaultCodexWSBusyPatienceSec,
+		CodexWSStatelessSlots:            defaultCodexWSStatelessSlots,
+		CodexOverloadThresholdPercent:    database.NormalizeCodexOverloadThresholdPercent(0),
+		CodexOverloadPauseMinutes:        database.NormalizeCodexOverloadPauseMinutes(0),
+		CodexOverloadWindowMinutes:       database.NormalizeCodexOverloadWindowMinutes(0),
 		CodexContinueMaxRounds:           defaultCodexContinueMaxRounds,
 		RequestIsolationMode:             defaultRequestIsolationMode(),
 		CodexCLIVersionSyncEnabled:       true,
@@ -266,6 +291,15 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.CodexWSBusyPatienceSec > maxCodexWSBusyWaitSec {
 		settings.CodexWSBusyPatienceSec = maxCodexWSBusyWaitSec
 	}
+	if settings.CodexWSStatelessSlots <= 0 {
+		settings.CodexWSStatelessSlots = defaultCodexWSStatelessSlots
+	}
+	if settings.CodexWSStatelessSlots > maxCodexWSStatelessSlots {
+		settings.CodexWSStatelessSlots = maxCodexWSStatelessSlots
+	}
+	settings.CodexOverloadThresholdPercent = database.NormalizeCodexOverloadThresholdPercent(settings.CodexOverloadThresholdPercent)
+	settings.CodexOverloadPauseMinutes = database.NormalizeCodexOverloadPauseMinutes(settings.CodexOverloadPauseMinutes)
+	settings.CodexOverloadWindowMinutes = database.NormalizeCodexOverloadWindowMinutes(settings.CodexOverloadWindowMinutes)
 	if settings.CodexContinueMaxRounds < minCodexContinueMaxRounds {
 		settings.CodexContinueMaxRounds = defaults.CodexContinueMaxRounds
 	}
@@ -300,7 +334,15 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSBusyMaxWaitSec = settings.CodexWSBusyAcquireMaxWaitSec
 		next.CodexWSBusyOverflow = settings.CodexWSBusyOverflowEnabled
 		next.CodexWSBusyPatienceSec = settings.CodexWSBusyPatienceSec
+		next.CodexWSStatelessSlots = settings.CodexWSStatelessSlots
+		next.GithubToken = strings.TrimSpace(settings.GithubToken)
+		next.GithubProxyURL = strings.TrimSpace(settings.GithubProxyURL)
+		next.CodexOverloadPauseEnabled = settings.CodexOverloadPauseEnabled
+		next.CodexOverloadThresholdPercent = settings.CodexOverloadThresholdPercent
+		next.CodexOverloadPauseMinutes = settings.CodexOverloadPauseMinutes
+		next.CodexOverloadWindowMinutes = settings.CodexOverloadWindowMinutes
 		next.OverflowAutoCompact = settings.OverflowAutoCompactEnabled
+		next.CompactViaResponses = settings.CompactViaResponsesEnabled
 		next.CodexPreflightSSEPassthrough = settings.CodexPreflightSSEPassthroughEnabled
 		next.FirstTokenExcludesWsAcquire = settings.FirstTokenExcludesWsAcquire
 		next.CodexContinueThinking = settings.CodexContinueThinkingEnabled

@@ -822,3 +822,51 @@ func TestUpsertOAuthIdentityAccountClearsBanOnReimport(t *testing.T) {
 		t.Fatalf("runtime HealthTier = %q, want not banned after reimport", tier)
 	}
 }
+
+// 重新授权(直接对已有账号 exchange-code)拿到新凭证后必须清除 error/401
+// 状态,与重新导入合并路径对齐;否则账号一直挂"异常"等一次可能失败的
+// 异步探针(issue #493)。限流冷却不受影响。
+func TestUpdateOAuthAccountCodeClearsErrorState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, cache.NewMemory(1), nil)
+	handler := &Handler{db: db, store: store}
+	handler.probeUsage = func(_ context.Context, _ *auth.Account) error { return nil }
+
+	newOAuthExchangeTestServer(t)
+
+	id := insertOAuthEditTestAccount(t, db, "oauth-errored", "old-refresh", "")
+	if err := db.SetError(context.Background(), id, "401 unauthorized"); err != nil {
+		t.Fatalf("SetError: %v", err)
+	}
+	if err := store.LoadAccountByID(context.Background(), id); err != nil {
+		t.Fatalf("LoadAccountByID: %v", err)
+	}
+
+	sessionID := "oauth-edit-clear-error-session"
+	globalOAuthStore.set(sessionID, &oauthSession{
+		State:        "state-clear-error",
+		CodeVerifier: "verifier-clear-error",
+		RedirectURI:  oauthDefaultRedirectURI,
+		CreatedAt:    time.Now(),
+	})
+	t.Cleanup(func() { globalOAuthStore.delete(sessionID) })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ctx.Request = newOAuthEditRequest(sessionID, "code-clear", "state-clear-error", "")
+
+	handler.UpdateOAuthAccountCode(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	row, err := db.GetAccountByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if !strings.EqualFold(row.Status, "active") || row.ErrorMessage != "" {
+		t.Fatalf("status=%q error=%q, want active with empty error", row.Status, row.ErrorMessage)
+	}
+}

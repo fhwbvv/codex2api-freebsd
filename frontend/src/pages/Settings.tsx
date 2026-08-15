@@ -1,4 +1,4 @@
-import type { ChangeEvent, ReactNode } from 'react'
+import type { ChangeEvent, FocusEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
@@ -60,19 +60,25 @@ import {
   ChevronDown,
   ChevronRight,
   CircleHelp,
+  Cloud,
   Database,
   ExternalLink,
   Gauge,
+  Globe,
   Image as ImageIcon,
   Layers,
   Link2,
   Palette,
   RefreshCw,
   Save,
+  Server,
   Shield,
+  ShieldAlert,
+  Terminal,
   Trash2,
   Timer,
   Upload,
+  Users,
   Wifi,
   Wrench,
   X,
@@ -699,40 +705,40 @@ function SettingsCard({
   return (
     <Card
       className={cn(
-        'gap-0 py-0',
-        tone === 'danger' && 'border-destructive/25 bg-destructive/[0.02]',
+        'gap-0 py-0 border-border/80 bg-card shadow-2xs transition-all duration-200 hover:border-border',
+        tone === 'danger' && 'border-destructive/30 bg-destructive/[0.02]',
         className,
       )}
     >
-      <CardContent className={cn('p-4 sm:p-5', contentClassName)}>
-        <div className="mb-4 flex shrink-0 items-start gap-3">
+      <CardContent className={cn('p-4.5 sm:p-5.5', contentClassName)}>
+        <div className="mb-4.5 flex shrink-0 items-start gap-3.5">
           {icon ? (
             <div
               className={cn(
-                'mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg ring-1 ring-inset sm:size-9 sm:rounded-xl',
+                'mt-0.5 flex size-8.5 shrink-0 items-center justify-center rounded-xl ring-1 ring-inset sm:size-9.5',
                 tone === 'danger'
-                  ? 'bg-destructive/10 text-destructive ring-destructive/15'
-                  : 'bg-primary/10 text-primary ring-primary/15',
+                  ? 'bg-destructive/10 text-destructive ring-destructive/20'
+                  : 'bg-primary/10 text-primary ring-primary/20',
               )}
               aria-hidden="true"
             >
-              <span className="[&_svg]:size-3.5 sm:[&_svg]:size-4">{icon}</span>
+              <span className="[&_svg]:size-4 sm:[&_svg]:size-4.5">{icon}</span>
             </div>
           ) : null}
           <div className="min-w-0 flex-1 pt-0.5">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
               <h3 className="text-[15px] font-semibold leading-snug tracking-tight text-foreground sm:text-base">
                 {title}
               </h3>
               {badge}
             </div>
             {description ? (
-              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{description}</p>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground/90">{description}</p>
             ) : null}
           </div>
         </div>
         {children}
-        {footer ? <div className="mt-4 border-t border-border pt-4 sm:mt-5">{footer}</div> : null}
+        {footer ? <div className="mt-4.5 border-t border-border/60 pt-4 sm:mt-5">{footer}</div> : null}
       </CardContent>
     </Card>
   )
@@ -797,13 +803,13 @@ function SettingField({
     return (
       <div
         className={cn(
-          'flex min-h-[48px] min-w-0 items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5',
+          'flex min-h-[52px] min-w-0 items-center justify-between gap-3 rounded-xl border border-border/70 bg-card p-3.5 shadow-2xs transition-colors hover:border-border/90',
           className,
         )}
       >
         <div className="min-w-0 flex-1 space-y-0.5">
           <div className="flex items-center gap-1.5">
-            <label className="block text-[13px] font-medium leading-snug text-foreground sm:text-sm">
+            <label className="block text-[13px] font-semibold leading-snug text-foreground sm:text-sm">
               {label}
             </label>
             {description ? <SettingHelp text={description} /> : null}
@@ -822,7 +828,7 @@ function SettingField({
   return (
     <div className={cn('flex min-w-0 flex-col gap-1.5', className)}>
       <div className="flex min-h-5 items-center gap-1.5">
-        <label className="block text-[13px] font-medium leading-none text-foreground sm:text-sm">
+        <label className="block text-[13px] font-semibold leading-none text-foreground sm:text-sm">
           {label}
         </label>
         {description ? <SettingHelp text={description} /> : null}
@@ -886,26 +892,26 @@ function ModelSummaryCard({
     <button
       type="button"
       onClick={onOpen}
-      className="group flex w-full items-start gap-3 rounded-lg border border-border/80 bg-card p-3.5 text-left shadow-sm transition-all hover:border-primary/30 hover:bg-muted/20 hover:shadow-md sm:p-4"
+      className="group flex w-full items-start gap-3.5 rounded-xl border border-border/70 bg-card p-4 text-left shadow-2xs transition-all hover:border-primary/40 hover:bg-muted/10 hover:shadow-xs"
     >
-      <div className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary ring-1 ring-primary/15">
-        <Layers className="size-4" />
+      <div className="mt-0.5 flex size-9.5 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary ring-1 ring-primary/20 transition-transform group-hover:scale-105">
+        <Layers className="size-4.5" />
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
-            <div className="text-[13px] font-semibold leading-snug text-foreground sm:text-sm">{title}</div>
+            <div className="text-sm font-semibold leading-snug text-foreground">{title}</div>
             <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
               {description}
             </p>
           </div>
-          <ChevronRight className="mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+          <ChevronRight className="mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary" />
         </div>
-        <div className="mt-2.5 flex flex-wrap items-center gap-2">
-          <Badge variant="secondary" className="tabular-nums">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Badge variant="secondary" className="text-xs font-semibold tabular-nums">
             {meta}
           </Badge>
-          <span className="text-[11px] font-semibold text-primary">{openLabel}</span>
+          <span className="text-xs font-semibold text-primary group-hover:underline">{openLabel}</span>
         </div>
       </div>
     </button>
@@ -915,20 +921,87 @@ function ModelSummaryCard({
 function StatusTile({
   label,
   children,
+  icon,
 }: {
   label: string
   children: ReactNode
+  icon?: ReactNode
 }) {
   return (
     <div
       data-slot="status-tile"
-      className="flex min-h-[72px] flex-col justify-between gap-2.5 rounded-lg border border-border/80 bg-muted/20 px-3.5 py-3"
+      className="flex min-h-[80px] flex-col justify-between gap-2.5 rounded-xl border border-border/70 bg-gradient-to-br from-card via-card to-muted/20 p-3.5 shadow-2xs transition-all hover:border-border"
     >
-      <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-        {label}
-      </span>
-      <div className="flex min-h-6 items-center text-sm font-semibold tabular-nums text-foreground">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/90">
+          {label}
+        </span>
+        {icon ? <span className="text-muted-foreground/70 [&_svg]:size-4">{icon}</span> : null}
+      </div>
+      <div className="flex min-h-6 items-center text-sm font-bold tabular-nums text-foreground">
         {children}
+      </div>
+    </div>
+  )
+}
+
+function SegmentedPillGroup<T extends string>({
+  value,
+  onChange,
+  options,
+  disabled = false,
+  className,
+}: {
+  value: T
+  onChange: (value: T) => void
+  options: Array<{ label: string; value: T; icon?: ReactNode }>
+  disabled?: boolean
+  className?: string
+}) {
+  const activeIndex = options.findIndex((opt) => opt.value === value)
+  const count = options.length
+
+  return (
+    <div
+      className={cn(
+        'relative flex items-center rounded-xl border border-border/70 bg-muted/35 p-1 shadow-2xs select-none',
+        className,
+      )}
+    >
+      {/* 平滑滑块背景 indicator */}
+      {activeIndex >= 0 && count > 0 ? (
+        <div
+          className="absolute inset-y-1 rounded-lg bg-background shadow-xs ring-1 ring-border/60 transition-all duration-200 ease-[cubic-bezier(0.16,1,0.3,1)]"
+          style={{
+            width: `calc((100% - 0.5rem) / ${count})`,
+            left: `calc(0.25rem + ${activeIndex} * ((100% - 0.5rem) / ${count}))`,
+          }}
+        />
+      ) : null}
+
+      {/* 选项按钮 */}
+      <div className="relative z-10 flex w-full items-center">
+        {options.map((opt) => {
+          const active = opt.value === value
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              disabled={disabled}
+              onClick={() => onChange(opt.value)}
+              className={cn(
+                'flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-semibold transition-colors duration-200 active:scale-98',
+                active
+                  ? 'text-foreground font-bold'
+                  : 'text-muted-foreground hover:text-foreground',
+                disabled && 'opacity-50 cursor-not-allowed',
+              )}
+            >
+              {opt.icon ? <span className="[&_svg]:size-3.5">{opt.icon}</span> : null}
+              <span className="whitespace-nowrap">{opt.label}</span>
+            </button>
+          )
+        })}
       </div>
     </div>
   )
@@ -938,20 +1011,30 @@ function SettingsSection({
   id,
   title,
   description,
+  icon,
   children,
 }: {
   id: string
   title: string
   description?: string
+  icon?: ReactNode
   children: ReactNode
 }) {
   return (
-    <section id={id} data-settings-section={id} className="scroll-mt-24 space-y-3.5 sm:scroll-mt-28">
-      <div className="px-0.5">
-        <h2 className="text-sm font-semibold tracking-tight text-foreground">{title}</h2>
-        {description ? (
-          <p className="mt-0.5 max-w-2xl text-xs leading-relaxed text-muted-foreground">{description}</p>
+    <section id={id} data-settings-section={id} className="scroll-mt-24 space-y-4 sm:scroll-mt-28">
+      <div className="flex items-center gap-3 px-0.5">
+        {icon ? (
+          <div className="flex size-7.5 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary ring-1 ring-primary/20">
+            <span className="[&_svg]:size-4">{icon}</span>
+          </div>
         ) : null}
+        <div className="min-w-0">
+          <h2 className="text-base font-bold tracking-tight text-foreground sm:text-lg">{title}</h2>
+          {description ? (
+            <p className="mt-0.5 max-w-3xl text-xs leading-relaxed text-muted-foreground">{description}</p>
+          ) : null}
+        </div>
+        <div className="h-px flex-1 bg-border/60" />
       </div>
       <div className="space-y-4">{children}</div>
     </section>
@@ -1117,10 +1200,17 @@ export default function Settings() {
   const schedulerModeOptions = [
     { label: t('settings.schedulerModeRoundRobin'), value: 'round_robin' },
     { label: t('settings.schedulerModeRemainingQuota'), value: 'remaining_quota' },
+    { label: t('settings.schedulerModeFillFirst'), value: 'fill_first' },
   ]
   const transportRetryPolicyOptions = [
     { label: t('settings.transportRetryPolicyRotate'), value: 'rotate' },
     { label: t('settings.transportRetryPolicySticky'), value: 'sticky' },
+  ]
+  const codexFingerprintDefaultModeOptions = [
+    { label: t('accounts.codexFingerprintModeOff'), value: 'off' },
+    { label: t('accounts.codexFingerprintModeDevice'), value: 'device' },
+    { label: t('accounts.codexFingerprintModeSession'), value: 'session' },
+    { label: t('accounts.codexFingerprintModeFull'), value: 'full' },
   ]
   const modelCooldownModeOptions = [
     { label: t('settings.modelCooldownModeOff'), value: 'off' },
@@ -1222,8 +1312,16 @@ export default function Settings() {
     codex_ws_busy_acquire_max_wait_sec: 30,
     codex_ws_busy_overflow_enabled: false,
     codex_ws_busy_patience_sec: 2,
+    codex_ws_stateless_slots: 8,
+    github_token_configured: false,
+    github_proxy_url: '',
+    codex_overload_pause_enabled: false,
+    codex_overload_threshold_percent: 20,
+    codex_overload_pause_minutes: 30,
+    codex_overload_window_minutes: 5,
     codex_continue_thinking_enabled: false,
     overflow_auto_compact_enabled: false,
+    compact_via_responses_enabled: false,
     codex_preflight_sse_passthrough_enabled: false,
     codex_continue_max_rounds: 8,
     utls_shutdown_timeout_minutes: 30,
@@ -1239,6 +1337,7 @@ export default function Settings() {
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
     transport_retry_policy: 'rotate',
+    codex_fingerprint_default_mode: 'off',
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -1329,6 +1428,8 @@ export default function Settings() {
   const [modelsSourceURL, setModelsSourceURL] = useState('')
   const [syncingModels, setSyncingModels] = useState(false)
   const [syncingCliVersion, setSyncingCliVersion] = useState(false)
+  // GitHub token 只写不回显：草稿态独立于 settingsForm，提交后清空（issue #522）
+  const [githubTokenDraft, setGithubTokenDraft] = useState('')
   const [syncedCliVersion, setSyncedCliVersion] = useState('')
   const logoFileInputRef = useRef<HTMLInputElement>(null)
   const backgroundFileInputRef = useRef<HTMLInputElement>(null)
@@ -1919,8 +2020,8 @@ export default function Settings() {
         {/* 顶部分段导航 + 自动保存状态：视口顶部居中固定 */}
         <div
           className={cn(
-            'fixed left-1/2 top-[max(0.625rem,env(safe-area-inset-top,0px))] z-50 flex -translate-x-1/2 items-center gap-2',
-            'max-w-[min(72rem,calc(100vw-1.25rem))]',
+            'fixed left-1/2 top-[max(0.625rem,env(safe-area-inset-top,0px))] z-50 flex w-full -translate-x-1/2 items-center gap-2',
+            'max-w-[min(72rem,calc(100vw-1.25rem))] px-1',
           )}
         >
           <nav
@@ -1942,9 +2043,9 @@ export default function Settings() {
                   aria-current={active ? 'true' : undefined}
                   onClick={() => scrollToSection(section.id)}
                   className={cn(
-                    'inline-flex shrink-0 items-center gap-2 rounded-full px-3.5 py-2 text-[13px] font-semibold tracking-tight transition-all duration-200 sm:px-4 sm:py-2.5 sm:text-sm',
+                    'inline-flex shrink-0 items-center gap-2 rounded-full px-3.5 py-1.5 text-[13px] font-semibold tracking-tight transition-all duration-200 sm:px-4 sm:py-2 sm:text-xs',
                     active
-                      ? 'bg-primary text-primary-foreground shadow-sm'
+                      ? 'bg-primary text-primary-foreground shadow-2xs ring-1 ring-primary/20 scale-[1.02]'
                       : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground',
                   )}
                 >
@@ -1970,7 +2071,7 @@ export default function Settings() {
         />
 
         <div className="space-y-6 pb-20 sm:pb-0">
-          <SettingsSection id="settings-overview" title={t('settings.nav.overview')} description={t('settings.nav.overviewDesc')}>
+          <SettingsSection id="settings-overview" title={t('settings.nav.overview')} description={t('settings.nav.overviewDesc')} icon={<Activity className="size-4" />}>
           <SettingsCard
             title={t('settings.systemStatus')}
             icon={<Activity className="size-4" />}
@@ -1981,22 +2082,22 @@ export default function Settings() {
             }
           >
             <div className="grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-4">
-              <StatusTile label={t('settings.service')}>
+              <StatusTile label={t('settings.service')} icon={<Activity className="size-4" />}>
                 <Badge variant={health?.status === 'ok' ? 'default' : 'destructive'} className="gap-1.5">
                   <span className={`size-1.5 rounded-full ${health?.status === 'ok' ? 'bg-emerald-500' : 'bg-red-400'}`} />
                   {health?.status === 'ok' ? t('common.running') : t('common.error')}
                 </Badge>
               </StatusTile>
-              <StatusTile label={t('settings.accountsLabel')}>
+              <StatusTile label={t('settings.accountsLabel')} icon={<Users className="size-4" />}>
                 {health?.available ?? 0} / {health?.total ?? 0}
               </StatusTile>
-              <StatusTile label={settingsForm.database_label}>
+              <StatusTile label={settingsForm.database_label} icon={<Database className="size-4" />}>
                 <Badge variant="default" className="gap-1.5">
                   <span className="size-1.5 rounded-full bg-emerald-500" />
                   {isExternalDatabase ? t('common.connected') : t('common.running')}
                 </Badge>
               </StatusTile>
-              <StatusTile label={settingsForm.cache_label}>
+              <StatusTile label={settingsForm.cache_label} icon={<Layers className="size-4" />}>
                 <Badge variant="default" className="gap-1.5">
                   <span className="size-1.5 rounded-full bg-emerald-500" />
                   {isExternalCache ? t('common.connected') : t('common.running')}
@@ -2006,7 +2107,7 @@ export default function Settings() {
           </SettingsCard>
           </SettingsSection>
 
-          <SettingsSection id="settings-traffic" title={t('settings.nav.traffic')} description={t('settings.nav.trafficDesc')}>
+          <SettingsSection id="settings-traffic" title={t('settings.nav.traffic')} description={t('settings.nav.trafficDesc')} icon={<Gauge className="size-4" />}>
           <div className="grid gap-4 lg:grid-cols-2">
             <SettingsCard title={t('settings.trafficProtection')} icon={<Gauge className="size-4" />}>
               <div className={SETTINGS_FIELD_GRID}>
@@ -2054,9 +2155,9 @@ export default function Settings() {
                   />
                 </SettingField>
                 <SettingField label={t('settings.transportRetryPolicy')} description={t('settings.transportRetryPolicyDesc')}>
-                  <Select
+                  <SegmentedPillGroup
                     value={settingsForm.transport_retry_policy || 'rotate'}
-                    onValueChange={(value) => autoSaveStringField('transport_retry_policy', value)}
+                    onChange={(value) => autoSaveStringField('transport_retry_policy', value)}
                     options={transportRetryPolicyOptions}
                   />
                 </SettingField>
@@ -2141,9 +2242,9 @@ export default function Settings() {
                 </div>
                 <div className={SETTINGS_FIELD_GRID}>
                   <SettingField label={t('settings.modelCooldownMode')} description={t('settings.modelCooldownModeDesc')}>
-                    <Select
+                    <SegmentedPillGroup
                       value={settingsForm.relay_model_cooldown_mode}
-                      onValueChange={(value) => autoSaveStringField('relay_model_cooldown_mode', value)}
+                      onChange={(value) => autoSaveStringField('relay_model_cooldown_mode', value)}
                       options={modelCooldownModeOptions}
                     />
                   </SettingField>
@@ -2186,9 +2287,9 @@ export default function Settings() {
                 </div>
                 <div className={SETTINGS_FIELD_GRID}>
                   <SettingField label={t('settings.modelCooldownMode')} description={t('settings.modelCooldownModeDesc')}>
-                    <Select
+                    <SegmentedPillGroup
                       value={settingsForm.oauth_model_cooldown_mode}
-                      onValueChange={(value) => autoSaveStringField('oauth_model_cooldown_mode', value)}
+                      onChange={(value) => autoSaveStringField('oauth_model_cooldown_mode', value)}
                       options={modelCooldownModeOptions}
                     />
                   </SettingField>
@@ -2284,8 +2385,61 @@ export default function Settings() {
           </SettingsCard>
 
           <SettingsCard title={t('settings.schedulingStrategy')} icon={<Layers className="size-4" />}>
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="space-y-3 rounded-xl border border-border/60 bg-muted/10 p-3.5">
+                <div>
+                  <h3 className="text-sm font-semibold">{t('settings.schedulingAccountGroup')}</h3>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    {t('settings.schedulingAccountGroupDesc')}
+                  </p>
+                </div>
+                <SettingField label={t('settings.fastSchedulerEnabled')} description={t('settings.fastSchedulerEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.fast_scheduler_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('fast_scheduler_enabled', checked)}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.schedulerMode')}
+                  description={t('settings.schedulerModeDesc')}
+                  warning={settingsForm.fast_scheduler_enabled ? undefined : t('settings.schedulerModeRequiresFast')}
+                  className={cn(!settingsForm.fast_scheduler_enabled && 'opacity-60')}
+                >
+                  <SegmentedPillGroup
+                    value={settingsForm.scheduler_mode}
+                    onChange={(value) => autoSaveStringField('scheduler_mode', value)}
+                    options={schedulerModeOptions}
+                  />
+                </SettingField>
+              </div>
+
+              <div className="space-y-3 rounded-xl border border-border/60 bg-muted/10 p-3.5">
+                <div>
+                  <h3 className="text-sm font-semibold">{t('settings.schedulingAffinityGroup')}</h3>
+                  <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                    {t('settings.schedulingAffinityGroupDesc')}
+                  </p>
+                </div>
+                <SettingField label={t('settings.affinityMode')} description={t('settings.affinityModeDesc')}>
+                  <SegmentedPillGroup
+                    value={settingsForm.affinity_mode || 'bounded'}
+                    onChange={(value) => autoSaveStringField('affinity_mode', value)}
+                    options={affinityModeOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.sessionAffinitySpread')} description={t('settings.sessionAffinitySpreadDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.session_affinity_spread}
+                    onCheckedChange={(checked) => autoSaveBooleanField('session_affinity_spread', checked)}
+                  />
+                </SettingField>
+              </div>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.connectivityTest')} description={t('settings.connectivityTestDesc')} icon={<Wifi className="size-4" />}>
             <div className="space-y-4">
-              <div className={SETTINGS_FIELD_GRID_3}>
+              <div className={SETTINGS_FIELD_GRID}>
                 <SettingField label={t('settings.testModelLabel')} description={t('settings.testModelHint')}>
                   <Select
                     value={settingsForm.test_model}
@@ -2301,47 +2455,19 @@ export default function Settings() {
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, test_concurrency: value }))}
                   />
                 </SettingField>
-                <SettingField label={t('settings.schedulerMode')} description={t('settings.schedulerModeDesc')}>
-                  <Select
-                    value={settingsForm.scheduler_mode}
-                    onValueChange={(value) => autoSaveStringField('scheduler_mode', value)}
-                    options={schedulerModeOptions}
-                  />
-                </SettingField>
-                <SettingField label={t('settings.affinityMode')} description={t('settings.affinityModeDesc')}>
-                  <Select
-                    value={settingsForm.affinity_mode || 'bounded'}
-                    onValueChange={(value) => autoSaveStringField('affinity_mode', value)}
-                    options={affinityModeOptions}
-                  />
-                </SettingField>
-                <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.testContent')} description={t('settings.testContentDesc')}>
-                  <textarea
-                    rows={3}
-                    value={settingsForm.test_content}
-                    placeholder={t('settings.testContentPlaceholder')}
-                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setSettingsForm(f => ({ ...f, test_content: e.target.value }))}
-                    onBlur={(e) => autoSaveStringField('test_content', e.currentTarget.value)}
-                    className={cn(
-                      'flex min-h-[88px] w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground shadow-xs transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50',
-                    )}
-                  />
-                </SettingField>
               </div>
-              <div className={SETTINGS_SWITCH_GRID}>
-                <SettingField label={t('settings.fastSchedulerEnabled')} description={t('settings.fastSchedulerEnabledDesc')} layout="switch">
-                  <Switch
-                    checked={settingsForm.fast_scheduler_enabled}
-                    onCheckedChange={(checked) => autoSaveBooleanField('fast_scheduler_enabled', checked)}
-                  />
-                </SettingField>
-                <SettingField label={t('settings.sessionAffinitySpread')} description={t('settings.sessionAffinitySpreadDesc')} layout="switch">
-                  <Switch
-                    checked={settingsForm.session_affinity_spread}
-                    onCheckedChange={(checked) => autoSaveBooleanField('session_affinity_spread', checked)}
-                  />
-                </SettingField>
-              </div>
+              <SettingField label={t('settings.testContent')} description={t('settings.testContentDesc')}>
+                <textarea
+                  rows={3}
+                  value={settingsForm.test_content}
+                  placeholder={t('settings.testContentPlaceholder')}
+                  onChange={(e: ChangeEvent<HTMLTextAreaElement>) => setSettingsForm(f => ({ ...f, test_content: e.target.value }))}
+                  onBlur={(e) => autoSaveStringField('test_content', e.currentTarget.value)}
+                  className={cn(
+                    'flex min-h-[88px] w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground shadow-xs transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50',
+                  )}
+                />
+              </SettingField>
             </div>
           </SettingsCard>
 
@@ -2474,7 +2600,7 @@ export default function Settings() {
 
           </SettingsSection>
 
-          <SettingsSection id="settings-grok" title={t('settings.nav.grok')} description={t('settings.nav.grokDesc')}>
+          <SettingsSection id="settings-grok" title={t('settings.nav.grok')} description={t('settings.nav.grokDesc')} icon={<ChannelLogo channel="grok" size={16} />}>
           <SettingsCard title={t('settings.grokSettingsTitle')} description={t('settings.grokSettingsDesc')} icon={<ChannelLogo channel="grok" size={16} />}>
             {/* 与「探测调度」一致：表单控件同宽网格，开关单独一行，避免 switch 卡片与 input 混排导致高低宽不一致。 */}
             <div className="space-y-4">
@@ -2567,7 +2693,7 @@ export default function Settings() {
           </SettingsCard>
           </SettingsSection>
 
-          <SettingsSection id="settings-runtime" title={t('settings.nav.runtime')} description={t('settings.nav.runtimeDesc')}>
+          <SettingsSection id="settings-runtime" title={t('settings.nav.runtime')} description={t('settings.nav.runtimeDesc')} icon={<Wrench className="size-4" />}>
           <SettingsCard
             title={t('settings.responseCache.title')}
             description={t('settings.responseCache.description')}
@@ -2630,6 +2756,42 @@ export default function Settings() {
                   {responseCacheValidationMessage}
                 </p>
               ) : null}
+
+              {/* 可视化预算分配比例条 (Memory Allocation Bar) */}
+              <div className="rounded-xl border border-border/70 bg-muted/20 p-3.5 space-y-2.5">
+                <div className="flex items-center justify-between text-xs font-semibold">
+                  <span className="text-foreground">内存缓存分配预览 (Memory Allocation)</span>
+                  <span className="font-mono text-primary font-bold">{responseCacheBudget.totalMiB} MiB</span>
+                </div>
+                <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-muted shadow-inner">
+                  <div
+                    className="bg-primary transition-all duration-300"
+                    style={{ width: `${Math.min(100, Math.round((responseCacheBudget.entryMiB / Math.max(1, responseCacheBudget.totalMiB)) * 100))}%` }}
+                  />
+                  <div
+                    className="bg-amber-500 transition-all duration-300"
+                    style={{ width: `${Math.min(100 - Math.round((responseCacheBudget.entryMiB / Math.max(1, responseCacheBudget.totalMiB)) * 100), Math.round((responseCacheBudget.reconstructMiB / Math.max(1, responseCacheBudget.totalMiB)) * 100))}%` }}
+                  />
+                  <div
+                    className="bg-emerald-500/40 flex-1 transition-all duration-300"
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[11px] text-muted-foreground">
+                  <div className="flex items-center gap-1.5">
+                    <span className="size-2 rounded-full bg-primary" />
+                    <span>{t('settings.responseCache.entry')}: <strong className="text-foreground font-mono">{responseCacheBudget.entryMiB} MiB</strong> ({Math.round((responseCacheBudget.entryMiB / Math.max(1, responseCacheBudget.totalMiB)) * 100)}%)</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="size-2 rounded-full bg-amber-500" />
+                    <span>{t('settings.responseCache.reconstruct')}: <strong className="text-foreground font-mono">{responseCacheBudget.reconstructMiB} MiB</strong> ({Math.round((responseCacheBudget.reconstructMiB / Math.max(1, responseCacheBudget.totalMiB)) * 100)}%)</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="size-2 rounded-full bg-emerald-500/60" />
+                    <span>常驻热点池: <strong className="text-foreground font-mono">{Math.max(0, responseCacheBudget.totalMiB - responseCacheBudget.entryMiB - responseCacheBudget.reconstructMiB)} MiB</strong></span>
+                  </div>
+                </div>
+              </div>
+
               <div className="rounded-lg border border-primary/15 bg-primary/5 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
                 <p>{t('settings.responseCache.l1Note')}</p>
                 <p className="mt-1.5">{t('settings.responseCache.memoryNote')}</p>
@@ -2765,6 +2927,23 @@ export default function Settings() {
                     }}
                   />
                 </SettingField>
+                <SettingField
+                  label={t('settings.codexWSStatelessSlots')}
+                  description={t('settings.codexWSStatelessSlotsDesc')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={32}
+                    value={settingsForm.codex_ws_stateless_slots}
+                    emptyValue={8}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_stateless_slots: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({
+                        codex_ws_stateless_slots: value,
+                      })
+                    }}
+                  />
+                </SettingField>
               </div>
             </div>
           </SettingsCard>
@@ -2814,6 +2993,17 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
+          <SettingsCard title={t('settings.compactViaResponses')} description={t('settings.compactViaResponsesDesc')} icon={<Layers className="size-4" />}>
+            <div className={SETTINGS_SWITCH_GRID}>
+              <SettingField label={t('settings.compactViaResponsesEnabled')} description={t('settings.compactViaResponsesEnabledDesc')} layout="switch">
+                <Switch
+                  checked={settingsForm.compact_via_responses_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField('compact_via_responses_enabled', checked)}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.codexPreflightSSEPassthrough')} description={t('settings.codexPreflightSSEPassthroughDesc')} icon={<Layers className="size-4" />}>
             <div className={SETTINGS_SWITCH_GRID}>
               <SettingField label={t('settings.codexPreflightSSEPassthroughEnabled')} description={t('settings.codexPreflightSSEPassthroughEnabledDesc')} layout="switch">
@@ -2825,13 +3015,120 @@ export default function Settings() {
             </div>
           </SettingsCard>
 
+          <SettingsCard title={t('settings.codexOverloadPause')} description={t('settings.codexOverloadPauseDesc')} icon={<ShieldAlert className="size-4" />}>
+            <div className="space-y-4">
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.codexOverloadPauseEnabled')} description={t('settings.codexOverloadPauseEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_overload_pause_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_overload_pause_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
+              <div className={cn(SETTINGS_FIELD_GRID_3, !settingsForm.codex_overload_pause_enabled && 'opacity-60')}>
+                <SettingField
+                  label={t('settings.codexOverloadThreshold')}
+                  description={t('settings.codexOverloadThresholdDesc')}
+                  suffix="%"
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={100}
+                    disabled={!settingsForm.codex_overload_pause_enabled}
+                    value={settingsForm.codex_overload_threshold_percent}
+                    emptyValue={20}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_overload_threshold_percent: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ codex_overload_threshold_percent: value })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexOverloadPauseMinutes')}
+                  description={t('settings.codexOverloadPauseMinutesDesc')}
+                  suffix={t('settings.unit.min')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={1440}
+                    disabled={!settingsForm.codex_overload_pause_enabled}
+                    value={settingsForm.codex_overload_pause_minutes}
+                    emptyValue={30}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_overload_pause_minutes: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ codex_overload_pause_minutes: value })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexOverloadWindow')}
+                  description={t('settings.codexOverloadWindowDesc')}
+                  suffix={t('settings.unit.min')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={120}
+                    disabled={!settingsForm.codex_overload_pause_enabled}
+                    value={settingsForm.codex_overload_window_minutes}
+                    emptyValue={5}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_overload_window_minutes: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ codex_overload_window_minutes: value })
+                    }}
+                  />
+                </SettingField>
+              </div>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.githubAccess')} description={t('settings.githubAccessDesc')} icon={<Globe className="size-4" />}>
+            <div className={SETTINGS_FIELD_GRID}>
+              <SettingField label={t('settings.githubToken')} description={t('settings.githubTokenDesc')}>
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="password"
+                    autoComplete="off"
+                    placeholder={settingsForm.github_token_configured ? t('settings.githubTokenConfiguredPlaceholder') : t('settings.githubTokenPlaceholder')}
+                    value={githubTokenDraft}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setGithubTokenDraft(e.target.value)}
+                    onBlur={() => {
+                      const value = githubTokenDraft.trim()
+                      if (!value) return
+                      void autoSaveSettingsPatch({ github_token: value, github_token_configured: true })
+                      setGithubTokenDraft('')
+                    }}
+                  />
+                  {settingsForm.github_token_configured && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        void autoSaveSettingsPatch({ github_token: '', github_token_configured: false })
+                      }}
+                    >
+                      {t('settings.githubTokenClear')}
+                    </Button>
+                  )}
+                </div>
+              </SettingField>
+              <SettingField label={t('settings.githubProxy')} description={t('settings.githubProxyDesc')}>
+                <Input
+                  value={settingsForm.github_proxy_url}
+                  placeholder="http://host:port / socks5://host:port"
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, github_proxy_url: e.target.value }))}
+                  onBlur={(e: FocusEvent<HTMLInputElement>) => autoSaveStringField('github_proxy_url', e.target.value.trim())}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.runtimeOptimization')} description={t('settings.runtimeOptimizationDesc')} icon={<Wrench className="size-4" />}>
             <div className="space-y-4">
               <div className={SETTINGS_FIELD_GRID_3}>
                 <SettingField label={t('settings.clientCompatMode')} description={t('settings.clientCompatModeDesc')}>
-                  <Select
+                  <SegmentedPillGroup
                     value={settingsForm.client_compat_mode}
-                    onValueChange={(value) => autoSaveStringField('client_compat_mode', value)}
+                    onChange={(value) => autoSaveStringField('client_compat_mode', value)}
                     options={clientCompatOptions}
                   />
                 </SettingField>
@@ -2923,6 +3220,13 @@ export default function Settings() {
                     </span>
                   </div>
                 </SettingField>
+                <SettingField label={t('settings.codexFingerprintDefaultMode')} description={t('settings.codexFingerprintDefaultModeDesc')}>
+                  <Select
+                    value={settingsForm.codex_fingerprint_default_mode || 'off'}
+                    onValueChange={(value) => autoSaveStringField('codex_fingerprint_default_mode', value)}
+                    options={codexFingerprintDefaultModeOptions}
+                  />
+                </SettingField>
                 <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUserAgentRaw')} description={t('settings.codexUserAgentRawDesc')}>
                   <Input
                     className="font-mono text-xs"
@@ -3011,16 +3315,16 @@ export default function Settings() {
                   />
                 </SettingField>
                 <SettingField label={t('settings.billingTierPolicy')} description={t('settings.billingTierPolicyDesc')}>
-                  <Select
+                  <SegmentedPillGroup
                     value={settingsForm.billing_tier_policy}
-                    onValueChange={(value) => autoSaveStringField('billing_tier_policy', value)}
+                    onChange={(value) => autoSaveStringField('billing_tier_policy', value)}
                     options={billingTierPolicyOptions}
                   />
                 </SettingField>
                 <SettingField label={t('settings.streamFlushPolicy')} description={t('settings.streamFlushPolicyDesc')}>
-                  <Select
+                  <SegmentedPillGroup
                     value={settingsForm.stream_flush_policy}
-                    onValueChange={(value) => autoSaveStringField('stream_flush_policy', value)}
+                    onChange={(value) => autoSaveStringField('stream_flush_policy', value)}
                     options={streamFlushPolicyOptions}
                   />
                 </SettingField>
@@ -3033,9 +3337,9 @@ export default function Settings() {
                   />
                 </SettingField>
                 <SettingField label={t('settings.firstTokenMode')} description={t('settings.firstTokenModeDesc')}>
-                  <Select
+                  <SegmentedPillGroup
                     value={settingsForm.first_token_mode}
-                    onValueChange={(value) => autoSaveStringField('first_token_mode', value)}
+                    onChange={(value) => autoSaveStringField('first_token_mode', value)}
                     options={firstTokenModeOptions}
                   />
                 </SettingField>
@@ -3124,67 +3428,74 @@ export default function Settings() {
 
           </SettingsSection>
 
-          <SettingsSection id="settings-storage" title={t('settings.nav.storage')} description={t('settings.nav.storageDesc')}>
+          <SettingsSection id="settings-storage" title={t('settings.nav.storage')} description={t('settings.nav.storageDesc')} icon={<ImageIcon className="size-4" />}>
           <SettingsCard title={t('settings.imageStorage')} description={t('settings.imageStorageDesc')} icon={<ImageIcon className="size-4" />}>
-            <div className={SETTINGS_FIELD_GRID_3}>
+            <div className="space-y-4">
               <SettingField label={t('settings.imageStorageBackend')} description={t('settings.imageStorageBackendDesc')}>
-                <Select
+                <SegmentedPillGroup
                   value={settingsForm.image_storage_backend}
-                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, image_storage_backend: value }))}
+                  onChange={(value) => setSettingsForm((f) => ({ ...f, image_storage_backend: value }))}
                   options={imageStorageBackendOptions}
                 />
               </SettingField>
+
               {settingsForm.image_storage_backend === 's3' ? (
-                <>
-                  <SettingField label={t('settings.imageS3Endpoint')} description={t('settings.imageS3EndpointDesc')}>
-                    <Input
-                      value={settingsForm.image_s3_endpoint}
-                      placeholder="https://..."
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_endpoint: e.target.value }))}
-                    />
-                  </SettingField>
-                  <SettingField label={t('settings.imageS3Region')} description={t('settings.imageS3RegionDesc')}>
-                    <Input
-                      value={settingsForm.image_s3_region}
-                      placeholder="auto"
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_region: e.target.value }))}
-                    />
-                  </SettingField>
-                  <SettingField label={t('settings.imageS3Bucket')} description={t('settings.imageS3BucketDesc')}>
-                    <Input
-                      value={settingsForm.image_s3_bucket}
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_bucket: e.target.value }))}
-                    />
-                  </SettingField>
-                  <SettingField label={t('settings.imageS3AccessKey')} description={t('settings.imageS3AccessKeyDesc')}>
-                    <Input
-                      value={settingsForm.image_s3_access_key}
-                      autoComplete="off"
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_access_key: e.target.value }))}
-                    />
-                  </SettingField>
-                  <SettingField label={t('settings.imageS3SecretKey')} description={t('settings.imageS3SecretKeyDesc')}>
-                    <Input
-                      type="password"
-                      value={settingsForm.image_s3_secret_key}
-                      autoComplete="new-password"
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_secret_key: e.target.value }))}
-                    />
-                  </SettingField>
-                  <SettingField label={t('settings.imageS3Prefix')} description={t('settings.imageS3PrefixDesc')}>
-                    <Input
-                      value={settingsForm.image_s3_prefix}
-                      placeholder="codex/images"
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_prefix: e.target.value }))}
-                    />
-                  </SettingField>
+                <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 space-y-4">
+                  <div className="flex items-center gap-2 font-semibold text-foreground text-sm border-b border-primary/10 pb-2.5">
+                    <Cloud className="size-4 text-primary" />
+                    <span>对象存储凭证 (S3 Compatible Storage)</span>
+                  </div>
+                  <div className={SETTINGS_FIELD_GRID_3}>
+                    <SettingField label={t('settings.imageS3Endpoint')} description={t('settings.imageS3EndpointDesc')}>
+                      <Input
+                        value={settingsForm.image_s3_endpoint}
+                        placeholder="https://..."
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_endpoint: e.target.value }))}
+                      />
+                    </SettingField>
+                    <SettingField label={t('settings.imageS3Region')} description={t('settings.imageS3RegionDesc')}>
+                      <Input
+                        value={settingsForm.image_s3_region}
+                        placeholder="auto"
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_region: e.target.value }))}
+                      />
+                    </SettingField>
+                    <SettingField label={t('settings.imageS3Bucket')} description={t('settings.imageS3BucketDesc')}>
+                      <Input
+                        value={settingsForm.image_s3_bucket}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_bucket: e.target.value }))}
+                      />
+                    </SettingField>
+                    <SettingField label={t('settings.imageS3AccessKey')} description={t('settings.imageS3AccessKeyDesc')}>
+                      <Input
+                        value={settingsForm.image_s3_access_key}
+                        autoComplete="off"
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_access_key: e.target.value }))}
+                      />
+                    </SettingField>
+                    <SettingField label={t('settings.imageS3SecretKey')} description={t('settings.imageS3SecretKeyDesc')}>
+                      <Input
+                        type="password"
+                        value={settingsForm.image_s3_secret_key}
+                        autoComplete="new-password"
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_secret_key: e.target.value }))}
+                      />
+                    </SettingField>
+                    <SettingField label={t('settings.imageS3Prefix')} description={t('settings.imageS3PrefixDesc')}>
+                      <Input
+                        value={settingsForm.image_s3_prefix}
+                        placeholder="codex/images"
+                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, image_s3_prefix: e.target.value }))}
+                      />
+                    </SettingField>
+                  </div>
                   <SettingField label={t('settings.imageS3ForcePathStyle')} description={t('settings.imageS3ForcePathStyleDesc')} layout="switch">
                     <Switch
                       checked={settingsForm.image_s3_force_path_style}
                       onCheckedChange={(checked) => autoSaveBooleanField('image_s3_force_path_style', checked)}
                     />
                   </SettingField>
-                </>
+                </div>
               ) : null}
             </div>
             {settingsForm.image_storage_backend === 's3' ? (
@@ -3239,7 +3550,7 @@ export default function Settings() {
           </SettingsCard>
           </SettingsSection>
 
-          <SettingsSection id="settings-security" title={t('settings.nav.security')} description={t('settings.nav.securityDesc')}>
+          <SettingsSection id="settings-security" title={t('settings.nav.security')} description={t('settings.nav.securityDesc')} icon={<Shield className="size-4" />}>
             <SettingsCard
               title={t('settings.security')}
               icon={<Shield className="size-4" />}
@@ -3251,6 +3562,22 @@ export default function Settings() {
               }
             >
               <div className="space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-destructive/20 bg-destructive/5 p-3.5 text-xs">
+                  <div className="flex items-center gap-2 font-medium text-foreground">
+                    <ShieldAlert className="size-4 text-destructive" />
+                    <span>系统防护与审计 (Security Guard)</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Badge variant={settingsForm.prompt_filter_enabled ? 'default' : 'outline'} className="text-[11px] gap-1">
+                      <span className={`size-1.5 rounded-full ${settingsForm.prompt_filter_enabled ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                      Prompt 风控: {settingsForm.prompt_filter_enabled ? '已开启' : '未开启'}
+                    </Badge>
+                    <Badge variant="secondary" className="text-[11px] uppercase font-mono">
+                      模式: {settingsForm.prompt_filter_mode}
+                    </Badge>
+                  </div>
+                </div>
+
                 <div className={SETTINGS_FIELD_GRID}>
                   <SettingField
                     label={t('settings.adminSecret')}
@@ -3312,7 +3639,7 @@ export default function Settings() {
             </SettingsCard>
           </SettingsSection>
 
-          <SettingsSection id="settings-appearance" title={t('settings.nav.appearance')} description={t('settings.nav.appearanceDesc')}>
+          <SettingsSection id="settings-appearance" title={t('settings.nav.appearance')} description={t('settings.nav.appearanceDesc')} icon={<Palette className="size-4" />}>
             <SettingsCard title={t('settings.display')} icon={<Palette className="size-4" />}>
               <div className="space-y-4">
                 <div className={SETTINGS_FIELD_GRID}>
@@ -3403,7 +3730,7 @@ export default function Settings() {
 
           <SettingsCard title={t('settings.backgroundImage')} description={t('settings.backgroundImageDesc')} icon={<ImageIcon className="size-4" />}>
             <div className="grid gap-5 xl:grid-cols-[minmax(0,1.4fr)_minmax(280px,0.6fr)] xl:items-start">
-              <div className="relative aspect-[16/7] min-h-[160px] overflow-hidden rounded-lg border border-border bg-muted/40 shadow-sm max-sm:aspect-[4/3] sm:min-h-[200px]">
+              <div className="relative aspect-[16/7] min-h-[180px] overflow-hidden rounded-xl border border-border/80 bg-muted/40 shadow-inner max-sm:aspect-[4/3] sm:min-h-[220px]">
                 {backgroundImagePreview && backgroundIsVideo ? (
                   <video
                     src={backgroundImagePreview}
@@ -3430,10 +3757,36 @@ export default function Settings() {
                     }}
                   />
                 ) : (
-                  <div className="flex size-full items-center justify-center text-xs font-medium text-muted-foreground">
+                  <div className="flex size-full items-center justify-center text-xs font-medium text-muted-foreground bg-gradient-to-br from-primary/10 via-muted/30 to-background">
                     {t('settings.backgroundImageEmpty')}
                   </div>
                 )}
+                {/* 毛玻璃效果实时预览卡片 (Glassmorphism Live Preview Overlay) */}
+                <div
+                  className="absolute inset-x-4 bottom-4 flex items-center justify-between rounded-xl border border-white/20 bg-background/60 p-3 shadow-lg backdrop-blur-md dark:border-white/10 dark:bg-black/50"
+                  style={{
+                    backgroundColor: `rgba(var(--bg-card-rgb, 255, 255, 255), ${Math.min(1, Math.max(0, settingsForm.background_glass_opacity / 100))})`,
+                    backdropFilter: `blur(${settingsForm.background_glass_blur}px)`,
+                    WebkitBackdropFilter: `blur(${settingsForm.background_glass_blur}px)`,
+                  }}
+                >
+                  <div className="flex items-center gap-2.5">
+                    {siteLogoPreview ? (
+                      <img src={siteLogoPreview} alt="" className="size-6 rounded object-contain shadow-2xs" />
+                    ) : (
+                      <div className="size-6 rounded bg-primary/20 flex items-center justify-center text-[10px] font-bold text-primary">
+                        CP
+                      </div>
+                    )}
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-bold leading-none text-foreground">{settingsForm.site_name || 'CodexProxy'}</div>
+                      <div className="text-[10px] text-muted-foreground">毛玻璃预览 Glass Effect</div>
+                    </div>
+                  </div>
+                  <Badge variant="outline" className="text-[10px] border-primary/30 bg-primary/10 text-primary font-mono">
+                    {settingsForm.background_glass_opacity}% glass
+                  </Badge>
+                </div>
               </div>
               <div className="flex min-w-0 flex-col gap-4">
                 <div className="min-w-0 space-y-2.5">
@@ -3518,7 +3871,7 @@ export default function Settings() {
           </SettingsCard>
           </SettingsSection>
 
-          <SettingsSection id="settings-models" title={t('settings.nav.models')} description={t('settings.nav.modelsDesc')}>
+          <SettingsSection id="settings-models" title={t('settings.nav.models')} description={t('settings.nav.modelsDesc')} icon={<Layers className="size-4" />}>
             <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-lg border border-border/80 bg-card/80 px-3.5 py-2.5 shadow-sm">
               <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-muted-foreground">
                 <Badge variant="secondary" className="tabular-nums">
@@ -3680,7 +4033,7 @@ export default function Settings() {
             </Sheet>
           </SettingsSection>
 
-          <SettingsSection id="settings-reference" title={t('settings.nav.reference')} description={t('settings.nav.referenceDesc')}>
+          <SettingsSection id="settings-reference" title={t('settings.nav.reference')} description={t('settings.nav.referenceDesc')} icon={<Link2 className="size-4" />}>
             <div className="overflow-hidden rounded-xl border border-border bg-card/85 shadow-sm">
               <button
                 type="button"

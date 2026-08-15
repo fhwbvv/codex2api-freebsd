@@ -17,15 +17,20 @@ import (
 	"unicode/utf8"
 
 	"github.com/codex2api/internal/openaiidentity"
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
 
 const usageStatsRollupInitTimeout = 5 * time.Minute
 
+const grokStateBackfillInitTimeout = 5 * time.Minute
+
 // AccountRow 数据库中的账号行
 type AccountRow struct {
 	ID                      int64
+	CredentialGeneration    int64
+	CredentialFamilyID      string
 	Name                    string
 	Platform                string
 	Type                    string
@@ -244,7 +249,7 @@ const (
 	maxUsageLogFlushIntervalSeconds     = 300
 
 	postgresMaxBindParams       = 65535
-	usageLogInsertColumnCount   = 49
+	usageLogInsertColumnCount   = 50
 	maxUsageLogInsertRowsPerSQL = 1000
 
 	// usageLogBufferHardLimit 内存缓冲的硬上限。PG 长时间不可用时（维护、主从切换、
@@ -292,6 +297,7 @@ func NormalizeUsageLogFlushIntervalSeconds(n int) int {
 type usageLogEntry struct {
 	StoreUsageLog          bool
 	AccountID              int64
+	CredentialGeneration   int64
 	Channel                string
 	ClientIP               string
 	ClientUserAgent        string
@@ -425,6 +431,17 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 	if err := db.migrate(ctx); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
+	grokStateCtx, grokStateCancel := grokStateStartupContext(ctx)
+	grokStateErr := db.ensureGrokStateSchema(grokStateCtx)
+	grokStateCancel()
+	if grokStateErr != nil {
+		return nil, fmt.Errorf("初始化 Grok 状态表失败: %w", grokStateErr)
+	}
+	// The detached Grok backfill may legitimately consume minutes. Do not reuse
+	// the original ten-second startup context for the remaining small schemas.
+	postGrokCtx, postGrokCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer postGrokCancel()
+	ctx = postGrokCtx
 	if err := db.ensurePromptFilterNewAPIBindingsTable(ctx); err != nil {
 		return nil, fmt.Errorf("创建 NewAPI 平台绑定表失败: %w", err)
 	}
@@ -489,8 +506,50 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 			log.Printf("回填提示词风险画像失败，将在下次启动继续: %v", err)
 		}
 	})
+	if !db.isSQLite() {
+		db.RunBackgroundTask(func(taskCtx context.Context) {
+			if err := db.ensureUsageLogsGenerationIndex(taskCtx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("在线创建 usage_logs 代际索引失败（仅影响查询性能，将在下次启动重试）: %v", err)
+			}
+		})
+	}
 
 	return db, nil
+}
+
+// ensureUsageLogsGenerationIndex 在启动后台在线构建 usage_logs 的代际聚合索引。
+// usage_logs 是有真实流量部署的最大表，普通 CREATE INDEX 会持 SHARE 锁阻塞全部
+// 日志写入，放进 10 秒启动事务还会超时回滚形成崩溃循环，因此这里独立于启动
+// 路径、用 CONCURRENTLY 构建（不阻塞写入），失败只降级查询性能，不影响服务。
+// CONCURRENTLY 构建被中断会留下 INVALID 索引且使 IF NOT EXISTS 误判存在，
+// 所以先探测有效性，无效则先删再建。
+func (db *DB) ensureUsageLogsGenerationIndex(parent context.Context) error {
+	const indexName = "idx_usage_logs_account_generation_created_at"
+	ctx, cancel := context.WithTimeout(parent, 60*time.Minute)
+	defer cancel()
+
+	var exists, valid bool
+	err := db.conn.QueryRowContext(ctx, `
+		SELECT to_regclass($1) IS NOT NULL,
+		       COALESCE((SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)), FALSE)
+	`, indexName).Scan(&exists, &valid)
+	if err != nil {
+		return fmt.Errorf("探测索引 %s 状态失败: %w", indexName, err)
+	}
+	if exists && valid {
+		return nil
+	}
+	if exists && !valid {
+		if _, err := db.conn.ExecContext(ctx, `DROP INDEX `+pq.QuoteIdentifier(indexName)); err != nil {
+			return fmt.Errorf("清理无效索引 %s 失败: %w", indexName, err)
+		}
+	}
+	// CONCURRENTLY 不能在事务块内执行；单条 ExecContext 走 autocommit，满足要求。
+	if _, err := db.conn.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+pq.QuoteIdentifier(indexName)+` ON usage_logs(account_id, credential_generation, created_at)`); err != nil {
+		return fmt.Errorf("在线创建索引 %s 失败: %w", indexName, err)
+	}
+	log.Printf("usage_logs 代际索引 %s 已就绪", indexName)
+	return nil
 }
 
 func (db *DB) ensureUsageStatsBaselineBillingColumns(ctx context.Context) error {
@@ -550,6 +609,13 @@ func usageStatsRollupStartupContext(parent context.Context) (context.Context, co
 	return context.WithTimeout(context.WithoutCancel(parent), usageStatsRollupInitTimeout)
 }
 
+// grokStateStartupContext detaches the one-time historical account backfill
+// from the shared ten-second schema deadline while preserving startup values.
+// A bounded deadline still prevents a stuck migration from hanging forever.
+func grokStateStartupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), grokStateBackfillInitTimeout)
+}
+
 func (db *DB) ensureUsageStatsRollup(ctx context.Context) error {
 	if _, err := db.conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS usage_stats_rollup (
 		channel VARCHAR(32) PRIMARY KEY,
@@ -572,9 +638,22 @@ func (db *DB) ensureUsageStatsRollup(ctx context.Context) error {
 	)`); err != nil {
 		return err
 	}
-	var initialized int
-	err := db.conn.QueryRowContext(ctx, `SELECT initialized FROM usage_stats_rollup_state WHERE id=1`).Scan(&initialized)
-	if err == nil && initialized == 1 {
+	if db.isSQLite() {
+		columns, err := db.sqliteTableColumns(ctx, "usage_stats_rollup_state")
+		if err != nil {
+			return err
+		}
+		if _, ok := columns["aggregation_version"]; !ok {
+			if _, err := db.conn.ExecContext(ctx, `ALTER TABLE usage_stats_rollup_state ADD COLUMN aggregation_version INTEGER NOT NULL DEFAULT 1`); err != nil {
+				return err
+			}
+		}
+	} else if _, err := db.conn.ExecContext(ctx, `ALTER TABLE usage_stats_rollup_state ADD COLUMN IF NOT EXISTS aggregation_version INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return err
+	}
+	var initialized, aggregationVersion int
+	err := db.conn.QueryRowContext(ctx, `SELECT initialized, aggregation_version FROM usage_stats_rollup_state WHERE id=1`).Scan(&initialized, &aggregationVersion)
+	if err == nil && initialized == 1 && aggregationVersion >= 2 {
 		return nil
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -602,7 +681,8 @@ func (db *DB) rebuildUsageStatsRollup(ctx context.Context) error {
 		b.first_token_ms_sum + COALESCE(SUM(CASE WHEN u.first_token_ms > 0 THEN u.first_token_ms ELSE 0 END), 0),
 		b.first_token_samples + COALESCE(SUM(CASE WHEN u.first_token_ms > 0 THEN 1 ELSE 0 END), 0),
 		b.account_billed + COALESCE(SUM(u.account_billed), 0), b.user_billed + COALESCE(SUM(u.user_billed), 0)
-	FROM usage_stats_baseline b LEFT JOIN usage_logs u ON u.status_code <> 499 WHERE b.id=1
+	FROM usage_stats_baseline b LEFT JOIN usage_logs u ON u.status_code <> 499
+		AND TRIM(COALESCE(u.internal_reason, '')) = '' WHERE b.id=1
 	GROUP BY b.total_requests, b.total_tokens, b.prompt_tokens, b.completion_tokens, b.cached_tokens,
 		b.cache_hit_requests, b.first_token_ms_sum, b.first_token_samples, b.account_billed, b.user_billed`); err != nil {
 		return err
@@ -616,12 +696,14 @@ func (db *DB) rebuildUsageStatsRollup(ctx context.Context) error {
 		COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(account_billed), 0), COALESCE(SUM(user_billed), 0)
-	FROM usage_logs WHERE status_code <> 499 AND TRIM(COALESCE(channel, '')) <> '' GROUP BY TRIM(COALESCE(channel, ''))`); err != nil {
+	FROM usage_logs WHERE status_code <> 499 AND TRIM(COALESCE(internal_reason, '')) = ''
+		AND TRIM(COALESCE(channel, '')) <> '' GROUP BY TRIM(COALESCE(channel, ''))`); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO usage_stats_rollup_state (id, initialized, last_log_id, updated_at)
-		VALUES (1, 1, COALESCE((SELECT MAX(id) FROM usage_logs), 0), CURRENT_TIMESTAMP)
-		ON CONFLICT(id) DO UPDATE SET initialized=1, last_log_id=excluded.last_log_id, updated_at=CURRENT_TIMESTAMP`); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO usage_stats_rollup_state (id, initialized, last_log_id, aggregation_version, updated_at)
+		VALUES (1, 1, COALESCE((SELECT MAX(id) FROM usage_logs), 0), 2, CURRENT_TIMESTAMP)
+		ON CONFLICT(id) DO UPDATE SET initialized=1, last_log_id=excluded.last_log_id,
+			aggregation_version=excluded.aggregation_version, updated_at=CURRENT_TIMESTAMP`); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -685,7 +767,7 @@ func applyUsageStatsRollupWithExec(ctx context.Context, execer sqlExecer, batch 
 		item.TotalUserBilled += entry.UserBilled
 	}
 	for _, entry := range batch {
-		if !entry.StoreUsageLog || entry.StatusCode == 499 {
+		if !entry.StoreUsageLog || entry.StatusCode == 499 || strings.TrimSpace(entry.InternalReason) != "" {
 			continue
 		}
 		add("", entry)
@@ -1067,6 +1149,11 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS attempt_index INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS upstream_error_kind VARCHAR(64) DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS error_message TEXT DEFAULT '';
+	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS credential_generation BIGINT NOT NULL DEFAULT 0;
+	-- idx_usage_logs_account_generation_created_at 不在此批次内创建：usage_logs 是
+	-- 生产最大表，非 CONCURRENTLY 建索引会持锁阻塞写入，且本批次运行在 10 秒启动
+	-- 超时的单个隐式事务里，大表下会超时回滚导致启动崩溃循环。改由
+	-- ensureUsageLogsGenerationIndex 在启动后用 CREATE INDEX CONCURRENTLY 在线构建。
 	-- 上游渠道（codex/grok），写入时按调度账号固化，供仪表盘/用量分渠道聚合
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS channel VARCHAR(16) DEFAULT '';
 	ALTER TABLE usage_logs ALTER COLUMN reasoning_effort TYPE VARCHAR(100);
@@ -1225,7 +1312,15 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_busy_acquire_max_wait_sec INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_busy_overflow_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_busy_patience_sec INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_stateless_slots INT DEFAULT 8;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS github_token TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS github_proxy_url TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_overload_pause_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_overload_threshold_percent INT DEFAULT 20;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_overload_pause_minutes INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_overload_window_minutes INT DEFAULT 5;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS overflow_auto_compact_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS compact_via_responses_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_preflight_sse_passthrough_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS first_token_excludes_ws_acquire BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_max_retries INT DEFAULT 2;
@@ -1249,6 +1344,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS utls_shutdown_timeout_minutes INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_fingerprint_default_mode VARCHAR(20) DEFAULT 'off';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS response_cache_local_max_bytes BIGINT NOT NULL DEFAULT 67108864;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS response_cache_local_max_entry_bytes BIGINT NOT NULL DEFAULT 8388608;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864;
@@ -2035,22 +2131,39 @@ type SystemSettings struct {
 	CodexWSBusyAcquireMaxWaitSec        int  // busy session/容量等待的累计上限（秒），默认 30（issue #413）
 	CodexWSBusyOverflowEnabled          bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
 	CodexWSBusyPatienceSec              int  // 触发溢出前的短等待（秒），默认 2（issue #413）
+	CodexWSStatelessSlots               int  // 无状态请求每 (账号, cacheKey) 的持久连接槽位数，默认 8，范围 1-32（issue #522）
+	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升限流配额，
+	// 只发给 api.github.com，绝不发给镜像/其他主机；空表示未配置，issue #522）。
+	GithubToken string
+	// GithubProxyURL GitHub 域名（github.com / api.github.com / *.githubusercontent.com）
+	// 专用出站代理；空表示回落全局代理/环境代理（issue #522）。
+	GithubProxyURL string
+	// Codex 过载熔断：单账号滑动窗口内 server_is_overloaded 占比达到阈值时
+	// 自动暂停调度一段时间（默认关闭）。
+	CodexOverloadPauseEnabled     bool
+	CodexOverloadThresholdPercent int // 触发比例（%），默认 20，范围 1-100
+	CodexOverloadPauseMinutes     int // 暂停时长（分钟），默认 30，范围 1-1440
+	CodexOverloadWindowMinutes    int // 统计窗口（分钟），默认 5，范围 1-120
 	OverflowAutoCompactEnabled          bool // 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）
+	CompactViaResponsesEnabled          bool // /v1/responses/compact 改写为 /responses body-signal 压缩（上游已下线专用端点，默认 false）
 	CodexPreflightSSEPassthroughEnabled bool // 前置元数据 SSE 事件立即透传下游（旧版兼容，默认 false，issue #425）
 	FirstTokenExcludesWsAcquire         bool // 落库 first_token_ms 扣除 WS 取连耗时，默认 false（原始值 = first_token_ms + ws_acquire_ms）
 	CodexContinueThinkingEnabled        bool // 检测到上游截断思考时自动续想并折叠成单响应，默认 false
 	CodexContinueMaxRounds              int  // 单次请求最大续想轮数（含首轮），默认 8
 	UTLSShutdownTimeoutMinutes          int  // uTLS 连接被摘出池后等待在途 stream 收尾的上限（分钟，默认 30，范围 1-240，issue #446）
-	AutoPause5hThreshold                float64
-	AutoPause7dThreshold                float64
-	AutoPause5hGuardBandPercent         float64
-	AutoPause5hGuardConcurrency         int
-	SmartPacingEnabled                  bool   // issue #312 智能配速总开关
-	SmartPacingMinConcurrency           int    // 配速并发下限
-	SmartPacingWindows                  string // "5h,7d" / "5h" / "7d"
-	IgnoreUsageLimitStatus              bool   // 用量窗口仅作参考，以 Responses 成功/usage_limit_reached 判定可用性
-	RetryIntervalMS                     int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
-	TransportRetryPolicy                string // 传输错误重试策略: rotate（换号，旧行为）/ sticky（同号延迟重试）
+	// CodexFingerprintDefaultMode 是新导入/新建 Codex 账号默认盖上的指纹收敛档位
+	// （off/device/session/full，默认 off）。只影响导入之后新建的账号，已有账号不变。
+	CodexFingerprintDefaultMode string
+	AutoPause5hThreshold        float64
+	AutoPause7dThreshold        float64
+	AutoPause5hGuardBandPercent float64
+	AutoPause5hGuardConcurrency int
+	SmartPacingEnabled          bool   // issue #312 智能配速总开关
+	SmartPacingMinConcurrency   int    // 配速并发下限
+	SmartPacingWindows          string // "5h,7d" / "5h" / "7d"
+	IgnoreUsageLimitStatus      bool   // 用量窗口仅作参考，以 Responses 成功/usage_limit_reached 判定可用性
+	RetryIntervalMS             int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
+	TransportRetryPolicy        string // 传输错误重试策略: rotate（换号，旧行为）/ sticky（同号延迟重试）
 	// CodexSyncedCLIVersion 是从 openai/codex releases 同步到的最新 Codex CLI 版本缓存，
 	// 用于抬升出站 UA / manifest 的模拟版本（绝不低于内置常量），空表示尚未同步。
 	CodexSyncedCLIVersion string
@@ -2078,6 +2191,10 @@ type SystemSettings struct {
 	// When true, an existing row keeps its current custom-pattern value instead
 	// of accepting a potentially stale full-settings snapshot.
 	PreservePromptFilterCustomPatterns bool
+	// PreservePromptFilterReviewAPIKey is the same guard for the review key
+	// list: individual keys can be deleted out-of-band, so a full-settings
+	// snapshot that didn't change the field must not write it back.
+	PreservePromptFilterReviewAPIKey bool
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -2244,7 +2361,16 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(first_token_excludes_ws_acquire, false),
 			       COALESCE(codex_preflight_sse_passthrough_enabled, false),
 			       COALESCE(utls_shutdown_timeout_minutes, 30),
-			       COALESCE(codex_ws_weak_network_mode, false)
+			       COALESCE(codex_ws_weak_network_mode, false),
+			       COALESCE(NULLIF(TRIM(codex_fingerprint_default_mode), ''), 'off'),
+			       COALESCE(compact_via_responses_enabled, false),
+		       COALESCE(codex_ws_stateless_slots, 8),
+		       COALESCE(github_token, ''),
+		       COALESCE(github_proxy_url, ''),
+		       COALESCE(codex_overload_pause_enabled, false),
+		       COALESCE(codex_overload_threshold_percent, 20),
+		       COALESCE(codex_overload_pause_minutes, 30),
+		       COALESCE(codex_overload_window_minutes, 5)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2310,6 +2436,15 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexPreflightSSEPassthroughEnabled,
 		&s.UTLSShutdownTimeoutMinutes,
 		&s.CodexWSWeakNetworkMode,
+		&s.CodexFingerprintDefaultMode,
+		&s.CompactViaResponsesEnabled,
+		&s.CodexWSStatelessSlots,
+		&s.GithubToken,
+		&s.GithubProxyURL,
+		&s.CodexOverloadPauseEnabled,
+		&s.CodexOverloadThresholdPercent,
+		&s.CodexOverloadPauseMinutes,
+		&s.CodexOverloadWindowMinutes,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2335,7 +2470,24 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
+	s.CodexFingerprintDefaultMode = NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode)
 	return s, err
+}
+
+// NormalizeCodexFingerprintDefaultMode 把新账号默认指纹收敛档位归一到四个已知
+// 取值之一；空值和非法值回落 off（与 auth.NormalizeCodexFingerprintMode 语义一致，
+// database 包不能反向依赖 auth，故此处独立实现）。
+func NormalizeCodexFingerprintDefaultMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "device":
+		return "device"
+	case "session":
+		return "session"
+	case "full":
+		return "full"
+	default:
+		return "off"
+	}
 }
 
 // UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）。
@@ -2424,9 +2576,18 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					first_token_excludes_ws_acquire,
 					codex_preflight_sse_passthrough_enabled,
 					utls_shutdown_timeout_minutes,
-					codex_ws_weak_network_mode
+					codex_ws_weak_network_mode,
+					codex_fingerprint_default_mode,
+					compact_via_responses_enabled,
+					codex_ws_stateless_slots,
+					github_token,
+					github_proxy_url,
+					codex_overload_pause_enabled,
+					codex_overload_threshold_percent,
+					codex_overload_pause_minutes,
+					codex_overload_window_minutes
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2466,10 +2627,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_log_matches = EXCLUDED.prompt_filter_log_matches,
 				prompt_filter_max_text_length = EXCLUDED.prompt_filter_max_text_length,
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
-				prompt_filter_custom_patterns = CASE WHEN $106 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
+				prompt_filter_custom_patterns = CASE WHEN $115 THEN system_settings.prompt_filter_custom_patterns ELSE EXCLUDED.prompt_filter_custom_patterns END,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
-				prompt_filter_review_api_key = EXCLUDED.prompt_filter_review_api_key,
+				prompt_filter_review_api_key = CASE WHEN $116 THEN system_settings.prompt_filter_review_api_key ELSE EXCLUDED.prompt_filter_review_api_key END,
 				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
 				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
 				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
@@ -2529,7 +2690,16 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					first_token_excludes_ws_acquire = EXCLUDED.first_token_excludes_ws_acquire,
 					codex_preflight_sse_passthrough_enabled = EXCLUDED.codex_preflight_sse_passthrough_enabled,
 					utls_shutdown_timeout_minutes = EXCLUDED.utls_shutdown_timeout_minutes,
-					codex_ws_weak_network_mode = EXCLUDED.codex_ws_weak_network_mode
+					codex_ws_weak_network_mode = EXCLUDED.codex_ws_weak_network_mode,
+					codex_fingerprint_default_mode = EXCLUDED.codex_fingerprint_default_mode,
+					compact_via_responses_enabled = EXCLUDED.compact_via_responses_enabled,
+					codex_ws_stateless_slots = EXCLUDED.codex_ws_stateless_slots,
+					github_token = EXCLUDED.github_token,
+					github_proxy_url = EXCLUDED.github_proxy_url,
+					codex_overload_pause_enabled = EXCLUDED.codex_overload_pause_enabled,
+					codex_overload_threshold_percent = EXCLUDED.codex_overload_threshold_percent,
+					codex_overload_pause_minutes = EXCLUDED.codex_overload_pause_minutes,
+					codex_overload_window_minutes = EXCLUDED.codex_overload_window_minutes
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2565,7 +2735,17 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.CodexPreflightSSEPassthroughEnabled,
 		NormalizeUTLSShutdownTimeoutMinutes(s.UTLSShutdownTimeoutMinutes),
 		s.CodexWSWeakNetworkMode,
-		s.PreservePromptFilterCustomPatterns)
+		NormalizeCodexFingerprintDefaultMode(s.CodexFingerprintDefaultMode),
+		s.CompactViaResponsesEnabled,
+		NormalizeCodexWSStatelessSlots(s.CodexWSStatelessSlots),
+		strings.TrimSpace(s.GithubToken),
+		strings.TrimSpace(s.GithubProxyURL),
+		s.CodexOverloadPauseEnabled,
+		NormalizeCodexOverloadThresholdPercent(s.CodexOverloadThresholdPercent),
+		NormalizeCodexOverloadPauseMinutes(s.CodexOverloadPauseMinutes),
+		NormalizeCodexOverloadWindowMinutes(s.CodexOverloadWindowMinutes),
+		s.PreservePromptFilterCustomPatterns,
+		s.PreservePromptFilterReviewAPIKey)
 	return err
 }
 
@@ -2665,6 +2845,50 @@ func NormalizeCodexWSBusyPatienceSec(seconds int) int {
 		return 300
 	}
 	return seconds
+}
+
+// NormalizeCodexOverloadThresholdPercent 把过载熔断触发比例限制在 1-100，非正值回落默认 20。
+func NormalizeCodexOverloadThresholdPercent(percent int) int {
+	if percent <= 0 {
+		return 20
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+// NormalizeCodexOverloadPauseMinutes 把过载暂停时长限制在 1-1440 分钟，非正值回落默认 30。
+func NormalizeCodexOverloadPauseMinutes(minutes int) int {
+	if minutes <= 0 {
+		return 30
+	}
+	if minutes > 1440 {
+		return 1440
+	}
+	return minutes
+}
+
+// NormalizeCodexOverloadWindowMinutes 把过载统计窗口限制在 1-120 分钟，非正值回落默认 5。
+func NormalizeCodexOverloadWindowMinutes(minutes int) int {
+	if minutes <= 0 {
+		return 5
+	}
+	if minutes > 120 {
+		return 120
+	}
+	return minutes
+}
+
+// NormalizeCodexWSStatelessSlots 把无状态 WS 连接槽位数限制在 1-32，非正值回落默认 8（issue #522）。
+func NormalizeCodexWSStatelessSlots(slots int) int {
+	if slots <= 0 {
+		return 8
+	}
+	if slots > 32 {
+		return 32
+	}
+	return slots
 }
 
 // normalizeCodexWSSilentMaxRetries 把 WS 静默重试次数限制在 0-10。
@@ -3263,12 +3487,168 @@ func (db *DB) CleanErrorProxies(ctx context.Context) (ProxyErrorCleanupResult, e
 	return result, nil
 }
 
+func scanUnboundAccountIDs(rows *sql.Rows) ([]int64, error) {
+	var ids []int64
+	for rows.Next() {
+		var accountID int64
+		if err := rows.Scan(&accountID); err != nil {
+			return nil, err
+		}
+		ids = append(ids, accountID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func unbindAccountsFromProxyURLsTx(ctx context.Context, tx *sql.Tx, sqlite bool, proxyURLs []string) ([]int64, error) {
+	if len(proxyURLs) == 0 {
+		return nil, nil
+	}
+	args := make([]interface{}, len(proxyURLs))
+	for i, proxyURL := range proxyURLs {
+		args[i] = proxyURL
+	}
+	query := fmt.Sprintf(`
+		UPDATE accounts
+		SET proxy_url = '', updated_at = CURRENT_TIMESTAMP
+		WHERE TRIM(COALESCE(proxy_url, '')) IN (%s)
+		RETURNING id
+	`, strings.Join(dbPlaceholders(sqlite, 1, len(proxyURLs)), ","))
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanUnboundAccountIDs(rows)
+}
+
+// RetireProxiesByIDs 删除指定代理，并在同一事务中解绑仍引用这些 URL 的账号。
+// 用于单条/批量删除，避免删除后账号 proxy_url 继续把流量打到已不存在的出口(issue #517)。
+func (db *DB) RetireProxiesByIDs(ctx context.Context, ids []int64) (ProxyErrorCleanupResult, error) {
+	var result ProxyErrorCleanupResult
+	if len(ids) == 0 {
+		return result, nil
+	}
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+
+		lockClause := ""
+		if !db.isSQLite() {
+			lockClause = " FOR UPDATE"
+		}
+		selectQuery := fmt.Sprintf(`
+			SELECT id, TRIM(url)
+			FROM proxies
+			WHERE id IN (%s)
+			ORDER BY id`+lockClause,
+			strings.Join(dbPlaceholders(db.isSQLite(), 1, len(ids)), ","),
+		)
+		rows, err := tx.QueryContext(ctx, selectQuery, argsFromInt64s(ids)...)
+		if err != nil {
+			return err
+		}
+		var proxyIDs []int64
+		var proxyURLs []string
+		for rows.Next() {
+			var id int64
+			var proxyURL string
+			if err := rows.Scan(&id, &proxyURL); err != nil {
+				rows.Close()
+				return err
+			}
+			proxyIDs = append(proxyIDs, id)
+			proxyURLs = append(proxyURLs, proxyURL)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(proxyIDs) == 0 {
+			return tx.Commit()
+		}
+
+		unboundIDs, err := unbindAccountsFromProxyURLsTx(ctx, tx, db.isSQLite(), proxyURLs)
+		if err != nil {
+			return err
+		}
+		result.UnboundAccountIDs = unboundIDs
+		result.Unbound = len(unboundIDs)
+
+		deleteQuery := fmt.Sprintf(
+			`DELETE FROM proxies WHERE id IN (%s) RETURNING id, TRIM(url)`,
+			strings.Join(dbPlaceholders(db.isSQLite(), 1, len(proxyIDs)), ","),
+		)
+		rows, err = tx.QueryContext(ctx, deleteQuery, argsFromInt64s(proxyIDs)...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var proxyID int64
+			var proxyURL string
+			if err := rows.Scan(&proxyID, &proxyURL); err != nil {
+				rows.Close()
+				return err
+			}
+			result.Deleted++
+			result.DeletedProxyURLs = append(result.DeletedProxyURLs, proxyURL)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	if err != nil {
+		return ProxyErrorCleanupResult{}, err
+	}
+	return result, nil
+}
+
+// RebindAccountProxyURLs 把仍指向 oldURL 的账号绑定改写为 newURL（代理行改 URL 时跟上）。
+func (db *DB) RebindAccountProxyURLs(ctx context.Context, oldURL, newURL string) ([]int64, error) {
+	oldURL = strings.TrimSpace(oldURL)
+	newURL = strings.TrimSpace(newURL)
+	if oldURL == "" || newURL == "" || oldURL == newURL {
+		return nil, nil
+	}
+	var ids []int64
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		rows, err := db.conn.QueryContext(ctx, `
+			UPDATE accounts
+			SET proxy_url = $1, updated_at = CURRENT_TIMESTAMP
+			WHERE TRIM(COALESCE(proxy_url, '')) = $2
+			RETURNING id
+		`, newURL, oldURL)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		ids, err = scanUnboundAccountIDs(rows)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 // ==================== Usage Logs（批量写入） ====================
 
 // UsageLog 请求日志行
 type UsageLog struct {
 	ID                     int64     `json:"id"`
 	AccountID              int64     `json:"account_id"`
+	CredentialGeneration   int64     `json:"credential_generation,omitempty"`
 	Channel                string    `json:"channel,omitempty"`
 	ClientIP               string    `json:"client_ip"`
 	ClientUserAgent        string    `json:"client_user_agent"`
@@ -3411,6 +3791,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 	db.logBuf = append(db.logBuf, usageLogEntry{
 		StoreUsageLog:          storeUsageLog,
 		AccountID:              log.AccountID,
+		CredentialGeneration:   log.CredentialGeneration,
 		Channel:                clampUsageLogText(log.Channel, usageLogChannelMaxLen),
 		ClientIP:               clampUsageLogText(log.ClientIP, usageLogShortTextMaxLen),
 		ClientUserAgent:        log.ClientUserAgent,
@@ -3474,6 +3855,9 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 // UsageLogInput 日志写入参数
 type UsageLogInput struct {
 	AccountID int64
+	// CredentialGeneration attributes internally-generated Grok traffic to the
+	// credential snapshot that issued it. Zero is legacy/unscoped traffic.
+	CredentialGeneration int64
 	// Channel 是处理该请求的上游渠道（codex/grok），写入时固化，空值表示未知。
 	Channel                string
 	ClientIP               string
@@ -3811,20 +4195,20 @@ func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEnt
 	logsToStore := storedUsageLogs(batch)
 	if len(logsToStore) > 0 {
 		stmt, err := tx.PrepareContext(ctx,
-			`INSERT INTO usage_logs (account_id, channel, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
+			`INSERT INTO usage_logs (account_id, credential_generation, channel, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 				  input_tokens, output_tokens, reasoning_tokens, first_token_ms, ws_acquire_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, has_compaction_history, cached_tokens, service_tier,
 				  requested_service_tier, actual_service_tier, billing_service_tier,
 				  api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
 				  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket,
 				  client_user_agent, upstream_user_agent, user_agent_overridden, internal_reason, parent_request_id, prompt_policy_incident_id)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49)`)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50)`)
 		if err != nil {
 			return fmt.Errorf("准备语句: %w", err)
 		}
 		defer stmt.Close()
 
 		for _, e := range logsToStore {
-			if _, err := stmt.ExecContext(ctx, e.AccountID, e.Channel, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
+			if _, err := stmt.ExecContext(ctx, e.AccountID, e.CredentialGeneration, e.Channel, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 				e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.WsAcquireMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.HasCompactionHistory, e.CachedTokens, e.ServiceTier,
 				e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 				e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
@@ -3914,7 +4298,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 			placeholders[i] = fmt.Sprintf("$%d", argIdx+i)
 		}
 		valueStrings = append(valueStrings, "("+strings.Join(placeholders, ", ")+")")
-		valueArgs = append(valueArgs, e.AccountID, e.Channel, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
+		valueArgs = append(valueArgs, e.AccountID, e.CredentialGeneration, e.Channel, e.ClientIP, e.Endpoint, e.Model, e.EffectiveModel, e.PromptTokens, e.CompletionTokens, e.TotalTokens, e.StatusCode, e.DurationMs,
 			e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.FirstTokenMs, e.WsAcquireMs, e.ReasoningEffort, e.InboundEndpoint, e.UpstreamEndpoint, e.Stream, e.Compact, e.HasCompactionHistory, e.CachedTokens, e.ServiceTier,
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
@@ -3923,7 +4307,7 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch 
 		argIdx += usageLogInsertColumnCount
 	}
 
-	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, channel, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
+	query := fmt.Sprintf(`INSERT INTO usage_logs (account_id, credential_generation, channel, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
 		input_tokens, output_tokens, reasoning_tokens, first_token_ms, ws_acquire_ms, reasoning_effort, inbound_endpoint, upstream_endpoint, stream, compact, has_compaction_history, cached_tokens, service_tier,
 		requested_service_tier, actual_service_tier, billing_service_tier,
 		api_key_id, api_key_name, api_key_masked, image_count, image_width, image_height, image_bytes, image_format, image_size, account_billed, user_billed,
@@ -4117,6 +4501,7 @@ func (db *DB) getUsageStats(ctx context.Context, rangeStart, rangeEnd time.Time,
 	FROM usage_logs
 	WHERE created_at >= $1` + endClause + `
 	  AND status_code <> 499
+	  AND TRIM(COALESCE(internal_reason, '')) = ''
 	`
 
 	var todayErrors int64
@@ -4190,6 +4575,7 @@ func (db *DB) CountTodayRequestsByChannel(ctx context.Context) (map[string]int64
 		SELECT COALESCE(channel, ''), COUNT(*)
 		FROM usage_logs
 		WHERE created_at >= $1 AND status_code <> 499
+		  AND TRIM(COALESCE(internal_reason, '')) = ''
 		GROUP BY 1`, db.timeArg(todayStart))
 	if err != nil {
 		return nil, err
@@ -4244,6 +4630,7 @@ func (db *DB) getUsageModelStats(ctx context.Context, limit int, rangeStart, ran
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
 		FROM usage_logs
 		WHERE `+timeWhere+` AND status_code <> 499
+		  AND TRIM(COALESCE(internal_reason, '')) = ''
 		GROUP BY 1
 		ORDER BY user_billed DESC, requests DESC, model_name ASC
 		LIMIT `+limitPlaceholder+`
@@ -4300,6 +4687,7 @@ func (db *DB) populateUsageBreakdownStats(ctx context.Context, stats *UsageStats
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_requests
 		FROM usage_logs
 		WHERE `+timeWhere+` AND status_code <> 499
+		  AND TRIM(COALESCE(internal_reason, '')) = ''
 	`, args...).Scan(
 		&stats.FeatureStats.StreamRequests,
 		&stats.FeatureStats.SyncRequests,
@@ -4342,6 +4730,7 @@ func (db *DB) getUsageEndpointStats(ctx context.Context, limit int, rangeStart, 
 			COALESCE(SUM(user_billed), 0) AS user_billed
 		FROM usage_logs
 		WHERE `+timeWhere+` AND status_code <> 499
+		  AND TRIM(COALESCE(internal_reason, '')) = ''
 		GROUP BY 1
 		ORDER BY requests DESC, endpoint_name ASC
 		LIMIT `+limitPlaceholder+`
@@ -4385,6 +4774,7 @@ func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int, rangeStart, ra
 			COALESCE(SUM(user_billed), 0) AS user_billed
 		FROM usage_logs
 		WHERE `+timeWhere+` AND status_code <> 499
+		  AND TRIM(COALESCE(internal_reason, '')) = ''
 		GROUP BY 1, 2
 		ORDER BY requests DESC, api_key_label ASC
 		LIMIT `+limitPlaceholder+`
@@ -4426,6 +4816,7 @@ func (db *DB) GetTrafficSnapshot(ctx context.Context) (*TrafficSnapshot, error) 
 			COALESCE(SUM(total_tokens), 0)::float8 AS token_count
 		FROM usage_logs
 		WHERE created_at >= NOW() - INTERVAL '5 minutes'
+		  AND TRIM(COALESCE(internal_reason, '')) = ''
 		GROUP BY 1
 	),
 	current_window AS (
@@ -4639,7 +5030,8 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 			duration_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, status_code
 		FROM usage_logs
 		WHERE created_at >= $1 AND created_at < $2
-		  AND status_code <> 499` + channelClause + `
+		  AND status_code <> 499
+		  AND TRIM(COALESCE(internal_reason, '')) = ''` + channelClause + `
 	)
 	SELECT
 		CASE WHEN GROUPING(bucket) = 0 THEN 'timeline' ELSE 'model' END AS row_kind,
@@ -4744,7 +5136,8 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64, days in
 		COALESCE(first_token_ms, 0), status_code, COALESCE(is_retry_attempt, false),
 		COALESCE(attempt_index, 0), COALESCE(stream, false), COALESCE(compact, false)
 	FROM usage_logs
-	WHERE account_id = $1 AND `+timeWhere+` AND status_code <> 499`, queryArgs...)
+	WHERE account_id = $1 AND `+timeWhere+` AND status_code <> 499
+	  AND TRIM(COALESCE(internal_reason, '')) = ''`, queryArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -5383,6 +5776,33 @@ type AccountTimeRangeUsage struct {
 	UserBilled    float64
 }
 
+// nonRetryUsageLogPredicate keeps transport retry attempts out of end-user
+// request, token, and billing aggregates. Historical rows can contain NULL;
+// SQLite stores booleans as integers while PostgreSQL uses BOOLEAN.
+func (db *DB) nonRetryUsageLogPredicate() string {
+	if db.isSQLite() {
+		return "COALESCE(is_retry_attempt, 0) = 0"
+	}
+	return "COALESCE(is_retry_attempt, false) = false"
+}
+
+// endUserUsageLogPredicate excludes maintenance/probe traffic from account
+// request, token, and billing aggregates. Internal rows remain queryable in the
+// raw usage log for diagnostics.
+func (db *DB) endUserUsageLogPredicate() string {
+	return "TRIM(COALESCE(internal_reason, '')) = ''"
+}
+
+// currentAccountUsageGenerationPredicate keeps generation-scoped internal
+// traffic (currently Grok capability probes) attached to the credential
+// identity that issued it. Legacy and ordinary request rows use generation 0
+// and remain visible. The correlated account lookup also makes a buffered old
+// probe harmless if credentials rotate after the probe's final pre-write CAS.
+func (db *DB) currentAccountUsageGenerationPredicate() string {
+	return `(COALESCE(usage_logs.credential_generation, 0) = 0 OR
+		usage_logs.credential_generation = COALESCE((SELECT accounts.credential_generation FROM accounts WHERE accounts.id = usage_logs.account_id), usage_logs.credential_generation))`
+}
+
 // GetAccountRequestCounts 按 account_id 聚合近 7 天成功/失败请求数
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
 	since := time.Now().AddDate(0, 0, -7)
@@ -5399,9 +5819,9 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 		COALESCE(SUM(CASE WHEN status_code >= 400 AND %s THEN 1 ELSE 0 END), 0) AS retry_error_count,
 		COALESCE(SUM(CASE WHEN status_code = 429 THEN 1 ELSE 0 END), 0) AS rate_limit_attempt_count
 	FROM usage_logs
-	WHERE created_at >= $1
+	WHERE created_at >= $1 AND %s
 	GROUP BY account_id
-	`, retryFalse, retryFalse, retryTrue)
+	`, retryFalse, retryFalse, retryTrue, db.endUserUsageLogPredicate())
 	rows, err := db.conn.QueryContext(ctx, query, db.timeArg(since))
 	if err != nil {
 		return nil, err
@@ -5421,16 +5841,16 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 
 // GetAccountTimeRangeUsage 按 account_id 聚合 since 之后的请求数和 token 数。
 func (db *DB) GetAccountTimeRangeUsage(ctx context.Context, since time.Time) (map[int64]*AccountTimeRangeUsage, error) {
-	query := `
+	query := fmt.Sprintf(`
 	SELECT account_id,
 		COUNT(*) AS requests,
 		COALESCE(SUM(total_tokens), 0) AS tokens,
 		COALESCE(SUM(account_billed), 0) AS account_billed,
 		COALESCE(SUM(user_billed), 0) AS user_billed
 	FROM usage_logs
-	WHERE created_at >= $1 AND status_code <> 499
+	WHERE created_at >= $1 AND status_code <> 499 AND %s AND %s AND %s
 	GROUP BY account_id
-	`
+	`, db.nonRetryUsageLogPredicate(), db.currentAccountUsageGenerationPredicate(), db.endUserUsageLogPredicate())
 	rows, err := db.conn.QueryContext(ctx, query, db.timeArg(since))
 	if err != nil {
 		return nil, err
@@ -5454,15 +5874,16 @@ func (db *DB) GetAccountUsageWindows(ctx context.Context, shortSince, longSince 
 	if shortSince.Before(longSince) {
 		shortSince, longSince = longSince, shortSince
 	}
-	rows, err := db.conn.QueryContext(ctx, `SELECT account_id,
+	query := fmt.Sprintf(`SELECT account_id,
 		COALESCE(SUM(CASE WHEN created_at >= $1 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN created_at >= $1 THEN total_tokens ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN created_at >= $1 THEN account_billed ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN created_at >= $1 THEN user_billed ELSE 0 END), 0),
 		COUNT(*), COALESCE(SUM(total_tokens), 0), COALESCE(SUM(account_billed), 0), COALESCE(SUM(user_billed), 0)
 	FROM usage_logs
-	WHERE created_at >= $2 AND status_code <> 499
-	GROUP BY account_id`, db.timeArg(shortSince), db.timeArg(longSince))
+	WHERE created_at >= $2 AND status_code <> 499 AND %s AND %s AND %s
+	GROUP BY account_id`, db.nonRetryUsageLogPredicate(), db.currentAccountUsageGenerationPredicate(), db.endUserUsageLogPredicate())
+	rows, err := db.conn.QueryContext(ctx, query, db.timeArg(shortSince), db.timeArg(longSince))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -5490,7 +5911,8 @@ func (db *DB) GetAccountUsageWindows(ctx context.Context, shortSince, longSince 
 func (db *DB) GetAccountBilledSince(ctx context.Context, accountID int64, since time.Time) (float64, error) {
 	var billed float64
 	err := db.conn.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(account_billed), 0) FROM usage_logs WHERE account_id = $1 AND created_at >= $2 AND status_code <> 499`,
+		`SELECT COALESCE(SUM(account_billed), 0) FROM usage_logs WHERE account_id = $1 AND created_at >= $2
+		 AND status_code <> 499 AND TRIM(COALESCE(internal_reason, '')) = ''`,
 		accountID, db.timeArg(since)).Scan(&billed)
 	return billed, err
 }
@@ -5556,6 +5978,7 @@ func (db *DB) getAccountsBilledSinceChunk(ctx context.Context, ids []int64, wind
 		ON usage_logs.account_id = billing_windows.account_id
 		AND usage_logs.created_at >= billing_windows.since_at
 		AND usage_logs.status_code <> 499
+		AND TRIM(COALESCE(usage_logs.internal_reason, '')) = ''
 	GROUP BY billing_windows.account_id
 	`, strings.Join(values, ","))
 
@@ -5606,7 +6029,7 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 	}
 
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at, COALESCE(credential_generation, 1), COALESCE(credential_family_id, '')
 		FROM accounts
 		WHERE ` + where + `
 		ORDER BY id
@@ -5647,6 +6070,8 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 			&a.Note,
 			&createdAtRaw,
 			&updatedAtRaw,
+			&a.CredentialGeneration,
+			&a.CredentialFamilyID,
 		); err != nil {
 			return nil, fmt.Errorf("扫描账号行失败: %w", err)
 		}
@@ -5773,7 +6198,7 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 		deletedFilter = ""
 	}
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at, COALESCE(credential_generation, 1), COALESCE(credential_family_id, '')
 		FROM accounts
 		WHERE id = $1 ` + deletedFilter + `
 		LIMIT 1
@@ -5806,6 +6231,8 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 		&a.Note,
 		&createdAtRaw,
 		&updatedAtRaw,
+		&a.CredentialGeneration,
+		&a.CredentialFamilyID,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -5922,103 +6349,113 @@ func (db *DB) UpdateAccountSchedulerConfig(ctx context.Context, id int64, scoreB
 // UpdateAccountSchedulerMetadata applies scheduler overrides and UI metadata in
 // one transaction. Runtime store updates should happen only after this returns.
 func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scoreBiasOverride OptionalNullInt64, baseConcurrencyOverride OptionalNullInt64, skipWarmTier OptionalBool, allowedAPIKeyIDs OptionalInt64Slice, tags OptionalStringSlice, groupIDs OptionalInt64Slice, proxyURL OptionalString, credentialUpdates map[string]interface{}) error {
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	query := `SELECT credentials FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
-	if db.isSQLite() {
-		query = `SELECT credentials FROM accounts WHERE id = ? AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
-	} else {
-		query += ` FOR UPDATE`
-	}
-	var currentRaw interface{}
-	if err := tx.QueryRowContext(ctx, query, id).Scan(&currentRaw); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return sql.ErrNoRows
-		}
-		return err
-	}
-
-	sets := make([]string, 0, 6)
-	args := make([]interface{}, 0, 8)
-	add := func(column string, value interface{}) {
-		args = append(args, value)
-		ph := "?"
-		if !db.isSQLite() {
-			ph = fmt.Sprintf("$%d", len(args))
-		}
-		sets = append(sets, column+" = "+ph)
-	}
-	if scoreBiasOverride.Set {
-		add("score_bias_override", nullableInt64Value(scoreBiasOverride.Value))
-	}
-	if baseConcurrencyOverride.Set {
-		add("base_concurrency_override", nullableInt64Value(baseConcurrencyOverride.Value))
-	}
-	if skipWarmTier.Set {
-		add("skip_warm_tier", skipWarmTier.Value)
-	}
-	if tags.Set {
-		if db.isSQLite() {
-			add("tags", encodeTagsJSON(tags.Values))
-		} else {
-			args = append(args, encodeTagsJSON(tags.Values))
-			sets = append(sets, fmt.Sprintf("tags = $%d::jsonb", len(args)))
-		}
-	}
-	if proxyURL.Set {
-		add("proxy_url", strings.TrimSpace(proxyURL.Value))
-	}
-	if allowedAPIKeyIDs.Set {
-		if credentialUpdates == nil {
-			credentialUpdates = make(map[string]interface{}, 1)
-		}
-		credentialUpdates["allowed_api_key_ids"] = normalizePositiveInt64Slice(allowedAPIKeyIDs.Values)
-	}
-	if len(credentialUpdates) > 0 {
-		merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentialUpdates)
-		credJSON, err := json.Marshal(merged)
+	return db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("序列化 credentials 失败: %w", err)
+			return err
 		}
+		defer tx.Rollback()
+
+		query := `SELECT credentials FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
 		if db.isSQLite() {
-			add("credentials", credJSON)
+			query = `SELECT credentials FROM accounts WHERE id = ? AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
 		} else {
-			args = append(args, credJSON)
-			sets = append(sets, fmt.Sprintf("credentials = $%d::jsonb", len(args)))
+			query += ` FOR UPDATE`
 		}
-	}
-	if len(sets) > 0 {
-		sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
-		args = append(args, id)
-		ph := "?"
-		if !db.isSQLite() {
-			ph = fmt.Sprintf("$%d", len(args))
-		}
-		if _, err := tx.ExecContext(ctx, "UPDATE accounts SET "+strings.Join(sets, ", ")+" WHERE id = "+ph, args...); err != nil {
+		var currentRaw interface{}
+		if err := tx.QueryRowContext(ctx, query, id).Scan(&currentRaw); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return sql.ErrNoRows
+			}
 			return err
 		}
-	}
-	if groupIDs.Set {
-		ph := "$1"
-		insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
-		if db.isSQLite() {
-			ph = "?"
-			insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
+
+		sets := make([]string, 0, 6)
+		args := make([]interface{}, 0, 8)
+		add := func(column string, value interface{}) {
+			args = append(args, value)
+			ph := "?"
+			if !db.isSQLite() {
+				ph = fmt.Sprintf("$%d", len(args))
+			}
+			sets = append(sets, column+" = "+ph)
 		}
-		if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE account_id = "+ph, id); err != nil {
-			return err
+		if scoreBiasOverride.Set {
+			add("score_bias_override", nullableInt64Value(scoreBiasOverride.Value))
 		}
-		for _, gid := range normalizeIDSlice(groupIDs.Values) {
-			if _, err := tx.ExecContext(ctx, insertQ, id, gid); err != nil {
+		if baseConcurrencyOverride.Set {
+			add("base_concurrency_override", nullableInt64Value(baseConcurrencyOverride.Value))
+		}
+		if skipWarmTier.Set {
+			add("skip_warm_tier", skipWarmTier.Value)
+		}
+		if tags.Set {
+			if db.isSQLite() {
+				add("tags", encodeTagsJSON(tags.Values))
+			} else {
+				args = append(args, encodeTagsJSON(tags.Values))
+				sets = append(sets, fmt.Sprintf("tags = $%d::jsonb", len(args)))
+			}
+		}
+		if proxyURL.Set {
+			add("proxy_url", strings.TrimSpace(proxyURL.Value))
+		}
+		if allowedAPIKeyIDs.Set {
+			if credentialUpdates == nil {
+				credentialUpdates = make(map[string]interface{}, 1)
+			}
+			credentialUpdates["allowed_api_key_ids"] = normalizePositiveInt64Slice(allowedAPIKeyIDs.Values)
+		}
+		if len(credentialUpdates) > 0 {
+			current := decodeCredentials(currentRaw)
+			merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentialUpdates)
+			identityChanged := grokIdentityCredentialChanged(current, merged)
+			credJSON, err := json.Marshal(merged)
+			if err != nil {
+				return fmt.Errorf("序列化 credentials 失败: %w", err)
+			}
+			if db.isSQLite() {
+				add("credentials", credJSON)
+			} else {
+				args = append(args, credJSON)
+				sets = append(sets, fmt.Sprintf("credentials = $%d::jsonb", len(args)))
+			}
+			if identityChanged {
+				// Keep the credentials document and its identity generation in the
+				// same row update/transaction. Configuration-only merges deliberately
+				// leave the generation untouched.
+				sets = append(sets, "credential_generation = credential_generation + 1")
+			}
+		}
+		if len(sets) > 0 {
+			sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
+			args = append(args, id)
+			ph := "?"
+			if !db.isSQLite() {
+				ph = fmt.Sprintf("$%d", len(args))
+			}
+			if _, err := tx.ExecContext(ctx, "UPDATE accounts SET "+strings.Join(sets, ", ")+" WHERE id = "+ph, args...); err != nil {
 				return err
 			}
 		}
-	}
-	return tx.Commit()
+		if groupIDs.Set {
+			ph := "$1"
+			insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
+			if db.isSQLite() {
+				ph = "?"
+				insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
+			}
+			if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE account_id = "+ph, id); err != nil {
+				return err
+			}
+			for _, gid := range normalizeIDSlice(groupIDs.Values) {
+				if _, err := tx.ExecContext(ctx, insertQ, id, gid); err != nil {
+					return err
+				}
+			}
+		}
+		return tx.Commit()
+	})
 }
 
 func (db *DB) BatchUpdateAccountMetadata(ctx context.Context, ids []int64, update BatchAccountMetadataUpdate) ([]int64, error) {
@@ -6026,50 +6463,50 @@ func (db *DB) BatchUpdateAccountMetadata(ctx context.Context, ids []int64, updat
 	if len(ids) == 0 || !update.HasChanges() {
 		return nil, nil
 	}
-
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	credentialUpdates := cloneCredentialUpdates(update.CredentialUpdates)
-	if update.AllowedAPIKeyIDs.Set {
-		if credentialUpdates == nil {
-			credentialUpdates = make(map[string]interface{}, 1)
+	var updatedIDs []int64
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
 		}
-		credentialUpdates["allowed_api_key_ids"] = normalizePositiveInt64Slice(update.AllowedAPIKeyIDs.Values)
-	}
+		defer tx.Rollback()
 
-	active, err := db.selectBatchAccounts(ctx, tx, ids, len(credentialUpdates) > 0)
-	if err != nil {
-		return nil, err
-	}
-	if len(active.ids) == 0 {
-		if err := tx.Commit(); err != nil {
-			return nil, err
+		credentialUpdates := cloneCredentialUpdates(update.CredentialUpdates)
+		if update.AllowedAPIKeyIDs.Set {
+			if credentialUpdates == nil {
+				credentialUpdates = make(map[string]interface{}, 1)
+			}
+			credentialUpdates["allowed_api_key_ids"] = normalizePositiveInt64Slice(update.AllowedAPIKeyIDs.Values)
 		}
-		return nil, nil
-	}
 
-	if err := db.batchUpdateAccountColumns(ctx, tx, active.ids, update); err != nil {
-		return nil, err
-	}
-	if len(credentialUpdates) > 0 {
-		if err := db.batchUpdateAccountCredentials(ctx, tx, active.credentials, credentialUpdates); err != nil {
-			return nil, err
+		active, selectErr := db.selectBatchAccounts(ctx, tx, ids, len(credentialUpdates) > 0)
+		if selectErr != nil {
+			return selectErr
 		}
-	}
-	if update.GroupIDs.Set {
-		if err := db.batchReplaceAccountGroups(ctx, tx, active.ids, update.GroupIDs.Values); err != nil {
-			return nil, err
+		if len(active.ids) == 0 {
+			return tx.Commit()
 		}
-	}
 
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return active.ids, nil
+		if updateErr := db.batchUpdateAccountColumns(ctx, tx, active.ids, update); updateErr != nil {
+			return updateErr
+		}
+		if len(credentialUpdates) > 0 {
+			if updateErr := db.batchUpdateAccountCredentials(ctx, tx, active.credentials, credentialUpdates); updateErr != nil {
+				return updateErr
+			}
+		}
+		if update.GroupIDs.Set {
+			if updateErr := db.batchReplaceAccountGroups(ctx, tx, active.ids, update.GroupIDs.Values); updateErr != nil {
+				return updateErr
+			}
+		}
+		if commitErr := tx.Commit(); commitErr != nil {
+			return commitErr
+		}
+		updatedIDs = active.ids
+		return nil
+	})
+	return updatedIDs, err
 }
 
 type batchAccountCredentials struct {
@@ -6181,16 +6618,26 @@ func (db *DB) batchUpdateAccountColumns(ctx context.Context, tx *sql.Tx, ids []i
 
 func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, current map[int64]map[string]interface{}, updates map[string]interface{}) error {
 	query := `UPDATE accounts SET credentials = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	identityQuery := `UPDATE accounts SET credentials = ?, credential_generation = credential_generation + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
 	if !db.isSQLite() {
 		query = `UPDATE accounts SET credentials = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+		identityQuery = `UPDATE accounts SET credentials = $1::jsonb, credential_generation = credential_generation + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	}
 	for id, credentials := range current {
-		merged := mergeCredentialMaps(credentials, updates)
+		// Each account can start with a different value. Compare independently
+		// so an idempotent update for one row does not inherit another row's
+		// generation bump.
+		merged := mergeCredentialMaps(cloneCredentialUpdates(credentials), updates)
+		identityChanged := grokIdentityCredentialChanged(credentials, merged)
 		credJSON, err := json.Marshal(merged)
 		if err != nil {
 			return fmt.Errorf("序列化 credentials 失败: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, query, credJSON, id); err != nil {
+		updateQuery := query
+		if identityChanged {
+			updateQuery = identityQuery
+		}
+		if _, err := tx.ExecContext(ctx, updateQuery, credJSON, id); err != nil {
 			return err
 		}
 	}
@@ -6365,14 +6812,19 @@ func (db *DB) updateCredentialsReadMerge(ctx context.Context, id int64, credenti
 	}
 
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
+	identityChanged := grokIdentityCredentialChanged(decodeCredentials(currentRaw), merged)
 	credJSON, err := json.Marshal(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
 
-	updateQuery := `UPDATE accounts SET credentials = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+	generationUpdate := ""
+	if identityChanged {
+		generationUpdate = ", credential_generation = credential_generation + 1"
+	}
+	updateQuery := `UPDATE accounts SET credentials = $1` + generationUpdate + `, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	if !db.isSQLite() {
-		updateQuery = `UPDATE accounts SET credentials = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+		updateQuery = `UPDATE accounts SET credentials = $1::jsonb` + generationUpdate + `, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	}
 	if _, err := tx.ExecContext(ctx, updateQuery, credJSON, id); err != nil {
 		return err
@@ -6385,13 +6837,16 @@ func (db *DB) updateCredentialsSQLite(ctx context.Context, id int64, credentials
 		if len(credentials) == 0 {
 			return nil
 		}
+		if grokIdentityUpdateKeysPresent(credentials) {
+			return db.updateCredentialsReadMergeSQLiteUnlocked(ctx, id, credentials)
+		}
 
 		args := make([]interface{}, 0, len(credentials)*2+1)
 		jsonSetArgs := make([]string, 0, len(credentials)*2)
 		argIdx := 1
 		for key, value := range credentials {
 			if !sqliteJSONSetKeySupported(key) {
-				return db.updateCredentialsReadMergeSQLite(ctx, id, credentials)
+				return db.updateCredentialsReadMergeSQLiteUnlocked(ctx, id, credentials)
 			}
 			valueJSON, err := json.Marshal(value)
 			if err != nil {
@@ -6423,6 +6878,12 @@ func (db *DB) updateCredentialsSQLite(ctx context.Context, id int64, credentials
 }
 
 func (db *DB) updateCredentialsReadMergeSQLite(ctx context.Context, id int64, credentials map[string]interface{}) error {
+	return db.withSQLiteWriteLock(ctx, func() error {
+		return db.updateCredentialsReadMergeSQLiteUnlocked(ctx, id, credentials)
+	})
+}
+
+func (db *DB) updateCredentialsReadMergeSQLiteUnlocked(ctx context.Context, id int64, credentials map[string]interface{}) error {
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -6434,15 +6895,49 @@ func (db *DB) updateCredentialsReadMergeSQLite(ctx context.Context, id int64, cr
 		return err
 	}
 
+	current := decodeCredentials(currentRaw)
 	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
+	identityChanged := grokIdentityCredentialChanged(current, merged)
 	credJSON, err := json.Marshal(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET credentials = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, credJSON, id); err != nil {
+	generationUpdate := ""
+	if identityChanged {
+		generationUpdate = ", credential_generation = credential_generation + 1"
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET credentials = $1`+generationUpdate+`, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, credJSON, id); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+var grokIdentityCredentialKeys = map[string]struct{}{
+	"access_token": {}, "refresh_token": {}, "api_key": {}, "upstream_type": {},
+	"base_url": {}, "grok_client_id": {}, "grok_token_endpoint": {},
+	"grok_oidc_issuer": {}, "grok_principal_type": {}, "grok_principal_id": {},
+	"account_id": {},
+}
+
+func grokIdentityUpdateKeysPresent(updates map[string]interface{}) bool {
+	for key := range updates {
+		if _, ok := grokIdentityCredentialKeys[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func grokIdentityCredentialChanged(before, after map[string]interface{}) bool {
+	if !strings.EqualFold(strings.TrimSpace(credentialStringFromMap(after, "upstream_type")), "grok") {
+		return false
+	}
+	for key := range grokIdentityCredentialKeys {
+		if strings.TrimSpace(credentialStringFromMap(before, key)) != strings.TrimSpace(credentialStringFromMap(after, key)) {
+			return true
+		}
+	}
+	return false
 }
 
 func sqliteJSONSetKeySupported(key string) bool {
@@ -6639,7 +7134,7 @@ func (db *DB) SoftDeleteAccount(ctx context.Context, id int64) error {
 // ListDeleted 获取回收站中的账号（被软删除、尚未彻底清除的账号）。
 func (db *DB) ListDeleted(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at, deleted_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at, deleted_at, COALESCE(credential_generation, 1), COALESCE(credential_family_id, '')
 		FROM accounts
 		WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted'
 		ORDER BY deleted_at DESC, id DESC
@@ -6682,6 +7177,8 @@ func (db *DB) ListDeleted(ctx context.Context) ([]*AccountRow, error) {
 			&createdAtRaw,
 			&updatedAtRaw,
 			&deletedAtRaw,
+			&a.CredentialGeneration,
+			&a.CredentialFamilyID,
 		); err != nil {
 			return nil, fmt.Errorf("扫描回收站账号行失败: %w", err)
 		}
@@ -6741,6 +7238,11 @@ func (db *DB) PurgeAccount(ctx context.Context, id int64) error {
 		return err
 	}
 	defer tx.Rollback()
+	// Grok observations intentionally do not rely on foreign-key cascades; keep
+	// purge behavior consistent across SQLite and PostgreSQL.
+	if err := db.deleteGrokAccountStateTx(ctx, tx, "= $1", id); err != nil {
+		return err
+	}
 	query := `DELETE FROM accounts WHERE id = $1 AND (status = 'deleted' OR COALESCE(error_message, '') = 'deleted')`
 	res, err := tx.ExecContext(ctx, query, id)
 	if err != nil {
@@ -6766,6 +7268,10 @@ func (db *DB) PurgeDeletedAccounts(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
+	deletedPredicate := `IN (SELECT id FROM accounts WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted')`
+	if err := db.deleteGrokAccountStateTx(ctx, tx, deletedPredicate); err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM account_group_members
 		WHERE account_id IN (SELECT id FROM accounts WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted')
@@ -6979,9 +7485,10 @@ func (db *DB) InsertAccountWithCredentials(ctx context.Context, name string, cre
 		return 0, err
 	}
 
-	return db.insertRowID(ctx,
+	return db.insertAccountRowWithFamily(ctx,
 		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`,
 		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
+		credentials,
 		name, credJSON, proxyURL,
 	)
 }
@@ -6995,9 +7502,10 @@ func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, cre
 		return 0, err
 	}
 
-	return db.insertRowID(ctx,
+	return db.insertAccountRowWithFamily(ctx,
 		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, 'openai', 'responses_api', $2, $3) RETURNING id`,
 		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, 'openai', 'responses_api', $2, $3)`,
+		credentials,
 		name, credJSON, proxyURL,
 	)
 }
@@ -7018,11 +7526,48 @@ func (db *DB) InsertAccountWithUpstream(ctx context.Context, name, platform, acc
 	if err != nil {
 		return 0, err
 	}
-	return db.insertRowID(ctx,
+	return db.insertAccountRowWithFamily(ctx,
 		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
 		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, $2, $3, $4, $5)`,
+		credentials,
 		name, platform, accountType, credJSON, proxyURL,
 	)
+}
+
+// insertAccountRowWithFamily keeps legacy insert SQL untouched while ensuring
+// every newly-created account immediately receives its stable family key.
+func (db *DB) insertAccountRowWithFamily(ctx context.Context, postgresQuery, sqliteQuery string, credentials map[string]interface{}, args ...interface{}) (int64, error) {
+	candidate := credentialFamilyCandidate(credentials)
+	returnID := int64(0)
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if db.isSQLite() {
+			query := strings.TrimSpace(sqliteQuery)
+			if _, err = tx.ExecContext(ctx, query, args...); err != nil {
+				return err
+			}
+			if err = tx.QueryRowContext(ctx, "SELECT last_insert_rowid()").Scan(&returnID); err != nil {
+				return err
+			}
+		} else if err = tx.QueryRowContext(ctx, strings.TrimSpace(postgresQuery), args...).Scan(&returnID); err != nil {
+			return err
+		}
+		if strings.TrimSpace(candidate) == "" {
+			candidate = "cf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE accounts SET credential_family_id=$1 WHERE id=$2 AND COALESCE(credential_family_id,'')=''`, candidate, returnID); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+	if err != nil {
+		return 0, err
+	}
+	return returnID, nil
 }
 
 // UpdateAccountName 仅更新账号名称。

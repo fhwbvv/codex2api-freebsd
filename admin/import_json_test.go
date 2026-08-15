@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -1419,6 +1420,21 @@ func TestMergeRefreshedDuplicateIntoExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Insert old: %v", err)
 	}
+	groupID, err := db.CreateAccountGroup(
+		context.Background(),
+		"repair-target",
+		"",
+		"",
+		0,
+		0,
+		sql.NullInt64{},
+	)
+	if err != nil {
+		t.Fatalf("CreateAccountGroup: %v", err)
+	}
+	if err := db.SetAccountGroups(context.Background(), oldID, []int64{groupID}); err != nil {
+		t.Fatalf("SetAccountGroups old: %v", err)
+	}
 
 	// 新导入的 RT 账号：刷新完成后身份与旧账号相同
 	newID, err := db.InsertAccountWithCredentials(context.Background(), "rt-later", map[string]interface{}{
@@ -1448,6 +1464,13 @@ func TestMergeRefreshedDuplicateIntoExisting(t *testing.T) {
 	}
 	if got := oldRow.GetCredential("codex_7d_used_percent"); got != "42.5" {
 		t.Fatalf("codex_7d_used_percent = %q, want 42.5 (用量统计必须保留)", got)
+	}
+	runtimeOld := store.FindByID(oldID)
+	if runtimeOld == nil {
+		t.Fatal("merged survivor missing from runtime store")
+	}
+	if got := runtimeOld.GroupIDSnapshot(); len(got) != 1 || got[0] != groupID {
+		t.Fatalf("survivor runtime groups = %v, want [%d]", got, groupID)
 	}
 
 	rows, err := db.ListActive(context.Background())

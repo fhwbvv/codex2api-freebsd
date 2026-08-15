@@ -245,16 +245,20 @@ func TestPagedAccountRuntimeStatusOverridesDatabaseRow(t *testing.T) {
 func TestAccountStatsCachesNeverBlockColdOrStaleReads(t *testing.T) {
 	handler, _, _ := newPagedAccountsHandler(t)
 	started := time.Now()
-	_, state := handler.getCachedRequestCountsNonBlocking()
+	_, state := handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil)
 	if state != "warming" || time.Since(started) > 100*time.Millisecond {
 		t.Fatalf("cold request stats state=%q elapsed=%s", state, time.Since(started))
 	}
-	// refreshAccountListSnapshotAsync acquires the lock before launching its
-	// goroutine, so taking it here waits until the background warmup is done.
-	handler.reqCountRefreshMu.Lock()
-	handler.reqCountRefreshMu.Unlock()
-	if _, state = handler.getCachedRequestCountsNonBlocking(); state != "ready" {
-		t.Fatalf("warmed request stats state=%q, want ready", state)
+	// 刷新在后台 goroutine 里完成,轮询等它把本渠道缓存转为 ready。
+	warmDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, state = handler.getCachedRequestCountsNonBlocking(database.UpstreamChannelCodex, nil); state == "ready" {
+			break
+		}
+		if time.Now().After(warmDeadline) {
+			t.Fatalf("warmed request stats state=%q, want ready", state)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	snapshot, err := handler.getAccountListSnapshot(context.Background(), database.UpstreamChannelCodex)
@@ -386,5 +390,251 @@ func TestBatchOperationsRejectIDsTogetherWithSelector(t *testing.T) {
 				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
 		})
+	}
+}
+
+// 删除/封禁后统计卡曾因快照缓存(5s TTL + stale-while-revalidate)不失效而
+// 显示变更前数字;失效后同一 TTL 窗口内必须立刻拿到重建的新 summary。
+func TestAccountMutationInvalidationServesFreshSummary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, codexIDs, _ := newPagedAccountsHandler(t)
+	ctx := context.Background()
+
+	before, err := handler.getAccountListSnapshot(ctx, database.UpstreamChannelCodex)
+	if err != nil {
+		t.Fatalf("build snapshot: %v", err)
+	}
+	if before.Summary.Total != len(codexIDs) {
+		t.Fatalf("summary total = %d, want %d", before.Summary.Total, len(codexIDs))
+	}
+
+	if err := handler.db.SoftDeleteAccount(ctx, codexIDs[0]); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	// 未失效时,新鲜窗口内仍返回变更前快照 —— 这是 bug 曾经的表现,
+	// 也证明修复必须依赖显式失效而非 TTL。
+	stale, err := handler.getAccountListSnapshot(ctx, database.UpstreamChannelCodex)
+	if err != nil {
+		t.Fatalf("stale read: %v", err)
+	}
+	if stale.Summary.Total != len(codexIDs) {
+		t.Fatalf("pre-invalidation total = %d, want stale %d", stale.Summary.Total, len(codexIDs))
+	}
+
+	handler.invalidateAccountSnapshotCaches()
+	fresh, err := handler.getAccountListSnapshot(ctx, database.UpstreamChannelCodex)
+	if err != nil {
+		t.Fatalf("fresh read: %v", err)
+	}
+	if fresh.Summary.Total != len(codexIDs)-1 {
+		t.Fatalf("post-invalidation total = %d, want %d", fresh.Summary.Total, len(codexIDs)-1)
+	}
+}
+
+// 在途重建若跨越了失效点(读库早于账号变更),不得把旧快照写回缓存。
+func TestInstallSkipsCacheWhenGenerationMoved(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, _, _ := newPagedAccountsHandler(t)
+	staleGen := handler.accountCachesGen.Load()
+	handler.invalidateAccountSnapshotCaches() // 模拟重建读库之后才提交的账号变更
+	snapshot := &accountListSnapshot{Channel: database.UpstreamChannelCodex}
+	handler.installAccountListSnapshot(database.UpstreamChannelCodex, snapshot, staleGen)
+	handler.accountListCacheMu.RLock()
+	cached := handler.accountListCache[database.UpstreamChannelCodex]
+	handler.accountListCacheMu.RUnlock()
+	if cached != nil {
+		t.Fatalf("stale-generation snapshot was cached")
+	}
+	handler.installAccountListSnapshot(database.UpstreamChannelCodex, snapshot, handler.accountCachesGen.Load())
+	handler.accountListCacheMu.RLock()
+	cached = handler.accountListCache[database.UpstreamChannelCodex]
+	handler.accountListCacheMu.RUnlock()
+	if cached != snapshot {
+		t.Fatalf("current-generation snapshot was not cached")
+	}
+}
+
+func TestShouldInvalidateAccountSnapshotCaches(t *testing.T) {
+	cases := []struct {
+		method string
+		path   string
+		status int
+		want   bool
+	}{
+		{http.MethodDelete, "/api/admin/accounts/7", http.StatusOK, true},
+		{http.MethodPost, "/api/admin/accounts/batch-delete", http.StatusOK, true},
+		{http.MethodPost, "/api/admin/accounts/7/enable", http.StatusOK, true},
+		{http.MethodPatch, "/api/admin/accounts/7/note", http.StatusOK, true},
+		{http.MethodDelete, "/api/admin/account-groups/3", http.StatusOK, true},
+		{http.MethodGet, "/api/admin/accounts", http.StatusOK, false},
+		{http.MethodDelete, "/api/admin/accounts/7", http.StatusNotFound, false},
+		{http.MethodPost, "/api/admin/keys", http.StatusOK, false},
+		{http.MethodPost, "/api/admin/prompt-filter/review/keys/x", http.StatusOK, false},
+	}
+	for _, tc := range cases {
+		if got := shouldInvalidateAccountSnapshotCaches(tc.method, tc.path, tc.status); got != tc.want {
+			t.Fatalf("shouldInvalidate(%s %s %d) = %t, want %t", tc.method, tc.path, tc.status, got, tc.want)
+		}
+	}
+}
+
+// 回归:调度优先级排序依赖列表投影带出 scheduler_priority;投影缺字段时
+// 快照全员按 0 打平,排序退化成 ID 序(账号页"排序不生效"反馈)。
+func TestListAccountsPageSortsBySchedulerPriority(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler, codexIDs, _ := newPagedAccountsHandler(t)
+	ctx := context.Background()
+	// codexIDs[0] 不设置(视同 0),其余两个分别 50 / 40。
+	if err := handler.db.UpdateCredentials(ctx, codexIDs[1], map[string]interface{}{"scheduler_priority": int64(50)}); err != nil {
+		t.Fatalf("set priority 50: %v", err)
+	}
+	if err := handler.db.UpdateCredentials(ctx, codexIDs[2], map[string]interface{}{"scheduler_priority": int64(40)}); err != nil {
+		t.Fatalf("set priority 40: %v", err)
+	}
+
+	assertOrder := func(order string, want []int64) {
+		t.Helper()
+		recorder := invokeListAccounts(t, handler,
+			"/api/admin/accounts?view=page&channel=codex&page=1&page_size=10&sort=scheduler_priority&order="+order)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+		}
+		var page accountsPageResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+			t.Fatalf("decode page: %v", err)
+		}
+		got := make([]int64, 0, len(page.Accounts))
+		for _, account := range page.Accounts {
+			got = append(got, account.ID)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("order=%s got %v, want %v", order, got, want)
+		}
+		for index := range want {
+			if got[index] != want[index] {
+				t.Fatalf("order=%s got %v, want %v", order, got, want)
+			}
+		}
+	}
+
+	assertOrder("desc", []int64{codexIDs[1], codexIDs[2], codexIDs[0]})
+	assertOrder("asc", []int64{codexIDs[0], codexIDs[2], codexIDs[1]})
+}
+
+func TestListAccountsPageKeepsGrokQuotaBars(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccountWithUpstream(ctx, "grok-quota", "xai", "oauth", map[string]interface{}{
+		"upstream_type":       "grok",
+		"refresh_token":       "rt-grok",
+		"email":               "grok@example.net",
+		"plan_type":           "supergrok",
+		"grok_billing_detail": `{"weekly_percent":42.5,"weekly_period_end":"2026-08-15T00:00:00Z"}`,
+	}, "")
+	if err != nil {
+		t.Fatalf("insert grok: %v", err)
+	}
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("store.Init: %v", err)
+	}
+	account := store.FindByID(id)
+	if account == nil {
+		t.Fatal("runtime account missing")
+	}
+	account.SetGrokRateLimitSnapshot(auth.GrokRateLimitSnapshot{
+		LimitTokens: 1000, RemainingTokens: 400, UpdatedAt: time.Now(),
+	})
+	tokenCache := cache.NewMemory(1)
+	t.Cleanup(func() { _ = tokenCache.Close() })
+	handler := NewHandler(store, db, tokenCache, nil, "")
+
+	recorder := invokeListAccounts(t, handler, "/api/admin/accounts?view=page&channel=grok&page=1&page_size=20")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var page accountsPageResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode page: %v", err)
+	}
+	if len(page.Accounts) != 1 || page.Accounts[0].ID != id {
+		t.Fatalf("page rows = %+v", page.Accounts)
+	}
+	row := page.Accounts[0]
+	if row.DetailLoaded || row.Usage5hDetail != nil || row.ModelMapping != "" {
+		t.Fatalf("paged grok row leaked expensive details: %+v", row)
+	}
+	if len(row.GrokBilling) == 0 || !strings.Contains(string(row.GrokBilling), `"weekly_percent":42.5`) {
+		t.Fatalf("paged grok row dropped quota bar payload: %s", row.GrokBilling)
+	}
+	if row.GrokRateLimit == nil || row.GrokRateLimit.LimitTokens != 1000 || row.GrokRateLimit.RemainingTokens != 400 {
+		t.Fatalf("paged grok row dropped rate-limit snapshot: %+v", row.GrokRateLimit)
+	}
+}
+
+func TestCodexNormalIncludesDisabledButSchedulingExcludesIt(t *testing.T) {
+	enabled := &accountListSnapshotItem{Status: "active", Enabled: true}
+	disabled := &accountListSnapshotItem{Status: "active", Enabled: false}
+	codex := database.UpstreamChannelCodex
+	if !accountListStatusMatches(enabled, "normal", codex) {
+		t.Fatal("enabled healthy account should match normal")
+	}
+	if !accountListStatusMatches(disabled, "normal", codex) {
+		t.Fatal("disabled account should classify as normal")
+	}
+	if accountListStatusMatches(disabled, "scheduling", codex) || accountListStatusMatches(disabled, "active", codex) {
+		t.Fatal("disabled account must be excluded from scheduling")
+	}
+	if !accountListStatusMatches(disabled, "disabled", codex) {
+		t.Fatal("disabled account should match disabled filter")
+	}
+	summary, _ := summarizeAccountList([]*accountListSnapshotItem{enabled, disabled}, codex)
+	if summary.Normal != 2 || summary.Active != 1 || summary.Disabled != 1 || summary.Total != 2 {
+		t.Fatalf("summary = %+v, want Normal=2 Active=1 Disabled=1 Total=2", summary)
+	}
+}
+
+func TestOverloadPausedCountsAsNormalNotRateLimitedOrScheduling(t *testing.T) {
+	item := &accountListSnapshotItem{
+		Status:         "overload_paused",
+		Enabled:        true,
+		CooldownReason: "overload_paused",
+	}
+	codex := database.UpstreamChannelCodex
+	if accountListRateLimited(item) {
+		t.Fatal("overload_paused must not count as rate limited")
+	}
+	if !accountListStatusMatches(item, "normal", codex) {
+		t.Fatal("overload_paused should classify as normal")
+	}
+	if accountListStatusMatches(item, "scheduling", codex) || accountListStatusMatches(item, "active", codex) {
+		t.Fatal("overload_paused must be excluded from scheduling")
+	}
+	if accountListStatusMatches(item, "rate_limited", codex) {
+		t.Fatal("overload_paused must not match rate_limited")
+	}
+	summary, _ := summarizeAccountList([]*accountListSnapshotItem{item}, codex)
+	if summary.Normal != 1 || summary.Active != 0 || summary.RateLimited != 0 || summary.OverloadPaused != 1 {
+		t.Fatalf("summary = %+v, want Normal=1 Active=0 RateLimited=0 OverloadPaused=1", summary)
+	}
+}
+
+func TestCodexAuthKindFilterSplitsOAuthAndResponsesAPI(t *testing.T) {
+	oauthItem := &accountListSnapshotItem{Status: "active", Enabled: true}
+	apiItem := &accountListSnapshotItem{Status: "active", Enabled: true, OpenAIResponses: true}
+	codex := database.UpstreamChannelCodex
+	if !accountListItemMatches(oauthItem, accountPageQuery{AuthKind: "oauth"}, codex) ||
+		accountListItemMatches(apiItem, accountPageQuery{AuthKind: "oauth"}, codex) {
+		t.Fatal("auth_kind=oauth should match only non-Responses accounts on codex channel")
+	}
+	if !accountListItemMatches(apiItem, accountPageQuery{AuthKind: "api_key"}, codex) ||
+		accountListItemMatches(oauthItem, accountPageQuery{AuthKind: "api_key"}, codex) {
+		t.Fatal("auth_kind=api_key should match only Responses API accounts on codex channel")
+	}
+	summary, _ := summarizeAccountList([]*accountListSnapshotItem{oauthItem, apiItem}, codex)
+	if summary.OAuth != 1 || summary.APIKey != 1 {
+		t.Fatalf("summary = %+v, want OAuth=1 APIKey=1", summary)
 	}
 }

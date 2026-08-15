@@ -5,6 +5,7 @@ import { useToast } from "../hooks/useToast";
 import type {
   APIKeyAccountGroup,
   APIKeyAccountGroupUsage,
+  APIKeyAccountUsageReconciliation,
   APIKeyAccountStat,
   APIKeyTokenStat,
 } from "../types";
@@ -151,6 +152,9 @@ export default function APIKeyTokenUsagePanel({
   const [expandedIds, setExpandedIds] = useState<Set<number>>(() => new Set());
   const [accountData, setAccountData] = useState<Record<number, APIKeyAccountStat[]>>({});
   const [groupData, setGroupData] = useState<Record<number, APIKeyAccountGroupUsage[]>>({});
+  const [reconciliationData, setReconciliationData] = useState<
+    Record<number, APIKeyAccountUsageReconciliation>
+  >({});
   const [accountLoadingIds, setAccountLoadingIds] = useState<Set<number>>(() => new Set());
   const [accountError, setAccountError] = useState<Record<number, string>>({});
   const reloadAbort = useRef<AbortController | null>(null);
@@ -199,6 +203,7 @@ export default function APIKeyTokenUsagePanel({
     setAccountLoadingIds(new Set());
     setAccountData({});
     setGroupData({});
+    setReconciliationData({});
     setAccountError({});
     try {
       const [data] = await Promise.all([
@@ -251,6 +256,10 @@ export default function APIKeyTokenUsagePanel({
       });
       setAccountData((prev) => ({ ...prev, [id]: data.items ?? [] }));
       setGroupData((prev) => ({ ...prev, [id]: data.groups ?? [] }));
+      const reconciliation = data.reconciliation;
+      if (reconciliation) {
+        setReconciliationData((prev) => ({ ...prev, [id]: reconciliation }));
+      }
     } catch (err) {
       if (!controller.signal.aborted) {
         setAccountError((prev) => ({ ...prev, [id]: getErrorMessage(err) }));
@@ -639,6 +648,7 @@ export default function APIKeyTokenUsagePanel({
                               error={accountError[item.api_key_id]}
                               rows={accountData[item.api_key_id]}
                               groups={groupData[item.api_key_id]}
+                              reconciliation={reconciliationData[item.api_key_id]}
                               showFull={showFullUsageNumbers}
                               locale={locale}
                             />
@@ -729,6 +739,7 @@ function KeyAccountBreakdown({
   error,
   rows,
   groups,
+  reconciliation,
   showFull,
   locale,
 }: {
@@ -736,6 +747,7 @@ function KeyAccountBreakdown({
   error?: string;
   rows?: APIKeyAccountStat[];
   groups?: APIKeyAccountGroupUsage[];
+  reconciliation?: APIKeyAccountUsageReconciliation;
   showFull: boolean;
   locale: string;
 }) {
@@ -889,13 +901,13 @@ function KeyAccountBreakdown({
       </div>
 
       <div className="grid gap-2 sm:grid-cols-2">
-        {groups && groups.length > 0 ? (
+        {(groups && groups.length > 0) || reconciliation?.ungrouped.accounts ? (
           <div className="col-span-full mb-1 rounded-xl border border-primary/20 bg-primary/[0.03] p-3">
             <div className="mb-2 text-xs font-semibold text-foreground">
               {t("apiKeys.keyGroupsTitle")}
             </div>
             <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-              {groups.map((group) => (
+              {(groups ?? []).map((group) => (
                 <div
                   key={group.id}
                   className="rounded-lg border border-border/70 bg-background px-3 py-2"
@@ -929,7 +941,65 @@ function KeyAccountBreakdown({
                   </div>
                 </div>
               ))}
+              {reconciliation && reconciliation.ungrouped.accounts > 0 ? (
+                <div className="rounded-lg border border-amber-300/70 bg-amber-50/70 px-3 py-2 dark:border-amber-800/60 dark:bg-amber-950/20">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-xs font-semibold text-amber-800 dark:text-amber-300">
+                      {t("apiKeys.keyGroupsUngrouped")}
+                    </span>
+                    <span className="text-[10px] text-muted-foreground">
+                      {t("apiKeys.keyGroupsAccounts", { count: reconciliation.ungrouped.accounts })}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] tabular-nums text-muted-foreground">
+                    <span>
+                      {formatUsageNumber(reconciliation.ungrouped.total_tokens, showFull, locale)}{" "}
+                      {t("apiKeys.keyAccountsTokUnit")}
+                    </span>
+                    <span>
+                      {t("apiKeys.keyGroupsAccountCost")}: {" "}
+                      <b className="text-foreground">{formatUSD(reconciliation.ungrouped.account_billed)}</b>
+                    </span>
+                    <span>
+                      {t("apiKeys.keyGroupsBilled")}: {" "}
+                      <b className="text-emerald-700 dark:text-emerald-400">
+                        {formatUSD(reconciliation.ungrouped.user_billed)}
+                      </b>
+                    </span>
+                  </div>
+                </div>
+              ) : null}
             </div>
+            {reconciliation ? (
+              <div className="mt-2 rounded-lg border border-border/70 bg-background/80 px-2.5 py-2 text-[10px] text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 tabular-nums">
+                  <span>{t("apiKeys.keyGroupsReconcileCost")}</span>
+                  <b className="text-foreground">{formatUSD(reconciliation.grouped_total.user_billed)}</b>
+                  <span>+</span>
+                  <b className="text-amber-700 dark:text-amber-300">{formatUSD(reconciliation.ungrouped.user_billed)}</b>
+                  <span>-</span>
+                  <b className="text-sky-700 dark:text-sky-300">{formatUSD(reconciliation.duplicate.user_billed)}</b>
+                  <span>=</span>
+                  <b className="text-emerald-700 dark:text-emerald-400">{formatUSD(totalBilled)}</b>
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 tabular-nums">
+                  <span>{t("apiKeys.keyGroupsReconcileAccounts")}</span>
+                  <b className="text-foreground">{reconciliation.grouped_total.accounts}</b>
+                  <span>+</span>
+                  <b className="text-amber-700 dark:text-amber-300">{reconciliation.ungrouped.accounts}</b>
+                  <span>-</span>
+                  <b className="text-sky-700 dark:text-sky-300">{reconciliation.duplicate.accounts}</b>
+                  <span>=</span>
+                  <b className="text-foreground">{rows.length}</b>
+                </div>
+                <p className="mt-1.5 leading-relaxed">
+                  {t("apiKeys.keyGroupsReconcileHint", {
+                    ungrouped: reconciliation.ungrouped.accounts,
+                    multi: reconciliation.multi_group_accounts,
+                  })}
+                </p>
+              </div>
+            ) : null}
             <p className="mt-2 text-[10px] text-muted-foreground">
               {t("apiKeys.keyGroupsCurrentHint")}
             </p>
@@ -963,6 +1033,11 @@ function KeyAccountBreakdown({
                     </Badge>
                   ) : null}
                   <AccountGroupChips groups={a.groups} />
+                  {!a.groups || a.groups.length === 0 ? (
+                    <span className="inline-flex items-center rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">
+                      {t(a.account_deleted ? "apiKeys.keyAccountHistoricalGroupMissing" : "apiKeys.keyAccountUngrouped")}
+                    </span>
+                  ) : null}
                 </div>
                 <span className="shrink-0 tabular-nums text-xs font-semibold text-muted-foreground">
                   {formatPercent(share)}

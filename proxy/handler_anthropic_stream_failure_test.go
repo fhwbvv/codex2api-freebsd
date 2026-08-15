@@ -17,6 +17,7 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // newAnthropicStreamFailureTestHandler 搭一个走 Resin HTTP 上游的 /v1/messages
@@ -229,5 +230,71 @@ func TestMessagesEntryRejectionLogsToConsole(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "/v1/messages 入口拒绝") {
 		t.Fatalf("entry rejection must log to console; logs=%q", logs.String())
+	}
+}
+
+func TestMessagesUpstreamErrorBodyIsBoundedAndUnstructuredBodyIsNotLeaked(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+
+	secret := "secret-provider-token-should-not-leak"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "<html><body>"+secret+strings.Repeat("x", upstreamErrorBodyReadMaxBytes+1024)+"</body></html>")
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, MaxRetries: 0, MaxRateLimitRetries: 0})
+	defer store.Stop()
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-opus-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.Messages(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), secret) || strings.Contains(strings.ToLower(recorder.Body.String()), "<html") {
+		t.Fatalf("unstructured upstream error leaked: %s", recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); !strings.Contains(got, "Upstream error response exceeded the safe read limit") {
+		t.Fatalf("message = %q; body=%s", got, recorder.Body.String())
+	}
+}
+
+func TestMessagesUpstreamHTMLMessageIsNotLeaked(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "<html>request-id=private-123</html>")
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, MaxRetries: 0, MaxRateLimitRetries: 0})
+	defer store.Stop()
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-opus-4-6","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.Messages(ctx)
+	if recorder.Code != http.StatusBadRequest || strings.Contains(recorder.Body.String(), "private-123") {
+		t.Fatalf("status/body = %d %s", recorder.Code, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); got != "Upstream returned status 400" {
+		t.Fatalf("message = %q; body=%s", got, recorder.Body.String())
 	}
 }

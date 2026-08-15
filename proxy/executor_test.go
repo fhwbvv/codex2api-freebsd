@@ -525,6 +525,22 @@ func TestPrepareCodexResponsesLiteTransportBridgesRequestScopedSignal(t *testing
 	if marker := gjson.GetBytes(nonLiteBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
 		t.Fatalf("HTTP body retained false WS-only Lite metadata: %s", nonLiteBody)
 	}
+
+	// 模型门禁剥离信号后（enabled=false），WS 路径必须清掉下游带来的体内标记，
+	// 否则非 lite 模型仍会把标记带上 WS 上游触发 400。
+	gatedWSBody := []byte(`{"model":"gpt-5.5","client_metadata":{"other":"kept","ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`)
+	gatedWSHeaders := make(http.Header)
+	gatedWSHeaders.Set(codexResponsesLiteHeader, "true")
+	gatedWSBody, gatedWSHeaders = prepareCodexResponsesLiteTransport(gatedWSBody, gatedWSHeaders, true, false)
+	if marker := gjson.GetBytes(gatedWSBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("WS body retained Lite metadata after gate disabled it: %s", gatedWSBody)
+	}
+	if got := gjson.GetBytes(gatedWSBody, "client_metadata.other").String(); got != "kept" {
+		t.Fatalf("unrelated client metadata = %q, want kept; body=%s", got, gatedWSBody)
+	}
+	if got := gatedWSHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("WS handshake Lite header = %q, want empty after gate disabled it", got)
+	}
 }
 
 func TestNormalizeCodexResponsesLiteBodyEnforcesUpstreamConstraints(t *testing.T) {
@@ -945,13 +961,13 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 	downstreamHeaders.Set("User-Agent", "curl/8.0")
 	downstreamHeaders.Set(codexResponsesLiteHeader, "true")
 
-	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.6-sol"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
 	}
 	resp.Body.Close()
 
-	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
+	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.6-sol"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesCompactRequest() error = %v", err)
 	}

@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -19,6 +19,8 @@ import (
 )
 
 // ==================== Anthropic 错误格式 ====================
+
+const upstreamErrorBodyReadMaxBytes = 1 << 20
 
 // sendAnthropicError 发送 Anthropic 格式的错误响应
 func sendAnthropicError(c *gin.Context, statusCode int, errType, message string) {
@@ -201,6 +203,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 	}()
 
+	capacityShedRetries := map[int64]int{}
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
@@ -234,7 +237,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
-			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
+			upstreamEndpoint = relayUpstreamEndpointForProtocol(account, GrokProtocolMessages, attemptEffectiveModel)
 		}
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
@@ -273,7 +276,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 			}
-			resp, reqErr = ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
+			resp, reqErr = ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolMessages, rawBody, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
 			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
@@ -317,6 +320,11 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 
 			if !retryable {
+				var structured *Error
+				if errors.As(reqErr, &structured) && structured.HTTPStatus == http.StatusBadRequest {
+					sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", structured.Message)
+					return
+				}
 				sendAnthropicError(c, http.StatusBadGateway, "api_error", "Upstream request failed")
 				return
 			}
@@ -338,13 +346,16 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
-			errBody, _ := io.ReadAll(resp.Body)
+			errBody, readErr := readAllLimited(resp.Body, upstreamErrorBodyReadMaxBytes)
+			if readErr != nil {
+				errBody = []byte(`{"error":{"message":"Upstream error response exceeded the safe read limit","type":"api_error"}}`)
+			}
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
 
-			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
+			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody, upstreamCyberPolicyAttempt{
 				Transport: upstreamPromptPolicyTransport(isStream, useWebsocket), StatusCode: resp.StatusCode,
@@ -400,11 +411,54 @@ func (h *Handler) Messages(c *gin.Context) {
 				return
 			}
 			errType := mapHTTPStatusToAnthropicError(resp.StatusCode)
-			msg := gjson.GetBytes(errBody, "error.message").String()
-			if msg == "" {
+			msg := usageLogErrorMessage(resp.StatusCode, errBody)
+			if msg == "" || msg == fmt.Sprintf("HTTP %d", resp.StatusCode) {
 				msg = fmt.Sprintf("Upstream returned status %d", resp.StatusCode)
 			}
 			sendAnthropicError(c, resp.StatusCode, errType, msg)
+			return
+		}
+		if isGrokNativeRouteResponse(resp) {
+			usage, outcome, wroteAnyBody, firstTokenMs := forwardGrokNativeResponse(c, resp, GrokProtocolMessages, isStream, start, ttftGuard.Stop)
+			totalDuration := int(time.Since(start).Milliseconds())
+			ttftGuard.Stop()
+			resp.Body.Close()
+			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), nil) {
+				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+				continue
+			}
+			nativeHTTPError := !wroteAnyBody && outcome.logStatusCode != http.StatusOK && c.Request.Context().Err() == nil
+			if nativeHTTPError {
+				h.sendGrokNativeHTTPError(c, GrokProtocolMessages, outcome)
+			}
+			logInput := &database.UsageLogInput{
+				AccountID: account.ID(), Endpoint: "/v1/messages", Model: model,
+				EffectiveModel: attemptEffectiveModel, StatusCode: outcome.logStatusCode,
+				DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
+				InboundEndpoint: "/v1/messages", UpstreamEndpoint: upstreamEndpoint,
+				Stream: isStream, ViaWebsocket: false, AttemptIndex: attempt + 1,
+			}
+			if usage != nil {
+				logInput.PromptTokens, logInput.CompletionTokens, logInput.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
+				logInput.InputTokens, logInput.OutputTokens = usage.InputTokens, usage.OutputTokens
+				logInput.ReasoningTokens, logInput.CachedTokens = usage.ReasoningTokens, usage.CachedTokens
+			}
+			if outcome.logStatusCode != http.StatusOK {
+				logInput.UpstreamErrorKind = outcome.failureKind
+				logInput.ErrorMessage = usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage)
+			}
+			h.logUsageForRequest(c, logInput)
+			if outcome.penalize {
+				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			} else if outcome.logStatusCode == http.StatusOK {
+				h.store.ClearModelCooldown(account, attemptEffectiveModel)
+				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+			}
+			h.store.Release(account)
 			return
 		}
 
@@ -661,7 +715,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 				InboundEndpoint: "/v1/messages", UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
-				ErrorMessage: usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage)),
+				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 			}, promptPolicyIncidentID)
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
@@ -670,11 +724,11 @@ func (h *Handler) Messages(c *gin.Context) {
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 			} else {
-				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			h.unbindOrRetainAffinityForCapacityShed(retryExclusions, affinityKey, account, outcome, capacityShedRetries)
 			continue
 		}
 
@@ -740,7 +794,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			AttemptIndex:           attempt + 1,
 		}
 		if logStatusCode != http.StatusOK {
-			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
+			logInput.ErrorMessage = usageLogFailureMessage(logStatusCode, outcome.failureMessage)
 			logInput.UpstreamErrorKind = outcome.failureKind
 		}
 		if usage != nil {
@@ -758,7 +812,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)

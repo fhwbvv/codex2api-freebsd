@@ -413,7 +413,7 @@ export default function ThemeSettings() {
                   <span className="text-xs text-muted-foreground">{section.items.length}</span>
                 </div>
               ) : null}
-              <div className="grid gap-3 grid-cols-1 min-[420px]:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+              <div className="grid gap-2.5 grid-cols-2 sm:gap-3 xl:grid-cols-3 2xl:grid-cols-4">
                 {section.items.map((item) => (
                   <ThemeStyleCard
                     key={item.id}

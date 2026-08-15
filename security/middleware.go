@@ -258,6 +258,7 @@ func IsSensitiveEndpoint(path string) bool {
 		"/api/admin/keys",
 		"/api/admin/settings",
 		"/api/admin/proxies",
+		"/api/admin/prompt-filter/review/keys",
 	}
 	for _, p := range sensitivePaths {
 		if strings.HasPrefix(path, p) {

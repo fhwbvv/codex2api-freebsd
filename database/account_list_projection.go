@@ -18,7 +18,7 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 	fromClause := `FROM accounts
 		CROSS JOIN LATERAL jsonb_to_record(accounts.credentials) AS account_public(
 			upstream_type text, email text, base_url text, plan_type text,
-			models jsonb, api_key text, refresh_token text
+			models jsonb, api_key text, refresh_token text, scheduler_priority text
 		)`
 	credentialColumns := `
 		COALESCE(account_public.upstream_type, ''),
@@ -27,7 +27,8 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 		COALESCE(account_public.plan_type, ''),
 		COALESCE(account_public.models, '[]'::jsonb)::text,
 		COALESCE(account_public.api_key, '') <> '',
-		COALESCE(account_public.refresh_token, '') <> ''`
+		COALESCE(account_public.refresh_token, '') <> '',
+		COALESCE(account_public.scheduler_priority, '')`
 	if db.isSQLite() {
 		upstreamExpr = `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), ''))`
 		fromClause = `FROM accounts`
@@ -38,7 +39,8 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 			COALESCE(json_extract(credentials, '$.plan_type'), ''),
 			COALESCE(json_extract(credentials, '$.models'), '[]'),
 			CASE WHEN COALESCE(json_extract(credentials, '$.api_key'), '') <> '' THEN 1 ELSE 0 END,
-			CASE WHEN COALESCE(json_extract(credentials, '$.refresh_token'), '') <> '' THEN 1 ELSE 0 END`
+			CASE WHEN COALESCE(json_extract(credentials, '$.refresh_token'), '') <> '' THEN 1 ELSE 0 END,
+			COALESCE(CAST(json_extract(credentials, '$.scheduler_priority') AS TEXT), '')`
 	}
 	switch channel {
 	case UpstreamChannelGrok:
@@ -48,7 +50,8 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 	}
 	query := `SELECT id, name, type, proxy_url, status, cooldown_reason, cooldown_until,
 		COALESCE(error_message, ''), COALESCE(enabled, true), COALESCE(locked, false),
-		score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at,` + credentialColumns + `
+		score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at,
+		COALESCE(credential_generation, 1), COALESCE(credential_family_id, ''),` + credentialColumns + `
 		` + fromClause + ` WHERE ` + where + ` ORDER BY id`
 	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {
@@ -73,14 +76,15 @@ type accountProjectionScanner interface {
 func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, error) {
 	row := &AccountRow{}
 	var cooldownRaw, tagsRaw, createdRaw, updatedRaw interface{}
-	var upstreamType, email, baseURL, planType string
+	var upstreamType, email, baseURL, planType, schedulerPriority string
 	var modelsRaw interface{}
 	var hasAPIKey, hasRefreshToken bool
 	if err := scanner.Scan(
 		&row.ID, &row.Name, &row.Type, &row.ProxyURL, &row.Status, &row.CooldownReason, &cooldownRaw,
 		&row.ErrorMessage, &row.Enabled, &row.Locked, &row.ScoreBiasOverride, &row.BaseConcurrencyOverride,
-		&tagsRaw, &createdRaw, &updatedRaw, &upstreamType, &email, &baseURL, &planType, &modelsRaw,
-		&hasAPIKey, &hasRefreshToken,
+		&tagsRaw, &createdRaw, &updatedRaw, &row.CredentialGeneration, &row.CredentialFamilyID,
+		&upstreamType, &email, &baseURL, &planType, &modelsRaw,
+		&hasAPIKey, &hasRefreshToken, &schedulerPriority,
 	); err != nil {
 		return nil, fmt.Errorf("扫描账号列表投影失败: %w", err)
 	}
@@ -103,6 +107,11 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 		"email":         email,
 		"base_url":      baseURL,
 		"plan_type":     planType,
+	}
+	// 调度优先级参与列表排序(issue 截图反馈:排序不生效),投影缺了它会让
+	// 快照全员按 0 打平、退化成 ID 序。以文本取出交给 GetCredentialInt64 解析。
+	if trimmed := strings.TrimSpace(schedulerPriority); trimmed != "" {
+		row.Credentials["scheduler_priority"] = trimmed
 	}
 	if models := decodeProjectionStringSlice(modelsRaw); len(models) > 0 {
 		row.Credentials["models"] = models
@@ -152,7 +161,8 @@ func (db *DB) ListActiveByIDs(ctx context.Context, ids []int64) ([]*AccountRow, 
 		cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false),
 		COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false),
 		COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override,
-		COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at
+		COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at,
+		COALESCE(credential_generation, 1), COALESCE(credential_family_id, '')
 		FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		AND id IN (` + strings.Join(placeholders, ",") + `) ORDER BY id`
 	rows, err := db.conn.QueryContext(ctx, query, args...)
@@ -169,6 +179,7 @@ func (db *DB) ListActiveByIDs(ctx context.Context, ids []int64) ([]*AccountRow, 
 			&row.CooldownReason, &cooldownRaw, &row.ErrorMessage, &row.Enabled, &row.Locked,
 			&row.CreditEnabled, &row.CreditSkipUsageWindow, &row.SkipWarmTier, &row.ScoreBiasOverride,
 			&row.BaseConcurrencyOverride, &tagsRaw, &row.Note, &createdRaw, &updatedRaw,
+			&row.CredentialGeneration, &row.CredentialFamilyID,
 		); err != nil {
 			return nil, fmt.Errorf("扫描账号行失败: %w", err)
 		}

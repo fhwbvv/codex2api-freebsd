@@ -144,6 +144,97 @@ func TestCooldownCacheWritesAndDeletes(t *testing.T) {
 	}
 }
 
+// ageModelCooldown 把已存的冷却记录往前拨，模拟「冷却早已过期、但不久前刚失败过」。
+func ageModelCooldown(acc *Account, model string, resetAgo, updatedAgo time.Duration) {
+	key := normalizeModelCooldownKey(model)
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	now := time.Now()
+	cd := acc.ModelCooldowns[key]
+	cd.ResetAt = now.Add(-resetAgo)
+	cd.UpdatedAt = now.Add(-updatedAgo)
+	acc.ModelCooldowns[key] = cd
+}
+
+// 低流量部署两次失败的间隔常常比冷却本身还长。退避档位不能因为「冷却已过期」
+// 就永远停在第一级——否则退避形同虚设，账号会以固定的基础间隔反复撞上游。
+func TestModelCooldownBackoffSurvivesSparseTraffic(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{DBID: 12}
+	const model = "gpt-5.6-sol"
+	const base = 5 * time.Minute
+
+	first := store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true)
+	if first.BackoffLevel != 0 {
+		t.Fatalf("first BackoffLevel = %d, want 0", first.BackoffLevel)
+	}
+
+	// 冷却已过期 5 分钟，但 10 分钟前刚失败过：连击仍在 TTL 内，档位必须继续升级。
+	ageModelCooldown(acc, model, 5*time.Minute, 10*time.Minute)
+	second := store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true)
+	if second.BackoffLevel != 1 {
+		t.Fatalf("second BackoffLevel = %d, want 1 (streak must survive an expired cooldown)", second.BackoffLevel)
+	}
+	if remaining := time.Until(second.ResetAt); remaining <= base {
+		t.Fatalf("second remaining = %v, want longer than the %v base", remaining, base)
+	}
+
+	// 再隔一轮同样的稀疏失败，档位继续推进。
+	ageModelCooldown(acc, model, 5*time.Minute, 10*time.Minute)
+	third := store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true)
+	if third.BackoffLevel != 2 {
+		t.Fatalf("third BackoffLevel = %d, want 2", third.BackoffLevel)
+	}
+	if !third.ResetAt.After(second.ResetAt.Add(-time.Second)) {
+		t.Fatalf("third cooldown should be at least as long as the second")
+	}
+}
+
+// 超过连击 TTL 后回到第一级，避免旧档位无限期挂在账号上。
+func TestModelCooldownBackoffResetsAfterStreakTTL(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{DBID: 13}
+	const model = "gpt-5.6-sol"
+	const base = 5 * time.Minute
+
+	store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true)
+	ageModelCooldown(acc, model, 5*time.Minute, 10*time.Minute)
+	escalated := store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true)
+	if escalated.BackoffLevel != 1 {
+		t.Fatalf("BackoffLevel = %d, want 1 before the TTL lapses", escalated.BackoffLevel)
+	}
+
+	// 上次失败已经是 TTL 之外的事了：连击断开，回到第一级与基础时长。
+	ageModelCooldown(acc, model, 2*modelCooldownStreakTTL, 2*modelCooldownStreakTTL)
+	revived := store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true)
+	if revived.BackoffLevel != 0 {
+		t.Fatalf("BackoffLevel = %d, want 0 after the streak TTL lapsed", revived.BackoffLevel)
+	}
+	if remaining := time.Until(revived.ResetAt); remaining > base+time.Minute {
+		t.Fatalf("remaining = %v, want back to the %v base", remaining, base)
+	}
+}
+
+// 成功会删掉冷却记录，连击随之归零。
+func TestModelCooldownBackoffResetsAfterSuccess(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{DBID: 14}
+	const model = "gpt-5.6-sol"
+	const base = 5 * time.Minute
+
+	store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true)
+	ageModelCooldown(acc, model, 5*time.Minute, time.Minute)
+	if lvl := store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true).BackoffLevel; lvl != 1 {
+		t.Fatalf("BackoffLevel = %d, want 1", lvl)
+	}
+
+	store.ClearModelCooldown(acc, model)
+	after := store.MarkModelCooldownWithBackoff(acc, model, base, "rate_limited_model", true)
+	if after.BackoffLevel != 0 {
+		t.Fatalf("BackoffLevel = %d, want 0 after a success cleared the cooldown", after.BackoffLevel)
+	}
+}
+
 func TestModelCooldownFixedModeDoesNotBackoff(t *testing.T) {
 	store := NewStore(nil, nil, nil)
 	acc := &Account{DBID: 11}

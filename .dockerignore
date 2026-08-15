@@ -20,6 +20,10 @@ Thumbs.db
 .env
 .env.local
 
+# Local credentials and account-test fixtures must never enter a build context.
+.private-account-fixtures/
+*.zip
+
 # Docker
 docker-compose.yml
 .dockerignore

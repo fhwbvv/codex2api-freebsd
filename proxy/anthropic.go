@@ -14,13 +14,14 @@ import (
 // anthropicRequest 表示 Anthropic Messages API 请求
 type anthropicRequest struct {
 	Model        string                 `json:"model"`
-	MaxTokens    int                    `json:"max_tokens"`
+	MaxTokens    *int                   `json:"max_tokens"`
 	System       json.RawMessage        `json:"system,omitempty"`
 	Messages     []anthropicMessage     `json:"messages"`
 	Tools        []anthropicTool        `json:"tools,omitempty"`
 	Stream       bool                   `json:"stream,omitempty"`
 	Temperature  *float64               `json:"temperature,omitempty"`
 	TopP         *float64               `json:"top_p,omitempty"`
+	TopK         json.RawMessage        `json:"top_k,omitempty"`
 	StopSeqs     []string               `json:"stop_sequences,omitempty"`
 	Thinking     *anthropicThinking     `json:"thinking,omitempty"`
 	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
@@ -35,7 +36,8 @@ type anthropicThinking struct {
 }
 
 type anthropicOutputConfig struct {
-	Effort string `json:"effort,omitempty"`
+	Effort string          `json:"effort,omitempty"`
+	Format json.RawMessage `json:"format,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -280,6 +282,18 @@ func shouldUseCodexPriorityForAnthropicSpeed(speed string) bool {
 // TranslateAnthropicToCodexWithModels 将 Anthropic Messages 请求转换为 Codex Responses 格式
 // 返回: (codex 请求体, 原始 Anthropic model 名, error)
 func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string, supportedModels []string) ([]byte, string, error) {
+	return translateAnthropicToResponses(rawJSON, modelMappingJSON, supportedModels, false)
+}
+
+// TranslateAnthropicToResponsesForGrok converts Messages into a canonical
+// Responses request for Grok routing while retaining all request controls that
+// Responses can represent. The existing Codex converter intentionally omits
+// these controls because the Codex endpoint rejects them.
+func TranslateAnthropicToResponsesForGrok(rawJSON []byte, modelMappingJSON string, supportedModels []string) ([]byte, string, error) {
+	return translateAnthropicToResponses(rawJSON, modelMappingJSON, supportedModels, true)
+}
+
+func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supportedModels []string, preserveControls bool) ([]byte, string, error) {
 	var req anthropicRequest
 	if err := json.Unmarshal(rawJSON, &req); err != nil {
 		return nil, "", fmt.Errorf("parse anthropic request: %w", err)
@@ -287,6 +301,9 @@ func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string
 
 	originalModel := req.Model
 	codexModel := resolveAnthropicModel(req.Model, modelMappingJSON, supportedModels)
+	if err := validateAnthropicToolReferences(req.Messages); err != nil {
+		return nil, originalModel, err
+	}
 
 	// 构建 input 数组
 	input := buildCodexInput(req.System, req.Messages)
@@ -326,11 +343,136 @@ func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string
 		}
 	}
 
+	if preserveControls {
+		if err := copyAnthropicResponsesControls(out, req); err != nil {
+			return nil, originalModel, err
+		}
+	}
+
 	body, err := json.Marshal(out)
 	if err != nil {
 		return nil, "", fmt.Errorf("marshal codex request: %w", err)
 	}
 	return body, originalModel, nil
+}
+
+func copyAnthropicResponsesControls(out map[string]any, req anthropicRequest) error {
+	if req.MaxTokens != nil {
+		out["max_output_tokens"] = *req.MaxTokens
+	}
+	if req.Temperature != nil {
+		out["temperature"] = *req.Temperature
+	}
+	if req.TopP != nil {
+		out["top_p"] = *req.TopP
+	}
+	if len(req.TopK) > 0 && strings.TrimSpace(string(req.TopK)) != "null" {
+		return fmt.Errorf("Messages top_k cannot be represented by Responses")
+	}
+	if req.StopSeqs != nil {
+		out["stop"] = append([]string(nil), req.StopSeqs...)
+	}
+
+	if len(req.ToolChoice) > 0 && strings.TrimSpace(string(req.ToolChoice)) != "null" {
+		choice := convertAnthropicToolChoice(req.ToolChoice)
+		if choice == nil {
+			return fmt.Errorf("Messages tool_choice cannot be represented by Responses")
+		}
+		if choiceMap, ok := choice.(map[string]any); ok {
+			function, _ := choiceMap["function"].(map[string]any)
+			name := strings.TrimSpace(firstNonEmptyAnyString(choiceMap["name"]))
+			if name == "" {
+				name = strings.TrimSpace(firstNonEmptyAnyString(function["name"]))
+			}
+			if name == "" {
+				return fmt.Errorf("Messages tool_choice type tool requires name")
+			}
+			choice = map[string]any{"type": "function", "name": name}
+		}
+		out["tool_choice"] = choice
+	}
+
+	format, err := anthropicOutputFormatToResponses(req.OutputConfig)
+	if err != nil {
+		return err
+	}
+	if format != nil {
+		out["text"] = map[string]any{"format": format}
+	}
+	return nil
+}
+
+func anthropicOutputFormatToResponses(config *anthropicOutputConfig) (map[string]any, error) {
+	if config == nil || len(config.Format) == 0 || strings.TrimSpace(string(config.Format)) == "null" {
+		return nil, nil
+	}
+	var format map[string]any
+	if json.Unmarshal(config.Format, &format) != nil || format == nil {
+		return nil, fmt.Errorf("Messages output_config.format must be an object")
+	}
+	formatType := strings.TrimSpace(firstNonEmptyAnyString(format["type"]))
+	switch formatType {
+	case "text", "json_object":
+		return map[string]any{"type": formatType}, nil
+	case "json_schema":
+		// The Grok Messages wire shape is {type,json_schema?} in some clients,
+		// but its canonical xAI type is {type,schema}. Accept both spellings.
+		schema := format["schema"]
+		name := "structured_output"
+		strict := true
+		if nested, ok := format["json_schema"].(map[string]any); ok {
+			if schema == nil {
+				schema = nested["schema"]
+			}
+			if value := strings.TrimSpace(firstNonEmptyAnyString(nested["name"])); value != "" {
+				name = value
+			}
+			if value, ok := nested["strict"].(bool); ok {
+				strict = value
+			}
+		}
+		if value := strings.TrimSpace(firstNonEmptyAnyString(format["name"])); value != "" {
+			name = value
+		}
+		if value, ok := format["strict"].(bool); ok {
+			strict = value
+		}
+		if schema == nil {
+			return nil, fmt.Errorf("Messages output_config.format json_schema requires schema")
+		}
+		return map[string]any{"type": "json_schema", "name": name, "schema": schema, "strict": strict}, nil
+	default:
+		return nil, fmt.Errorf("Messages output_config.format type %q cannot be represented by Responses", formatType)
+	}
+}
+
+// validateAnthropicToolReferences rejects request semantics that cannot be
+// represented safely in Responses. A detached tool_result must not be silently
+// converted into ordinary user text because doing so changes tool causality.
+func validateAnthropicToolReferences(messages []anthropicMessage) error {
+	known := make(map[string]struct{})
+	for messageIndex, message := range messages {
+		blocks := parseAnthropicContent(message.Content)
+		for blockIndex, block := range blocks {
+			switch block.Type {
+			case "tool_use":
+				id := strings.TrimSpace(block.ID)
+				if id == "" {
+					return fmt.Errorf("messages[%d].content[%d] tool_use requires id", messageIndex, blockIndex)
+				}
+				known[id] = struct{}{}
+			case "tool_result":
+				id := strings.TrimSpace(block.ToolUseID)
+				if id == "" {
+					return fmt.Errorf("messages[%d].content[%d] tool_result requires tool_use_id", messageIndex, blockIndex)
+				}
+				if _, ok := known[id]; !ok {
+					return fmt.Errorf("messages[%d].content[%d] orphan tool_result for tool_use_id %q", messageIndex, blockIndex, id)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // buildCodexInput 将 Anthropic system + messages 转换为 Codex input 数组
@@ -417,11 +559,33 @@ func appendUserBlocks(input []any, blocks []anthropicContentBlock) []any {
 		case "tool_result":
 			// tool_result → function_call_output（独立 item）
 			output := extractToolResultText(b)
+			images := extractToolResultImages(b)
+			if output == "" && len(images) > 0 {
+				// 纯图片工具结果：function_call_output 不能为空，留占位指向随后的 user 消息。
+				output = toolResultImageMovedMarker
+			}
+			callID := toCodexCallID(b.ToolUseID)
 			input = append(input, map[string]any{
 				"type":    "function_call_output",
-				"call_id": toCodexCallID(b.ToolUseID),
+				"call_id": callID,
 				"output":  output,
 			})
+			// Chat/Responses 协议下 function_call_output 只能是文本，图片视觉模型看不见；
+			// 抽出来放进紧随其后的合成 user 消息，附带 call 归属说明。
+			if len(images) > 0 {
+				mediaParts := []any{map[string]any{
+					"type": "input_text",
+					"text": fmt.Sprintf(toolResultImageAttribution, callID),
+				}}
+				for _, dataURI := range images {
+					mediaParts = append(mediaParts, map[string]any{"type": "input_image", "image_url": dataURI})
+				}
+				input = append(input, map[string]any{
+					"type":    "message",
+					"role":    "user",
+					"content": mediaParts,
+				})
+			}
 		}
 	}
 	if len(contentParts) > 0 {
@@ -498,6 +662,31 @@ func appendAssistantBlocks(input []any, blocks []anthropicContentBlock) []any {
 		})
 	}
 	return input
+}
+
+const (
+	toolResultImageMovedMarker = "[Tool output image moved to the following user message]"
+	toolResultImageAttribution = "[Tool output image for call %s]"
+)
+
+// extractToolResultImages 从 tool_result 块的 content 中提取图片，返回 data URI 列表。
+// 只识别 content 为 []block 时的 image 块（Anthropic base64 source）；字符串或非法
+// content 不含结构化图片，返回 nil。图片能力缺失时该函数是无副作用的 no-op。
+func extractToolResultImages(b anthropicContentBlock) []string {
+	if len(b.Content) == 0 || string(b.Content) == "null" {
+		return nil
+	}
+	var blocks []anthropicContentBlock
+	if json.Unmarshal(b.Content, &blocks) != nil {
+		return nil
+	}
+	var images []string
+	for _, cb := range blocks {
+		if cb.Type == "image" && cb.Source != nil && cb.Source.Data != "" {
+			images = append(images, fmt.Sprintf("data:%s;base64,%s", cb.Source.MediaType, cb.Source.Data))
+		}
+	}
+	return images
 }
 
 // extractToolResultText 从 tool_result 块提取文本输出

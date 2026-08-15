@@ -1012,6 +1012,226 @@ func TestFastSchedulerRemainingQuotaTieBreakProvenThenDBID(t *testing.T) {
 	}
 }
 
+func TestFastSchedulerFillFirstPicksHighestUsage(t *testing.T) {
+	highUsage := &Account{
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           90,
+		UsagePercent7dValid:      true,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+	lowUsage := &Account{
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           10,
+		UsagePercent7dValid:      true,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+
+	scheduler := NewFastScheduler(4, "fill_first")
+	scheduler.Rebuild([]*Account{lowUsage, highUsage})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != highUsage.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want highest-usage account %d", got.DBID, highUsage.DBID)
+	}
+}
+
+func TestFastSchedulerFillFirstSortOrderUsageDescending(t *testing.T) {
+	a1 := &Account{
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           70,
+		UsagePercent7dValid:      true,
+		BaseConcurrencyEffective: 1,
+		DynamicConcurrencyLimit:  1,
+	}
+	a2 := &Account{
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           30,
+		UsagePercent7dValid:      true,
+		BaseConcurrencyEffective: 1,
+		DynamicConcurrencyLimit:  1,
+	}
+	a3 := &Account{
+		DBID:                     3,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           90,
+		UsagePercent7dValid:      true,
+		BaseConcurrencyEffective: 1,
+		DynamicConcurrencyLimit:  1,
+	}
+
+	scheduler := NewFastScheduler(1, "fill_first")
+	scheduler.Rebuild([]*Account{a1, a2, a3})
+
+	// Acquire all without releasing; concurrency limit 1 forces
+	// iteration through the usage-descending sorted order.
+	var got []int64
+	for i := 0; i < 3; i++ {
+		acc := scheduler.Acquire()
+		if acc == nil {
+			t.Fatalf("Acquire() returned nil at iteration %d", i)
+		}
+		got = append(got, acc.DBID)
+	}
+
+	// Expect descending usage: a3 (90%), a1 (70%), a2 (30%)
+	want := []int64{3, 1, 2}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("fill_first sort order mismatch: got=%v want=%v", got, want)
+		}
+	}
+}
+
+func TestFastSchedulerFillFirstSticksUntilUnavailable(t *testing.T) {
+	draining := &Account{
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           80,
+		UsagePercent7dValid:      true,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+	standby := &Account{
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           20,
+		UsagePercent7dValid:      true,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+
+	scheduler := NewFastScheduler(4, "fill_first")
+	scheduler.Rebuild([]*Account{draining, standby})
+
+	// 连续取号应始终命中同一个账号，而不是在两个账号间轮询。
+	for i := 0; i < 5; i++ {
+		acc := scheduler.Acquire()
+		if acc == nil {
+			t.Fatalf("Acquire() returned nil at iteration %d", i)
+		}
+		if acc.DBID != draining.DBID {
+			t.Fatalf("iteration %d picked dbID=%d, want sticky account %d", i, acc.DBID, draining.DBID)
+		}
+		scheduler.Release(acc)
+	}
+
+	// 账号进入冷却后，下一次取号应滑落到备用账号。
+	draining.mu.Lock()
+	draining.Status = StatusCooldown
+	draining.CooldownUtil = time.Now().Add(time.Minute)
+	draining.mu.Unlock()
+
+	acc := scheduler.Acquire()
+	if acc == nil {
+		t.Fatal("Acquire() returned nil after cooldown")
+	}
+	defer scheduler.Release(acc)
+	if acc.DBID != standby.DBID {
+		t.Fatalf("after cooldown, Acquire() picked dbID=%d, want standby account %d", acc.DBID, standby.DBID)
+	}
+}
+
+func TestFastSchedulerFillFirstPriorityBeatsUsage(t *testing.T) {
+	lowPriorityHighUsage := &Account{
+		DBID:                     1,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           90,
+		UsagePercent7dValid:      true,
+		SchedulerPriority:        -10,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+	highPriorityLowUsage := &Account{
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		HealthTier:               HealthTierHealthy,
+		UsagePercent7d:           10,
+		UsagePercent7dValid:      true,
+		SchedulerPriority:        10,
+		BaseConcurrencyEffective: 4,
+		DynamicConcurrencyLimit:  4,
+	}
+
+	scheduler := NewFastScheduler(4, "fill_first")
+	scheduler.Rebuild([]*Account{lowPriorityHighUsage, highPriorityLowUsage})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil")
+	}
+	defer scheduler.Release(got)
+
+	if got.DBID != highPriorityLowUsage.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want high-priority account %d", got.DBID, highPriorityLowUsage.DBID)
+	}
+}
+
+func TestFastSchedulerSetSchedulerModeFillFirstResorts(t *testing.T) {
+	highUsage := newFastSchedulerTestAccount(1, HealthTierHealthy, 90, 2)
+	highUsage.UsagePercent7d = 90
+	highUsage.UsagePercent7dValid = true
+	lowUsage := newFastSchedulerTestAccount(2, HealthTierHealthy, 10, 2)
+	lowUsage.UsagePercent7d = 10
+	lowUsage.UsagePercent7dValid = true
+
+	s := NewFastScheduler(4, "round_robin")
+	s.Rebuild([]*Account{highUsage, lowUsage})
+
+	first := s.Acquire()
+	s.Release(first)
+
+	s.SetSchedulerMode("fill_first")
+	// After re-sort + zero cursor, should pick highest usage first
+	first = s.Acquire()
+	if first == nil {
+		t.Fatal("Acquire() returned nil after mode switch")
+	}
+	if first.DBID != highUsage.DBID {
+		t.Fatalf("after fill_first switch, Acquire() picked dbID=%d, want highest-usage account %d", first.DBID, highUsage.DBID)
+	}
+	s.Release(first)
+}
+
+func TestStoreSetSchedulerModeAcceptsFillFirst(t *testing.T) {
+	s := &Store{}
+	s.SetSchedulerMode("fill_first")
+	if got := s.GetSchedulerMode(); got != "fill_first" {
+		t.Fatalf("GetSchedulerMode() = %q, want fill_first", got)
+	}
+	s.SetSchedulerMode("bogus")
+	if got := s.GetSchedulerMode(); got != "round_robin" {
+		t.Fatalf("GetSchedulerMode() after invalid mode = %q, want round_robin", got)
+	}
+}
+
 func TestFastSchedulerSetSchedulerModeEmptyDefaultsToRoundRobin(t *testing.T) {
 	s := NewFastScheduler(4, "remaining_quota")
 	if s.SchedulerMode() != "remaining_quota" {

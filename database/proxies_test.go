@@ -386,3 +386,99 @@ func TestSQLiteProxyStatusMigrationBackfillsExistingTestData(t *testing.T) {
 		t.Fatalf("migrated test_status = %q, want %q", got, ProxyTestStatusSuccess)
 	}
 }
+
+func TestRetireProxiesByIDsUnbindsMatchingAccounts(t *testing.T) {
+	db := newProxyTestDB(t)
+	ctx := context.Background()
+	const (
+		retiredURL = "http://retired.example:8080"
+		keptURL    = "http://kept.example:8080"
+	)
+	retiredID, err := db.InsertProxy(ctx, retiredURL, "")
+	if err != nil {
+		t.Fatalf("InsertProxy(retired) returned error: %v", err)
+	}
+	if _, err := db.InsertProxy(ctx, keptURL, ""); err != nil {
+		t.Fatalf("InsertProxy(kept) returned error: %v", err)
+	}
+	boundID, err := db.InsertAccount(ctx, "bound", "rt-bound", retiredURL)
+	if err != nil {
+		t.Fatalf("InsertAccount(bound) returned error: %v", err)
+	}
+	keptAccountID, err := db.InsertAccount(ctx, "kept", "rt-kept", keptURL)
+	if err != nil {
+		t.Fatalf("InsertAccount(kept) returned error: %v", err)
+	}
+
+	result, err := db.RetireProxiesByIDs(ctx, []int64{retiredID})
+	if err != nil {
+		t.Fatalf("RetireProxiesByIDs returned error: %v", err)
+	}
+	if result.Deleted != 1 || result.Unbound != 1 {
+		t.Fatalf("result = %#v, want deleted=1 unbound=1", result)
+	}
+	if len(result.UnboundAccountIDs) != 1 || result.UnboundAccountIDs[0] != boundID {
+		t.Fatalf("UnboundAccountIDs = %v, want [%d]", result.UnboundAccountIDs, boundID)
+	}
+
+	rows, err := db.ListProxies(ctx)
+	if err != nil {
+		t.Fatalf("ListProxies returned error: %v", err)
+	}
+	if len(rows) != 1 || rows[0].URL != keptURL {
+		t.Fatalf("remaining proxies = %#v, want only %q", rows, keptURL)
+	}
+	bound, err := db.GetAccountByID(ctx, boundID)
+	if err != nil {
+		t.Fatalf("GetAccountByID(bound) returned error: %v", err)
+	}
+	if bound.ProxyURL != "" {
+		t.Fatalf("retired account proxy_url = %q, want empty", bound.ProxyURL)
+	}
+	kept, err := db.GetAccountByID(ctx, keptAccountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID(kept) returned error: %v", err)
+	}
+	if kept.ProxyURL != keptURL {
+		t.Fatalf("kept account proxy_url = %q, want %q", kept.ProxyURL, keptURL)
+	}
+}
+
+func TestRebindAccountProxyURLsRewritesMatchingPins(t *testing.T) {
+	db := newProxyTestDB(t)
+	ctx := context.Background()
+	const (
+		oldURL = "http://old.example:8080"
+		newURL = "http://new.example:8080"
+	)
+	accountID, err := db.InsertAccount(ctx, "bound", "rt-bound", oldURL)
+	if err != nil {
+		t.Fatalf("InsertAccount returned error: %v", err)
+	}
+	otherID, err := db.InsertAccount(ctx, "other", "rt-other", "http://other.example:8080")
+	if err != nil {
+		t.Fatalf("InsertAccount(other) returned error: %v", err)
+	}
+
+	ids, err := db.RebindAccountProxyURLs(ctx, oldURL, newURL)
+	if err != nil {
+		t.Fatalf("RebindAccountProxyURLs returned error: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != accountID {
+		t.Fatalf("rebound ids = %v, want [%d]", ids, accountID)
+	}
+	row, err := db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID returned error: %v", err)
+	}
+	if row.ProxyURL != newURL {
+		t.Fatalf("rebound proxy_url = %q, want %q", row.ProxyURL, newURL)
+	}
+	other, err := db.GetAccountByID(ctx, otherID)
+	if err != nil {
+		t.Fatalf("GetAccountByID(other) returned error: %v", err)
+	}
+	if other.ProxyURL != "http://other.example:8080" {
+		t.Fatalf("untouched proxy_url = %q", other.ProxyURL)
+	}
+}

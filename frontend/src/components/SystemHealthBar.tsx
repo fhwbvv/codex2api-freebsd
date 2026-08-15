@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { Activity } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { getBucketConfig, type TimeRangeKey } from '../lib/timeRange'
 import type { ChartAggregation } from '../types'
@@ -177,46 +178,49 @@ export default function SystemHealthBar({ chartData, timeRange, loading = false 
   }
 
   return (
-    <Card className="py-0">
-      <CardContent className="p-4">
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <h3 className="text-base font-semibold text-foreground">
-            {t('dashboard.systemHealthTitle')}
-          </h3>
+    <Card className="py-0 border-border/70 bg-card shadow-2xs">
+      <CardContent className="p-4 sm:p-5">
+        <div className="mb-3.5 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Activity className="size-4 text-primary" />
+            <h3 className="text-sm font-semibold text-foreground">
+              {t('dashboard.systemHealthTitle')}
+            </h3>
+          </div>
           <span
-            className={`inline-flex items-center rounded px-2 py-0.5 text-xs font-semibold tabular-nums ${rateClass}`}
+            className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-bold tabular-nums shadow-2xs ${rateClass}`}
           >
             {hasData ? formatSuccessRate(successRate) : '--'}
           </span>
         </div>
 
         {loading && !hasData ? (
-          <div className="flex gap-[3px]">
+          <div className="flex gap-1">
             {Array.from({ length: bucketCount }).map((_, i) => (
               <div
                 key={i}
-                className="h-2.5 flex-1 animate-pulse rounded-[3px] bg-muted/60"
+                className="h-3 flex-1 animate-pulse rounded-full bg-muted/60"
                 style={{ animationDelay: `${i * 40}ms` }}
               />
             ))}
           </div>
         ) : (
-          <div className="relative flex gap-[3px]" ref={blocksRef}>
+          <div className="relative flex gap-1 items-center" ref={blocksRef}>
             {blocks.map((block, idx) => {
               const isIdle = block.rate === -1
               const isActive = activeTooltip === idx
               return (
                 <div
                   key={idx}
-                  className="group relative min-w-[3px] flex-1 cursor-pointer"
+                  className="group relative min-w-[3px] flex-1 cursor-pointer py-1"
                   onPointerEnter={(e) => handlePointerEnter(e, idx)}
                   onPointerLeave={handlePointerLeave}
                   onPointerDown={(e) => handlePointerDown(e, idx)}
                 >
                   <div
-                    className={`h-2.5 w-full rounded-[3px] transition-transform duration-150 group-hover:scale-y-125 ${
-                      isIdle ? 'bg-border' : ''
-                    } ${isActive ? 'scale-y-125 opacity-90' : ''}`}
+                    className={`h-3 w-full rounded-full transition-all duration-150 group-hover:scale-y-125 ${
+                      isIdle ? 'bg-muted/70' : ''
+                    } ${isActive ? 'scale-y-125 opacity-90 ring-2 ring-primary/40' : ''}`}
                     style={isIdle ? undefined : { backgroundColor: rateToColor(block.rate) }}
                   />
                   {isActive && renderTooltip(block, idx)}

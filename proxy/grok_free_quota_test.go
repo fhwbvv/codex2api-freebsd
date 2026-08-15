@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -24,6 +25,57 @@ func TestParseGrokFreeQuotaUsage(t *testing.T) {
 	if model := parseGrokFreeQuotaModel(body); model != "grok-4.5-build-free" {
 		t.Fatalf("unexpected model: %q", model)
 	}
+}
+
+func TestApplyGrokCooldownSeparatesAuthPaymentPolicyAndVersion(t *testing.T) {
+	t.Run("unknown 402 is not hard disabled", func(t *testing.T) {
+		store, acc := newGrokTestAccount("SuperGrok")
+		decision := applyGrokCooldown(store, acc, http.StatusPaymentRequired, []byte(`{"error":{"code":"provider_unknown"}}`), nil, "grok-4.5")
+		if decision.Reason != "payment_required_unknown" {
+			t.Fatalf("reason = %q", decision.Reason)
+		}
+		if got := acc.RuntimeStatus(); got != "active" {
+			t.Fatalf("runtime status = %q, want active", got)
+		}
+	})
+
+	t.Run("explicit balance exhaustion is hard gated", func(t *testing.T) {
+		store, acc := newGrokTestAccount("SuperGrok")
+		decision := applyGrokCooldown(store, acc, http.StatusPaymentRequired, []byte(`{"error":{"message":"Grok Build usage balance exhausted"}}`), nil, "grok-4.5")
+		if decision.Reason != "usage_limited" || acc.RuntimeStatus() != "usage_limited" {
+			t.Fatalf("decision=%+v status=%q", decision, acc.RuntimeStatus())
+		}
+	})
+
+	t.Run("403 is policy and never unauthorized", func(t *testing.T) {
+		store, acc := newGrokTestAccount("SuperGrok")
+		decision := applyGrokCooldown(store, acc, http.StatusForbidden, []byte(`{"error":{"code":"subscription_required"}}`), nil, "grok-4.5")
+		if decision.Reason != "forbidden" || acc.GetCooldownReason() != "forbidden" {
+			t.Fatalf("decision=%+v cooldown=%q", decision, acc.GetCooldownReason())
+		}
+		if acc.IsBanned() {
+			t.Fatal("403 must not mark the credential banned")
+		}
+	})
+
+	t.Run("401 schedules neutral refresh isolation", func(t *testing.T) {
+		store, acc := newGrokTestAccount("SuperGrok")
+		decision := applyGrokCooldown(store, acc, http.StatusUnauthorized, []byte(`{"error":{"code":"invalid_token"}}`), nil, "grok-4.5")
+		if decision.Reason != "unauthorized" || acc.GetCooldownReason() != "credential_refresh" {
+			t.Fatalf("decision=%+v cooldown=%q", decision, acc.GetCooldownReason())
+		}
+		if acc.IsBanned() {
+			t.Fatal("a refreshable Grok 401 must not permanently ban before refresh result")
+		}
+	})
+
+	t.Run("426 is distinct", func(t *testing.T) {
+		store, acc := newGrokTestAccount("SuperGrok")
+		decision := applyGrokCooldown(store, acc, http.StatusUpgradeRequired, nil, nil, "grok-4.5")
+		if decision.Reason != "version_required" || acc.GetCooldownReason() != "version_required" {
+			t.Fatalf("decision=%+v cooldown=%q", decision, acc.GetCooldownReason())
+		}
+	})
 }
 
 func TestParseGrokFreeQuotaUsageVariants(t *testing.T) {

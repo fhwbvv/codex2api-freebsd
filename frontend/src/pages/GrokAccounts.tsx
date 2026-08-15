@@ -30,6 +30,7 @@ import {
   RotateCcw,
   Pencil,
   BarChart3,
+  Layers,
 } from "lucide-react";
 import { api, getAdminKey } from "../api";
 import type { ProxyRow } from "../api";
@@ -41,7 +42,12 @@ import type {
   AccountListSummary,
   AccountOperationSelector,
   AddGrokAccountRequest,
+  BatchUpdateGrokModelsRequest,
   GrokSSOImportItem,
+  GrokAccountState,
+  GrokModelCatalogItem,
+  GrokProtocol,
+  AccountLiveStateResponse,
 } from "../types";
 import AccountDetailSheet from "../components/AccountDetailSheet";
 import AccountGroupFilterSelect, {
@@ -59,9 +65,11 @@ import Modal from "../components/Modal";
 import ModelLogo from "../components/ModelLogo";
 import OperationResultsModal from "../components/OperationResultsModal";
 import PageHeader from "../components/PageHeader";
+import { CompactStat } from "../components/CompactStat";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
+import { mergeAccountLiveState, useAccountLiveState } from "../hooks/useAccountLiveState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -91,6 +99,7 @@ import {
 import { cn } from "@/lib/utils";
 
 const DEFAULT_GROK_TEST_MODELS = [
+  "grok-4.6",
   "grok-4.5",
   "grok-4",
   "grok-3-fast",
@@ -160,7 +169,7 @@ interface GrokRowHandlers {
   edit: (account: AccountRow) => void;
   editGroups: (account: AccountRow) => void;
   remove: (account: AccountRow) => void;
-  usageRefreshed: () => void;
+  usageRefreshed: (account: AccountRow) => void;
 }
 
 function resolveAccountGroups(
@@ -173,6 +182,10 @@ function resolveAccountGroups(
 }
 
 function accountUsageSortValue(account: AccountRow): number {
+  const monthly = account.grok_billing?.monthly_percent;
+  if (typeof monthly === "number") return monthly;
+  const weekly = account.grok_billing?.weekly_percent;
+  if (typeof weekly === "number") return weekly;
   if (typeof account.usage_percent_7d === "number") return account.usage_percent_7d;
   if (typeof account.usage_percent_5h === "number") return account.usage_percent_5h;
   return -1;
@@ -322,9 +335,9 @@ function GrokPlanBadge({
     );
   }
   const tone = plan.paid
-    ? "bg-amber-50 text-amber-800 ring-amber-600/20 dark:bg-amber-950 dark:text-amber-300 dark:ring-amber-400/20"
+    ? "bg-amber-500/10 text-amber-700 ring-amber-600/20 dark:bg-amber-500/20 dark:text-amber-300 dark:ring-amber-400/20"
     : plan.key === "free"
-      ? "bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-300 dark:ring-emerald-400/20"
+      ? "bg-emerald-500/10 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/20 dark:text-emerald-300 dark:ring-emerald-400/20"
       : "bg-muted text-muted-foreground ring-border";
   return (
     <span
@@ -378,7 +391,7 @@ function isAccountActive(account: AccountRow): boolean {
   );
 }
 
-export default function GrokAccounts({
+function GrokAccounts({
   headerSlot,
   showOperationResults = false,
   onShowOperationResultsChange,
@@ -502,11 +515,18 @@ export default function GrokAccounts({
   // 与 Codex 账号页一致：右侧详情 Sheet，按过滤后的列表顺序可左右切换。
   const [detailAccountId, setDetailAccountId] = useState<number | null>(null);
   const [detailAccountData, setDetailAccountData] = useState<AccountRow | null>(null);
+  const [detailGrokState, setDetailGrokState] = useState<GrokAccountState | null>(null);
+  const [detailGrokStateLoading, setDetailGrokStateLoading] = useState(false);
+  const [detailGrokStateError, setDetailGrokStateError] = useState<string | null>(null);
+  const [detailGrokAction, setDetailGrokAction] = useState<"sync" | "probe" | null>(null);
   const detailNavigationTargetRef = useRef<"first" | "last" | null>(null);
   const [batchTesting, setBatchTesting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [exporting, setExporting] = useState(false);
   const [batchBusy, setBatchBusy] = useState(false);
+  const [batchModelsOpen, setBatchModelsOpen] = useState(false);
+  const [batchModelsDraft, setBatchModelsDraft] = useState<string[]>([]);
+  const [batchModelInput, setBatchModelInput] = useState("");
   const selectAllRef = useRef<HTMLInputElement>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -562,11 +582,12 @@ export default function GrokAccounts({
     }
   }, [viewMode]);
 
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (options?: { silent?: boolean }) => {
     requestAbortRef.current?.abort();
     const controller = new AbortController();
     requestAbortRef.current = controller;
-    setLoading(true);
+    // silent 供后台补拉使用:不把整页切回 loading,避免统计追平时闪烁。
+    if (!options?.silent) setLoading(true);
     try {
       const res = await api.getAccountsPage({
         channel: "grok",
@@ -623,6 +644,14 @@ export default function GrokAccounts({
     setDetailAccountData((current) => current?.id === id ? account : current);
     return account;
   }, []);
+  const visibleAccountIDs = useMemo(
+    () => accounts.map((account) => account.id),
+    [accounts],
+  );
+  const applyAccountLiveState = useCallback((response: AccountLiveStateResponse) => {
+    setAccounts((current) => mergeAccountLiveState(current, response));
+  }, []);
+  useAccountLiveState(visibleAccountIDs, applyAccountLiveState);
   const loadAccountDetail = useCallback(
     (account: AccountRow) =>
       account.detail_loaded ? Promise.resolve(account) : api.getAccount(account.id),
@@ -639,6 +668,27 @@ export default function GrokAccounts({
   }, [reload]);
 
   useEffect(() => () => requestAbortRef.current?.abort(), []);
+
+  // stats_state 补拉:与 Codex 页同理——统计缓存两层 stale-while-revalidate,
+  // 从 stale 转 ready 需要连续几次轮询;非 ready 时用 3s 短间隔静默追平,
+  // 带次数上限防后端统计查询持续失败时退化成常驻轮询。
+  const statsStaleRetriesRef = useRef(0);
+  useEffect(() => {
+    if (loading) return undefined;
+    if (statsState === "ready") {
+      statsStaleRetriesRef.current = 0;
+      return undefined;
+    }
+    if (statsStaleRetriesRef.current >= 5) return undefined;
+    const timer = window.setTimeout(() => {
+      if (document.hidden) return;
+      statsStaleRetriesRef.current += 1;
+      void reload({ silent: true });
+    }, 3000);
+    return () => window.clearTimeout(timer);
+    // accounts 作为"每次响应都会变化"的信号:连续两次都返回 stale 时
+    // statsState 字符串不变,不依赖它定时器就不会被重新拉起。
+  }, [loading, statsState, reload, accounts]);
 
   // 导入/添加账号后,后端的 billing 用量探针是异步的(OAuth 号还要先刷 AT,
   // 通常 2~10s 才写回)。导入完成那一刻 reload 拿到的还是没有用量的账号,
@@ -738,6 +788,8 @@ export default function GrokAccounts({
   const closeAccountDetail = useCallback(() => {
     setDetailAccountId(null);
     setDetailAccountData(null);
+    setDetailGrokState(null);
+    setDetailGrokStateError(null);
   }, []);
   const goDetailPrev = useCallback(() => {
     if (detailNavIndex > 0) {
@@ -785,6 +837,66 @@ export default function GrokAccounts({
       .catch(() => undefined);
     return () => controller.abort();
   }, [detailAccountId, detailListAccount?.enabled, detailListAccount?.locked, detailListAccount?.status, detailListAccount?.updated_at]);
+
+  // Grok 控制面状态可能包含目录与能力明细，列表接口保持轻量；只有打开详情时才按需读取。
+  useEffect(() => {
+    if (detailAccountId == null) {
+      setDetailGrokState(null);
+      setDetailGrokStateError(null);
+      setDetailGrokStateLoading(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setDetailGrokState(null);
+    setDetailGrokStateError(null);
+    setDetailGrokStateLoading(true);
+    void api.getGrokAccountState(detailAccountId, controller.signal)
+      .then((state) => {
+        if (!controller.signal.aborted) setDetailGrokState(state);
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setDetailGrokStateError(getErrorMessage(error));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setDetailGrokStateLoading(false);
+      });
+    return () => controller.abort();
+  }, [detailAccountId]);
+
+  const syncDetailGrokState = useCallback(async () => {
+    if (detailAccountId == null || detailGrokAction) return;
+    setDetailGrokAction("sync");
+    setDetailGrokStateError(null);
+    try {
+      const result = await api.syncGrokAccountState(detailAccountId);
+      setDetailGrokState(result.state);
+      showToast(t("grok.stateSyncDone", { count: result.models?.length ?? 0 }));
+      await refreshAccountRow(detailAccountId);
+    } catch (error) {
+      const message = getErrorMessage(error);
+      setDetailGrokStateError(message);
+      showToast(message, "error");
+    } finally {
+      setDetailGrokAction(null);
+    }
+  }, [detailAccountId, detailGrokAction, refreshAccountRow, showToast, t]);
+
+  const probeDetailGrokCapabilities = useCallback(async () => {
+    if (detailAccountId == null || detailGrokAction) return;
+    setDetailGrokAction("probe");
+    setDetailGrokStateError(null);
+    try {
+      const result = await api.probeGrokAccountCapabilities(detailAccountId);
+      setDetailGrokState(result.state);
+      showToast(t("grok.capabilityProbeDone", { count: result.results?.length ?? 0 }));
+    } catch (error) {
+      const message = getErrorMessage(error);
+      setDetailGrokStateError(message);
+      showToast(message, "error");
+    } finally {
+      setDetailGrokAction(null);
+    }
+  }, [detailAccountId, detailGrokAction, showToast, t]);
 
   useEffect(() => {
     const target = detailNavigationTargetRef.current;
@@ -838,7 +950,9 @@ export default function GrokAccounts({
     edit: (account) => openEdit(account),
     editGroups: (account) => openQuickGroupEditor(account),
     remove: (account) => void handleDelete(account),
-    usageRefreshed: () => void reload(),
+    usageRefreshed: (account) => {
+      void refreshAccountRow(account.id);
+    },
   };
   const rowHandlers = useMemo<GrokRowHandlers>(
     () => ({
@@ -851,7 +965,7 @@ export default function GrokAccounts({
       edit: (account) => rowHandlersRef.current.edit(account),
       editGroups: (account) => rowHandlersRef.current.editGroups(account),
       remove: (account) => rowHandlersRef.current.remove(account),
-      usageRefreshed: () => rowHandlersRef.current.usageRefreshed(),
+      usageRefreshed: (account) => rowHandlersRef.current.usageRefreshed(account),
     }),
     [],
   );
@@ -1579,6 +1693,65 @@ export default function GrokAccounts({
     }
   };
 
+  const openBatchSetModels = () => {
+    if (selectedIds.length === 0) return;
+    setBatchModelsDraft([]);
+    setBatchModelInput("");
+    setBatchModelsOpen(true);
+  };
+
+  const batchAddModels = (raw: string) => {
+    const tokens = parseModelTokens(raw);
+    if (tokens.length === 0) return;
+    setBatchModelsDraft((current) => mergeModels(current, tokens));
+    setBatchModelInput("");
+  };
+
+  const batchRemoveModel = (model: string) =>
+    setBatchModelsDraft((current) => current.filter((item) => item !== model));
+
+  const batchTogglePreset = (model: string) => {
+    setBatchModelsDraft((current) => {
+      const exists = current.some(
+        (item) => item.toLowerCase() === model.toLowerCase(),
+      );
+      if (exists) {
+        return current.filter(
+          (item) => item.toLowerCase() !== model.toLowerCase(),
+        );
+      }
+      return mergeModels(current, [model]);
+    });
+  };
+
+  const handleBatchSetModels = async () => {
+    if (selectedIds.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const payload: BatchUpdateGrokModelsRequest = {
+        ids: selectedIds,
+        models: batchModelsDraft,
+      };
+      const res = await api.batchUpdateGrokModels(payload);
+      showToast(
+        t("grok.batchSetModelsDone", {
+          success: res.success ?? 0,
+          fail: res.failed ?? 0,
+        }),
+      );
+      setBatchModelsOpen(false);
+      clearSelection();
+      await reload();
+    } catch (err) {
+      showToast(
+        t("grok.batchSetModelsFailed", { error: getErrorMessage(err) }),
+        "error",
+      );
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
   const handleBatchEnabled = async (enabled: boolean) => {
     if (selectedIds.length === 0) return;
     setBatchBusy(true);
@@ -1804,7 +1977,11 @@ export default function GrokAccounts({
         {loading || statsState !== "ready" ? (
           <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
             {loading ? <Loader2 className="size-3 animate-spin" /> : null}
-            {loading ? t("common.loading") : statsState}
+            {loading
+              ? t("common.loading")
+              : statsState === "warming"
+                ? t("accounts.statsWarming")
+                : t("accounts.statsStale")}
           </div>
         ) : null}
         <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
@@ -1847,7 +2024,7 @@ export default function GrokAccounts({
         </div>
 
         <div className="toolbar-surface mb-3 flex flex-col gap-2.5">
-          <div className="flex items-center gap-1.5 overflow-x-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <div className="flex items-center gap-1.5 overflow-x-auto [-mx-3] [px-3] [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             <span className="shrink-0 whitespace-nowrap text-[12px] font-semibold text-foreground">
               {t("accounts.filter")}
             </span>
@@ -1924,6 +2101,7 @@ export default function GrokAccounts({
                   ["supergrok", t("grok.planSuperGrok")],
                   ["supergrok_heavy", t("grok.planSuperGrokHeavy")],
                   ["supergrok_lite", t("grok.planSuperGrokLite")],
+                  ["supergrok_plus", t("grok.planSuperGrokPlus")],
                   ["other", t("grok.planOther")],
                 ] as const
               ).map(([key, label]) => (
@@ -2044,6 +2222,17 @@ export default function GrokAccounts({
                   {batchTesting
                     ? t("accounts.batchTesting")
                     : t("accounts.batchTest")}
+                </span>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={batchBusy || batchTesting}
+                onClick={openBatchSetModels}
+              >
+                <Layers className="size-3.5" />
+                <span className="hidden sm:inline">
+                  {t("grok.batchSetModels")}
                 </span>
               </Button>
               <Button
@@ -2596,7 +2785,7 @@ export default function GrokAccounts({
                         className="flex items-start gap-1.5 text-xs"
                       >
                         {item.ok ? (
-                          <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+                          <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-[hsl(var(--success))]" />
                         ) : (
                           <XCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
                         )}
@@ -2902,7 +3091,22 @@ export default function GrokAccounts({
             <GrokUsageCell
               account={detailAccount}
               detailed
-              onRefreshed={() => void reload()}
+              onRefreshed={() => {
+                void refreshAccountRow(detailAccount.id);
+              }}
+            />
+          ) : null
+        }
+        providerSlot={
+          detailAccount ? (
+            <GrokStateDetail
+              account={detailAccount}
+              state={detailGrokState}
+              loading={detailGrokStateLoading}
+              error={detailGrokStateError}
+              action={detailGrokAction}
+              onSync={() => void syncDetailGrokState()}
+              onProbe={() => void probeDetailGrokCapabilities()}
             />
           ) : null
         }
@@ -3120,7 +3324,7 @@ export default function GrokAccounts({
               {importResult.items.map((item, index) => (
                 <div key={index} className="flex items-start gap-1.5 text-xs">
                   {item.ok ? (
-                    <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+                    <CheckCircle2 className="mt-0.5 size-3.5 shrink-0 text-[hsl(var(--success))]" />
                   ) : (
                     <XCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
                   )}
@@ -3133,6 +3337,131 @@ export default function GrokAccounts({
             </div>
           </div>
         ) : null}
+      </Modal>
+
+      <Modal
+        show={batchModelsOpen}
+        title={t("grok.batchSetModelsTitle")}
+        contentClassName="sm:max-w-[560px]"
+        onClose={() => {
+          if (!batchBusy) setBatchModelsOpen(false);
+        }}
+        footer={
+          <>
+            <Button
+              variant="outline"
+              disabled={batchBusy}
+              onClick={() => setBatchModelsOpen(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              onClick={() => void handleBatchSetModels()}
+              disabled={batchBusy}
+            >
+              {batchBusy ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : null}
+              {t("grok.batchSetModelsApply", { count: selectedIds.length })}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            {t("grok.batchSetModelsDesc", { count: selectedIds.length })}
+          </p>
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <label className="text-sm font-medium text-muted-foreground">
+                {t("grok.models")}
+              </label>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                disabled={batchBusy || batchModelsDraft.length === 0}
+                onClick={() => setBatchModelsDraft([])}
+              >
+                {t("grok.batchSetModelsClear")}
+              </Button>
+            </div>
+            <p className="mb-2 text-xs text-muted-foreground">
+              {t("grok.batchSetModelsPresetHint")}
+            </p>
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              {DEFAULT_GROK_TEST_MODELS.map((model) => {
+                const isPicked = batchModelsDraft.some(
+                  (item) => item.toLowerCase() === model.toLowerCase(),
+                );
+                return (
+                  <button
+                    key={model}
+                    type="button"
+                    disabled={batchBusy}
+                    onClick={() => batchTogglePreset(model)}
+                    className={cn(
+                      "rounded-md px-2 py-1 font-mono text-[11px] font-medium ring-1 ring-inset transition-colors",
+                      isPicked
+                        ? "bg-primary/10 text-primary ring-primary/30"
+                        : "bg-muted/40 text-muted-foreground ring-border hover:bg-accent hover:text-foreground",
+                    )}
+                  >
+                    {model}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mb-2 flex gap-2">
+              <Input
+                placeholder={t("grok.modelsPlaceholder")}
+                value={batchModelInput}
+                disabled={batchBusy}
+                onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                  setBatchModelInput(e.target.value)
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    batchAddModels(batchModelInput);
+                  }
+                }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                disabled={batchBusy || !batchModelInput.trim()}
+                onClick={() => batchAddModels(batchModelInput)}
+              >
+                <Plus className="size-3.5" />
+              </Button>
+            </div>
+            {batchModelsDraft.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                {t("grok.batchSetModelsEmptyHint")}
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {batchModelsDraft.map((model) => (
+                  <span
+                    key={model}
+                    className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/40 px-2 py-0.5 text-xs font-medium"
+                  >
+                    {model}
+                    <button
+                      type="button"
+                      disabled={batchBusy}
+                      onClick={() => batchRemoveModel(model)}
+                      className="text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
       </Modal>
 
       <Modal
@@ -3321,7 +3650,7 @@ const MemoGrokAccountTableRow = memo(function MemoGrokAccountTableRow({
       onEdit={() => handlers.edit(account)}
       onEditGroups={() => handlers.editGroups(account)}
       onDelete={() => handlers.remove(account)}
-      onUsageRefreshed={handlers.usageRefreshed}
+      onUsageRefreshed={() => handlers.usageRefreshed(account)}
     />
   );
 });
@@ -3367,7 +3696,7 @@ const MemoGrokAccountCard = memo(function MemoGrokAccountCard({
       onEdit={() => handlers.edit(account)}
       onEditGroups={() => handlers.editGroups(account)}
       onDelete={() => handlers.remove(account)}
-      onUsageRefreshed={handlers.usageRefreshed}
+      onUsageRefreshed={() => handlers.usageRefreshed(account)}
     />
   );
 });
@@ -3471,6 +3800,15 @@ function GrokAccountCard({
                 status={disabled ? "paused" : (account.status ?? "unknown")}
                 errorMessage={account.error_message}
               />
+              {(account.active_requests ?? 0) > 0 && (
+                <span
+                  className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                  title={t("accounts.activeRequestsTooltip", { count: account.active_requests ?? 0 })}
+                >
+                  <span className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400" aria-hidden />
+                  {account.active_requests}
+                </span>
+              )}
             </div>
             <h3
               className="mt-1.5 break-all text-[15px] font-semibold leading-snug tracking-tight text-foreground transition-colors hover:text-primary sm:text-base"
@@ -3505,7 +3843,7 @@ function GrokAccountCard({
 
         {/* Meta badges */}
         <div className="flex flex-wrap items-center gap-1.5">
-          <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+          <span className="inline-flex items-center gap-0.5 rounded-md bg-muted/60 px-1.5 py-0.5 text-[10px] font-medium text-foreground ring-1 ring-inset ring-border">
             <Sparkles className="size-2.5" />
             Grok
           </span>
@@ -3513,8 +3851,8 @@ function GrokAccountCard({
             className={cn(
               "inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset",
               isOAuth
-                ? "bg-violet-50 text-violet-700 ring-violet-600/20 dark:bg-violet-950 dark:text-violet-300 dark:ring-violet-400/20"
-                : "bg-sky-50 text-sky-700 ring-sky-600/20 dark:bg-sky-950 dark:text-sky-300 dark:ring-sky-400/20",
+                ? "bg-violet-500/10 text-violet-700 ring-violet-600/20 dark:bg-violet-500/20 dark:text-violet-300 dark:ring-violet-400/20"
+                : "bg-sky-500/10 text-sky-700 ring-sky-600/20 dark:bg-sky-500/20 dark:text-sky-300 dark:ring-sky-400/20",
             )}
           >
             {isOAuth ? (
@@ -3533,7 +3871,7 @@ function GrokAccountCard({
             emptyLabel={t("accounts.groupQuickEdit")}
           />
           {disabled ? (
-            <span className="inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300">
+            <span className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-border">
               <PowerOff className="mr-0.5 size-2.5" />
               {t("accounts.disabled")}
             </span>
@@ -3800,8 +4138,8 @@ function GrokAccountTableRow({
                 className={cn(
                   "inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset",
                   isOAuth
-                    ? "bg-violet-50 text-violet-700 ring-violet-600/20 dark:bg-violet-950 dark:text-violet-300 dark:ring-violet-400/20"
-                    : "bg-sky-50 text-sky-700 ring-sky-600/20 dark:bg-sky-950 dark:text-sky-300 dark:ring-sky-400/20",
+                    ? "bg-violet-500/10 text-violet-700 ring-violet-600/20 dark:bg-violet-500/20 dark:text-violet-300 dark:ring-violet-400/20"
+                    : "bg-sky-500/10 text-sky-700 ring-sky-600/20 dark:bg-sky-500/20 dark:text-sky-300 dark:ring-sky-400/20",
                 )}
                 title={t("grok.authKind")}
               >
@@ -3842,17 +4180,26 @@ function GrokAccountTableRow({
             status={disabled ? "paused" : (account.status ?? "unknown")}
             errorMessage={account.error_message}
           />
+          {(account.active_requests ?? 0) > 0 && (
+            <span
+              className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+              title={t("accounts.activeRequestsTooltip", { count: account.active_requests ?? 0 })}
+            >
+              <span className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400" aria-hidden />
+              {account.active_requests}
+            </span>
+          )}
           <AccountHealthBar buckets={healthBuckets} />
         </div>
       </TableCell>
       <TableCell>
         <div className="space-y-0.5 text-[13px]">
           <div className="flex items-center gap-1.5 whitespace-nowrap">
-            <span className="font-medium text-emerald-600">
+            <span className="font-medium tabular-nums text-[hsl(var(--success))]">
               {account.success_requests ?? 0}
             </span>
             <span className="text-muted-foreground">/</span>
-            <span className="font-medium text-red-500">
+            <span className="font-medium tabular-nums text-destructive">
               {account.error_requests ?? 0}
             </span>
           </div>
@@ -3932,6 +4279,351 @@ function grokFormatDollars(cents?: number | null): string {
   if (cents === null || cents === undefined || !Number.isFinite(cents))
     return "--";
   return `$${(cents / 100).toFixed(2)}`;
+}
+
+function grokStateRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function grokStateString(record: Record<string, unknown> | null, ...keys: string[]): string {
+  if (!record) return "";
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function grokStateOptionalBoolean(
+  record: Record<string, unknown> | null,
+  ...keys: string[]
+): boolean | null {
+  if (!record) return null;
+  for (const key of keys) {
+    if (typeof record[key] === "boolean") return record[key] as boolean;
+  }
+  return null;
+}
+
+function grokStateNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const record = grokStateRecord(value);
+  if (record && typeof record.val === "number" && Number.isFinite(record.val)) {
+    return record.val;
+  }
+  return null;
+}
+
+function findGrokStateFact(state: GrokAccountState | null, kind: string) {
+  if (!state) return undefined;
+  if (state.facts?.[kind]) return state.facts[kind];
+  return Object.values(state.facts ?? {}).find(
+    (fact) => fact.kind === kind || fact.kind.endsWith(`_${kind}`),
+  );
+}
+
+function latestGrokCatalog(state: GrokAccountState | null) {
+  if (!state?.catalogs?.length) return undefined;
+  return [...state.catalogs].sort((a, b) =>
+    (b.snapshot.observed_at ?? "").localeCompare(a.snapshot.observed_at ?? ""),
+  )[0];
+}
+
+function grokProtocolLabel(protocol: GrokProtocol | string): string {
+  if (protocol === "chat_completions") return "Chat Completions";
+  if (protocol === "messages") return "Messages";
+  if (protocol === "responses") return "Responses";
+  return protocol || "—";
+}
+
+function grokCapabilityTone(status?: string): string {
+  switch ((status ?? "").toLowerCase()) {
+    case "ok":
+      return "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+    case "unauthorized":
+    case "subscription_required":
+    case "exhausted":
+    case "unavailable":
+      return "bg-red-500/10 text-red-700 dark:text-red-300";
+    case "rate_limited":
+    case "version_required":
+      return "bg-amber-500/10 text-amber-700 dark:text-amber-300";
+    default:
+      return "bg-muted text-muted-foreground";
+  }
+}
+
+function GrokStateDetail({
+  account,
+  state,
+  loading,
+  error,
+  action,
+  onSync,
+  onProbe,
+}: {
+  account: AccountRow;
+  state: GrokAccountState | null;
+  loading: boolean;
+  error: string | null;
+  action: "sync" | "probe" | null;
+  onSync: () => void;
+  onProbe: () => void;
+}) {
+  const { t } = useTranslation();
+  const userFact = findGrokStateFact(state, "user");
+  const settingsFact = findGrokStateFact(state, "settings");
+  const billingFact = findGrokStateFact(state, "billing");
+  const user = grokStateRecord(userFact?.payload);
+  const settings = grokStateRecord(settingsFact?.payload);
+  const billingRoot = grokStateRecord(billingFact?.payload);
+  const billing = grokStateRecord(billingRoot?.config) ?? billingRoot;
+  const currentPeriod = grokStateRecord(billing?.currentPeriod ?? billing?.current_period);
+
+  const livePlan = grokStateString(user, "subscriptionTier", "subscription_tier");
+  const settingsPlan = grokStateString(
+    settings,
+    "subscription_tier_display",
+    "subscriptionTierDisplay",
+  );
+  const jwtPlan = state?.identity?.jwt_tier ?? "";
+  const archivePlan = state?.identity?.archive_plan ?? account.plan_type ?? "";
+  const allowAccess = grokStateOptionalBoolean(settings, "allow_access", "allowAccess");
+  const accessLabel =
+    allowAccess === true
+      ? t("grok.accessAllowed")
+      : allowAccess === false
+        ? t("grok.accessGated")
+        : t("grok.accessUnknown");
+  const accessTone =
+    allowAccess === true
+      ? "text-emerald-700 dark:text-emerald-300"
+      : allowAccess === false
+        ? "text-red-700 dark:text-red-300"
+        : "text-muted-foreground";
+
+  const periodType = grokStateString(currentPeriod, "type") || t("grok.billingPeriodUnknown");
+  const periodStart = grokStateString(currentPeriod, "start");
+  const periodEnd =
+    grokStateString(currentPeriod, "end") ||
+    grokStateString(billing, "billingPeriodEnd", "billing_period_end");
+  const usagePercent = grokStateNumber(
+    billing?.creditUsagePercent ?? billing?.credit_usage_percent,
+  );
+  const prepaid = grokStateNumber(billing?.prepaidBalance ?? billing?.prepaid_balance);
+  const onDemandCap = grokStateNumber(billing?.onDemandCap ?? billing?.on_demand_cap);
+  const onDemandUsed = grokStateNumber(billing?.onDemandUsed ?? billing?.on_demand_used);
+
+  const catalog = latestGrokCatalog(state);
+  const visibleModels = (catalog?.items ?? []).filter((item) => item.hidden !== true);
+  const primaryModel: GrokModelCatalogItem | undefined =
+    visibleModels.find((item) => item.model_id === settings?.default_model) ?? visibleModels[0];
+  const primaryBackend = primaryModel?.api_backend ?? "";
+  const protocols: GrokProtocol[] = ["responses", "chat_completions", "messages"];
+
+  return (
+    <section className="space-y-2.5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+          {t("grok.stateTitle")}
+        </h3>
+        <div className="flex items-center gap-1.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={loading || action !== null}
+            onClick={onSync}
+            title={t("grok.stateSyncHint")}
+          >
+            <RefreshCw className={cn("size-3", action === "sync" && "animate-spin")} />
+            {action === "sync" ? t("grok.stateSyncing") : t("grok.stateSync")}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={loading || action !== null || visibleModels.length === 0}
+            onClick={onProbe}
+            title={t("grok.capabilityProbeHint")}
+          >
+            <FlaskConical className={cn("size-3", action === "probe" && "animate-pulse")} />
+            {action === "probe" ? t("grok.capabilityProbing") : t("grok.capabilityProbe")}
+          </Button>
+        </div>
+      </div>
+
+      <div className="space-y-3 rounded-xl border border-border bg-card p-3">
+        {loading ? (
+          <div className="flex items-center gap-2 py-3 text-xs text-muted-foreground">
+            <Loader2 className="size-3.5 animate-spin" />
+            {t("grok.stateLoading")}
+          </div>
+        ) : null}
+        {error ? (
+          <div className="rounded-lg bg-red-500/10 px-2.5 py-2 text-xs text-red-700 dark:text-red-300">
+            {error}
+          </div>
+        ) : null}
+        {!loading && !state ? (
+          <div className="py-2 text-xs text-muted-foreground">{t("grok.stateEmpty")}</div>
+        ) : null}
+
+        {state ? (
+          <>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                [t("grok.planLive"), livePlan || "—", userFact?.observed_at],
+                [t("grok.planSettings"), settingsPlan || "—", settingsFact?.observed_at],
+                [
+                  t("grok.planJwt"),
+                  jwtPlan
+                    ? `${jwtPlan}${state.identity?.jwt_tier_trust === "verified" ? "" : ` · ${t("grok.planUnverified")}`}`
+                    : "—",
+                  undefined,
+                ],
+                [t("grok.planArchive"), archivePlan || "—", undefined],
+              ].map(([label, value, observedAt]) => (
+                <div key={String(label)} className="min-w-0 rounded-lg bg-muted/35 px-2.5 py-2">
+                  <div className="text-[10px] text-muted-foreground">{label}</div>
+                  <div className="mt-0.5 truncate text-xs font-semibold" title={String(value)}>
+                    {value}
+                  </div>
+                  {observedAt ? (
+                    <div className="mt-0.5 text-[9px] text-muted-foreground/75">
+                      {formatRelativeTime(String(observedAt))}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-between gap-2 rounded-lg border border-border px-2.5 py-2 text-xs">
+              <div>
+                <div className="font-semibold">{t("grok.accessGate")}</div>
+                <div className="mt-0.5 text-[10px] text-muted-foreground">
+                  {allowAccess === null
+                    ? t("grok.accessUnknownHint")
+                    : settingsFact?.observed_at
+                      ? formatBeijingTime(settingsFact.observed_at, "")
+                      : "—"}
+                </div>
+              </div>
+              <span className={cn("font-semibold", accessTone)}>{accessLabel}</span>
+            </div>
+
+            <div className="space-y-1.5 rounded-lg border border-border px-2.5 py-2 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold">{t("grok.billingCurrentPeriod")}</span>
+                <span className="text-[10px] text-muted-foreground">{periodType}</span>
+              </div>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+                <span className="text-muted-foreground">{t("grok.billingUsage")}</span>
+                <span className="text-right tabular-nums">
+                  {usagePercent === null ? "—" : `${usagePercent.toFixed(1)}%`}
+                </span>
+                <span className="text-muted-foreground">{t("grok.billingPeriod")}</span>
+                <span className="text-right" title={[periodStart, periodEnd].filter(Boolean).join(" ~ ")}>
+                  {periodEnd ? formatBeijingTime(periodEnd, "") : "—"}
+                </span>
+                <span className="text-muted-foreground">{t("grok.billingPrepaid")}</span>
+                <span className="text-right tabular-nums">
+                  {prepaid === null ? "—" : grokFormatDollars(Math.abs(prepaid))}
+                </span>
+                <span className="text-muted-foreground">{t("grok.billingPayg")}</span>
+                <span className="text-right tabular-nums">
+                  {onDemandCap === null
+                    ? "—"
+                    : `${grokFormatDollars(Math.abs(onDemandUsed ?? 0))} / ${grokFormatDollars(Math.abs(onDemandCap))}`}
+                </span>
+              </div>
+            </div>
+
+            <div className="space-y-2 rounded-lg border border-border px-2.5 py-2 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <span className="font-semibold">{t("grok.catalogTitle")}</span>
+                  <span className="ml-1.5 text-[10px] text-muted-foreground">
+                    {t("grok.catalogModels", { count: visibleModels.length })}
+                  </span>
+                </div>
+                <span className="rounded-md bg-primary/10 px-1.5 py-0.5 text-[10px] font-semibold text-primary">
+                  {primaryBackend ? grokProtocolLabel(primaryBackend) : t("grok.catalogBackendUnknown")}
+                </span>
+              </div>
+              {visibleModels.length > 0 ? (
+                <div className="flex flex-wrap gap-1">
+                  {visibleModels.slice(0, 8).map((item) => (
+                    <span
+                      key={`${item.origin}:${item.model_id}`}
+                      className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                      title={`${item.model_id} · ${grokProtocolLabel(item.api_backend ?? "")}`}
+                    >
+                      {item.model_id}
+                    </span>
+                  ))}
+                  {visibleModels.length > 8 ? (
+                    <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                      +{visibleModels.length - 8}
+                    </span>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="text-[10px] text-muted-foreground">{t("grok.catalogEmpty")}</div>
+              )}
+
+              <div className="grid grid-cols-1 gap-1.5 pt-1 sm:grid-cols-3">
+                {protocols.map((protocol) => {
+                  const capability = state.capabilities
+                    ?.filter((item) => item.protocol === protocol)
+                    .sort((a, b) => (b.observed_at ?? "").localeCompare(a.observed_at ?? ""))[0];
+                  const native = capability?.status === "ok";
+                  const route = native
+                    ? t("grok.capabilityNative")
+                    : primaryBackend
+                      ? protocol === primaryBackend
+                        ? t("grok.capabilityCatalogRoute")
+                        : t("grok.capabilityConverted", {
+                            backend: grokProtocolLabel(primaryBackend),
+                          })
+                      : t("grok.capabilityUnrouted");
+                  return (
+                    <div key={protocol} className="rounded-md bg-muted/35 px-2 py-1.5">
+                      <div className="truncate text-[10px] font-semibold">
+                        {grokProtocolLabel(protocol)}
+                      </div>
+                      <span
+                        className={cn(
+                          "mt-1 inline-flex max-w-full rounded px-1 py-0.5 text-[9px] font-semibold",
+                          grokCapabilityTone(capability?.status),
+                        )}
+                        title={capability?.provider_code || capability?.status || route}
+                      >
+                        {capability?.status || t("grok.capabilityUntested")}
+                      </span>
+                      <div className="mt-1 truncate text-[9px] text-muted-foreground" title={route}>
+                        {route}
+                      </div>
+                      {capability?.observed_at ? (
+                        <div
+                          className="mt-0.5 truncate text-[9px] text-muted-foreground/75"
+                          title={formatBeijingTime(capability.observed_at, "")}
+                        >
+                          {formatRelativeTime(capability.observed_at)}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </>
+        ) : null}
+      </div>
+    </section>
+  );
 }
 
 function GrokUsageCell({
@@ -4221,21 +4913,21 @@ function GrokUsageCell({
 }
 
 function grokUsageBarColor(pct: number): string {
-  if (pct >= 90) return "bg-red-500";
-  if (pct >= 70) return "bg-amber-500";
-  return "bg-emerald-500";
+  if (pct >= 90) return "bg-destructive";
+  if (pct >= 70) return "bg-[hsl(var(--warning))]";
+  return "bg-[hsl(var(--success))]";
 }
 
 function grokUsageTrackColor(pct: number): string {
-  if (pct >= 90) return "bg-red-500/15";
-  if (pct >= 70) return "bg-amber-500/15";
-  return "bg-emerald-500/15";
+  if (pct >= 90) return "bg-destructive/15";
+  if (pct >= 70) return "bg-[hsl(var(--warning))]/15";
+  return "bg-[hsl(var(--success))]/15";
 }
 
 function grokUsageTextColor(pct: number): string {
-  if (pct >= 90) return "text-red-600 dark:text-red-400";
-  if (pct >= 70) return "text-amber-700 dark:text-amber-400";
-  return "text-emerald-700 dark:text-emerald-400";
+  if (pct >= 90) return "text-destructive";
+  if (pct >= 70) return "text-[hsl(var(--warning))]";
+  return "text-[hsl(var(--success))]";
 }
 
 function grokFormatResetAt(
@@ -4586,9 +5278,9 @@ function GrokTestConnectionModal({
   const statusIconSpin = status === "connecting" || status === "streaming";
   const statusColor = {
     connecting: "text-muted-foreground",
-    streaming: "text-blue-500",
-    success: "text-emerald-500",
-    error: "text-red-500",
+    streaming: "text-[hsl(var(--info))]",
+    success: "text-[hsl(var(--success))]",
+    error: "text-destructive",
   }[status];
 
   return (
@@ -4660,82 +5352,12 @@ function GrokTestConnectionModal({
         )}
 
         {status === "error" && errorMsg ? (
-          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+          <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
             {errorMsg}
           </div>
         ) : null}
       </div>
     </Modal>
-  );
-}
-
-function CompactStat({
-  label,
-  chipLabel,
-  value,
-  tone,
-  active = false,
-  onClick,
-}: {
-  label: string;
-  chipLabel?: string;
-  value: number;
-  tone: "neutral" | "success" | "warning" | "danger";
-  active?: boolean;
-  onClick?: () => void;
-}) {
-  const toneStyle = {
-    neutral: {
-      chip: "bg-muted text-muted-foreground",
-      dot: "bg-slate-500",
-    },
-    success: {
-      chip: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-      dot: "bg-emerald-500",
-    },
-    warning: {
-      chip: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
-      dot: "bg-amber-500",
-    },
-    danger: {
-      chip: "bg-red-500/10 text-red-700 dark:text-red-300",
-      dot: "bg-red-500",
-    },
-  }[tone];
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "flex min-h-[72px] w-full items-center justify-between gap-2 rounded-xl border px-2.5 py-2 text-left shadow-sm transition-[border-color,box-shadow,background-color,transform] duration-200 sm:min-h-[84px] sm:gap-3 sm:px-3 sm:py-2.5",
-        active
-          ? "border-primary/40 bg-primary/5 shadow-sm ring-1 ring-primary/25"
-          : "border-border bg-card/85 hover:border-border hover:bg-card hover:shadow-sm",
-        onClick &&
-          "cursor-pointer active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-      )}
-    >
-      <div className="min-w-0">
-        <div className="truncate text-[11px] font-medium text-muted-foreground sm:text-[12px]">
-          {label}
-        </div>
-        <div className="mt-1.5 text-[22px] font-semibold leading-none tracking-tight text-foreground tabular-nums sm:text-[26px]">
-          {value}
-        </div>
-      </div>
-      <div
-        className={cn(
-          "inline-flex items-center gap-1.5 rounded-full px-1.5 py-0.5 text-[11px] font-medium sm:px-2 sm:py-1 sm:text-[12px]",
-          toneStyle.chip,
-        )}
-      >
-        <span className={cn("size-1.5 rounded-full", toneStyle.dot)} />
-        <span className="max-w-[4.5rem] truncate sm:max-w-none">
-          {chipLabel ?? label}
-        </span>
-      </div>
-    </button>
   );
 }
 
@@ -4750,3 +5372,6 @@ function downloadBlob(blob: Blob, filename: string) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
+
+// memo 边界:宿主 Accounts 组件的 codex 侧状态变化不应连带整棵 Grok 视图重渲染。
+export default memo(GrokAccounts);

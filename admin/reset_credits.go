@@ -137,7 +137,11 @@ func (h *Handler) ResetCredits(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	// 消费重置券不可撤销：一旦发出就必须把结果读完。挂在客户端请求 context 上
+	// 时，用户关页面/超时会把「已经扣掉的券」当成失败中断，而重试会另生成一个
+	// 幂等键（下面的 uuid），于是同一张券被扣两次。WithoutCancel 保留请求作用域
+	// 的值（日志、追踪）但摘掉取消信号，只受自己的超时约束。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 30*time.Second)
 	defer cancel()
 
 	// 整个重置操作（含 401 刷新后的重试）复用同一个幂等键，

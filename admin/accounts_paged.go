@@ -3,6 +3,8 @@ package admin
 import (
 	"context"
 	"fmt"
+	"log"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,7 +19,11 @@ const (
 	accountListSnapshotTTL = 5 * time.Second
 	accountListPageMax     = 500
 	accountListPageDefault = 20
-	requestCountCacheTTL   = 10 * time.Second
+	// requestCountCacheTTL 是请求数统计缓存的保鲜期。它只喂列表排序与统计卡,
+	// 不需要 10s 级新鲜度;前端静默刷新退避后轮询间隔最长 80s,TTL 太短会让
+	// 几乎每次轮询都撞上过期缓存、stats_state 长期停在 stale(表现为
+	// 「统计刷新中…」常驻)。
+	requestCountCacheTTL = 30 * time.Second
 )
 
 type accountListSnapshot struct {
@@ -72,6 +78,7 @@ type accountListSummary struct {
 	Total                int `json:"total"`
 	Normal               int `json:"normal"`
 	Active               int `json:"active"`
+	OverloadPaused       int `json:"overload_paused"`
 	RateLimited          int `json:"rate_limited"`
 	RateLimited5h        int `json:"rate_limited_5h"`
 	RateLimited7d        int `json:"rate_limited_7d"`
@@ -295,8 +302,8 @@ func parseAccountPageQuery(c *gin.Context) (accountPageQuery, error) {
 
 func validateAccountPageFilters(query accountPageQuery) error {
 	validStatuses := map[string]bool{
-		"": true, "all": true, "normal": true, "active": true,
-		"rate_limited": true, "abnormal": true, "banned": true,
+		"": true, "all": true, "normal": true, "active": true, "scheduling": true,
+		"overload_paused": true, "rate_limited": true, "abnormal": true, "banned": true,
 		"error": true, "unsampled": true, "disabled": true, "locked": true,
 	}
 	if !validStatuses[query.Status] {
@@ -442,7 +449,35 @@ func (h *Handler) refreshAccountListSnapshotAsync(channel string) {
 	}()
 }
 
+// shouldInvalidateAccountSnapshotCaches 判定一次管理请求是否改动了账号数据:
+// 非只读方法 + 账号/分组路由前缀 + 2xx/3xx。挂在路由组中间件上,覆盖全部
+// 现有与未来的账号变更端点(含流式批量操作),避免逐 handler 手工失效。
+func shouldInvalidateAccountSnapshotCaches(method, path string, status int) bool {
+	if method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions {
+		return false
+	}
+	if status >= http.StatusBadRequest {
+		return false
+	}
+	return strings.HasPrefix(path, "/api/admin/accounts") ||
+		strings.HasPrefix(path, "/api/admin/account-groups")
+}
+
+// invalidateAccountSnapshotCaches 在账号发生变更(删除/封禁/禁用/导入等)后
+// 丢弃列表快照与分析缓存,让下一次读取同步重建。否则 stale-while-revalidate
+// 的读路径会把变更前的统计卡/筛选计数原样返回给变更后的第一次刷新。
+func (h *Handler) invalidateAccountSnapshotCaches() {
+	h.accountCachesGen.Add(1)
+	h.accountListCacheMu.Lock()
+	h.accountListCache = nil
+	h.accountListCacheMu.Unlock()
+	h.accountAnalysisCacheMu.Lock()
+	h.accountAnalysisCache = nil
+	h.accountAnalysisCacheMu.Unlock()
+}
+
 func (h *Handler) rebuildAccountListSnapshot(ctx context.Context, channel string) (*accountListSnapshot, error) {
+	gen := h.accountCachesGen.Load()
 	rows, err := h.db.ListAccountListProjection(ctx, channel)
 	if err != nil {
 		return nil, err
@@ -454,7 +489,11 @@ func (h *Handler) rebuildAccountListSnapshot(ctx context.Context, channel string
 		groupNames[group.ID] = group.Name
 		groupSort[group.ID] = fmt.Sprintf("%020d\x00%s", group.SortOrder, strings.ToLower(group.Name))
 	}
-	requestCounts, statsState := h.getCachedRequestCountsNonBlocking()
+	channelIDs := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		channelIDs = append(channelIDs, row.ID)
+	}
+	requestCounts, statsState := h.getCachedRequestCountsNonBlocking(channel, channelIDs)
 	items := make([]*accountListSnapshotItem, 0, len(rows))
 	for _, row := range rows {
 		items = append(items, h.buildAccountListSnapshotItem(row, requestCounts, groupNames, groupSort))
@@ -464,13 +503,22 @@ func (h *Handler) rebuildAccountListSnapshot(ctx context.Context, channel string
 	}
 	snapshot.ExpiresAt = snapshot.BuiltAt.Add(accountListSnapshotTTL)
 	snapshot.Summary, snapshot.Facets = summarizeAccountList(items, channel)
+	h.installAccountListSnapshot(channel, snapshot, gen)
+	return snapshot, nil
+}
+
+// installAccountListSnapshot 只在代数未漂移时入缓存:读库期间发生过账号
+// 变更的快照可能早于变更,返回给当前调用方无妨,但不能留给后续请求。
+func (h *Handler) installAccountListSnapshot(channel string, snapshot *accountListSnapshot, gen uint64) {
+	if h.accountCachesGen.Load() != gen {
+		return
+	}
 	h.accountListCacheMu.Lock()
 	if h.accountListCache == nil {
 		h.accountListCache = make(map[string]*accountListSnapshot)
 	}
 	h.accountListCache[channel] = snapshot
 	h.accountListCacheMu.Unlock()
-	return snapshot, nil
 }
 
 func (h *Handler) buildAccountListSnapshotItem(row *database.AccountRow, requestCounts map[int64]*database.AccountRequestCount, groupNames, groupSort map[int64]string) *accountListSnapshotItem {
@@ -575,39 +623,85 @@ func valueOrZero(value *int64) int64 {
 	return *value
 }
 
-func (h *Handler) getCachedRequestCountsNonBlocking() (map[int64]*database.AccountRequestCount, string) {
+// requestCountCacheEntry 是单个渠道的请求数统计缓存。
+type requestCountCacheEntry struct {
+	counts    map[int64]*database.AccountRequestCount
+	expiresAt time.Time
+}
+
+// getCachedRequestCountsNonBlocking 返回指定渠道的请求数统计。统计按渠道独立
+// 缓存与刷新:在 codex 页刷新只扫 codex 账号的日志行,不为 grok 账号买单,
+// 反之亦然。ids 是该渠道当前的账号列表,过期时交给后台刷新用。
+func (h *Handler) getCachedRequestCountsNonBlocking(channel string, ids []int64) (map[int64]*database.AccountRequestCount, string) {
 	now := time.Now()
 	h.reqCountMu.RLock()
-	cached := h.reqCountCache
-	fresh := cached != nil && now.Before(h.reqCountExpiresAt)
+	entry := h.reqCountCache[channel]
 	h.reqCountMu.RUnlock()
-	if fresh {
-		return cached, "ready"
+	if entry != nil && now.Before(entry.expiresAt) {
+		return entry.counts, "ready"
 	}
-	h.refreshRequestCountsAsync()
-	if cached != nil {
-		return cached, "stale"
+	h.refreshRequestCountsAsync(channel, ids)
+	if entry != nil {
+		return entry.counts, "stale"
 	}
 	return map[int64]*database.AccountRequestCount{}, "warming"
 }
 
-func (h *Handler) refreshRequestCountsAsync() {
-	if !h.reqCountRefreshMu.TryLock() {
+func (h *Handler) refreshRequestCountsAsync(channel string, ids []int64) {
+	h.reqCountRefreshMu.Lock()
+	if h.reqCountRefreshing == nil {
+		h.reqCountRefreshing = make(map[string]bool)
+	}
+	if h.reqCountRefreshing[channel] {
+		h.reqCountRefreshMu.Unlock()
 		return
 	}
+	h.reqCountRefreshing[channel] = true
+	h.reqCountRefreshMu.Unlock()
 	go func() {
-		defer h.reqCountRefreshMu.Unlock()
+		defer func() {
+			h.reqCountRefreshMu.Lock()
+			delete(h.reqCountRefreshing, channel)
+			h.reqCountRefreshMu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		counts, err := h.db.GetAccountRequestCounts(ctx)
+		counts, err := h.db.GetAccountRequestCountsByIDs(ctx, ids)
 		if err != nil {
+			// 静默失败会让请求数/用量排序与统计永久停在 warming 且无从排查
+			// (issue #493),失败必须留痕。
+			log.Printf("刷新账号请求统计失败 channel=%s(排序/统计将继续使用旧值): %v", channel, err)
 			return
 		}
-		h.reqCountMu.Lock()
-		h.reqCountCache = counts
-		h.reqCountExpiresAt = time.Now().Add(requestCountCacheTTL)
-		h.reqCountMu.Unlock()
+		h.storeRequestCountCache(channel, counts)
+		// stats_state 是烙在列表快照里的:快照重建时统计缓存还没刷完,烙出来
+		// 就是 stale,并一直随快照被返回。统计刷完后把本渠道快照标记为过期,
+		// 下一次轮询即触发重建、烙上 ready——否则要等快照自然过期再叠一轮轮询,
+		// 前端退避后「统计刷新中…」会挂几分钟。
+		h.expireAccountListSnapshot(channel)
 	}()
+}
+
+func (h *Handler) storeRequestCountCache(channel string, counts map[int64]*database.AccountRequestCount) {
+	h.reqCountMu.Lock()
+	if h.reqCountCache == nil {
+		h.reqCountCache = make(map[string]*requestCountCacheEntry)
+	}
+	h.reqCountCache[channel] = &requestCountCacheEntry{
+		counts:    counts,
+		expiresAt: time.Now().Add(requestCountCacheTTL),
+	}
+	h.reqCountMu.Unlock()
+}
+
+// expireAccountListSnapshot 把指定渠道的列表快照标记为过期,但保留内容:
+// 读路径仍按 stale-while-revalidate 先返回旧值,只是下一次读取会立刻触发重建。
+func (h *Handler) expireAccountListSnapshot(channel string) {
+	h.accountListCacheMu.Lock()
+	if cached := h.accountListCache[channel]; cached != nil {
+		cached.ExpiresAt = time.Time{}
+	}
+	h.accountListCacheMu.Unlock()
 }
 
 func accountListItemMatches(item *accountListSnapshotItem, query accountPageQuery, channel string) bool {
@@ -626,8 +720,15 @@ func accountListItemMatches(item *accountListSnapshotItem, query accountPageQuer
 			return false
 		}
 	}
-	if query.AuthKind != "" && query.AuthKind != "all" && item.GrokAuthKind != query.AuthKind {
-		return false
+	if query.AuthKind != "" && query.AuthKind != "all" {
+		if channel == database.UpstreamChannelGrok {
+			if item.GrokAuthKind != query.AuthKind {
+				return false
+			}
+		} else if item.OpenAIResponses != (query.AuthKind == auth.GrokAuthKindAPIKey) {
+			// Codex 渠道复用 auth_kind：api_key=Responses API 中转账号，oauth=官方账号（issue #522）
+			return false
+		}
 	}
 	if query.Tag != "" && !containsString(item.Tags, query.Tag) {
 		return false
@@ -679,8 +780,12 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 	limited := accountListRateLimited(item)
 	if channel == database.UpstreamChannelGrok {
 		switch status {
-		case "active", "normal":
-			return item.Enabled && !banned && !errorState && !limited
+		case "normal":
+			return accountListNormal(item)
+		case "active", "scheduling":
+			return accountListSchedulable(item)
+		case "overload_paused":
+			return accountListOverloadPaused(item)
 		case "rate_limited":
 			return limited
 		case "disabled":
@@ -693,8 +798,13 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 		return true
 	}
 	switch status {
-	case "normal", "active":
-		return !banned && !errorState && !limited
+	case "normal":
+		// 过载暂停、禁用都归入「正常」；真正可调度的账号走 scheduling/active。
+		return accountListNormal(item)
+	case "active", "scheduling":
+		return accountListSchedulable(item)
+	case "overload_paused":
+		return accountListOverloadPaused(item)
 	case "rate_limited":
 		return !banned && !errorState && limited
 	case "abnormal":
@@ -713,8 +823,34 @@ func accountListStatusMatches(item *accountListSnapshotItem, status, channel str
 	return true
 }
 
+func accountListOverloadPaused(item *accountListSnapshotItem) bool {
+	return strings.EqualFold(item.Status, "overload_paused") ||
+		strings.EqualFold(item.CooldownReason, "overload_paused")
+}
+
+func accountListNormal(item *accountListSnapshotItem) bool {
+	if item.Status == "unauthorized" || item.Status == "error" {
+		return false
+	}
+	if !item.Enabled || accountListOverloadPaused(item) {
+		return true
+	}
+	return !accountListRateLimited(item)
+}
+
+func accountListSchedulable(item *accountListSnapshotItem) bool {
+	return item.Enabled &&
+		item.Status != "unauthorized" &&
+		item.Status != "error" &&
+		!accountListRateLimited(item) &&
+		!accountListOverloadPaused(item)
+}
+
 func accountListRateLimited(item *accountListSnapshotItem) bool {
 	if item.UsingCredits || item.Status == "unauthorized" || item.Status == "error" {
+		return false
+	}
+	if accountListOverloadPaused(item) {
 		return false
 	}
 	limited := map[string]bool{
@@ -828,6 +964,7 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		banned := item.Status == "unauthorized"
 		errorState := item.Status == "error"
 		limited := accountListRateLimited(item)
+		overloadPaused := accountListOverloadPaused(item)
 		if banned {
 			summary.Banned++
 		}
@@ -836,6 +973,9 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		}
 		if banned || errorState {
 			summary.Abnormal++
+		}
+		if overloadPaused {
+			summary.OverloadPaused++
 		}
 		if limited {
 			summary.RateLimited++
@@ -848,10 +988,10 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 				summary.RateLimited5h++
 			}
 		}
-		if !banned && !errorState && !limited {
+		if accountListNormal(item) {
 			summary.Normal++
 		}
-		if item.Enabled && !banned && !errorState && !limited {
+		if accountListSchedulable(item) {
 			summary.Active++
 		}
 		if !item.Enabled {
@@ -876,6 +1016,13 @@ func summarizeAccountList(items []*accountListSnapshotItem, channel string) (acc
 		}
 		if item.GrokAuthKind == auth.GrokAuthKindAPIKey {
 			summary.APIKey++
+		}
+		if channel == database.UpstreamChannelCodex {
+			if item.OpenAIResponses {
+				summary.APIKey++
+			} else {
+				summary.OAuth++
+			}
 		}
 		if channel == database.UpstreamChannelCodex && accountListSubscriptionPlan(item.PlanType) && !item.Locked {
 			summary.SubscriptionUnlocked++

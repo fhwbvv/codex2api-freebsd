@@ -342,10 +342,13 @@ func (h *Handler) evaluatePromptGuardEnvelope(c *gin.Context, cfg promptfilter.C
 			if policy, subjectKey, trusted := h.promptRiskTrustPolicyForRequest(c); trusted && promptRiskTrustCanBypassReview(decision, verdict, reviewText) && !promptRiskTrustReviewRequired(c, cfg, policy, subjectKey) {
 				verdict.Reason = "adaptive trusted profile bypassed synchronous model review"
 				decision.ReasonCode = "adaptive_trust_review_bypass"
-				h.recordPromptRiskTrustBypass(c, policy, subjectKey)
+				h.recordPromptRiskTrustBypass(c, policy, subjectKey, promptRiskTrustBypassedSignalNames(decision, verdict))
 			} else {
 				localTrustRisk := trusted && promptRiskTrustShouldSuspend(decision, verdict)
 				verdict = h.reviewPromptFilterVerdict(ctx, reviewText, verdict, cfg)
+				if trusted && verdict.ReviewError != "" {
+					promptRiskTrustReleaseReviewLease(subjectKey)
+				}
 				var terminalBypassed bool
 				verdict, terminalBypassed = applyPromptGuardTerminalModelBypass(verdict, envelope, cfg)
 				if terminalBypassed {
@@ -513,10 +516,13 @@ func (h *Handler) evaluateLegacyPromptGuard(c *gin.Context, ctx context.Context,
 	if shouldReviewPromptFilterVerdict(verdict, cfg) {
 		if policy, subjectKey, trusted := h.promptRiskTrustPolicyForRequest(c); trusted && verdict.Action == promptfilter.ActionAllow && verdict.Score == 0 && verdict.RawScore == 0 && len(verdict.Matched) == 0 && strings.TrimSpace(text) != "" && !promptRiskTrustReviewRequired(c, cfg, policy, subjectKey) {
 			verdict.Reason = "adaptive trusted profile bypassed synchronous model review"
-			h.recordPromptRiskTrustBypass(c, policy, subjectKey)
+			h.recordPromptRiskTrustBypass(c, policy, subjectKey, nil)
 		} else {
 			localTrustRisk := trusted && (verdict.Action != promptfilter.ActionAllow || verdict.Score > 0 || verdict.RawScore > 0 || len(verdict.Matched) > 0)
 			verdict = h.reviewPromptFilterVerdict(ctx, text, verdict, cfg)
+			if trusted && verdict.ReviewError != "" {
+				promptRiskTrustReleaseReviewLease(subjectKey)
+			}
 			var terminalBypassed bool
 			verdict, terminalBypassed = applyPromptGuardTerminalModelBypass(verdict, envelope, cfg)
 			if terminalBypassed {

@@ -13,60 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-
-// 带复制按钮的代码块
-function CodeBlock({ label, content, lang }: { label?: string; content: string; lang?: string }) {
-  const [copied, setCopied] = useState(false)
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(content)
-    } catch {
-      const ta = document.createElement('textarea')
-      ta.value = content
-      ta.style.cssText = 'position:fixed;left:-9999px'
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-    }
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
-
-  return (
-    <div className="bg-zinc-900 dark:bg-zinc-950 rounded-xl overflow-hidden">
-      {label && (
-        <div className="flex items-center justify-between px-4 py-2 bg-zinc-800 dark:bg-zinc-900 border-b border-zinc-700">
-          <span className="text-xs text-zinc-400 font-mono">{label}</span>
-          <button
-            onClick={() => void handleCopy()}
-            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg transition-colors ${
-              copied ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-700 hover:bg-zinc-600 text-zinc-300 hover:text-white'
-            }`}
-          >
-            {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
-            {copied ? 'Copied' : 'Copy'}
-          </button>
-        </div>
-      )}
-      {!label && (
-        <div className="absolute top-2 right-2 z-10">
-          <button
-            onClick={() => void handleCopy()}
-            className={`flex items-center gap-1 px-2 py-1 text-xs rounded-md transition-colors ${
-              copied ? 'bg-emerald-500/20 text-emerald-400' : 'bg-zinc-700/80 hover:bg-zinc-600 text-zinc-400 hover:text-white'
-            }`}
-          >
-            {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
-          </button>
-        </div>
-      )}
-      <pre className={`p-4 font-mono text-zinc-100 overflow-x-auto leading-relaxed ${lang === 'json' ? 'text-[13px]' : 'text-sm'}`}>
-        <code>{content}</code>
-      </pre>
-    </div>
-  )
-}
+import { CodeBlock } from './docs/EndpointDoc'
 
 // 状态码 Tab 切换
 function StatusTabs({ tabs, active, onChange }: { tabs: { code: number; label?: string }[]; active: number; onChange: (c: number) => void }) {

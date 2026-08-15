@@ -35,6 +35,8 @@ Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理
 
 Anthropic `/v1/messages` 仅将官方 `speed:"fast"` 映射为上游 Codex `service_tier:"priority"`；Anthropic 请求侧 `service_tier`（Priority Tier）不在此映射范围内。用量日志的 `service_tier` / `fast` 过滤反映该解析结果。
 
+**Service Tier 语义说明**：请求侧 `fast` / `priority` 会统一以 `priority` 转发上游，其余取值（`auto`/`default`/`flex`/`scale` 等）不转发。用量日志区分三个字段：`requested_service_tier`（客户端请求意图）、`actual_service_tier`（上游回传 Tier，原样取自 `response.completed.response.service_tier`）、`billing_service_tier`（计费采用值，由 Tier 计费策略 `BillingTierPolicy` 决定，默认 `actual`，上游未回传时回退按请求意图计）。注意：在 ChatGPT OAuth / Codex backend 路径上，Fast 由上游服务端路由处理，`service_tier` 不是端到端可校验字段——上游回传 `default` 并不代表 Fast 未生效（openai/codex#14204 官方说明；#494 的交错 A/B 实测在回传 `default` 时仍有约 1.5× 生成吞吐提升）。因此"上游回传 Tier"仅反映上游申报值，不能单独用于判断加速是否生效；`BillingTierPolicy=actual` 下此类请求按标准价计费。
+
 **Base URL:** `http://localhost:8080` (默认端口)
 
 **请求格式:**
@@ -564,6 +566,35 @@ data: [DONE]
   "message": "已更新 3 个账号，失败 0 个",
   "success": 3,
   "failed": 0
+}
+```
+
+#### POST /api/admin/accounts/grok/batch-models
+
+批量替换 Grok 账号的模型白名单。`ids` 会自动去重；非 Grok 或不存在的账号计入 `failed`，不中断整批。空数组表示清空白名单（未声明，仅 grok 渠道 Key 可调度）。
+
+**请求:**
+
+```json
+{
+  "ids": [1, 2, 3],
+  "models": ["grok-4.5"]
+}
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| ids | integer[] | 是 | 要更新的 Grok 账号 ID |
+| models | string[] | 否 | 替换后的模型白名单；省略或空数组表示清空声明 |
+
+**响应:**
+
+```json
+{
+  "message": "已更新 3 个账号，失败 0 个",
+  "success": 3,
+  "failed": 0,
+  "models": ["grok-4.5"]
 }
 ```
 
@@ -1283,6 +1314,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 0,
   "transport_retry_policy": "rotate",
+  "codex_fingerprint_default_mode": "off",
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
   "database_driver": "postgres",
@@ -1319,6 +1351,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_rate_limit_retries": 2,
   "retry_interval_ms": 500,
   "transport_retry_policy": "sticky",
+  "codex_fingerprint_default_mode": "session",
   "response_cache_local_max_bytes": 134217728,
   "response_cache_local_max_entry_bytes": 8388608,
   "response_cache_reconstruct_max_bytes": 134217728
@@ -1326,6 +1359,8 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 ```
 
 **响应:** 更新后的完整设置对象
+
+`codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
 
 Responses 上下文缓存字段使用原始字节数：
 
@@ -1388,11 +1423,11 @@ PUT 可只提交其中一部分可写预算，服务端会在数据库事务中�
 
 #### DELETE /api/admin/proxies/:id
 
-删除代理。
+删除代理，并清空仍引用该 URL 的账号绑定。提交后立即从当前进程的运行时代理池剔除；若数据库快照重载失败，接口返回 HTTP `500` 和已完成的 `deleted` / `unbound` 数量，但不会把已删除代理重新投入调度。
 
 #### PATCH /api/admin/proxies/:id
 
-更新代理。
+更新代理。禁用会立刻从运行时代理池剔除该 URL，但保留账号上的 `proxy_url` 绑定——这些账号在重新启用前不会改走其它代理，也不会直连。修改 URL 时，仍指向旧 URL 的账号绑定会改写为新 URL。
 
 **请求:**
 
@@ -1405,7 +1440,7 @@ PUT 可只提交其中一部分可写预算，服务端会在数据库事务中�
 
 #### POST /api/admin/proxies/batch-delete
 
-批量删除代理。
+批量删除代理，并解绑仍引用这些 URL 的账号。重载失败时的语义与单条删除相同。
 
 **请求:**
 

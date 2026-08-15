@@ -37,15 +37,28 @@ type Result struct {
 // caller resolved from the request, going through the shared LRU cache and the
 // global concurrency gate. Unlike Bytes, a parseable requestedSize is treated
 // as the exact physical target — the public Images API promises the size in
-// the request, not the tier long side. It returns nil when no upscale is
-// needed: scale is empty, or the source already covers the target box.
+// the request, not the tier long side. An explicit size may therefore trigger
+// strict local resizing even without a 2K/4K tier. It returns nil when no
+// resize is needed or neither a scale nor a physical size was supplied.
 func EnsureSize(ctx context.Context, imageBytes []byte, scale, requestedSize string) (*Result, error) {
+	return EnsureSizeWithFit(ctx, imageBytes, scale, requestedSize, "")
+}
+
+// EnsureSizeWithFit is the strict-size variant used when a request contains a
+// physical WIDTHxHEIGHT target. It always produces that canvas, defaulting to
+// content-preserving padding unless the caller explicitly selects cover.
+func EnsureSizeWithFit(ctx context.Context, imageBytes []byte, scale, requestedSize, fit string) (*Result, error) {
 	scale = imageproc.NormalizeUpscale(scale)
-	if scale == "" || len(imageBytes) == 0 {
+	targetWidth, targetHeight, exact := 0, 0, false
+	if width, height, ok := parseSize(requestedSize); ok {
+		targetWidth, targetHeight, exact = width, height, true
+		fit = imageproc.NormalizeResizeFit(fit, true)
+	}
+	if len(imageBytes) == 0 || (scale == "" && !exact) {
 		return nil, nil
 	}
 	cache := imageproc.GlobalUpscaleCache()
-	key := imageproc.ComputeUpscaleCacheKey(imageBytes, scale) + "-" + strings.ToLower(strings.TrimSpace(requestedSize))
+	key := imageproc.ComputeUpscaleCacheKey(imageBytes, scale) + "-" + strings.ToLower(strings.TrimSpace(requestedSize)) + "-" + fit
 	if data, contentType, ok := cache.Get(key); ok && contentType != "" {
 		return resultFromData(data, contentType, "cache", imageBytes), nil
 	}
@@ -57,10 +70,7 @@ func EnsureSize(ctx context.Context, imageBytes []byte, scale, requestedSize str
 		return resultFromData(data, contentType, "cache", imageBytes), nil
 	}
 
-	targetWidth, targetHeight, exact := 0, 0, false
-	if width, height, ok := parseSize(requestedSize); ok {
-		targetWidth, targetHeight, exact = width, height, true
-	} else {
+	if !exact {
 		width, height := Dimensions(imageBytes)
 		targetLongSide := imageproc.UpscaleLongSide(scale)
 		if width <= 0 || height <= 0 || targetLongSide <= 0 {
@@ -68,7 +78,14 @@ func EnsureSize(ctx context.Context, imageBytes []byte, scale, requestedSize str
 		}
 		targetWidth, targetHeight, exact = TargetDimensions(width, height, targetLongSide, requestedSize)
 	}
-	data, contentType, method, err := upscaleToBox(ctx, imageBytes, targetWidth, targetHeight, exact)
+	var data []byte
+	var contentType, method string
+	var err error
+	if exact {
+		data, contentType, method, err = upscaleToBoxWithFit(ctx, imageBytes, targetWidth, targetHeight, fit)
+	} else {
+		data, contentType, method, err = upscaleToBox(ctx, imageBytes, targetWidth, targetHeight, false)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -81,6 +98,11 @@ func EnsureSize(ctx context.Context, imageBytes []byte, scale, requestedSize str
 	}
 	cache.Put(key, data, contentType)
 	return result, nil
+}
+
+// ParseSize reports whether value is a positive WIDTHxHEIGHT image size.
+func ParseSize(size string) (int, int, bool) {
+	return parseSize(size)
 }
 
 func parseSize(size string) (int, int, bool) {
@@ -138,6 +160,21 @@ func Bytes(ctx context.Context, imageBytes []byte, scale, requestedSize string) 
 	}
 	targetWidth, targetHeight, exactTarget := TargetDimensions(width, height, targetLongSide, requestedSize)
 	return upscaleToBox(ctx, imageBytes, targetWidth, targetHeight, exactTarget)
+}
+
+// BytesWithFit preserves Bytes' legacy behavior unless strict is requested
+// with a valid physical size. Strict calls may run even without a 2K/4K tier,
+// because the explicit size itself is the authoritative target.
+func BytesWithFit(ctx context.Context, imageBytes []byte, scale, requestedSize, fit string, strict bool) ([]byte, string, string, error) {
+	if strict {
+		if targetWidth, targetHeight, ok := parseSize(requestedSize); ok {
+			if width, height := Dimensions(imageBytes); width <= 0 || height <= 0 {
+				return nil, "", "", fmt.Errorf("image upscaler: invalid source dimensions")
+			}
+			return upscaleToBoxWithFit(ctx, imageBytes, targetWidth, targetHeight, fit)
+		}
+	}
+	return Bytes(ctx, imageBytes, scale, requestedSize)
 }
 
 // upscaleToBox dispatches one upscale toward an explicit target box to the
@@ -221,6 +258,105 @@ func upscaleToBox(ctx context.Context, imageBytes []byte, targetWidth, targetHei
 		return nil, "", "", fmt.Errorf("image upscaler returned unsupported content type %q", response.Header.Get("Content-Type"))
 	}
 	return body, contentType, method, nil
+}
+
+// upscaleToBoxWithFit uses the configured backend for enlargement, then
+// performs a local finalization pass so external and local backends obey the
+// same exact-canvas contract.
+func upscaleToBoxWithFit(ctx context.Context, imageBytes []byte, targetWidth, targetHeight int, fit string) ([]byte, string, string, error) {
+	fit = imageproc.NormalizeResizeFit(fit, true)
+	width, height := Dimensions(imageBytes)
+	if width <= 0 || height <= 0 {
+		return nil, "", "", fmt.Errorf("image upscaler: invalid source dimensions")
+	}
+	if width == targetWidth && height == targetHeight {
+		return nil, "", "", nil
+	}
+
+	endpoint := strings.TrimSpace(os.Getenv("IMAGE_UPSCALER_ENDPOINT"))
+	if endpoint == "" || (width >= targetWidth && height >= targetHeight) {
+		data, contentType, err := imageproc.DoResizeTo(imageBytes, targetWidth, targetHeight, fit)
+		return data, contentType, "catmull-rom-" + fit, err
+	}
+
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return nil, "", "", fmt.Errorf("image upscaler: invalid endpoint %q", endpoint)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/v1/upscale"
+	query := parsed.Query()
+	query.Set("target_width", strconv.Itoa(targetWidth))
+	query.Set("target_height", strconv.Itoa(targetHeight))
+	query.Set("format", "png")
+	query.Set("trigger_ratio", "1")
+	if fit == imageproc.ResizeFitCover {
+		query.Set("fit", "cover")
+	} else {
+		query.Set("fit", "inside")
+	}
+	parsed.RawQuery = query.Encode()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, parsed.String(), bytes.NewReader(imageBytes))
+	if err != nil {
+		return nil, "", "", err
+	}
+	request.Header.Set("Content-Type", http.DetectContentType(imageBytes))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("call image upscaler: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxUpscalerResponseBytes+1))
+	if err != nil {
+		return nil, "", "", fmt.Errorf("read image upscaler response: %w", err)
+	}
+	if len(body) > maxUpscalerResponseBytes {
+		return nil, "", "", fmt.Errorf("image upscaler response exceeds %d bytes", maxUpscalerResponseBytes)
+	}
+	if response.StatusCode != http.StatusOK {
+		message := strings.TrimSpace(string(body))
+		if len(message) > 1024 {
+			message = message[:1024]
+		}
+		return nil, "", "", fmt.Errorf("image upscaler returned %d: %s", response.StatusCode, message)
+	}
+
+	applied := true
+	if marker := strings.TrimSpace(response.Header.Get("X-Upscale-Applied")); marker != "" {
+		parsedApplied, parseErr := strconv.ParseBool(marker)
+		if parseErr != nil {
+			return nil, "", "", fmt.Errorf("image upscaler returned an invalid applied marker %q", marker)
+		}
+		applied = parsedApplied
+	}
+	method := strings.TrimSpace(response.Header.Get("X-Upscale-Method"))
+	if method == "" {
+		method = "realesrgan-general-x4v3"
+	}
+	candidate := imageBytes
+	candidateType := http.DetectContentType(imageBytes)
+	if applied {
+		if len(body) == 0 {
+			return nil, "", "", fmt.Errorf("image upscaler returned empty image data")
+		}
+		candidateType = NormalizeContentType(response.Header.Get("Content-Type"))
+		if candidateType == "" {
+			return nil, "", "", fmt.Errorf("image upscaler returned unsupported content type %q", response.Header.Get("Content-Type"))
+		}
+		candidate = body
+	}
+
+	final, contentType, err := imageproc.DoResizeTo(candidate, targetWidth, targetHeight, fit)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if contentType != "" {
+		return final, contentType, method + "+" + fit, nil
+	}
+	if !applied {
+		return nil, "", method, nil
+	}
+	return candidate, candidateType, method, nil
 }
 
 // NormalizeContentType keeps the stored asset MIME type within image/*. The

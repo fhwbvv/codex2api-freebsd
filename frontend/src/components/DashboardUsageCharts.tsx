@@ -53,8 +53,9 @@ const axisColor = 'var(--color-muted-foreground)'
 const tooltipContentStyle = {
   backgroundColor: 'var(--color-card)',
   border: '1px solid var(--color-border)',
-  borderRadius: '16px',
-  boxShadow: '0 18px 40px rgba(0, 0, 0, 0.12)',
+  borderRadius: '12px',
+  boxShadow: '0 10px 30px rgba(0, 0, 0, 0.12)',
+  padding: '10px 14px',
 }
 const tooltipLabelStyle = { color: 'var(--color-foreground)', fontWeight: 600 }
 const tooltipItemStyle = { color: 'var(--color-foreground)' }
@@ -299,13 +300,13 @@ export default function DashboardUsageCharts({
 
 function ChartCard({ title, description, children }: { title: string; description: string; children: ReactNode }) {
   return (
-    <Card className="py-0">
-      <CardContent className="p-6">
-        <div className="mb-5">
-          <h4 className="text-base font-semibold text-foreground">{title}</h4>
-          <p className="mt-1 text-sm leading-relaxed text-muted-foreground">{description}</p>
+    <Card className="py-0 border-border/70 bg-card shadow-2xs transition-all duration-200 hover:border-border">
+      <CardContent className="p-3.5 sm:p-5">
+        <div className="mb-3 sm:mb-4">
+          <h4 className="text-sm font-bold tracking-tight text-foreground">{title}</h4>
+          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground/90">{description}</p>
         </div>
-        <div className="h-[280px]">{children}</div>
+        <div className="h-[220px] sm:h-[280px]">{children}</div>
       </CardContent>
     </Card>
   )

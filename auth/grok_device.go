@@ -70,6 +70,11 @@ func DiscoverGrokOIDC(ctx context.Context, proxyURL string) (*GrokOIDCDiscovery,
 	if strings.TrimSpace(doc.TokenEndpoint) == "" {
 		doc.TokenEndpoint = GrokDefaultTokenURL
 	}
+	deviceURL, deviceErr := url.Parse(doc.DeviceAuthorizationEndpoint)
+	tokenURL, tokenErr := url.Parse(doc.TokenEndpoint)
+	if deviceErr != nil || tokenErr != nil || !grokAllowedOAuthURL(deviceURL) || !grokAllowedOAuthURL(tokenURL) {
+		return nil, fmt.Errorf("grok OIDC discovery 返回了未允许的 OAuth 主机")
+	}
 	return &doc, nil
 }
 
@@ -138,6 +143,9 @@ func PollGrokDeviceToken(ctx context.Context, deviceCode, tokenEndpoint, proxyUR
 	}
 	if strings.TrimSpace(tokenEndpoint) == "" {
 		tokenEndpoint = GrokDefaultTokenURL
+	}
+	if parsed, parseErr := url.Parse(tokenEndpoint); parseErr != nil || !grokAllowedOAuthURL(parsed) {
+		return nil, fmt.Errorf("grok device token endpoint 未被允许")
 	}
 	client, err := grokHTTPClient(proxyURL)
 	if err != nil {

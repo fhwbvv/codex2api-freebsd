@@ -33,10 +33,11 @@ func (h *Handler) buildAccountResponse(
 		} else {
 			grokAuthKind = auth.GrokAuthKindOAuth
 		}
-		if includeDetails {
-			if detail := strings.TrimSpace(row.GetCredential("grok_billing_detail")); detail != "" && json.Valid([]byte(detail)) {
-				grokBilling = json.RawMessage(detail)
-			}
+		// Quota bars on the paged Grok list need this compact credential
+		// (issue #521). It is a small JSON projection, not the expensive
+		// control-plane / cooldown / mapping payload gated by includeDetails.
+		if detail := strings.TrimSpace(row.GetCredential("grok_billing_detail")); detail != "" && json.Valid([]byte(detail)) {
+			grokBilling = json.RawMessage(detail)
 		}
 	}
 	email := row.GetCredential("email")
@@ -65,6 +66,11 @@ func (h *Handler) buildAccountResponse(
 	codexClientMetadataMode := ""
 	if isOpenAIResponsesAccount && includeDetails {
 		codexClientMetadataMode = auth.NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
+	}
+	// 指纹收敛只作用于 Codex 官方出站路径，中转/Grok 账号不暴露该字段。
+	codexFingerprintMode := ""
+	if !isOpenAIResponsesAccount && !isGrokAccount {
+		codexFingerprintMode = auth.NormalizeCodexFingerprintMode(row.GetCredential(auth.CodexFingerprintModeCredentialKey))
 	}
 	ignoreUsageLimitStatusOverride := row.GetCredentialOptionalBool("ignore_usage_limit_status_override")
 	ignoreUsageLimitStatusEffective := h.store.IgnoreUsageLimitStatus()
@@ -116,6 +122,7 @@ func (h *Handler) buildAccountResponse(
 		Models:                   row.GetCredentialStringSlice("models"),
 		ModelMapping:             modelMapping,
 		CodexClientMetadataMode:  codexClientMetadataMode,
+		CodexFingerprintMode:     codexFingerprintMode,
 		CustomHeaders:            customHeaders,
 		ProxyURL:                 row.ProxyURL,
 		Enabled:                  row.Enabled,
@@ -154,7 +161,7 @@ func (h *Handler) buildAccountResponse(
 		}
 		resp.UsageLimitOverride = runtimeAccount.GetIgnoreUsageLimitStatusOverride()
 		resp.UsageLimitEffective = runtimeAccount.IgnoresUsageLimitStatus()
-		if isGrokAccount && includeDetails {
+		if isGrokAccount {
 			if snap, hasSnap := runtimeAccount.GetGrokRateLimitSnapshot(); hasSnap {
 				resp.GrokRateLimit = &snap
 			}
@@ -308,9 +315,6 @@ func stripAccountDetailFields(resp *accountResponse) {
 	if resp == nil {
 		return
 	}
-	resp.GrokBilling = nil
-	resp.GrokRateLimit = nil
-	resp.GrokFreeQuota = nil
 	resp.ModelMapping = ""
 	resp.CodexClientMetadataMode = ""
 	resp.CustomHeaders = nil

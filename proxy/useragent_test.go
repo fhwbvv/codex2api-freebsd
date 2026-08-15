@@ -120,6 +120,100 @@ func TestCodexUserAgentConfigRawOverrideWithoutVersionDoesNotSynthesizeVersion(t
 	}
 }
 
+// raw UA 只贡献指纹形状:可解析的版本段出站前重建为当前生效版本(前缀与尾部标识组两处)。
+func TestCodexUserAgentConfigRawOverrideRebuildsVersionSegments(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	s := prev
+	s.CodexSyncedCLIVersion = ""
+	ApplyRuntimeSettings(s)
+
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/0.100.0 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.100.0)"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, "")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	if version != latestCodexCLIVersion {
+		t.Fatalf("version = %q, want builtin %q", version, latestCodexCLIVersion)
+	}
+	want := "codex-tui/" + latestCodexCLIVersion + " (Linux Unknown; x86_64) xterm-256color (codex-tui; " + latestCodexCLIVersion + ")"
+	if userAgent != want {
+		t.Fatalf("User-Agent = %q, want both version segments rebuilt: %q", userAgent, want)
+	}
+}
+
+// 远端同步到更高版本后,raw UA 的版本段跟随同步值。
+func TestCodexUserAgentConfigRawOverrideFollowsSyncedVersion(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	s := prev
+	s.CodexSyncedCLIVersion = "0.200.0"
+	ApplyRuntimeSettings(s)
+
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/0.144.1 (Mac OS 15.5.0; arm64) xterm-256color (codex-tui; 0.144.1)"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, "")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	if version != "0.200.0" {
+		t.Fatalf("version = %q, want synced 0.200.0", version)
+	}
+	if !strings.Contains(userAgent, "codex-tui/0.200.0 ") || !strings.Contains(userAgent, "(codex-tui; 0.200.0)") {
+		t.Fatalf("User-Agent = %q, want synced version in both markers", userAgent)
+	}
+}
+
+// raw UA 钉了高于生效版本的版本号时保留(版本抬升绝不降级)。
+func TestCodexUserAgentConfigRawOverrideKeepsAheadPin(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	s := prev
+	s.CodexSyncedCLIVersion = ""
+	ApplyRuntimeSettings(s)
+
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/9.999.0 (Linux Unknown; x86_64) xterm-256color (codex-tui; 9.999.0)"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	userAgent, version, ok := codexUserAgentFromConfig(normalized, "")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	if version != "9.999.0" {
+		t.Fatalf("version = %q, want ahead pin 9.999.0 preserved", version)
+	}
+	if !strings.Contains(userAgent, "codex-tui/9.999.0 ") {
+		t.Fatalf("User-Agent = %q, want ahead pin preserved", userAgent)
+	}
+}
+
+// raw UA 分支同样叠加最低版本门槛(floor 高于生效版本时以 floor 为准)。
+func TestCodexUserAgentConfigRawOverrideAppliesVersionFloor(t *testing.T) {
+	prev := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+	s := prev
+	s.CodexSyncedCLIVersion = ""
+	ApplyRuntimeSettings(s)
+
+	normalized, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/0.100.0 (Linux Unknown; x86_64) xterm-256color (codex-tui; 0.100.0)"}`)
+	if err != nil {
+		t.Fatalf("NormalizeCodexUserAgentConfigJSON() error = %v", err)
+	}
+	_, version, ok := codexUserAgentFromConfig(normalized, "0.150.0")
+	if !ok {
+		t.Fatal("codexUserAgentFromConfig() ok = false")
+	}
+	if version != "0.150.0" {
+		t.Fatalf("version = %q, want floor 0.150.0", version)
+	}
+}
+
 func TestCodexUserAgentConfigRejectsHeaderBreaks(t *testing.T) {
 	if _, err := NormalizeCodexUserAgentConfigJSON(`{"raw_user_agent":"codex-tui/0.142.3\r\nX-Bad: yes"}`); err == nil {
 		t.Fatal("NormalizeCodexUserAgentConfigJSON() accepted a raw UA with CRLF")

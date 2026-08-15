@@ -62,3 +62,18 @@ export function needsUsageReload(account: {
     account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   return !has5h && !has7d
 }
+
+// Codex OAuth/AT 账号的官方 7d 成本来自本地快照。列表打开时快照经常还是空的，
+// 需要重拉 page-stats 直到回补完成（中转/Grok 没有该字段，不要空转）。
+// official_usage_synced 表示后端已成功同步过但上游没有数据（官方统计有
+// 滞后），这时继续重拉也不会有结果，交给后台小时级探针即可。
+export function needsOfficialCostReload(account: {
+  openai_responses_api?: boolean
+  grok_api?: boolean
+  official_usd_7d?: number | null
+  official_usage_synced?: boolean
+}): boolean {
+  if (account.openai_responses_api || account.grok_api) return false
+  if (account.official_usage_synced) return false
+  return account.official_usd_7d === null || account.official_usd_7d === undefined
+}

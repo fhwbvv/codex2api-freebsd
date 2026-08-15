@@ -1,6 +1,6 @@
 module github.com/codex2api
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/andybalholm/brotli v1.0.6
@@ -19,9 +19,9 @@ require (
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
 	golang.org/x/crypto v0.52.0
-	golang.org/x/image v0.43.0
+	golang.org/x/image v0.45.0
 	golang.org/x/net v0.55.0
-	golang.org/x/text v0.39.0
+	golang.org/x/text v0.41.0
 	modernc.org/sqlite v1.47.0
 )
 
@@ -72,7 +72,7 @@ require (
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/arch v0.22.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 	modernc.org/libc v1.70.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

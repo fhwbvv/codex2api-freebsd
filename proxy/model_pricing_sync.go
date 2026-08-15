@@ -60,42 +60,26 @@ func SyncModelPricingFromURL(ctx context.Context, db *database.DB, syncURL, prox
 		return result, fmt.Errorf("定价源未解析到任何模型")
 	}
 
-	settings, err := db.GetSystemSettings(ctx)
-	if err != nil {
-		return result, err
-	}
-	if settings == nil {
-		settings = &database.SystemSettings{}
-	}
-	current, err := database.ParseModelPricingOverridesJSON(settings.ModelPricingOverrides)
-	if err != nil {
-		current = map[string]database.ModelPricingOverride{}
-	}
-
-	for model, ov := range fetched {
-		key := strings.ToLower(strings.TrimSpace(model))
-		if key == "" || ov.IsEmpty() {
-			continue
+	_, err = db.MutateModelPricingSettings(ctx, &fieldURL, func(current map[string]database.ModelPricingOverride) error {
+		for model, ov := range fetched {
+			key := strings.ToLower(strings.TrimSpace(model))
+			if key == "" || ov.IsEmpty() {
+				continue
+			}
+			// 已有 custom 覆盖优先，跳过不动。
+			if existing, ok := current[key]; ok && existing.Source == database.ModelPricingSourceCustom {
+				result.Skipped++
+				continue
+			}
+			ov.Source = database.ModelPricingSourceSynced
+			current[key] = ov
+			result.Applied++
 		}
-		// 已有 custom 覆盖优先，跳过不动。
-		if existing, ok := current[key]; ok && existing.Source == database.ModelPricingSourceCustom {
-			result.Skipped++
-			continue
-		}
-		ov.Source = database.ModelPricingSourceSynced
-		current[key] = ov
-		result.Applied++
-	}
-
-	blob, err := database.MarshalModelPricingOverridesJSON(current)
+		return nil
+	})
 	if err != nil {
 		return result, err
 	}
-	// 字段为空则清空存储来源（下次回退默认）；非空则存为来源。
-	if err := db.UpdateModelPricingSettings(ctx, blob, fieldURL); err != nil {
-		return result, err
-	}
-	database.SetModelPricingOverrides(current)
 	return result, nil
 }
 
@@ -109,7 +93,9 @@ func fetchModelPricingJSON(ctx context.Context, syncURL, proxyURL string) (map[s
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "codex2api")
 
-	client := &http.Client{Transport: newCodexStandardTransport(proxyURL), Timeout: 20 * time.Second}
+	// 目标是 GitHub 域（默认定价 JSON 在 raw.githubusercontent.com）时套用专用代理；
+	// URL 可被部署方改成任意地址，故这里绝不附加 github_token。
+	client := &http.Client{Transport: newCodexStandardTransport(GithubProxyOrDefault(syncURL, proxyURL)), Timeout: 20 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("pricing request: %w", err)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -129,6 +130,105 @@ func TestPromptReviewConnectionTestsAllKeysConcurrentlyWithoutReturningSecrets(t
 		}
 		if strings.Contains(recorder.Body.String(), strings.TrimPrefix(authorization, "Bearer ")) {
 			t.Fatalf("response leaked key: %s", recorder.Body.String())
+		}
+	}
+	for index, result := range response.Results {
+		if result.KeyID == "" || result.KeyMasked == "" || result.KeyIndex != index+1 {
+			t.Fatalf("result %d has no stable redacted identity: %+v", index, result)
+		}
+	}
+}
+
+func TestDeletePromptReviewAPIKeyRemovesOnlySelectedKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "review-keys.db"))
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+	settings := &database.SystemSettings{
+		PromptFilterReviewEnabled: true, PromptFilterReviewAPIKey: "key-one\nkey-two",
+		PromptFilterReviewBaseURL: "https://review.example.com", PromptFilterReviewModel: "review-model",
+	}
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+	store := auth.NewStore(nil, nil, settings)
+	t.Cleanup(store.Stop)
+	handler := &Handler{db: db, store: store}
+
+	deleteKey := func(key string) *httptest.ResponseRecorder {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(recorder)
+		c.Params = gin.Params{{Key: "key_id", Value: promptReviewAPIKeyID(key)}}
+		c.Request = httptest.NewRequest(http.MethodDelete, "/api/admin/prompt-filter/review/keys/selected", nil)
+		handler.DeletePromptReviewAPIKey(c)
+		return recorder
+	}
+
+	if recorder := deleteKey("key-one"); recorder.Code != http.StatusOK {
+		t.Fatalf("delete selected status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil || persisted.PromptFilterReviewAPIKey != "key-two" {
+		t.Fatalf("persisted keys=%q err=%v, want key-two", persisted.PromptFilterReviewAPIKey, err)
+	}
+	if got := store.GetPromptFilterConfig().Review.APIKeyList(); len(got) != 1 || got[0] != "key-two" {
+		t.Fatalf("runtime keys=%v, want [key-two]", got)
+	}
+	if recorder := deleteKey("key-two"); recorder.Code != http.StatusConflict {
+		t.Fatalf("delete last enabled key status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestPromptReviewAPIKeyDescriptorsNeverExposeSecrets(t *testing.T) {
+	keys := []string{"sk-secret-alpha-1234", "opaque-secret-beta-9876"}
+	items := promptReviewAPIKeyDescriptors(keys)
+	if len(items) != len(keys) || items[0].ID == items[1].ID {
+		t.Fatalf("descriptors=%+v", items)
+	}
+	encoded, err := json.Marshal(items)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	for _, key := range keys {
+		if strings.Contains(string(encoded), key) {
+			t.Fatalf("descriptor response leaked key %q: %s", key, encoded)
+		}
+	}
+}
+
+// 短 Key 曾因前 3 位与后 4 位重叠被整串还原(如 "hunter2"→"hun••••ter2"),
+// 多字节 Key 曾被按字节切坏;掩码只允许在长度足够时露出前 3 + 后 4。
+func TestMaskPromptReviewAPIKeyNeverRevealsShortOrOverlappingKeys(t *testing.T) {
+	fullyMasked := "••••"
+	cases := []struct {
+		key  string
+		want string
+	}{
+		{"", fullyMasked},
+		{"a", fullyMasked},
+		{"abcd", fullyMasked},
+		{"abcde", fullyMasked},
+		{"hunter2", fullyMasked},
+		{"sk-12345", fullyMasked},
+		{"abcdefghijk", fullyMasked},
+		{"sk-abcdefghi", "sk-••••fghi"},
+		{"sk-secret-alpha-1234", "sk-••••1234"},
+		{"密钥密钥密钥密钥密钥", fullyMasked},
+		{"密钥一二三四五六七八九十日月", "密钥一••••九十日月"},
+	}
+	for _, tc := range cases {
+		if got := maskPromptReviewAPIKey(tc.key); got != tc.want {
+			t.Fatalf("mask(%q) = %q, want %q", tc.key, got, tc.want)
+		}
+	}
+	for _, tc := range cases {
+		masked := maskPromptReviewAPIKey(tc.key)
+		runes := []rune(tc.key)
+		if len(runes) >= 8 && len(runes) < 12 && masked != fullyMasked {
+			t.Fatalf("mask(%q) reveals fragments of a key too short to mask safely: %q", tc.key, masked)
 		}
 	}
 }

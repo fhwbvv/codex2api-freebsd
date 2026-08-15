@@ -1,8 +1,11 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
@@ -397,5 +400,51 @@ func TestDSNOmitsSchemaWhenEmpty(t *testing.T) {
 	}
 	if got := d.DSN(); strings.Contains(got, "search_path") {
 		t.Fatalf("空 schema 时 DSN 不应包含 search_path: %s", got)
+	}
+}
+
+// issue #498: .env 里的 TZ 必须作用于 time.Local,否则自然日限额按宿主机时区重置。
+func TestLoadAppliesTimezoneFromEnvFile(t *testing.T) {
+	origLocal := time.Local
+	t.Cleanup(func() { time.Local = origLocal })
+	t.Setenv("TZ", "") // 注册测试结束后的恢复
+	if err := os.Unsetenv("TZ"); err != nil {
+		t.Fatalf("Unsetenv(TZ) 失败: %v", err)
+	}
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte("TZ=America/Chicago\n"), 0o600); err != nil {
+		t.Fatalf("写临时 .env 失败: %v", err)
+	}
+
+	if _, err := Load(envPath); err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := time.Local.String(); got != "America/Chicago" {
+		t.Fatalf("time.Local = %q, want %q", got, "America/Chicago")
+	}
+}
+
+func TestApplyTimezoneHandlesPosixColonPrefix(t *testing.T) {
+	origLocal := time.Local
+	t.Cleanup(func() { time.Local = origLocal })
+	t.Setenv("TZ", ":Asia/Tokyo")
+
+	applyTimezone()
+	if got := time.Local.String(); got != "Asia/Tokyo" {
+		t.Fatalf("time.Local = %q, want %q", got, "Asia/Tokyo")
+	}
+}
+
+func TestApplyTimezoneKeepsLocalOnInvalidTZ(t *testing.T) {
+	origLocal := time.Local
+	t.Cleanup(func() { time.Local = origLocal })
+	t.Setenv("TZ", "Not/A_Zone")
+
+	applyTimezone()
+	if time.Local != origLocal {
+		t.Fatalf("非法 TZ 不应改动 time.Local, got %q", time.Local)
 	}
 }

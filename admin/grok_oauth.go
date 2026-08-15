@@ -341,9 +341,12 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 		name = "grok-oauth"
 	}
 
-	id, err := h.db.InsertAccountWithUpstream(ctx, name, "xai", auth.UpstreamGrok, credentials, in.ProxyURL)
+	id, duplicateID, err := h.db.InsertGrokAccountIfAbsent(ctx, name, credentials, in.ProxyURL, true)
 	if err != nil {
 		return 0, "", err
+	}
+	if duplicateID > 0 {
+		return 0, "", fmt.Errorf("Grok 凭据身份已存在（账号 ID %d）", duplicateID)
 	}
 	source := in.Source
 	if source == "" {

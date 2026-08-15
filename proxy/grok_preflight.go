@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -42,6 +43,12 @@ var grokDroppedTopLevelFields = map[string]struct{}{
 // 钳制、无工具时撤掉 tool_choice，并顺带算出轮次序号与模型名。
 // 请求体非法 JSON 或顶层不是对象时原样返回，交由上游报错。
 func prepareGrokUpstreamBody(body []byte) grokPreflightResult {
+	if lifted, changed := liftGrokAdditionalTools(body); changed {
+		return prepareGrokUpstreamBody(lifted)
+	}
+	if guarded, changed := addGrokGiantToolInstructions(body); changed {
+		return prepareGrokUpstreamBody(guarded)
+	}
 	result := grokPreflightResult{Body: body, TurnIndex: 1}
 	if !gjson.ValidBytes(body) {
 		return result
@@ -51,15 +58,11 @@ func prepareGrokUpstreamBody(body []byte) grokPreflightResult {
 		return result
 	}
 
-	aliases := make(map[string]grokNsIdentity)
-	register := func(namespace, name string) string {
-		alias := grokNamespaceAliasName(namespace, name)
-		if existing, ok := aliases[alias]; ok && (existing.Namespace != namespace || existing.Name != name) {
-			alias = grokDisambiguatedAlias(alias, namespace, name)
-		}
-		aliases[alias] = grokNsIdentity{Namespace: namespace, Name: name}
-		return alias
+	if model := root.Get("model"); model.Exists() {
+		result.Model = model.String()
 	}
+
+	register, aliases := newGrokAliasRegister()
 
 	// tools 先处理：input 与 tool_choice 的 namespace 引用要改写成同一份别名，
 	// 处理顺序必须与逐步改写实现一致，否则别名撞名时的消歧结果会不同。
@@ -120,14 +123,14 @@ func prepareGrokUpstreamBody(body []byte) grokPreflightResult {
 				return true
 			}
 		case "reasoning":
-			if patched, ok := grokClampReasoningObjectRaw(value); ok {
+			if patched, ok := grokClampReasoningObjectRaw(value, result.Model); ok {
 				grokWriteObjectKey(&out, &first, key)
 				out.Write(patched)
 				changed = true
 				return true
 			}
 		case "reasoning_effort":
-			if mapped, ok := mapGrokReasoningEffort(value.String()); ok {
+			if mapped, ok := mapGrokReasoningEffort(value.String(), result.Model); ok {
 				if encoded, err := json.Marshal(mapped); err == nil {
 					grokWriteObjectKey(&out, &first, key)
 					out.Write(encoded)
@@ -156,6 +159,106 @@ func prepareGrokUpstreamBody(body []byte) grokPreflightResult {
 	return result
 }
 
+const grokGiantToolInstructionMarker = "[codex2api giant-tool-call guard]"
+
+func addGrokGiantToolInstructions(body []byte) ([]byte, bool) {
+	if !bytes.Contains(bytes.ToLower(body), []byte(`"apply_patch"`)) || bytes.Contains(body, []byte(grokGiantToolInstructionMarker)) {
+		return body, false
+	}
+	var request map[string]any
+	if decodeGrokJSONPreservingNumbers(body, &request) != nil || !grokBodyHasNamedTool(request, "apply_patch") {
+		return body, false
+	}
+	// The 96 KiB guidance leaves deliberate headroom below the 128 KiB hard stop
+	// for wrapper JSON and escaping overhead.
+	guidance := grokGiantToolInstructionMarker + "\nWhen using apply_patch or another code-writing tool, modify at most 2 files per call and keep each tool input below 96 KiB. Split larger work into verified batches."
+	existing := strings.TrimSpace(grokNsStringField(request, "instructions"))
+	if existing != "" {
+		guidance = existing + "\n\n" + guidance
+	}
+	request["instructions"] = guidance
+	out, err := json.Marshal(request)
+	return out, err == nil
+}
+
+func grokBodyHasNamedTool(request map[string]any, want string) bool {
+	var scan func([]any) bool
+	scan = func(tools []any) bool {
+		for _, raw := range tools {
+			tool, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if strings.EqualFold(strings.TrimSpace(grokNsStringField(tool, "name")), want) {
+				return true
+			}
+			if nested, ok := tool["tools"].([]any); ok && scan(nested) {
+				return true
+			}
+		}
+		return false
+	}
+	tools, _ := request["tools"].([]any)
+	return scan(tools)
+}
+
+func liftGrokAdditionalTools(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte(`"additional_tools"`)) && !bytes.Contains(body, []byte(`"tool_search_output"`)) && !bytes.Contains(body, []byte(`"tool_search_call_output"`)) {
+		return body, false
+	}
+	var request map[string]any
+	if decodeGrokJSONPreservingNumbers(body, &request) != nil {
+		return body, false
+	}
+	input, ok := request["input"].([]any)
+	if !ok {
+		return body, false
+	}
+	tools, _ := request["tools"].([]any)
+	filtered := make([]any, 0, len(input))
+	changed := false
+	for _, raw := range input {
+		item, itemOK := raw.(map[string]any)
+		if !itemOK {
+			filtered = append(filtered, raw)
+			continue
+		}
+		itemType := strings.TrimSpace(grokNsStringField(item, "type"))
+		additional, toolsOK := item["tools"].([]any)
+		if !toolsOK || (itemType != "additional_tools" && itemType != "tool_search_output" && itemType != "tool_search_call_output") {
+			filtered = append(filtered, raw)
+			continue
+		}
+		tools = append(tools, additional...)
+		changed = true
+		if itemType != "additional_tools" {
+			output := item["output"]
+			if output == nil {
+				output = additional
+			}
+			item["output"] = output
+			delete(item, "tools")
+			filtered = append(filtered, raw)
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	request["input"] = filtered
+	request["tools"] = tools
+	out, err := json.Marshal(request)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+func decodeGrokJSONPreservingNumbers(body []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	return decoder.Decode(target)
+}
+
 // grokWriteObjectKey 写出 JSON 对象里的 `"key":`，必要时补上分隔逗号。
 func grokWriteObjectKey(out *bytes.Buffer, first *bool, key gjson.Result) {
 	if !*first {
@@ -176,7 +279,7 @@ func grokWriteObjectKey(out *bytes.Buffer, first *bool, key gjson.Result) {
 // 降级为上游接受的最小形态，其余工具原样拷贝。
 // 返回 (新数组 JSON, 是否改写, 归一后是否等同于"没有工具", 是否移除过 web_search)。
 // "没有工具"含 tools 缺失与归一后空数组两种——两者都让 tool_choice 失去意义。
-func grokNormalizeToolsRaw(tools gjson.Result, register func(namespace, name string) string) (raw []byte, changed, empty, webSearchDropped bool) {
+func grokNormalizeToolsRaw(tools gjson.Result, register grokAliasRegister) (raw []byte, changed, empty, webSearchDropped bool) {
 	if !tools.Exists() {
 		return nil, false, true, false
 	}
@@ -189,6 +292,7 @@ func grokNormalizeToolsRaw(tools gjson.Result, register func(namespace, name str
 	buf.WriteByte('[')
 	first := true
 	kept := 0
+	emittedFunctions := make(map[string]bool)
 
 	writeRaw := func(value string) {
 		if !first {
@@ -199,6 +303,16 @@ func grokNormalizeToolsRaw(tools gjson.Result, register func(namespace, name str
 		kept++
 	}
 	writeObject := func(value map[string]any) bool {
+		if grokNsStringField(value, "type") == "function" {
+			name := strings.TrimSpace(grokNsStringField(value, "name"))
+			if name != "" && emittedFunctions[name] {
+				changed = true
+				return true
+			}
+			if name != "" {
+				emittedFunctions[name] = true
+			}
+		}
 		encoded, err := json.Marshal(value)
 		if err != nil {
 			return false
@@ -218,6 +332,37 @@ func grokNormalizeToolsRaw(tools gjson.Result, register func(namespace, name str
 			return true
 		}
 		kind := tool.Get("type").String()
+		if kind == "tool_search" {
+			writeObject(grokFunctionToolForToolSearch(register("", grokToolSearchProxyName, false, true)))
+			changed = true
+			return true
+		}
+		if kind == "function" {
+			name := strings.TrimSpace(tool.Get("name").String())
+			registered := register("", name, false, false)
+			decoded, ok := grokDecodeObject(tool.Raw)
+			if !ok {
+				writeRaw(tool.Raw)
+				return true
+			}
+			normalized := normalizeGrokFunctionTool(decoded, registered)
+			writeObject(normalized)
+			if registered != name || !reflect.DeepEqual(decoded, normalized) {
+				changed = true
+			}
+			return true
+		}
+		if kind == "custom" {
+			decoded, ok := grokDecodeObject(tool.Raw)
+			if !ok {
+				writeRaw(tool.Raw)
+				return true
+			}
+			name := strings.TrimSpace(grokNsStringField(decoded, "name"))
+			writeObject(grokFunctionToolForCustom(decoded, register("", name, true, false)))
+			changed = true
+			return true
+		}
 		if _, isWebSearch := grokWebSearchTypes[kind]; isWebSearch {
 			decoded, ok := grokDecodeObject(tool.Raw)
 			if !ok {
@@ -243,16 +388,20 @@ func grokNormalizeToolsRaw(tools gjson.Result, register func(namespace, name str
 		}
 		namespace := strings.TrimSpace(tool.Get("name").String())
 		tool.Get("tools").ForEach(func(_, child gjson.Result) bool {
-			if !child.IsObject() || child.Get("type").String() != "function" {
+			childType := child.Get("type").String()
+			if !child.IsObject() || (childType != "function" && childType != "custom") {
 				return true
 			}
 			decoded, ok := grokDecodeObject(child.Raw)
 			if !ok {
 				return true
 			}
-			decoded["name"] = register(namespace, strings.TrimSpace(grokNsStringField(decoded, "name")))
-			delete(decoded, "defer_loading")
-			writeObject(decoded)
+			alias := register(namespace, strings.TrimSpace(grokNsStringField(decoded, "name")), childType == "custom", false)
+			if childType == "custom" {
+				writeObject(grokFunctionToolForCustom(decoded, alias))
+			} else {
+				writeObject(normalizeGrokFunctionTool(decoded, alias))
+			}
 			return true
 		})
 		changed = true
@@ -267,7 +416,7 @@ func grokNormalizeToolsRaw(tools gjson.Result, register func(namespace, name str
 // tool_choice 但 tools 为空"硬校验 400）。
 // 判定顺序与逐步改写实现一致：先 web_search 撤销、再 namespace 改写、最后空工具撤销，
 // 使 namespace 别名的注册时机不受影响。
-func grokNormalizeToolChoiceRaw(choice gjson.Result, toolsEmpty, webSearchDropped bool, register func(namespace, name string) string) (raw []byte, changed, dropped bool) {
+func grokNormalizeToolChoiceRaw(choice gjson.Result, toolsEmpty, webSearchDropped bool, register grokAliasRegister) (raw []byte, changed, dropped bool) {
 	if !choice.Exists() {
 		return nil, false, false
 	}
@@ -278,10 +427,23 @@ func grokNormalizeToolChoiceRaw(choice gjson.Result, toolsEmpty, webSearchDroppe
 				return nil, false, true
 			}
 		}
-		if kind == "function" {
+		if kind == "custom" {
+			if decoded, ok := grokDecodeObject(choice.Raw); ok {
+				decoded["type"] = "function"
+				decoded["name"] = register(strings.TrimSpace(choice.Get("namespace").String()), strings.TrimSpace(choice.Get("name").String()), true, false)
+				delete(decoded, "namespace")
+				if encoded, err := json.Marshal(decoded); err == nil {
+					raw, changed = encoded, true
+				}
+			}
+		} else if kind == "tool_search" {
+			if encoded, err := json.Marshal(map[string]any{"type": "function", "name": register("", grokToolSearchProxyName, false, true)}); err == nil {
+				raw, changed = encoded, true
+			}
+		} else if kind == "function" {
 			if namespace := strings.TrimSpace(choice.Get("namespace").String()); namespace != "" {
 				if decoded, ok := grokDecodeObject(choice.Raw); ok {
-					decoded["name"] = register(namespace, strings.TrimSpace(grokNsStringField(decoded, "name")))
+					decoded["name"] = register(namespace, strings.TrimSpace(grokNsStringField(decoded, "name")), false, false)
 					delete(decoded, "namespace")
 					if encoded, err := json.Marshal(decoded); err == nil {
 						raw, changed = encoded, true
@@ -299,7 +461,7 @@ func grokNormalizeToolChoiceRaw(choice gjson.Result, toolsEmpty, webSearchDroppe
 // grokWriteRebuiltInput 逐项处理 input[] 并直接写入 out：干净项原样拷贝 raw 字节，
 // 只有需要重建的项才走重写。顺带数出 user 消息数作为轮次序号，
 // 省掉一趟独立的全量遍历。
-func grokWriteRebuiltInput(out *bytes.Buffer, input gjson.Result, register func(namespace, name string) string) (changed bool, turns int) {
+func grokWriteRebuiltInput(out *bytes.Buffer, input gjson.Result, register grokAliasRegister) (changed bool, turns int) {
 	out.WriteByte('[')
 	first := true
 	input.ForEach(func(_, item gjson.Result) bool {
@@ -322,7 +484,7 @@ func grokWriteRebuiltInput(out *bytes.Buffer, input gjson.Result, register func(
 
 // grokWriteHistoryItem 把单个历史项写入 out，返回 (是否改写, 是否计入轮次)。
 // 无需改写时原样拷贝 raw 字节。
-func grokWriteHistoryItem(out *bytes.Buffer, item gjson.Result, register func(namespace, name string) string) (bool, bool) {
+func grokWriteHistoryItem(out *bytes.Buffer, item gjson.Result, register grokAliasRegister) (bool, bool) {
 	verbatim := func() (bool, bool) {
 		out.WriteString(item.Raw)
 		return false, grokRawItemIsUserMessage(item)
@@ -340,6 +502,22 @@ func grokWriteHistoryItem(out *bytes.Buffer, item gjson.Result, register func(na
 		out.Write(encoded)
 		return true, false
 	}
+	if itemType == "custom_tool_call" || itemType == "custom_tool_call_output" || itemType == "tool_search_call" || itemType == "tool_search_output" || itemType == "tool_search_call_output" {
+		decoded, ok := grokDecodeObject(item.Raw)
+		if !ok {
+			return verbatim()
+		}
+		rebuilt, changed := rebuildGrokHistoryItem(decoded, register)
+		if !changed {
+			return verbatim()
+		}
+		encoded, err := json.Marshal(rebuilt)
+		if err != nil {
+			return verbatim()
+		}
+		out.Write(encoded)
+		return true, false
+	}
 	fields, known := grokNativeHistoryFields[itemType]
 	if !known {
 		return verbatim() // 未知类型原样透传
@@ -350,7 +528,7 @@ func grokWriteHistoryItem(out *bytes.Buffer, item gjson.Result, register func(na
 	aliasName := ""
 	if itemType == "function_call" {
 		if namespace := strings.TrimSpace(grokRawStringField(item, "namespace")); namespace != "" {
-			aliasName = register(namespace, strings.TrimSpace(grokRawStringField(item, "name")))
+			aliasName = register(namespace, strings.TrimSpace(grokRawStringField(item, "name")), false, false)
 		}
 	}
 	if aliasName == "" && grokHistoryItemFieldsAreNative(item, fields) {
@@ -516,7 +694,7 @@ func grokDecodedItemIsUserMessage(item map[string]any) bool {
 }
 
 // grokClampReasoningObjectRaw 钳制 reasoning.effort，返回 (新对象 JSON, 是否改写)。
-func grokClampReasoningObjectRaw(reasoning gjson.Result) ([]byte, bool) {
+func grokClampReasoningObjectRaw(reasoning gjson.Result, model string) ([]byte, bool) {
 	if !reasoning.IsObject() {
 		return nil, false
 	}
@@ -524,7 +702,7 @@ func grokClampReasoningObjectRaw(reasoning gjson.Result) ([]byte, bool) {
 	if !effort.Exists() {
 		return nil, false
 	}
-	mapped, ok := mapGrokReasoningEffort(effort.String())
+	mapped, ok := mapGrokReasoningEffort(effort.String(), model)
 	if !ok {
 		return nil, false
 	}

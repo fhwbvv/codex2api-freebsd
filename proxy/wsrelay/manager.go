@@ -443,12 +443,48 @@ func accountConnectionLimit(account *auth.Account) int {
 	}
 	// 尚未完成调度快照初始化的账号保留原有槽位上限，生产请求进入账号池后
 	// DynamicConcurrencyLimit 会始终为正数。
-	return StatelessConnectionSlots
+	return statelessConnectionSlots()
 }
 
 type idleAccountConnection struct {
 	wc       *WsConnection
 	lastUsed int64
+}
+
+// isOneShotPoolConn 判断连接是否挂在每请求唯一的 stateless 池键下（8 槽全忙时的
+// fallback 一次性连接，或直连 stateless key 的路径）。这类连接的池键不可能被后续
+// 请求按键命中，仅 response_id 续链亲和可能定向取回。
+func isOneShotPoolConn(wc *WsConnection) bool {
+	return wc != nil && wc.session != nil && proxy.IsStatelessWebsocketSessionID(wc.session.ID)
+}
+
+// sortIdleForEviction 决定容量裁剪的逐出顺序：一次性池键连接优先，组内按 LRU。
+// 纯 LRU 会出现倒挂——刚用完的一次性连接比几分钟前用过的可复用槽连接"更新"，
+// 结果保住永远不会被按键复用的僵尸、逐出真正的热槽，拖垮复用率。
+func sortIdleForEviction(idle []idleAccountConnection) {
+	sort.Slice(idle, func(i, j int) bool {
+		oi, oj := isOneShotPoolConn(idle[i].wc), isOneShotPoolConn(idle[j].wc)
+		if oi != oj {
+			return oi
+		}
+		return idle[i].lastUsed < idle[j].lastUsed
+	})
+}
+
+// hasLiveResponseBinding 是否存在未过期的 response_id 续链绑定指向该连接。
+func (m *Manager) hasLiveResponseBinding(wc *WsConnection) bool {
+	if m == nil || wc == nil {
+		return false
+	}
+	now := time.Now()
+	m.respConnMu.Lock()
+	defer m.respConnMu.Unlock()
+	for _, b := range m.respConnBindings {
+		if b.conn == wc && now.Before(b.expiresAt) {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureAccountConnectionCapacity 为即将创建的新连接腾出一个账号级槽位。
@@ -482,7 +518,7 @@ func (m *Manager) ensureAccountConnectionCapacity(accountID int64, limit int, pr
 	if count+pendingCreates < limit {
 		return true
 	}
-	sort.Slice(idle, func(i, j int) bool { return idle[i].lastUsed < idle[j].lastUsed })
+	sortIdleForEviction(idle)
 	for _, candidate := range idle {
 		if count+pendingCreates < limit {
 			break
@@ -525,7 +561,7 @@ func (m *Manager) trimIdleAccountConnections(accountID int64, limit int, protect
 		return
 	}
 
-	sort.Slice(idle, func(i, j int) bool { return idle[i].lastUsed < idle[j].lastUsed })
+	sortIdleForEviction(idle)
 	for _, candidate := range idle {
 		if count <= limit {
 			break

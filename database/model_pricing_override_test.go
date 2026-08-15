@@ -67,3 +67,31 @@ func TestParseModelPricingOverridesJSON(t *testing.T) {
 		t.Fatalf("empty string should parse to empty map")
 	}
 }
+
+func TestModelPricingOverride_LongPriorityFieldsRoundTripAndApply(t *testing.T) {
+	t.Cleanup(func() { SetModelPricingOverrides(nil) })
+
+	override := ModelPricingOverride{
+		Source:                     ModelPricingSourceSynced,
+		InputLongPriority:          20,
+		CachedInputLongPriority:    2,
+		OutputLongPriority:         90,
+		LongContextThresholdTokens: 200000,
+	}
+	if override.IsEmpty() {
+		t.Fatal("long priority-only override must not be dropped as empty")
+	}
+	SetModelPricingOverrides(map[string]ModelPricingOverride{"gpt-5.6-sol": override})
+	pricing := GetModelPricing("gpt-5.6-sol")
+	if pricing.LongInputPricePerMTokenPriority != 20 ||
+		pricing.LongCacheReadPricePerMTokenPriority != 2 ||
+		pricing.LongOutputPricePerMTokenPriority != 90 ||
+		pricing.LongContextThresholdTokens != 200000 {
+		t.Fatalf("long priority override not applied: %+v", pricing)
+	}
+
+	projected := ModelPricingOverrideFromPricing(pricing, ModelPricingSourceSynced)
+	if projected.InputLongPriority != 20 || projected.CachedInputLongPriority != 2 || projected.OutputLongPriority != 90 || projected.LongContextThresholdTokens != 200000 {
+		t.Fatalf("long priority projection lost values: %+v", projected)
+	}
+}

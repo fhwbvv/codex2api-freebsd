@@ -107,6 +107,46 @@ func TestDoUpscaleToRejectsInvalidImage(t *testing.T) {
 	}
 }
 
+func TestDoResizeToPadsToExactMismatchedCanvas(t *testing.T) {
+	out, contentType, err := DoResizeTo(testPNG(t, 4, 4), 12, 6, ResizeFitPad)
+	if err != nil {
+		t.Fatalf("DoResizeTo returned error: %v", err)
+	}
+	if contentType != "image/png" {
+		t.Fatalf("contentType = %q, want image/png", contentType)
+	}
+	img, _, err := image.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode resized image: %v", err)
+	}
+	if got := img.Bounds(); got.Dx() != 12 || got.Dy() != 6 {
+		t.Fatalf("resized size = %dx%d, want 12x6", got.Dx(), got.Dy())
+	}
+	if _, _, _, alpha := img.At(0, 0).RGBA(); alpha != 0 {
+		t.Fatalf("padding alpha = %d, want transparent", alpha)
+	}
+	if _, _, _, alpha := img.At(3, 0).RGBA(); alpha == 0 {
+		t.Fatal("centered source should start after the transparent padding")
+	}
+}
+
+func TestDoResizeToCoversExactMismatchedCanvas(t *testing.T) {
+	out, _, err := DoResizeTo(testPNG(t, 4, 4), 12, 6, ResizeFitCover)
+	if err != nil {
+		t.Fatalf("DoResizeTo returned error: %v", err)
+	}
+	img, _, err := image.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("decode resized image: %v", err)
+	}
+	if got := img.Bounds(); got.Dx() != 12 || got.Dy() != 6 {
+		t.Fatalf("resized size = %dx%d, want 12x6", got.Dx(), got.Dy())
+	}
+	if _, _, _, alpha := img.At(0, 0).RGBA(); alpha == 0 {
+		t.Fatal("cover mode should fill the complete canvas")
+	}
+}
+
 func TestDoUpscaleKeepsLargeSource(t *testing.T) {
 	src := testPNG(t, 2600, 16)
 	out, contentType, err := DoUpscale(src, "2k")

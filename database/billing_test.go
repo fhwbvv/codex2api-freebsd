@@ -280,14 +280,14 @@ func TestProModelsHaveCorrectPricing(t *testing.T) {
 	}
 }
 
-func TestLongContextPricingTriggersAbove272KTokens(t *testing.T) {
+func TestLongContextPricingTriggersAt272KTokens(t *testing.T) {
 	// Below threshold: standard pricing.
-	std := CalculateCostBreakdown(272000, 1000, 0, "gpt-5.4", "")
+	std := CalculateCostBreakdown(271999, 1000, 0, "gpt-5.4", "")
 	assertFloatEqual(t, std.InputPricePerMToken, 2.5)
 	assertFloatEqual(t, std.OutputPricePerMToken, 15.0)
 
-	// Above threshold: long context premium pricing.
-	long := CalculateCostBreakdown(272001, 1000, 0, "gpt-5.4", "")
+	// Official table says <272K is short, so the 272K boundary is long pricing.
+	long := CalculateCostBreakdown(272000, 1000, 0, "gpt-5.4", "")
 	assertFloatEqual(t, long.InputPricePerMToken, 5.0)
 	assertFloatEqual(t, long.OutputPricePerMToken, 22.5)
 	if !long.LongContext {
@@ -395,6 +395,8 @@ func TestGrokPricingUsesXAIRates(t *testing.T) {
 		wantOutput float64
 		wantCache  float64
 	}{
+		{model: "grok-4.6", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.5},
+		{model: "grok-4.6-beta", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.5},
 		{model: "grok-4.5", wantInput: 2.0, wantOutput: 6.0, wantCache: 0.3},
 		{model: "grok-4.3", wantInput: 1.25, wantOutput: 2.5, wantCache: 0.2},
 		{model: "grok-4-fast", wantInput: 0.2, wantOutput: 0.5, wantCache: 0.05},
@@ -417,9 +419,12 @@ func TestGrokPricingUsesXAIRates(t *testing.T) {
 	}
 }
 
-// grok-4.5 更专用的规则必须压过 grok-4，否则 $2/$6 会被当成 $3/$15。
+// grok-4.6 / grok-4.5 更专用的规则必须压过 grok-4，否则 $2/$6 会被当成 $3/$15。
 func TestGrokMoreSpecificRuleWinsOverShorterPrefix(t *testing.T) {
+	assertPricing(t, GetModelPricing("grok-4.6"), 2.0, 6.0)
+	assertFloatEqual(t, GetModelPricing("grok-4.6").CacheReadPricePerMToken, 0.5)
 	assertPricing(t, GetModelPricing("grok-4.5"), 2.0, 6.0)
+	assertFloatEqual(t, GetModelPricing("grok-4.5").CacheReadPricePerMToken, 0.3)
 	assertPricing(t, GetModelPricing("grok-4"), 3.0, 15.0)
 	assertPricing(t, GetModelPricing("grok-3-fast"), 5.0, 25.0)
 	assertPricing(t, GetModelPricing("grok-3"), 3.0, 15.0)
@@ -427,14 +432,14 @@ func TestGrokMoreSpecificRuleWinsOverShorterPrefix(t *testing.T) {
 
 // Grok 的长上下文分档线是 200K，不是 OpenAI 的 272K。
 func TestGrokLongContextThresholdIs200K(t *testing.T) {
-	std := CalculateCostBreakdown(200000, 1000, 0, "grok-4.5", "")
+	std := CalculateCostBreakdown(199999, 1000, 0, "grok-4.5", "")
 	assertFloatEqual(t, std.InputPricePerMToken, 2.0)
 	assertFloatEqual(t, std.OutputPricePerMToken, 6.0)
 	if std.LongContext {
-		t.Fatal("LongContext = true at 200K for grok-4.5, want false")
+		t.Fatal("LongContext = true below 200K for grok-4.5, want false")
 	}
 
-	long := CalculateCostBreakdown(200001, 1000, 500, "grok-4.5", "")
+	long := CalculateCostBreakdown(200000, 1000, 500, "grok-4.5", "")
 	assertFloatEqual(t, long.InputPricePerMToken, 4.0)
 	assertFloatEqual(t, long.OutputPricePerMToken, 12.0)
 	assertFloatEqual(t, long.CacheReadPricePerMToken, 1.0)
@@ -445,12 +450,45 @@ func TestGrokLongContextThresholdIs200K(t *testing.T) {
 		t.Fatalf("LongContextThreshold = %d, want 200000", long.LongContextThreshold)
 	}
 
-	// Codex 模型不受影响，仍是 272K。
-	codex := CalculateCostBreakdown(272000, 1000, 0, "gpt-5.4", "")
+	// grok-4.6 同分档线；缓存短档 $0.50、长档 $1.00（与 grok-4.5 的 $0.30 不同）。
+	std46 := CalculateCostBreakdown(199999, 1000, 500, "grok-4.6", "")
+	assertFloatEqual(t, std46.InputPricePerMToken, 2.0)
+	assertFloatEqual(t, std46.CacheReadPricePerMToken, 0.5)
+	if std46.LongContext {
+		t.Fatal("LongContext = true below 200K for grok-4.6, want false")
+	}
+	long46 := CalculateCostBreakdown(200000, 1000, 500, "grok-4.6", "")
+	assertFloatEqual(t, long46.InputPricePerMToken, 4.0)
+	assertFloatEqual(t, long46.OutputPricePerMToken, 12.0)
+	assertFloatEqual(t, long46.CacheReadPricePerMToken, 1.0)
+	if !long46.LongContext {
+		t.Fatal("LongContext = false at 200K for grok-4.6, want true")
+	}
+
+	// Codex 模型不受影响，仍是 272K（官方短档为 <272K）。
+	codex := CalculateCostBreakdown(271999, 1000, 0, "gpt-5.4", "")
 	if codex.LongContext {
-		t.Fatal("gpt-5.4 LongContext = true at 272K, want false")
+		t.Fatal("gpt-5.4 LongContext = true below 272K, want false")
 	}
 	if codex.LongContextThreshold != longContextThreshold {
 		t.Fatalf("gpt-5.4 LongContextThreshold = %d, want %d", codex.LongContextThreshold, longContextThreshold)
+	}
+}
+
+func TestGrok46OfficialPricingAndLongContextThreshold(t *testing.T) {
+	pricing := GetModelPricing("grok-4.6")
+	if pricing.InputPricePerMToken != 2 || pricing.CacheReadPricePerMToken != 0.5 || pricing.OutputPricePerMToken != 6 {
+		t.Fatalf("grok-4.6 short pricing = %+v", pricing)
+	}
+	if pricing.LongInputPricePerMToken != 4 || pricing.LongCacheReadPricePerMToken != 1 || pricing.LongOutputPricePerMToken != 12 {
+		t.Fatalf("grok-4.6 long pricing = %+v", pricing)
+	}
+	if pricing.LongContextThresholdTokens != 200000 {
+		t.Fatalf("grok-4.6 long threshold = %d, want 200000", pricing.LongContextThresholdTokens)
+	}
+
+	breakdown := CalculateCostBreakdown(200001, 1000000, 0, "grok-4.6", "")
+	if !breakdown.LongContext || breakdown.LongContextThreshold != 200000 {
+		t.Fatalf("grok-4.6 should enter long pricing above 200K: %+v", breakdown)
 	}
 }

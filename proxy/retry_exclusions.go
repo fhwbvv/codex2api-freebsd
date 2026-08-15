@@ -121,6 +121,12 @@ func (r *retryAccountExclusions) MarkHard(accountID int64) {
 }
 
 func (r *retryAccountExclusions) MarkSoftFirstTokenTimeout(accountID int64) {
+	r.MarkSoft(accountID)
+}
+
+// MarkSoft 把账号加入本次请求的软排除集：调度选号时跳过它，但账号池试完后由
+// ResetSoft 清空重来，不会永久搁置请求。用于"重试时暂时避开该账号但不惩罚它"。
+func (r *retryAccountExclusions) MarkSoft(accountID int64) {
 	if r == nil || accountID == 0 {
 		return
 	}
@@ -153,16 +159,34 @@ func (r *retryAccountExclusions) ForSelection() map[int64]bool {
 }
 
 func (h *Handler) nextRetryAccountForSession(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false)
+}
+
+func (h *Handler) nextRetryAccountForContinuation(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true)
+}
+
+func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
 	for {
 		exclude := exclusions.ForSelection()
-		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, filter)
+		var account *auth.Account
+		var stickyProxyURL string
+		if preserveBinding {
+			account, stickyProxyURL = h.store.NextForContinuationWithFilter(affinityKey, apiKeyID, exclude, filter)
+		} else {
+			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, filter)
+		}
 		if account != nil {
 			return account, stickyProxyURL
 		}
-		account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
+		if preserveBinding {
+			account, stickyProxyURL = h.store.WaitForContinuationAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
+		} else {
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
+		}
 		if account != nil {
 			return account, stickyProxyURL
 		}

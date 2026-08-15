@@ -8,6 +8,7 @@ export const GROK_KNOWN_PLAN_KEYS = [
   "x_premium_plus",
   "supergrok_heavy",
   "supergrok_lite",
+  "supergrok_plus",
 ] as const;
 
 export type GrokKnownPlanKey = (typeof GROK_KNOWN_PLAN_KEYS)[number];
@@ -53,11 +54,18 @@ const PLANS_BY_TIER: Record<string, GrokPlanInfo> = {
     paid: true,
     billing: true,
   },
+  "7": {
+    key: "supergrok_plus",
+    display: "SuperGrok Plus",
+    paid: true,
+    billing: true,
+  },
 };
 
 const PLAN_TIER_BY_ALIAS: Record<string, string> = {
   free: "0",
   supergrok: "1",
+  grokpro: "1",
   x_basic: "2",
   xbasic: "2",
   x_premium: "3",
@@ -67,8 +75,11 @@ const PLAN_TIER_BY_ALIAS: Record<string, string> = {
   xpremiumplus: "4",
   supergrok_heavy: "5",
   supergrokheavy: "5",
+  supergrokpro: "5",
   supergrok_lite: "6",
   supergroklite: "6",
+  supergrok_plus: "7",
+  supergrokplus: "7",
 };
 
 export function resolveGrokPlan(value: unknown): GrokPlanInfo | null {

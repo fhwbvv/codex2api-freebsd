@@ -26,6 +26,44 @@ test("buildBatchMetadataUpdate includes enabled scheduler fields", () => {
   });
 });
 
+test("buildBatchMetadataUpdate omits the fingerprint mode unless explicitly enabled", () => {
+  const untouched = buildBatchMetadataUpdate({
+    ids: [1],
+    updateTags: false,
+    tags: [],
+    updateGroups: false,
+    groupIds: [],
+    updateScoreBias: false,
+    scoreBias: null,
+    updateBaseConcurrency: false,
+    baseConcurrency: null,
+    updateSchedulerPriority: false,
+    schedulerPriority: null,
+    updateCodexFingerprintMode: false,
+    codexFingerprintMode: "session",
+  });
+
+  assert.deepEqual(untouched, { ids: [1] });
+
+  const applied = buildBatchMetadataUpdate({
+    ids: [1],
+    updateTags: false,
+    tags: [],
+    updateGroups: false,
+    groupIds: [],
+    updateScoreBias: false,
+    scoreBias: null,
+    updateBaseConcurrency: false,
+    baseConcurrency: null,
+    updateSchedulerPriority: false,
+    schedulerPriority: null,
+    updateCodexFingerprintMode: true,
+    codexFingerprintMode: "session",
+  });
+
+  assert.deepEqual(applied, { ids: [1], codex_fingerprint_mode: "session" });
+});
+
 test("buildBatchMetadataUpdate sends null only for enabled reset fields", () => {
   const payload = buildBatchMetadataUpdate({
     ids: [5],

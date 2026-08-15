@@ -208,6 +208,42 @@ func TestBindSessionAffinityUsesConfigurableTTL(t *testing.T) {
 	}
 }
 
+func TestNextForContinuationPreservesBoundedAffinity(t *testing.T) {
+	bound := &Account{DBID: 1, AccessToken: "tok-1"}
+	fallback := &Account{DBID: 2, AccessToken: "tok-2"}
+	fallback.SetSchedulerPriority(20)
+	store := &Store{
+		accounts:       []*Account{bound, fallback},
+		maxConcurrency: 2,
+	}
+	store.bindSessionAffinity("conversation-1", bound, "")
+
+	store.sessionMu.Lock()
+	binding := store.sessionBindings["conversation-1"]
+	binding.boundAt = time.Now().Add(-defaultMaxAffinityDuration - time.Minute)
+	binding.requestCount = defaultMaxAffinityRequests
+	store.sessionBindings["conversation-1"] = binding
+	store.sessionMu.Unlock()
+
+	acc, _ := store.NextForContinuationWithFilter("conversation-1", 0, nil, nil)
+	if acc == nil || acc.DBID != bound.DBID {
+		t.Fatalf("continuation account = %#v, want bound account %d", acc, bound.DBID)
+	}
+	store.Release(acc)
+
+	acc, _ = store.NextForContinuationWithFilter("conversation-1", 0, map[int64]bool{bound.DBID: true}, nil)
+	if acc != nil {
+		store.Release(acc)
+		t.Fatalf("continuation fell through to account %d when bound account was excluded", acc.DBID)
+	}
+
+	acc, _ = store.NextForSessionWithFilter("conversation-1", 0, nil, nil)
+	if acc == nil || acc.DBID != fallback.DBID {
+		t.Fatalf("ordinary bounded request account = %#v, want fallback account %d", acc, fallback.DBID)
+	}
+	store.Release(acc)
+}
+
 func TestNextForSessionFallsBackWhenBoundAccountExcluded(t *testing.T) {
 	store := &Store{
 		accounts: []*Account{

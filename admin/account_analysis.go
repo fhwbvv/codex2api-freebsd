@@ -179,6 +179,7 @@ func (h *Handler) refreshAccountAnalysisAsync(channel string) {
 }
 
 func (h *Handler) rebuildAccountAnalysis(ctx context.Context, channel string) (*accountAnalysisResponse, error) {
+	gen := h.accountCachesGen.Load()
 	snapshot, err := h.getAccountListSnapshot(ctx, channel)
 	if err != nil {
 		return nil, err
@@ -187,6 +188,10 @@ func (h *Handler) rebuildAccountAnalysis(ctx context.Context, channel string) (*
 	now := time.Now()
 	result := buildAccountAnalysis(snapshot, traffic, now)
 	result.StatsState = combineAccountStatsState(snapshot.StatsState, trafficState)
+	if h.accountCachesGen.Load() != gen {
+		// 构建期间发生账号变更:返回结果但不入缓存,下一次读取重建。
+		return result, nil
+	}
 	h.accountAnalysisCacheMu.Lock()
 	if h.accountAnalysisCache == nil {
 		h.accountAnalysisCache = make(map[string]*accountAnalysisCacheEntry)

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -10,6 +11,16 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 )
+
+type failingSharedLeaseCache struct {
+	cache.TokenCache
+}
+
+func (f failingSharedLeaseCache) SharedAcrossInstances() bool { return true }
+
+func (f failingSharedLeaseCache) AcquireLease(context.Context, string, string, string, time.Duration) (bool, error) {
+	return false, errors.New("shared lease unavailable")
+}
 
 func TestPropagateSharedOAuthCredentialsPreservesWorkspaceRoutes(t *testing.T) {
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
@@ -154,6 +165,21 @@ func TestOAuthRefreshLeaseHoldDeadlinePrecedesTTL(t *testing.T) {
 	remaining := time.Until(deadline)
 	if remaining <= 0 || remaining >= oauthRefreshLeaseTTL {
 		t.Fatalf("lease hold deadline remaining = %v, want between zero and TTL %v", remaining, oauthRefreshLeaseTTL)
+	}
+}
+
+func TestOAuthRefreshLeaseFailsClosedWhenSharedCacheIsUnavailable(t *testing.T) {
+	base := cache.NewMemory(1)
+	store := NewStore(nil, failingSharedLeaseCache{TokenCache: base}, &database.SystemSettings{MaxConcurrency: 2})
+	defer store.Stop()
+
+	if lease, err := store.acquireOAuthRefreshLease(context.Background(), "shared-rt"); err == nil || lease != nil {
+		t.Fatalf("shared lease failure must fail closed, lease=%v err=%v", lease, err)
+	}
+	store.oauthRefreshLocksMu.Lock()
+	defer store.oauthRefreshLocksMu.Unlock()
+	if len(store.oauthRefreshLocks) != 0 {
+		t.Fatalf("failed shared lease retained %d local locks", len(store.oauthRefreshLocks))
 	}
 }
 

@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,20 +18,88 @@ import (
 	"github.com/codex2api/database"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 const (
 	promptConversationLockedReasonCode = "conversation_cyber_locked"
-	promptConversationLockedMessage    = "此对话因触发网络安全策略（CYB）已被锁定，请新建对话后继续。本次锁定拦截不会重复累计；在新对话中再次触发 CYB 可能会停用账号。如果确认是误判，请联系管理员解锁。"
+	promptConversationLockedMessage    = "当前对话因上游 CYB 已被锁定。本次锁定拦截不会重复累计处罚；可等待自动到期，或由管理员在「Prompt 检查 → 风险画像 → 会话详情」手动解锁。解除后再次触发 CYB 可能会停用账号。"
+	promptUserCyberCooldownReasonCode  = "user_cyber_cooldown"
+	promptUserCyberCooldownMessage     = "该用户因上游 CYB 现处于安全冷却期。冷却期间的新请求不会继续转发，也不会重复累计处罚；可等待自动到期，或由管理员在「Prompt 检查 → 风险画像 → 用户详情」手动解除冷却。"
 	promptConversationLockCacheTTL     = 30 * time.Second
 )
 
+type promptCyberRestriction struct {
+	ReasonCode        string
+	Message           string
+	Scope             string
+	LockedAt          time.Time
+	ExpiresAt         time.Time
+	RetryAfterSeconds int64
+	IncidentID        string
+}
+
 type promptConversationLockIdentity struct {
+	Kind               string
 	LockKey            string
 	Platform           string
 	NewAPIUserID       string
 	SessionFingerprint string
 	SessionHash        string
+}
+
+func verifiedPromptUserCooldownIdentity(c *gin.Context, policyContext verifiedNewAPIPolicyContext) (promptConversationLockIdentity, bool) {
+	if c == nil || !policyContext.MetaVerified {
+		return promptConversationLockIdentity{}, false
+	}
+	platform := normalizedNewAPIPlatform(policyContext.Platform)
+	userID := strings.TrimSpace(policyContext.Identity.UserID)
+	if platform == "" || userID == "" {
+		return promptConversationLockIdentity{}, false
+	}
+	digest := sha256.Sum256([]byte("prompt-user-cooldown-v1\x00" + platform + "\x00" + userID))
+	return promptConversationLockIdentity{
+		Kind:    database.PromptConversationLockIdentityNewAPI,
+		LockKey: hex.EncodeToString(digest[:]), Platform: platform, NewAPIUserID: userID,
+	}, true
+}
+
+// promptConversationLockFallbackPlatform 标记降级身份来源,避免与真实 NewAPI
+// 平台代码混淆。
+const promptConversationLockFallbackPlatform = "codex-local"
+
+// promptSessionFingerprint32 产出 32 位十六进制会话指纹,与 NewAPI 透传指纹的
+// 长度约定一致,因此降级身份可以复用同一套存储与校验不变量。
+func promptSessionFingerprint32(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("prompt-conversation-session-v1\x00" + strings.TrimSpace(value)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// promptConversationSessionSignal 提取 Codex 客户端自带的稳定会话标识。Codex
+// 请求必带 x-codex-* 头,其中 window-id / installation-id 与 session-id 头一起
+// 构成不依赖 NewAPI 的会话身份。
+func promptConversationSessionSignal(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if value := promptSessionID(c); value != "" {
+		return value
+	}
+	body := ingressRequestBody(c, nil)
+	for _, path := range []string{"client_metadata.x-codex-window-id", "client_metadata.x-codex-installation-id"} {
+		if value := strings.TrimSpace(gjson.GetBytes(body, path).String()); value != "" {
+			return value
+		}
+	}
+	for _, name := range []string{"X-Codex-Window-Id", "X-Codex-Installation-Id", "Thread-Id"} {
+		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func verifiedPromptConversationLockIdentity(c *gin.Context, policyContext verifiedNewAPIPolicyContext) (promptConversationLockIdentity, bool) {
@@ -44,52 +114,276 @@ func verifiedPromptConversationLockIdentity(c *gin.Context, policyContext verifi
 	}
 	digest := sha256.Sum256([]byte("prompt-conversation-lock-v1\x00" + platform + "\x00" + userID + "\x00" + fingerprint))
 	return promptConversationLockIdentity{
+		Kind:    database.PromptConversationLockIdentityNewAPI,
 		LockKey: hex.EncodeToString(digest[:]), Platform: platform, NewAPIUserID: userID,
 		SessionFingerprint: fingerprint, SessionHash: hashRiskIdentity(fingerprint),
 	}, true
+}
+
+func promptConversationLockTTL(cfg promptfilter.Config) time.Duration {
+	hours := promptfilter.NormalizeAdvancedConfig(cfg.Advanced).Enforcement.ConversationLockTTLHours
+	return time.Duration(hours) * time.Hour
+}
+
+func promptUserCyberCooldownTTL(cfg promptfilter.Config) time.Duration {
+	minutes := promptfilter.NormalizeAdvancedConfig(cfg.Advanced).Enforcement.UserCyberCooldownMinutes
+	return time.Duration(minutes) * time.Minute
+}
+
+func promptConversationLockExpired(item *database.PromptConversationLock, ttl time.Duration) bool {
+	return item == nil || (ttl > 0 && !item.LockedAt.After(time.Now().UTC().Add(-ttl)))
+}
+
+func promptCyberRestrictionDecision(item *database.PromptConversationLock, cfg promptfilter.Config) promptCyberRestriction {
+	result := promptCyberRestriction{
+		ReasonCode: promptConversationLockedReasonCode,
+		Message:    promptConversationLockedMessage,
+		Scope:      database.PromptConversationRestrictionScopeConversation,
+	}
+	ttl := promptConversationLockTTL(cfg)
+	if item != nil {
+		result.LockedAt = item.LockedAt.UTC()
+		result.IncidentID = strings.TrimSpace(item.IncidentID)
+		if item.ReasonCode == promptUserCyberCooldownReasonCode {
+			result.ReasonCode = promptUserCyberCooldownReasonCode
+			result.Scope = database.PromptConversationRestrictionScopeUserCooldown
+			ttl = promptUserCyberCooldownTTL(cfg)
+		}
+	}
+	if !result.LockedAt.IsZero() && ttl > 0 {
+		result.ExpiresAt = result.LockedAt.Add(ttl)
+		remaining := time.Until(result.ExpiresAt)
+		if remaining > 0 {
+			result.RetryAfterSeconds = int64((remaining + time.Second - 1) / time.Second)
+		}
+	}
+	remainingText := promptCyberRestrictionRemainingText(result.RetryAfterSeconds)
+	if result.Scope == database.PromptConversationRestrictionScopeUserCooldown {
+		result.Message = fmt.Sprintf("该用户因上游 CYB 进入安全冷却，剩余约 %s；冷却期间所有新请求均不会转发，也不会重复累计处罚。管理员可在「Prompt 检查 → 风险画像 → 用户详情」解除冷却。错误码：%s。", remainingText, result.ReasonCode)
+	} else {
+		result.Message = fmt.Sprintf("当前对话因上游 CYB 已锁定，剩余约 %s；后续请求不会转发或重复累计处罚。管理员可在「Prompt 检查 → 风险画像 → 会话详情」手动解锁。错误码：%s。", remainingText, result.ReasonCode)
+	}
+	return result
+}
+
+func promptCyberRestrictionRemainingText(seconds int64) string {
+	if seconds <= 0 {
+		return "不到 1 分钟"
+	}
+	minutes := (seconds + 59) / 60
+	if minutes < 60 {
+		return fmt.Sprintf("%d 分钟", minutes)
+	}
+	hours := minutes / 60
+	remainingMinutes := minutes % 60
+	if remainingMinutes == 0 {
+		return fmt.Sprintf("%d 小时", hours)
+	}
+	return fmt.Sprintf("%d 小时 %d 分钟", hours, remainingMinutes)
+}
+
+func promptCyberRestrictionDetails(restriction promptCyberRestriction, signedDetails gin.H) gin.H {
+	details := gin.H{}
+	for key, value := range signedDetails {
+		details[key] = value
+	}
+	details["reason_code"] = restriction.ReasonCode
+	details["restriction_scope"] = restriction.Scope
+	details["retry_after_seconds"] = restriction.RetryAfterSeconds
+	details["manual_unlock_path"] = "/admin/prompt-filter/profiles"
+	if !restriction.LockedAt.IsZero() {
+		details["locked_at"] = restriction.LockedAt.Format(time.RFC3339)
+	}
+	if !restriction.ExpiresAt.IsZero() {
+		details["expires_at"] = restriction.ExpiresAt.Format(time.RFC3339)
+	}
+	if restriction.IncidentID != "" {
+		details["incident_id"] = restriction.IncidentID
+	}
+	return details
+}
+
+func promptCyberRestrictionAPIError(restriction promptCyberRestriction, signedDetails gin.H) *api.APIError {
+	return api.NewAPIErrorWithDetails(
+		api.ErrorCode(restriction.ReasonCode), restriction.Message,
+		api.ErrorTypeInvalidRequest, promptCyberRestrictionDetails(restriction, signedDetails),
+	)
+}
+
+func writePromptCyberRestrictionHeaders(c *gin.Context, restriction promptCyberRestriction) {
+	if c == nil {
+		return
+	}
+	c.Header("X-Codex2API-Policy-Restriction-Scope", restriction.Scope)
+	if restriction.RetryAfterSeconds > 0 {
+		c.Header("Retry-After", strconv.FormatInt(restriction.RetryAfterSeconds, 10))
+	}
+	if !restriction.ExpiresAt.IsZero() {
+		c.Header("X-Codex2API-Policy-Restriction-Expires-At", restriction.ExpiresAt.Format(time.RFC3339))
+	}
+}
+
+func (h *Handler) sendNewAPIPromptCyberRestriction(c *gin.Context, cfg promptfilter.Config, decision promptfilter.Decision, verdict promptfilter.Verdict, body []byte, endpoint, model string, signedBody []byte, restriction promptCyberRestriction) bool {
+	policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, signedBody)
+	if !verified {
+		return false
+	}
+	metadata := buildNewAPIPolicyDecisionMetadataWithSecret(policyContext.Identity, decision, verdict, cfg, body, endpoint, model, "", policyContext.VerificationSecret)
+	writeNewAPIPolicyDecisionHeaders(c, metadata)
+	writePromptCyberRestrictionHeaders(c, restriction)
+	apiErr := promptCyberRestrictionAPIError(restriction, newAPIPolicyDecisionDetails(metadata))
+	if requestUsesAnthropicErrorEnvelope(c) {
+		c.JSON(http.StatusBadRequest, gin.H{"type": "error", "error": gin.H{
+			"type": string(apiErr.Type), "message": apiErr.Message, "details": apiErr.Details,
+		}})
+		return true
+	}
+	api.SendErrorWithStatus(c, apiErr, http.StatusBadRequest)
+	return true
+}
+
+func promptCyberRestrictionLock(item *database.PromptConversationLock, exactConversation bool) *database.PromptConversationLock {
+	if item == nil {
+		return nil
+	}
+	copy := *item
+	if exactConversation {
+		copy.ReasonCode = promptConversationLockedReasonCode
+	} else {
+		copy.ReasonCode = promptUserCyberCooldownReasonCode
+	}
+	return &copy
+}
+
+// promptConversationLockFallbackIdentity 在没有 NewAPI 透传签名时,用下游
+// API Key 加 Codex 自带会话标识构成锁定身份。没有这条降级路径,未接 NewAPI 的
+// 部署完全无法锁定会话,拦截就只能逐条命中,无法封死一个正在试探的会话。
+func promptConversationLockFallbackIdentity(c *gin.Context) (promptConversationLockIdentity, bool) {
+	if c == nil {
+		return promptConversationLockIdentity{}, false
+	}
+	apiKeyID := requestAPIKeyID(c)
+	fingerprint := promptSessionFingerprint32(promptConversationSessionSignal(c))
+	if apiKeyID == 0 || len(fingerprint) != 32 {
+		return promptConversationLockIdentity{}, false
+	}
+	subject := fmt.Sprintf("apikey:%d", apiKeyID)
+	digest := sha256.Sum256([]byte("prompt-conversation-lock-v1\x00" +
+		database.PromptConversationLockIdentityCodexSession + "\x00" + subject + "\x00" + fingerprint))
+	return promptConversationLockIdentity{
+		Kind:               database.PromptConversationLockIdentityCodexSession,
+		LockKey:            hex.EncodeToString(digest[:]),
+		Platform:           promptConversationLockFallbackPlatform,
+		NewAPIUserID:       subject,
+		SessionFingerprint: fingerprint,
+		SessionHash:        hashRiskIdentity(fingerprint),
+	}, true
+}
+
+// resolvePromptConversationLockIdentity 优先使用已验证的 NewAPI 身份,缺失时
+// 退化到 Codex 会话身份。NewAPI 场景的行为与升级前一致。
+func (h *Handler) resolvePromptConversationLockIdentity(c *gin.Context, cfg promptfilter.Config, signedBody []byte) (promptConversationLockIdentity, bool) {
+	if h == nil || c == nil {
+		return promptConversationLockIdentity{}, false
+	}
+	if policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, signedBody); verified {
+		if identity, ok := verifiedPromptConversationLockIdentity(c, policyContext); ok {
+			return identity, true
+		}
+	}
+	return promptConversationLockFallbackIdentity(c)
 }
 
 func (h *Handler) activePromptConversationLock(c *gin.Context, cfg promptfilter.Config, signedBody []byte) (*database.PromptConversationLock, bool) {
 	if h == nil || h.db == nil || c == nil || !cfg.Advanced.Enforcement.ConversationLockEnabled {
 		return nil, false
 	}
+	lockTTL := promptConversationLockTTL(cfg)
 	policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, signedBody)
-	if !verified {
-		return nil, false
+	if verified {
+		userIdentity, ok := verifiedPromptUserCooldownIdentity(c, policyContext)
+		if !ok {
+			return nil, false
+		}
+		conversationIdentity, hasConversationIdentity := verifiedPromptConversationLockIdentity(c, policyContext)
+		lockKey := ""
+		if hasConversationIdentity {
+			lockKey = conversationIdentity.LockKey
+		}
+		if hasConversationIdentity && h.cache != nil {
+			if raw, found, err := h.cache.GetRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, conversationIdentity.LockKey); err == nil && found {
+				var item database.PromptConversationLock
+				if json.Unmarshal(raw, &item) == nil && item.Status == database.PromptConversationLockStatusActive && !promptConversationLockExpired(&item, lockTTL) {
+					return promptCyberRestrictionLock(&item, true), true
+				}
+				_ = h.cache.DeleteRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, conversationIdentity.LockKey)
+			}
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		item, exactConversation, err := h.db.GetActivePromptConversationRestriction(
+			ctx, lockKey, userIdentity.Platform, userIdentity.NewAPIUserID,
+			lockTTL, promptUserCyberCooldownTTL(cfg),
+		)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false
+		}
+		if err != nil {
+			log.Printf("check prompt conversation restriction failed identity=%s: %v", userIdentity.LockKey[:12], err)
+			return nil, false
+		}
+		if exactConversation {
+			h.cachePromptConversationLock(c.Request.Context(), item, lockTTL)
+		}
+		return promptCyberRestrictionLock(item, exactConversation), true
 	}
-	identity, ok := verifiedPromptConversationLockIdentity(c, policyContext)
+
+	// 未接入签名 NewAPI 的部署只按 API Key + Codex 会话锁定当前会话；不应用
+	// 用户级冷却，避免共享 Key 下不同用户相互影响。
+	identity, ok := promptConversationLockFallbackIdentity(c)
 	if !ok {
 		return nil, false
 	}
 	if h.cache != nil {
 		if raw, found, err := h.cache.GetRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, identity.LockKey); err == nil && found {
 			var item database.PromptConversationLock
-			if json.Unmarshal(raw, &item) == nil && item.Status == database.PromptConversationLockStatusActive {
-				return &item, true
+			if json.Unmarshal(raw, &item) == nil && item.Status == database.PromptConversationLockStatusActive && !promptConversationLockExpired(&item, lockTTL) {
+				return promptCyberRestrictionLock(&item, true), true
 			}
+			_ = h.cache.DeleteRuntime(c.Request.Context(), database.PromptConversationLockCacheNamespace, identity.LockKey)
 		}
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
 	defer cancel()
-	item, err := h.db.GetActivePromptConversationLock(ctx, identity.LockKey)
+	item, err := h.db.GetActivePromptConversationLockWithTTL(ctx, identity.LockKey, lockTTL)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false
 	}
 	if err != nil {
-		log.Printf("check prompt conversation lock failed key=%s: %v", identity.LockKey[:12], err)
+		log.Printf("check fallback prompt conversation lock failed identity=%s: %v", identity.LockKey[:12], err)
 		return nil, false
 	}
-	h.cachePromptConversationLock(c.Request.Context(), item)
-	return item, true
+	h.cachePromptConversationLock(c.Request.Context(), item, lockTTL)
+	return promptCyberRestrictionLock(item, true), true
 }
 
-func (h *Handler) cachePromptConversationLock(ctx context.Context, item *database.PromptConversationLock) {
+func (h *Handler) cachePromptConversationLock(ctx context.Context, item *database.PromptConversationLock, lockTTL time.Duration) {
 	if h == nil || h.cache == nil || item == nil || item.Status != database.PromptConversationLockStatusActive {
 		return
 	}
+	cacheTTL := promptConversationLockCacheTTL
+	if lockTTL > 0 {
+		remaining := time.Until(item.LockedAt.Add(lockTTL))
+		if remaining <= 0 {
+			return
+		}
+		if remaining < cacheTTL {
+			cacheTTL = remaining
+		}
+	}
 	raw, err := json.Marshal(item)
 	if err == nil {
-		_ = h.cache.SetRuntime(ctx, database.PromptConversationLockCacheNamespace, item.LockKey, raw, promptConversationLockCacheTTL)
+		_ = h.cache.SetRuntime(ctx, database.PromptConversationLockCacheNamespace, item.LockKey, raw, cacheTTL)
 	}
 }
 
@@ -102,17 +396,31 @@ func (h *Handler) lockPromptConversationAfterUpstreamCYB(c *gin.Context, endpoin
 		return false
 	}
 	policyContext, verified := h.verifyNewAPIPolicyContext(c, cfg.Advanced.NewAPI, ingressRequestBody(c, nil))
-	if !verified {
-		return false
-	}
-	identity, ok := verifiedPromptConversationLockIdentity(c, policyContext)
-	if !ok {
-		return false
+	identity := promptConversationLockIdentity{}
+	exactConversation := false
+	if verified {
+		userIdentity, ok := verifiedPromptUserCooldownIdentity(c, policyContext)
+		if !ok {
+			return false
+		}
+		identity = userIdentity
+		if conversationIdentity, ok := verifiedPromptConversationLockIdentity(c, policyContext); ok {
+			identity = conversationIdentity
+			exactConversation = true
+		}
+	} else {
+		var ok bool
+		identity, ok = promptConversationLockFallbackIdentity(c)
+		if !ok {
+			return false
+		}
+		exactConversation = true
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 	defer cancel()
 	item, _, err := h.db.LockPromptConversation(ctx, database.PromptConversationLockInput{
-		LockKey: identity.LockKey, Platform: identity.Platform, NewAPIUserID: identity.NewAPIUserID,
+		LockKey: identity.LockKey, IdentityKind: identity.Kind,
+		Platform: identity.Platform, NewAPIUserID: identity.NewAPIUserID,
 		SessionFingerprint: identity.SessionFingerprint, SessionHash: identity.SessionHash,
 		IncidentID: incidentID, DecisionID: metadata.DecisionID, RequestID: metadata.RequestID,
 		ReasonCode: metadata.ReasonCode, Endpoint: endpoint, Model: model, LockedAt: time.Now().UTC(),
@@ -121,14 +429,59 @@ func (h *Handler) lockPromptConversationAfterUpstreamCYB(c *gin.Context, endpoin
 		log.Printf("persist prompt conversation lock failed decision=%s: %v", metadata.DecisionID, err)
 		return false
 	}
-	h.cachePromptConversationLock(c.Request.Context(), item)
+	if !exactConversation {
+		return false
+	}
+	h.cachePromptConversationLock(c.Request.Context(), item, promptConversationLockTTL(cfg))
+	return item != nil && item.Status == database.PromptConversationLockStatusActive
+}
+
+// lockPromptConversationOnLocalBlock 在本地规则判定 block 时立即锁定会话,
+// 使风险在**发往上游供应商之前**就被扼杀。
+//
+// 为什么必须前置:纯正则单轮命中率有限(见 promptfilter 对抗性基线,12 种绕过
+// 变形仅 3 种被拦),攻击者只要改写措辞、拆词、换语言就能让下一条请求穿透本地
+// 规则打到上游,从而产生真实的 cyber_policy 封号信号。等上游返回 CYB 再锁,
+// 风险已经泄露。会话级封锁把"逐条命中"变成"一次命中即封死整段会话",这是纵深
+// 防御里唯一能覆盖未知变形的一层。
+func (h *Handler) lockPromptConversationOnLocalBlock(c *gin.Context, cfg promptfilter.Config, signedBody []byte, endpoint, model, reasonCode string) bool {
+	if h == nil || h.db == nil || c == nil || !cfg.Advanced.Enforcement.ConversationLockEnabled {
+		return false
+	}
+	identity, ok := h.resolvePromptConversationLockIdentity(c, cfg, signedBody)
+	if !ok {
+		return false
+	}
+	reasonCode = strings.TrimSpace(reasonCode)
+	if reasonCode == "" {
+		reasonCode = "local_prompt_block"
+	}
+	// 每次本地 block 使用独立的决策 ID,使 trigger_count 如实反映命中次数;
+	// 同一请求重放则保持幂等。
+	decisionID := "local-block:" + ensurePromptPolicyRequestCorrelationID(c)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	item, _, err := h.db.LockPromptConversation(ctx, database.PromptConversationLockInput{
+		LockKey: identity.LockKey, IdentityKind: identity.Kind,
+		Platform: identity.Platform, NewAPIUserID: identity.NewAPIUserID,
+		SessionFingerprint: identity.SessionFingerprint, SessionHash: identity.SessionHash,
+		DecisionID: decisionID, ReasonCode: reasonCode,
+		Endpoint: endpoint, Model: model, LockedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		log.Printf("persist local-block prompt conversation lock failed decision=%s: %v", decisionID, err)
+		return false
+	}
+	h.cachePromptConversationLock(c.Request.Context(), item, promptConversationLockTTL(cfg))
 	return item != nil && item.Status == database.PromptConversationLockStatusActive
 }
 
 func (h *Handler) rejectLockedPromptConversation(c *gin.Context, cfg promptfilter.Config, signedBody, responseBody []byte, endpoint, model string) bool {
-	if _, locked := h.activePromptConversationLock(c, cfg, signedBody); !locked {
+	item, locked := h.activePromptConversationLock(c, cfg, signedBody)
+	if !locked {
 		return false
 	}
+	restriction := promptCyberRestrictionDecision(item, cfg)
 	profile := strings.ToLower(strings.TrimSpace(cfg.Advanced.Guard.DefaultProfile))
 	switch profile {
 	case promptfilter.GuardProfileBalanced, promptfilter.GuardProfileStrict, promptfilter.GuardProfileResearch:
@@ -137,16 +490,20 @@ func (h *Handler) rejectLockedPromptConversation(c *gin.Context, cfg promptfilte
 	}
 	decision := promptfilter.Decision{
 		Action: promptfilter.ActionBlock, Profile: profile,
-		ReasonCode: promptConversationLockedReasonCode, StrikeEligible: false, Terminal: true,
+		ReasonCode: restriction.ReasonCode, StrikeEligible: false, Terminal: true,
 	}
-	verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: promptConversationLockedMessage, FullText: promptConversationLockedReasonCode}
-	if h.sendNewAPIPolicyDecision(c, cfg, decision, verdict, responseBody, endpoint, model, signedBody) {
+	verdict := promptfilter.Verdict{Action: promptfilter.ActionBlock, Reason: restriction.Message, FullText: restriction.ReasonCode}
+	if h.sendNewAPIPromptCyberRestriction(c, cfg, decision, verdict, responseBody, endpoint, model, signedBody, restriction) {
 		return true
 	}
+	writePromptCyberRestrictionHeaders(c, restriction)
+	apiErr := promptCyberRestrictionAPIError(restriction, nil)
 	if requestUsesAnthropicErrorEnvelope(c) {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", promptConversationLockedMessage)
+		c.JSON(http.StatusBadRequest, gin.H{"type": "error", "error": gin.H{
+			"type": string(apiErr.Type), "message": apiErr.Message, "details": apiErr.Details,
+		}})
 		return true
 	}
-	api.SendErrorWithStatus(c, api.NewAPIError(api.ErrorCode(promptConversationLockedReasonCode), promptConversationLockedMessage, api.ErrorTypeInvalidRequest), http.StatusBadRequest)
+	api.SendErrorWithStatus(c, apiErr, http.StatusBadRequest)
 	return true
 }

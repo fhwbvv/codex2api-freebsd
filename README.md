@@ -500,6 +500,7 @@ Observability:
 | --- | --- |
 | `round_robin` (default) | Round-robin across available accounts per health tier, weighted by dispatch score |
 | `remaining_quota` | Prioritizes accounts with lower usage percent; round-robin for ties |
+| `fill_first` | Keeps draining the account with the least remaining quota until it is exhausted or rate-limited, then falls to the next (A → B → C) |
 
 **Credit accounts** (per-account flags):
 

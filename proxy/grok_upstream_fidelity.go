@@ -67,8 +67,7 @@ const (
 )
 
 // decodeGrokResponseEncoding 在手动声明 Accept-Encoding 后接管响应解压。
-// SSE 流上游不压缩（无 Content-Encoding），此处只处理非流式的压缩响应（错误/billing/非流式补全）：
-// 整体缓冲后按 Content-Encoding 逆序解码。event-stream 一律跳过，避免缓冲流式响应。
+// SSE 使用 reader 链逐层流式解码，绝不整体缓冲；普通 JSON 仍受压缩/解压双上限保护。
 // 超出上限或解码失败时原样返回压缩体，与既有"解码失败不放大成空响应"的语义一致
 // （下游按 Content-Encoding 自行处理）。
 func decodeGrokResponseEncoding(resp *http.Response) {
@@ -80,6 +79,15 @@ func decodeGrokResponseEncoding(resp *http.Response) {
 		return
 	}
 	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream") {
+		decoded, err := newGrokContentDecodingReader(resp.Body, encoding)
+		if err != nil {
+			return
+		}
+		resp.Body = decoded
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
+		resp.ContentLength = -1
+		resp.Uncompressed = true
 		return
 	}
 	// 多读 1 字节用于判断是否已超限：读满即说明压缩体比上限还大。
@@ -103,6 +111,62 @@ func decodeGrokResponseEncoding(resp *http.Response) {
 	resp.Header.Del("Content-Length")
 	resp.ContentLength = int64(len(decoded))
 	resp.Uncompressed = true
+}
+
+type chainedReadCloser struct {
+	io.Reader
+	closers []io.Closer
+}
+
+func (r *chainedReadCloser) Close() error {
+	var first error
+	for _, closer := range r.closers {
+		if err := closer.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// newGrokContentDecodingReader installs decoders in reverse Content-Encoding
+// order. Deflate follows the HTTP zlib form; unlike buffered decode it cannot
+// safely sniff-and-rewind a live body, so a rare raw-deflate stream remains
+// encoded rather than consuming bytes and corrupting the stream.
+func newGrokContentDecodingReader(body io.ReadCloser, encoding string) (io.ReadCloser, error) {
+	if body == nil {
+		return nil, fmt.Errorf("nil encoded body")
+	}
+	current := io.Reader(body)
+	closers := []io.Closer{body}
+	encs := strings.Split(encoding, ",")
+	for i := len(encs) - 1; i >= 0; i-- {
+		switch enc := strings.ToLower(strings.TrimSpace(encs[i])); enc {
+		case "", "identity":
+			continue
+		case "gzip", "x-gzip":
+			reader, err := gzip.NewReader(current)
+			if err != nil {
+				_ = body.Close()
+				return nil, err
+			}
+			current = reader
+			closers = append([]io.Closer{reader}, closers...)
+		case "br":
+			current = brotli.NewReader(current)
+		case "deflate":
+			reader, err := zlib.NewReader(current)
+			if err != nil {
+				_ = body.Close()
+				return nil, err
+			}
+			current = reader
+			closers = append([]io.Closer{reader}, closers...)
+		default:
+			_ = body.Close()
+			return nil, fmt.Errorf("unsupported content-encoding %q", enc)
+		}
+	}
+	return &chainedReadCloser{Reader: current, closers: closers}, nil
 }
 
 // decodeContentEncoding 按 Content-Encoding（可能是逗号分隔的多重编码）逆序解压 gzip/br/deflate。

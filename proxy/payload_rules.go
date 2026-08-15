@@ -558,6 +558,12 @@ func ApplyPayloadRulesToBody(body []byte, model string, headers http.Header, ide
 			}
 			value := text
 			if prev := existing.String(); strings.TrimSpace(prev) != "" {
+				// 幂等保护：重试/续想等路径可能带着已改写的 body 重入规则引擎，
+				// 已作为完整追加块存在的文本不再重复拼接，否则请求体随重入次数
+				// 膨胀且改变提示词语义。
+				if payloadAppendAlreadyApplied(prev, text) {
+					continue
+				}
 				value = prev + "\n\n" + text
 			}
 			if updated, err := sjson.SetBytes(out, path, value); err == nil {
@@ -585,6 +591,16 @@ func ApplyPayloadRulesToBody(body []byte, model string, headers http.Header, ide
 		}
 	}
 	return out
+}
+
+// payloadAppendAlreadyApplied 判断 text 是否已作为完整追加块存在于 prev 中：
+// prev 整体即 text，或 text 以 "\n\n" 分隔符对齐地出现在开头/结尾/中间。
+// 下游正文恰好自带同样完整块时跳过追加与追加后去重等价，不改变最终语义。
+func payloadAppendAlreadyApplied(prev, text string) bool {
+	return prev == text ||
+		strings.HasPrefix(prev, text+"\n\n") ||
+		strings.HasSuffix(prev, "\n\n"+text) ||
+		strings.Contains(prev, "\n\n"+text+"\n\n")
 }
 
 // EffectiveRequestedServiceTier 返回请求体经当前规则改写后将真正发往上游的 service_tier，

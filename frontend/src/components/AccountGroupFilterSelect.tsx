@@ -150,7 +150,7 @@ export default function AccountGroupFilterSelect({
       </button>
 
       {open ? (
-        <div className="absolute left-0 top-[calc(100%+0.5rem)] z-50 w-64 overflow-hidden rounded-lg border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm">
+        <div className="absolute left-0 top-[calc(100%+0.5rem)] z-50 w-64 max-w-[calc(100vw-2.5rem)] overflow-hidden rounded-lg border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm max-sm:right-0 max-sm:left-auto">
           <div className="space-y-0.5 p-1.5">
             <button
               type="button"

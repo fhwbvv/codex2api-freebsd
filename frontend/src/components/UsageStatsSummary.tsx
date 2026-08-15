@@ -23,13 +23,13 @@ export default function UsageStatsSummary({
   const rangeParams = rangeLabel ? { range: rangeLabel } : undefined
 
   return (
-    <Card className={`py-0 ${className}`}>
-      <CardContent className="p-4">
-        <h3 className="mb-3 text-base font-semibold text-foreground">{t('dashboard.usageStats')}</h3>
-        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+    <Card className={`py-0 border-border/70 bg-card shadow-2xs ${className}`}>
+      <CardContent className="p-4.5 sm:p-5.5">
+        <h3 className="mb-3.5 text-sm font-bold text-foreground tracking-tight">{t('dashboard.usageStats')}</h3>
+        <div className="grid gap-3.5 md:grid-cols-2 xl:grid-cols-4">
           <MetricGroup
-            icon={<BarChart3 className="size-5" />}
-            iconBg="bg-blue-500/10 text-blue-500"
+            icon={<BarChart3 className="size-4.5" />}
+            iconBg="bg-blue-500/10 text-blue-600 dark:text-blue-400 ring-1 ring-blue-500/20"
             title={t('dashboard.trafficGroup')}
             primaryLabel={rangeLabel ? t('dashboard.rangeRequests', rangeParams) : t('dashboard.todayRequests')}
             primaryValue={formatInteger(stats.today_requests, locale)}
@@ -42,8 +42,8 @@ export default function UsageStatsSummary({
           </MetricGroup>
 
           <MetricGroup
-            icon={<Zap className="size-5" />}
-            iconBg="bg-purple-500/10 text-purple-500"
+            icon={<Zap className="size-4.5" />}
+            iconBg="bg-purple-500/10 text-purple-600 dark:text-purple-400 ring-1 ring-purple-500/20"
             title={t('dashboard.tokenGroup')}
             primaryLabel={rangeLabel ? t('dashboard.rangeTokens', rangeParams) : t('dashboard.todayTokens')}
             primaryValue={formatUsageNumber(stats.today_tokens, showFullUsageNumbers, locale)}
@@ -56,8 +56,8 @@ export default function UsageStatsSummary({
           </MetricGroup>
 
           <MetricGroup
-            icon={<Gauge className="size-5" />}
-            iconBg="bg-teal-500/10 text-teal-500"
+            icon={<Gauge className="size-4.5" />}
+            iconBg="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 ring-1 ring-emerald-500/20"
             title={t('dashboard.cacheGroup')}
             primaryLabel={rangeLabel ? t('dashboard.rangeCacheHitRate', rangeParams) : t('dashboard.todayCacheHitRate')}
             primaryValue={formatPercent(stats.today_cache_rate ?? 0)}
@@ -70,8 +70,8 @@ export default function UsageStatsSummary({
           </MetricGroup>
 
           <MetricGroup
-            icon={<Clock className="size-5" />}
-            iconBg="bg-cyan-500/10 text-cyan-500"
+            icon={<Clock className="size-4.5" />}
+            iconBg="bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 ring-1 ring-cyan-500/20"
             title={t('dashboard.healthGroup')}
             primaryLabel={t('dashboard.avgFirstTokenLatency')}
             primaryValue={formatLatency(stats.avg_first_token_ms)}
@@ -105,20 +105,20 @@ function MetricGroup({
   children: ReactNode
 }) {
   return (
-    <section className="min-w-0 rounded-lg border border-border/70 bg-muted/25 p-3.5">
-      <div className="mb-2.5 flex items-center gap-3">
-        <div className={`flex size-8 shrink-0 items-center justify-center rounded-md ${iconBg}`} aria-hidden="true">
+    <section className="min-w-0 rounded-xl border border-border/70 bg-card p-4 shadow-2xs transition-all duration-200 hover:border-border">
+      <div className="mb-3 flex items-center gap-3">
+        <div className={`flex size-8.5 shrink-0 items-center justify-center rounded-xl ${iconBg}`} aria-hidden="true">
           {icon}
         </div>
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold text-foreground" title={title}>{title}</div>
-          <div className="truncate text-xs text-muted-foreground" title={primaryLabel}>{primaryLabel}</div>
+          <div className="truncate text-xs font-bold uppercase tracking-wider text-foreground/90" title={title}>{title}</div>
+          <div className="truncate text-[11px] text-muted-foreground" title={primaryLabel}>{primaryLabel}</div>
         </div>
       </div>
-      <div className="truncate text-[26px] font-bold leading-none tabular-nums text-foreground" title={primaryValue}>
+      <div className="truncate text-[26px] font-extrabold leading-none tabular-nums tracking-tight text-foreground sm:text-[28px]" title={primaryValue}>
         {primaryValue}
       </div>
-      <div className="mt-2.5 space-y-1.5 border-t border-border/60 pt-2">
+      <div className="mt-3 space-y-1.5 border-t border-border/60 pt-2.5">
         {children}
       </div>
     </section>
@@ -127,9 +127,9 @@ function MetricGroup({
 
 function MetricLine({ label, value, tone = 'default' }: { label: string; value: string; tone?: 'default' | 'danger' }) {
   return (
-    <div className="flex min-w-0 items-center justify-between gap-3 text-sm">
+    <div className="flex min-w-0 items-center justify-between gap-3 text-xs">
       <span className="truncate text-muted-foreground" title={label}>{label}</span>
-      <span className={`shrink-0 font-semibold tabular-nums ${tone === 'danger' ? 'text-destructive' : 'text-foreground'}`} title={value}>
+      <span className={`shrink-0 font-semibold font-mono tabular-nums ${tone === 'danger' ? 'text-destructive font-bold' : 'text-foreground'}`} title={value}>
         {value}
       </span>
     </div>

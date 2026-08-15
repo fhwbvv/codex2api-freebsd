@@ -43,6 +43,9 @@ new-api/
 CPA-Manager-Plus/
 grok2api/
 grokcli2api-go/
+grok-build-main/
+.private-account-fixtures/
 .gstack/
 .superpowers/
 CLAUDE.md
+.cursor

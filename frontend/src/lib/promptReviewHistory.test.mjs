@@ -57,3 +57,12 @@ test('each audit section clears independently and explains that risk profiles ar
   assert.match(zh.promptFilter.reviewLogsCleared, /风险画像已保留/)
   assert.match(zh.promptFilter.localLogsCleared, /风险画像已保留/)
 })
+
+test('final actions distinguish model-review blocks from local-rule and conversation-lock blocks', () => {
+  assert.match(source, /function promptFilterDecisionSource/)
+  assert.match(source, /review_flagged/)
+  assert.match(source, /conversation_cyber_locked/)
+  assert.match(source, /promptFilter\.decisionSource/)
+  assert.equal(zh.promptFilter.decisionSource.model, '模型复核拦截')
+  assert.equal(zh.promptFilter.decisionSource.local, '本地规则拦截')
+})

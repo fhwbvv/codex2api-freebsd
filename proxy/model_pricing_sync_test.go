@@ -88,6 +88,13 @@ func TestParseModelPricingPayloadModelsDevIncludesXAI(t *testing.T) {
 		"xai": {
 			"id": "xai",
 			"models": {
+				"grok-4.6": {
+					"id": "grok-4.6",
+					"cost": {
+						"input": 2, "output": 6, "cache_read": 0.5,
+						"tiers": [{"input": 4, "output": 12, "cache_read": 1, "tier": {"type": "context", "size": 200000}}]
+					}
+				},
 				"grok-4.5": {
 					"id": "grok-4.5",
 					"cost": {
@@ -117,6 +124,16 @@ func TestParseModelPricingPayloadModelsDevIncludesXAI(t *testing.T) {
 	}
 	if ov.InputLong != 4 || ov.OutputLong != 12 || ov.CachedInputLong != 1 {
 		t.Fatalf("grok-4.5 long tier = %+v", ov)
+	}
+	ov46, ok := got["grok-4.6"]
+	if !ok {
+		t.Fatalf("missing grok-4.6, got keys: %v", got)
+	}
+	if ov46.Input != 2 || ov46.Output != 6 || ov46.CachedInput != 0.5 {
+		t.Fatalf("grok-4.6 standard tier = %+v, want $2/$6 cache $0.50", ov46)
+	}
+	if ov46.InputLong != 4 || ov46.OutputLong != 12 || ov46.CachedInputLong != 1 {
+		t.Fatalf("grok-4.6 long tier = %+v", ov46)
 	}
 	if ov5 := got["gpt-5.5"]; ov5.Input != 5 {
 		t.Fatalf("openai entries must survive alongside xai: %+v", ov5)

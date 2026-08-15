@@ -359,7 +359,9 @@ func TestWebSocketPolicyDecisionIDUsesLogicalFrameSequence(t *testing.T) {
 	}
 }
 
-func TestOnlyExplicitUpstreamCyberPolicyDecisionIsStrikeEligible(t *testing.T) {
+// 上游 CYB 始终是权威封号信号;本地高置信度严重违规是否累计封号则由
+// LocalSevereStrikeEnabled 掌控。两条路径都要覆盖,任一策略回归都应被发现。
+func TestUpstreamCYBStrikeAlwaysAndLocalSevereFollowsSwitch(t *testing.T) {
 	cfg := promptGuardTestConfig()
 	cfg.Advanced.Enforcement.CYBStrikeEnabled = true
 	binding := database.PromptFilterNewAPIBinding{
@@ -382,15 +384,26 @@ func TestOnlyExplicitUpstreamCyberPolicyDecisionIsStrikeEligible(t *testing.T) {
 
 	local := promptfilter.Decision{
 		Action: promptfilter.ActionBlock, Profile: promptfilter.GuardProfileStrict,
-		ReasonCode: "prompt_policy_match", StrikeEligible: true, Terminal: true,
+		ReasonCode: "terminal_policy_match", StrikeEligible: true, Terminal: true,
 	}
-	localMetadata := buildNewAPIPolicyDecisionMetadataWithSecret(
-		newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8", RequestID: "local-policy-request"},
-		local, promptfilter.Verdict{Action: promptfilter.ActionBlock, FullText: "local match"}, cfg,
-		body, "/v1/responses", "gpt-5.5", "", "gateway-a-secret",
-	)
-	if localMetadata.StrikeEligible {
-		t.Fatalf("local prompt decision unexpectedly became strike eligible: %+v", localMetadata)
+	buildLocal := func(c promptfilter.Config) newAPIPolicyDecisionMetadata {
+		return buildNewAPIPolicyDecisionMetadataWithSecret(
+			newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8", RequestID: "local-policy-request"},
+			local, promptfilter.Verdict{Action: promptfilter.ActionBlock, FullText: "local match"}, c,
+			body, "/v1/responses", "gpt-5.5", "", "gateway-a-secret",
+		)
+	}
+
+	disabled := cfg
+	disabled.Advanced.Enforcement.LocalSevereStrikeEnabled = false
+	if buildLocal(disabled).StrikeEligible {
+		t.Fatal("关闭 LocalSevereStrikeEnabled 后本地严重违规仍被判为可累计封号")
+	}
+
+	enabled := cfg
+	enabled.Advanced.Enforcement.LocalSevereStrikeEnabled = true
+	if !buildLocal(enabled).StrikeEligible {
+		t.Fatal("开启 LocalSevereStrikeEnabled 后本地最高置信度严重违规未累计封号")
 	}
 }
 

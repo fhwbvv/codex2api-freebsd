@@ -16,10 +16,8 @@ import (
 
 // Grok billing 端点（cli-chat-proxy，与官方 Grok CLI 对齐）。
 const (
-	grokBillingWeeklyPath   = "/billing?format=credits"
-	grokBillingMonthlyPath  = "/billing"
-	grokSuperGrokCents      = 15_000  // $150
-	grokSuperGrokHeavyCents = 150_000 // $1,500
+	grokBillingWeeklyPath  = "/billing?format=credits"
+	grokBillingMonthlyPath = "/billing"
 )
 
 // GrokProductUsage 是周额度内单个产品（如 GrokBuild / Api）的用量。
@@ -31,6 +29,7 @@ type GrokProductUsage struct {
 // GrokBillingSummary 是 Grok 周/月额度的合并视图，供列表展示。
 type GrokBillingSummary struct {
 	Plan               string
+	CurrentPeriodType  string
 	WeeklyPercent      *float64
 	WeeklyPeriodStart  string
 	WeeklyPeriodEnd    string
@@ -59,6 +58,115 @@ type GrokBillingDetail struct {
 	MonthlyPeriodStart string             `json:"monthly_period_start,omitempty"`
 	MonthlyPeriodEnd   string             `json:"monthly_period_end,omitempty"`
 	UpdatedAt          string             `json:"updated_at,omitempty"`
+}
+
+// GrokBillingSummaryFromFact builds the legacy display projection from the
+// sanitized /billing?format=credits fact. The endpoint exposes one real
+// currentPeriod; it must never be duplicated into both weekly and monthly
+// buckets. Unknown period types keep amounts/PAYG details but do not invent a
+// weekly/monthly percentage or rolling window.
+func GrokBillingSummaryFromFact(payload map[string]any, presence map[string]string) *GrokBillingSummary {
+	if payload == nil {
+		return nil
+	}
+	config := payload
+	if nested, ok := payload["config"].(map[string]any); ok {
+		config = nested
+	}
+	if config == nil {
+		return nil
+	}
+	summary := &GrokBillingSummary{}
+	value := func(key string) *float64 {
+		raw, exists := config[key]
+		if !exists || raw == nil {
+			return nil
+		}
+		if object, ok := raw.(map[string]any); ok {
+			raw, exists = object["val"]
+			if !exists || raw == nil {
+				return nil
+			}
+		}
+		return anyToFloat64(raw)
+	}
+	text := func(object map[string]any, key string) string {
+		if raw, ok := object[key].(string); ok {
+			return strings.TrimSpace(raw)
+		}
+		return ""
+	}
+
+	usagePercent := value("creditUsagePercent")
+	periodType, periodStart, periodEnd := "", "", ""
+	if current, ok := config["currentPeriod"].(map[string]any); ok {
+		periodType = strings.ToLower(text(current, "type"))
+		periodStart = text(current, "start")
+		periodEnd = text(current, "end")
+	}
+	if periodStart == "" {
+		periodStart = text(config, "billingPeriodStart")
+	}
+	if periodEnd == "" {
+		periodEnd = text(config, "billingPeriodEnd")
+	}
+	summary.CurrentPeriodType = periodType
+	switch {
+	case strings.Contains(periodType, "weekly"):
+		summary.WeeklyPercent = usagePercent
+		summary.WeeklyPeriodStart = periodStart
+		summary.WeeklyPeriodEnd = periodEnd
+	case strings.Contains(periodType, "monthly"):
+		summary.MonthlyPercent = usagePercent
+		summary.MonthlyPeriodStart = periodStart
+		summary.MonthlyPeriodEnd = periodEnd
+	}
+
+	summary.MonthlyLimitCents = value("monthlyLimit")
+	summary.MonthlyUsedCents = value("used")
+	summary.OnDemandCapCents = value("onDemandCap")
+	summary.OnDemandUsedCents = value("onDemandUsed")
+	if summary.OnDemandUsedCents == nil && summary.MonthlyUsedCents != nil && summary.MonthlyLimitCents != nil &&
+		*summary.MonthlyUsedCents > *summary.MonthlyLimitCents {
+		over := *summary.MonthlyUsedCents - *summary.MonthlyLimitCents
+		summary.OnDemandUsedCents = &over
+	}
+	// Legacy monthly payloads may omit creditUsagePercent; only then derive a
+	// display percentage from explicit absolute amount fields.
+	if strings.Contains(periodType, "monthly") && summary.MonthlyPercent == nil &&
+		summary.MonthlyLimitCents != nil && *summary.MonthlyLimitCents > 0 && summary.MonthlyUsedCents != nil {
+		pct := math.Min(*summary.MonthlyUsedCents / *summary.MonthlyLimitCents * 100, 100)
+		summary.MonthlyPercent = &pct
+	}
+	_ = presence // presence remains authoritative in the fact snapshot itself.
+	return summary
+}
+
+// LegacyGrokBillingCredentialsFromFact creates the additive-migration
+// credentials projection from one sanitized billing fact. Explicit nil values
+// clear a legacy bucket that does not match the single real currentPeriod, so
+// an older monthly observation cannot make a new weekly period look like 30D
+// (and vice versa).
+func LegacyGrokBillingCredentialsFromFact(account *auth.Account, payload map[string]any, presence map[string]string) map[string]any {
+	summary := GrokBillingSummaryFromFact(payload, presence)
+	if summary == nil {
+		return nil
+	}
+	credentials := ApplyGrokBilling(nil, account, summary)
+	switch {
+	case strings.Contains(summary.CurrentPeriodType, "weekly"):
+		credentials["grok_monthly_usage_percent"] = nil
+		credentials["grok_monthly_period_end"] = nil
+	case strings.Contains(summary.CurrentPeriodType, "monthly"):
+		credentials["grok_weekly_usage_percent"] = nil
+		credentials["grok_weekly_period_end"] = nil
+	default:
+		credentials["grok_weekly_usage_percent"] = nil
+		credentials["grok_weekly_period_end"] = nil
+		credentials["grok_monthly_usage_percent"] = nil
+		credentials["grok_monthly_period_end"] = nil
+	}
+	return credentials
 }
 
 type grokBillingPayload struct {
@@ -109,11 +217,10 @@ func FetchGrokBilling(ctx context.Context, account *auth.Account, proxyURL strin
 		return nil, fmt.Errorf("billing 探针失败: weekly=%v monthly=%v", weeklyErr, monthlyErr)
 	}
 
-	// OAuth access_token 的 tier claim 能区分 X Basic / X Premium(+)
-	// / SuperGrok Lite 等完整套餐；billing 金额仅作为旧 token 的兜底。
-	summary := &GrokBillingSummary{
-		Plan: auth.GrokPlanTypeFromAccessToken(account.GetAccessToken()),
-	}
+	// Billing is an independent balance/period fact. It must never infer or
+	// overwrite a subscription tier: live /user, settings display, JWT and the
+	// import archive label are persisted and presented as separate sources.
+	summary := &GrokBillingSummary{}
 	if weekly != nil && weekly.Config != nil {
 		cfg := weekly.Config
 		if cfg.CreditUsagePercent != nil {
@@ -154,9 +261,6 @@ func FetchGrokBilling(ctx context.Context, account *auth.Account, proxyURL strin
 		}
 		if len(summary.ProductUsage) == 0 {
 			summary.ProductUsage = parseGrokProductUsage(cfg)
-		}
-		if summary.Plan == "" {
-			summary.Plan = resolveGrokPlan(summary.MonthlyLimitCents)
 		}
 	}
 	// weekly 载荷也可能带 onDemand 字段，作为兜底。
@@ -223,43 +327,18 @@ func fetchGrokBillingOnce(ctx context.Context, client *http.Client, account *aut
 	return &payload, nil
 }
 
-// ApplyGrokBilling 把 billing 摘要写入账号运行时字段（plan + 周/月用量），
-// 并返回需落库的 credentials 增量。
+// ApplyGrokBilling keeps the legacy billing detail fields in sync during the
+// additive migration. Billing periods are deliberately not copied into the
+// generic 5h/7d quota slots and do not mutate plan_type: rolling 7d/30d usage
+// is aggregated from terminal gateway usage events, while subscription facts
+// remain independent of balance facts.
 func ApplyGrokBilling(store *auth.Store, account *auth.Account, summary *GrokBillingSummary) map[string]interface{} {
 	if account == nil || summary == nil {
 		return nil
 	}
 	now := time.Now()
 	credentials := map[string]interface{}{}
-
-	planType := ""
-	if plan, ok := auth.ResolveGrokPlan(summary.Plan); ok {
-		planType = plan.Key
-	}
-	if planType != "" {
-		account.Mu().Lock()
-		account.PlanType = planType
-		account.Mu().Unlock()
-		credentials["plan_type"] = planType
-	}
-
-	// 周额度映射到 5h 字段位（前端进度条复用）；月额度映射到 7d。
-	if summary.WeeklyPercent != nil {
-		resetAt := parseGrokTime(summary.WeeklyPeriodEnd)
-		account.SetUsageSnapshot5hAt(*summary.WeeklyPercent, resetAt, now)
-	}
-	if summary.MonthlyPercent != nil {
-		account.SetUsageSnapshot(*summary.MonthlyPercent, now)
-		if end := parseGrokTime(summary.MonthlyPeriodEnd); !end.IsZero() {
-			account.SetReset7dAt(end)
-		}
-	}
-
-	if store != nil {
-		store.ReportRequestSuccess(account, 0)
-		// 成功探针清除 unauthorized/error 冷却
-		store.ClearCooldown(account)
-	}
+	_ = store // retained for source compatibility while callers migrate.
 
 	if summary.WeeklyPercent != nil {
 		credentials["grok_weekly_usage_percent"] = *summary.WeeklyPercent
@@ -285,7 +364,7 @@ func ApplyGrokBilling(store *auth.Store, account *auth.Account, summary *GrokBil
 	// 完整额度视图（产品用量、按量付费、月度金额）单独落一个 JSON 凭据，
 	// 供账号列表透出给前端渲染。
 	detail := &GrokBillingDetail{
-		Plan:               planType,
+		Plan:               "",
 		WeeklyPercent:      summary.WeeklyPercent,
 		WeeklyPeriodStart:  summary.WeeklyPeriodStart,
 		WeeklyPeriodEnd:    summary.WeeklyPeriodEnd,
@@ -303,26 +382,6 @@ func ApplyGrokBilling(store *auth.Store, account *auth.Account, summary *GrokBil
 		credentials["grok_billing_detail"] = string(detailJSON)
 	}
 	return credentials
-}
-
-// resolveGrokPlan 从月度包含额度推断套餐名。仅在 billing 月度配置成功返回时被调用
-// （见 FetchGrokBilling 里的 monthly.Config != nil 分支），因此月度额度为 0 或字段缺失
-// 即代表"没有付费月度额度" = 免费档；付费档按已知额度精确匹配，未知非零额度不臆断
-// （返回空，交由上层保留占位，避免把未识别的付费档误标成 free）。
-func resolveGrokPlan(monthlyLimitCents *float64) string {
-	if monthlyLimitCents == nil {
-		return "free"
-	}
-	switch math.Round(*monthlyLimitCents) {
-	case grokSuperGrokCents:
-		return "supergrok"
-	case grokSuperGrokHeavyCents:
-		return "supergrok_heavy"
-	case 0:
-		return "free"
-	default:
-		return ""
-	}
 }
 
 func parseGrokCentValue(raw json.RawMessage) *float64 {

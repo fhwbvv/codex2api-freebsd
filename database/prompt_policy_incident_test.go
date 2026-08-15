@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -171,6 +172,29 @@ func TestPromptPolicyIncidentReconcilesAsyncShadowEvidenceInEitherWriteOrder(t *
 		if eventKind != "upstream_cy_local_detected" || comparison != PromptPolicyComparisonLocalDetected {
 			t.Fatalf("risk event was not reconciled: kind=%q comparison=%q", eventKind, comparison)
 		}
+		evidenceRows, err := db.ListPromptRuleCandidateEvidence(context.Background(), got.CandidateID, 100)
+		if err != nil {
+			t.Fatalf("query reconciled candidate evidence len=%d err=%v", len(evidenceRows), err)
+		}
+		var evidenceMetadata string
+		for _, row := range evidenceRows {
+			if row.PromptPolicyIncidentID == incidentID {
+				evidenceMetadata = row.MetadataJSON
+				break
+			}
+		}
+		if evidenceMetadata == "" {
+			t.Fatalf("candidate evidence link for incident %q not found", incidentID)
+		}
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(evidenceMetadata), &metadata); err != nil {
+			t.Fatalf("decode reconciled evidence metadata: %v", err)
+		}
+		learning, _ := metadata["learning_evidence"].(map[string]any)
+		shadow, _ := learning["shadow_audit"].(map[string]any)
+		if metadata["local_comparison"] != PromptPolicyComparisonLocalDetected || metadata["local_outcome"] != PromptPolicyOutcomeAuditHit || metadata["local_reason_code"] != "prompt_policy_shadow_async" || shadow["audit_score"] != float64(20) {
+			t.Fatalf("candidate learning evidence was not reconciled: %#v", metadata)
+		}
 	}
 
 	t.Run("shadow_before_incident", func(t *testing.T) {
@@ -230,6 +254,33 @@ func TestPromptPolicyIncidentReconcilesAsyncShadowEvidenceInEitherWriteOrder(t *
 			assertReconciled(t, db, incidentID)
 		}
 	})
+}
+
+func TestMergePromptPolicyCandidateEvidenceMetadataCompactsNearLimit(t *testing.T) {
+	rawBytes, err := json.Marshal(map[string]any{
+		"padding":          strings.Repeat("x", 65200),
+		"evidence_quality": "complete",
+		"learning_evidence": map[string]any{
+			"version": 1, "quality": "complete", "prompt_text": "durable prompt",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := mergePromptPolicyCandidateEvidenceMetadata(string(rawBytes), PromptPolicyOutcomeAuditHit,
+		PromptPolicyComparisonLocalDetected, 80, "prompt_policy_shadow_async", "current_user",
+		`[{"name":"rule","weight":80}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged) > 64*1024 || !json.Valid([]byte(merged)) {
+		t.Fatalf("compacted metadata bytes=%d valid=%t", len(merged), json.Valid([]byte(merged)))
+	}
+	if strings.Contains(merged, `"padding"`) || !strings.Contains(merged, `"prompt_text":"durable prompt"`) || !strings.Contains(merged, `"local_comparison":"local_detected"`) {
+		t.Fatalf("unexpected compacted metadata bytes=%d padding=%t prompt=%t comparison=%t", len(merged),
+			strings.Contains(merged, `"padding"`), strings.Contains(merged, `"prompt_text":"durable prompt"`),
+			strings.Contains(merged, `"local_comparison":"local_detected"`))
+	}
 }
 
 func TestClearPromptFilterLogsKeepsIncidentsAndCandidateEvidence(t *testing.T) {
@@ -417,4 +468,27 @@ func TestUsageLogIncidentIDSurvivesEveryDetailQueryPath(t *testing.T) {
 		t.Fatalf("paged query: %#v err=%v", paged, err)
 	}
 	assertID("paged", paged.Logs, nil)
+}
+
+// TestMergePromptPolicyCandidateEvidenceMetadataEscapeInflation 验证 JSON
+// HTML 转义膨胀(<>& → \u00XX)不会让对账报错回滚整个日志事务:学习包正文
+// 按编码后体积收缩,对账结论字段始终保留。
+func TestMergePromptPolicyCandidateEvidenceMetadataEscapeInflation(t *testing.T) {
+	bundle := fmt.Sprintf(`{"version":1,"quality":"complete","prompt_text":%q,"context":[{"origin":"history","text":%q}],"upstream_error":%q}`,
+		strings.Repeat("<", 20000), strings.Repeat("&", 11000), strings.Repeat(">", 4000))
+	raw := `{"evidence_quality":"complete","incident_id":"escape","learning_evidence":` + bundle + `}`
+	merged, err := mergePromptPolicyCandidateEvidenceMetadata(raw, PromptPolicyOutcomeAuditHit, PromptPolicyComparisonLocalDetected, 42, "rc", "current_user", `[]`)
+	if err != nil {
+		t.Fatalf("escape-heavy merge must not fail: %v", err)
+	}
+	if len(merged) > 64*1024 || !json.Valid([]byte(merged)) {
+		t.Fatalf("merged bytes=%d valid=%t", len(merged), json.Valid([]byte(merged)))
+	}
+	parsed := map[string]any{}
+	if err := json.Unmarshal([]byte(merged), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed["local_outcome"] != PromptPolicyOutcomeAuditHit || parsed["local_comparison"] != PromptPolicyComparisonLocalDetected {
+		t.Fatalf("reconciled decision fields lost: %v", parsed)
+	}
 }

@@ -18,15 +18,28 @@ import {
   Search,
   Users,
   Power,
+  ShieldCheck,
+  RotateCcw,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { api, type ProxyRow } from "../api";
 import type { AccountRow } from "../types";
 import ChannelLogo from "../components/ChannelLogo";
 import Modal from "../components/Modal";
+import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
+import { StatTile } from "../components/StatTile";
 import StatusBadge from "../components/StatusBadge";
 import {
   DEFAULT_PAGE_SIZE_OPTIONS,
@@ -42,12 +55,13 @@ import {
   readProxyBatchTestSSE,
 } from "../lib/proxyTestState";
 import { getErrorMessage } from "../utils/error";
+import { cn } from "@/lib/utils";
 
 const PROXY_SCHEMES = ["http:", "https:", "socks5:", "socks5h:"];
 
 type BindFilter = "all" | "unbound" | "this" | "other";
-// 账号池大类：Codex 池（含 AT / Agent / OpenAI Responses）与 Grok 池
 type BindKindFilter = "all" | "codex" | "grok";
+type StatusFilter = "all" | "enabled" | "disabled" | "error" | "untested";
 
 function accountDisplayName(account: AccountRow): string {
   if (account.openai_responses_api) {
@@ -80,17 +94,14 @@ function isAccountBoundToProxy(
 function validateProxyInput(url: string): boolean {
   const trimmed = url.trim();
   if (!trimmed) return false;
-  // 优先用 URL 严格解析（覆盖 IPv6 等）。
   try {
     const parsed = new URL(trimmed);
     if (Boolean(parsed.hostname) && PROXY_SCHEMES.includes(parsed.protocol)) {
       return true;
     }
   } catch {
-    /* 落到下方宽松校验 */
+    /* fallback */
   }
-  // 宽松结构校验：密码可能含 # / ? @ 等特殊字符，会让 new URL 抛错（issue #293）。
-  // 形如 scheme://[user[:pass]@]host[:port]，userinfo 贪婪匹配到最后一个 '@'。
   const m = /^([a-z0-9+.-]+):\/\/(?:.*@)?([^@\s:/?#]+)(?::(\d{1,5}))?\/?$/i.exec(
     trimmed,
   );
@@ -101,6 +112,18 @@ function validateProxyInput(url: string): boolean {
     if (port < 1 || port > 65535) return false;
   }
   return true;
+}
+
+function getProxyScheme(url: string): string {
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.protocol.replace(":", "").toUpperCase();
+  } catch {
+    if (url.toLowerCase().startsWith("socks5")) return "SOCKS5";
+    if (url.toLowerCase().startsWith("https")) return "HTTPS";
+    if (url.toLowerCase().startsWith("http")) return "HTTP";
+    return "PROXY";
+  }
 }
 
 function latencyColor(ms: number): string {
@@ -129,11 +152,26 @@ function maskUrl(url: string): string {
   }
 }
 
-function ProxyStatusBadge({
-  proxy,
-}: {
-  proxy: ProxyRow;
-}) {
+function SchemeBadge({ scheme }: { scheme: string }) {
+  const isSocks = scheme.includes("SOCKS");
+  const isHttps = scheme === "HTTPS";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold font-mono tracking-wide uppercase border",
+        isSocks
+          ? "border-purple-500/25 bg-purple-500/10 text-purple-600 dark:text-purple-400"
+          : isHttps
+            ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+            : "border-sky-500/25 bg-sky-500/10 text-sky-600 dark:text-sky-400"
+      )}
+    >
+      {scheme}
+    </span>
+  );
+}
+
+function ProxyStatusBadge({ proxy }: { proxy: ProxyRow }) {
   const { t } = useTranslation();
   const kind = getProxyStatusBadgeKind(proxy);
   const styles =
@@ -160,18 +198,15 @@ function ProxyStatusBadge({
         : kind === "enabled"
           ? t("proxies.enabled")
           : t("proxies.disabled");
-  const className = `inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-all ${styles}`;
 
   return (
-    <span className={className}>
+    <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-all ${styles}`}>
       <span className={`size-1.5 rounded-full ${dot}`} />
       {label}
     </span>
   );
 }
 
-// BindAccountRow 是绑定弹窗里的单行账号。memo 化:勾选状态变化时只重渲染
-// 受影响的行,避免大列表整体重排(大号池卡死问题)。
 const BindAccountRow = memo(function BindAccountRow({
   account,
   checked,
@@ -272,7 +307,9 @@ export default function Proxies() {
   const [editSaving, setEditSaving] = useState(false);
   const [editError, setEditError] = useState("");
 
-  // 代理 → 账号池绑定
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+
   const [accounts, setAccounts] = useState<AccountRow[]>([]);
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [bindingProxy, setBindingProxy] = useState<ProxyRow | null>(null);
@@ -287,19 +324,14 @@ export default function Proxies() {
   const bindAbortRef = useRef<AbortController | null>(null);
   const [bindSubmitting, setBindSubmitting] = useState(false);
 
-  // 一键均衡绑定(把账号按最少绑定优先摊到可用代理上)
   const [showBalance, setShowBalance] = useState(false);
-  const [balanceChannel, setBalanceChannel] = useState<"" | "codex" | "grok">(
-    "grok",
-  );
+  const [balanceChannel, setBalanceChannel] = useState<"" | "codex" | "grok">("grok");
   const [balanceMode, setBalanceMode] = useState<"unbound" | "all">("unbound");
   const [balanceMaxPerProxy, setBalanceMaxPerProxy] = useState("");
   const [balanceSubmitting, setBalanceSubmitting] = useState(false);
 
   const ipApiLang = i18n.language?.startsWith("zh") ? "zh-CN" : "en";
 
-  // 账号列表只在绑定弹窗打开时按需加载 lite 视图(只含身份/绑定字段)。
-  // 页面本身的绑定计数用服务端聚合的 bound_count,大号池下不再拉全量账号。
   const reloadAccounts = useCallback(async () => {
     if (!bindingProxy) return;
     bindAbortRef.current?.abort();
@@ -373,9 +405,43 @@ export default function Proxies() {
     reload();
   }, [reload]);
 
-  const totalPages = Math.max(1, Math.ceil(proxies.length / pageSize));
+  const counts = useMemo(() => {
+    let enabled = 0;
+    let disabled = 0;
+    let error = 0;
+    let untested = 0;
+    for (const p of proxies) {
+      if (p.test_status === "error") error += 1;
+      else if (!p.test_status || p.test_status === "untested") untested += 1;
+
+      if (p.enabled) enabled += 1;
+      else disabled += 1;
+    }
+    return { total: proxies.length, enabled, disabled, error, untested };
+  }, [proxies]);
+
+  const filteredProxies = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return proxies.filter((p) => {
+      if (statusFilter === "enabled" && !p.enabled) return false;
+      if (statusFilter === "disabled" && p.enabled) return false;
+      if (statusFilter === "error" && p.test_status !== "error") return false;
+      if (statusFilter === "untested" && p.test_status && p.test_status !== "untested") return false;
+
+      if (q) {
+        const matchUrl = p.url.toLowerCase().includes(q);
+        const matchLabel = p.label?.toLowerCase().includes(q) ?? false;
+        const matchIp = p.test_ip?.toLowerCase().includes(q) ?? false;
+        const matchLoc = p.test_location?.toLowerCase().includes(q) ?? false;
+        if (!matchUrl && !matchLabel && !matchIp && !matchLoc) return false;
+      }
+      return true;
+    });
+  }, [proxies, query, statusFilter]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredProxies.length / pageSize));
   const currentPage = Math.min(page, totalPages);
-  const pagedProxies = proxies.slice(
+  const pagedProxies = filteredProxies.slice(
     (currentPage - 1) * pageSize,
     currentPage * pageSize,
   );
@@ -464,9 +530,7 @@ export default function Proxies() {
               fail: result.failed,
             }),
       );
-      // 同时刷新代理列表的服务端 bound_count。
       await Promise.all([reloadAccounts(), reload()]);
-      // 绑定成功后同步本地选中：绑定时保持选中，解绑后清空
       if (mode === "unbind") {
         setBindSelected(new Set());
       }
@@ -739,7 +803,7 @@ export default function Proxies() {
     }
   };
 
-  const errorCount = proxies.filter((p) => p.test_status === "error").length;
+  const errorCount = counts.error;
   const testsRunning = testAllLoading || testingIds.size > 0;
 
   const handleCleanErrors = async () => {
@@ -792,75 +856,62 @@ export default function Proxies() {
     }
   };
 
-  const enabledCount = proxies.filter((p) => p.enabled).length;
-  const untestedCount = proxies.filter(
-    (p) => !p.test_status || p.test_status === "untested",
-  ).length;
   const canEnable = proxies.some(
     (p) => p.enabled && p.test_status !== "error",
   );
 
+  const statusFilterItems: Array<{ id: StatusFilter; label: string; count: number }> = [
+    { id: "all", label: t("proxies.filterAll"), count: counts.total },
+    { id: "enabled", label: t("proxies.filterEnabled"), count: counts.enabled },
+    { id: "disabled", label: t("proxies.filterDisabled"), count: counts.disabled },
+    { id: "error", label: t("proxies.filterError"), count: counts.error },
+    { id: "untested", label: t("proxies.filterUntested"), count: counts.untested },
+  ];
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-5 sm:space-y-6">
       {confirmDialog}
       {/* Header */}
-      <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div>
-          <h2 className="text-2xl font-bold text-foreground flex items-center gap-2.5">
-            <Globe className="size-6 text-primary" />
-            {t("nav.proxies")}
-          </h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {t("proxies.description")}
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          {/* Pool Toggle Switch */}
-          <div
-            className="flex items-center gap-3"
-            title={
-              !canEnable && !poolEnabled
-                ? t("proxies.addFirstProxy")
-                : undefined
-            }
-          >
-            <span
-              className={`text-sm font-medium ${poolEnabled ? "text-emerald-600 dark:text-emerald-400" : "text-muted-foreground"}`}
-            >
-              {poolEnabled
-                ? t("proxies.poolEnabled")
-                : t("proxies.poolDisabled")}
-            </span>
-            <button
-              role="switch"
-              aria-checked={poolEnabled}
-              disabled={!canEnable && !poolEnabled}
-              onClick={handleTogglePool}
-              className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 disabled:cursor-not-allowed disabled:opacity-40 ${
-                poolEnabled ? "bg-emerald-500" : "bg-muted-foreground/30"
-              }`}
+      <PageHeader
+        title={t("nav.proxies")}
+        description={t("proxies.description")}
+        className="mb-0 sm:mb-0"
+        actions={
+          <>
+            <div
+              className="flex h-9 shrink-0 items-center gap-2.5 rounded-lg border border-border/60 bg-muted/20 px-3"
+              title={
+                !canEnable && !poolEnabled
+                  ? t("proxies.addFirstProxy")
+                  : t("proxies.poolFailClosedHint")
+              }
             >
               <span
-                className={`pointer-events-none inline-block size-5 transform rounded-full bg-white shadow-lg ring-0 transition-transform duration-200 ${poolEnabled ? "translate-x-5" : "translate-x-0"}`}
+                className={`text-[13px] font-medium ${poolEnabled ? "text-foreground" : "text-muted-foreground"}`}
+              >
+                {poolEnabled
+                  ? t("proxies.poolEnabled")
+                  : t("proxies.poolDisabled")}
+              </span>
+              <Switch
+                checked={poolEnabled}
+                onCheckedChange={handleTogglePool}
+                disabled={!canEnable && !poolEnabled}
               />
-            </button>
-          </div>
+            </div>
 
-          {selected.size > 0 && (
-            <button
-              onClick={handleBatchDelete}
-              className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm font-semibold text-destructive transition-colors hover:bg-destructive/20"
-            >
-              <Trash2 className="size-4" />
-              {t("proxies.deleteSelected", { count: selected.size })}
-            </button>
-          )}
+            {selected.size > 0 && (
+              <Button variant="destructive" onClick={handleBatchDelete}>
+                <Trash2 className="size-4" />
+                {t("proxies.deleteSelected", { count: selected.size })}
+              </Button>
+            )}
 
-          {errorCount > 0 && (
-            <button
+            <Button
+              variant="outline"
               onClick={handleCleanErrors}
-              disabled={cleaningErrors || testsRunning}
-              className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm font-semibold text-destructive transition-colors hover:bg-destructive/20 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={errorCount === 0 || cleaningErrors || testsRunning}
+              className="text-destructive hover:bg-destructive/10 hover:text-destructive dark:hover:bg-destructive/10"
             >
               {cleaningErrors ? (
                 <Loader2 className="size-4 animate-spin" />
@@ -870,25 +921,24 @@ export default function Proxies() {
               {cleaningErrors
                 ? t("proxies.cleaningErrors")
                 : t("proxies.cleanErrors", { count: errorCount })}
-            </button>
-          )}
+            </Button>
 
-          {proxies.some((p) => p.enabled && p.test_status !== "error") && (
-            <button
+            <Button
+              variant="outline"
               onClick={() => setShowBalance(true)}
-              disabled={balanceSubmitting}
-              className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm font-semibold text-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
+              disabled={
+                balanceSubmitting ||
+                !proxies.some((p) => p.enabled && p.test_status !== "error")
+              }
             >
               <Scale className="size-4" />
               {t("proxies.autoBalance")}
-            </button>
-          )}
+            </Button>
 
-          {proxies.length > 0 && (
-            <button
+            <Button
+              variant="outline"
               onClick={handleTestAll}
-              disabled={testsRunning || cleaningErrors}
-              className="flex items-center gap-2 rounded-md border border-border px-3 py-2 text-sm font-semibold text-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
+              disabled={proxies.length === 0 || testsRunning || cleaningErrors}
             >
               {testAllLoading ? (
                 <Loader2 className="size-4 animate-spin" />
@@ -902,107 +952,220 @@ export default function Proxies() {
                     failed: testAllFailed,
                   })
                 : t("proxies.testAll")}
-            </button>
-          )}
+            </Button>
 
-          <button
-            onClick={() => setShowAdd(!showAdd)}
-            className="flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-primary-foreground shadow-sm transition-colors hover:bg-primary/90"
-          >
-            <Plus className="size-4" />
-            {t("proxies.addProxy")}
-          </button>
+            <Button onClick={() => setShowAdd(!showAdd)}>
+              <Plus className="size-4" />
+              {t("proxies.addProxy")}
+            </Button>
+          </>
+        }
+      />
+
+      {/* 批量测试进度条 */}
+      {testAllLoading && testAllTotal > 0 ? (
+        <div className="rounded-xl border border-primary/20 bg-primary/5 p-3.5 space-y-2">
+          <div className="flex items-center justify-between text-xs font-semibold">
+            <span className="flex items-center gap-1.5 text-primary">
+              <Loader2 className="size-3.5 animate-spin" />
+              {t("proxies.testingAllProgress", {
+                current: testAllDone,
+                total: testAllTotal,
+                failed: testAllFailed,
+              })}
+            </span>
+            <span className="tabular-nums text-muted-foreground">
+              {Math.round((testAllDone / testAllTotal) * 100)}%
+            </span>
+          </div>
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-primary/10">
+            <div
+              className="h-full bg-primary transition-all duration-300 rounded-full"
+              style={{ width: `${(testAllDone / testAllTotal) * 100}%` }}
+            />
+          </div>
         </div>
-      </div>
+      ) : null}
 
       {/* Add Panel */}
       {showAdd && (
         <Card className="py-0">
-          <CardContent className="p-6 space-y-4">
-            <h4 className="text-base font-semibold text-foreground">
-              {t("proxies.addProxyTitle")}
-            </h4>
-            <p className="text-sm text-muted-foreground">
-              {t("proxies.addProxyDesc")}
-            </p>
+          <CardContent className="p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h4 className="text-base font-semibold text-foreground">
+                  {t("proxies.addProxyTitle")}
+                </h4>
+                <p className="mt-0.5 text-xs text-muted-foreground">
+                  {t("proxies.addProxyDesc")}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="h-8 text-xs text-muted-foreground"
+                  onClick={() => setAddInput("socks5://127.0.0.1:1080\nhttp://user:pass@1.2.3.4:8080")}
+                >
+                  <RotateCcw className="size-3 mr-1" />
+                  {t("proxies.insertTemplate")}
+                </Button>
+                {addInput ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 text-xs text-muted-foreground"
+                    onClick={() => setAddInput("")}
+                  >
+                    {t("proxies.clearAll")}
+                  </Button>
+                ) : null}
+              </div>
+            </div>
             <textarea
               value={addInput}
               onChange={(e) => setAddInput(e.target.value)}
               placeholder={"http://user:pass@ip:port\nsocks5://ip:port"}
-              className="w-full h-32 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
+              className="w-full h-32 px-3.5 py-2.5 text-xs rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground resize-none outline-none focus:ring-2 focus:ring-primary/30 font-mono"
             />
             <div className="flex items-center gap-3">
-              <input
+              <Input
                 type="text"
                 value={addLabel}
                 onChange={(e) => setAddLabel(e.target.value)}
                 placeholder={t("proxies.labelPlaceholder")}
-                className="flex-1 px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                className="flex-1 rounded-xl h-10"
               />
-              <button
+              <Button
                 onClick={handleAdd}
                 disabled={addLoading || !addInput.trim()}
-                className="px-5 py-2 rounded-md text-sm font-semibold bg-primary text-primary-foreground hover:bg-primary/90 transition-colors disabled:opacity-50 shadow-sm"
+                className="rounded-xl h-10 px-5"
               >
                 {addLoading ? t("proxies.adding") : t("proxies.confirmAdd")}
-              </button>
+              </Button>
             </div>
           </CardContent>
         </Card>
       )}
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 gap-3 min-[520px]:grid-cols-4 sm:gap-4">
-        <Card className="py-0">
-          <CardContent className="p-4 text-center">
-            <div className="text-2xl font-bold tabular-nums text-foreground">
-              {proxies.length}
-            </div>
-            <div className="text-xs text-muted-foreground mt-1">
-              {t("proxies.totalProxies")}
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="py-0">
-          <CardContent className="p-4 text-center">
-            <div className="text-2xl font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
-              {enabledCount}
-            </div>
-            <div className="text-xs text-muted-foreground mt-1">
-              {t("proxies.enabledCount")}
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="py-0">
-          <CardContent className="p-4 text-center">
-            <div className="text-2xl font-bold tabular-nums text-primary">
-              {totalBoundAccounts}
-            </div>
-            <div className="text-xs text-muted-foreground mt-1">
-              {t("proxies.boundAccounts")}
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="py-0">
-          <CardContent className="p-4 text-center">
-            <div className="text-2xl font-bold tabular-nums text-amber-600 dark:text-amber-400">
-              {untestedCount}
-            </div>
-            <div className="text-xs text-muted-foreground mt-1">
-              {t("proxies.untestedCount")}
-            </div>
-          </CardContent>
-        </Card>
+      {/* Stats （点击快捷筛选） */}
+      {loading ? (
+        <div
+          className="grid grid-cols-2 gap-3 min-[520px]:grid-cols-4 sm:gap-4"
+          aria-busy="true"
+        >
+          {[0, 1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className="h-[76px] animate-pulse rounded-lg border border-border bg-muted/40"
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-3 min-[520px]:grid-cols-4 sm:gap-4">
+          <StatTile
+            label={t("proxies.totalProxies")}
+            value={counts.total}
+            icon={<Globe className="size-4" />}
+            active={statusFilter === "all"}
+            onClick={() => setStatusFilter("all")}
+          />
+          <StatTile
+            label={t("proxies.enabledCount")}
+            value={counts.enabled}
+            icon={<Power className="size-4" />}
+            tone="success"
+            active={statusFilter === "enabled"}
+            onClick={() => setStatusFilter("enabled")}
+          />
+          <StatTile
+            label={t("proxies.boundAccounts")}
+            value={totalBoundAccounts}
+            icon={<Users className="size-4" />}
+            tone="info"
+          />
+          <StatTile
+            label={t("proxies.untestedCount")}
+            value={counts.untested}
+            icon={<Zap className="size-4" />}
+            tone="warning"
+            active={statusFilter === "untested"}
+            onClick={() => setStatusFilter("untested")}
+          />
+        </div>
+      )}
+
+      {/* Sticky toolbar */}
+      <div className="sticky top-2 z-20 -mx-1 px-1">
+        <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-card/95 p-2.5 shadow-sm backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between sm:p-2 sm:pl-3">
+          <div className="relative min-w-0 flex-1 sm:max-w-xs">
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              className="h-9 border-transparent bg-muted/40 pl-9 text-sm shadow-none focus-visible:bg-background"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={t("proxies.searchPlaceholder")}
+            />
+          </div>
+
+          <div
+            className="flex max-w-full gap-0.5 overflow-x-auto rounded-xl bg-muted/50 p-0.5 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            role="tablist"
+          >
+            {statusFilterItems.map((item) => {
+              const active = statusFilter === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => setStatusFilter(item.id)}
+                  className={cn(
+                    "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold transition-all",
+                    active
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {item.label}
+                  <span
+                    className={cn(
+                      "tabular-nums rounded-md px-1 py-px text-[10px] font-bold",
+                      active
+                        ? item.id === "error" && item.count > 0
+                          ? "bg-destructive/20 text-destructive"
+                          : "bg-primary/10 text-primary"
+                        : item.id === "error" && item.count > 0
+                          ? "bg-destructive/10 text-destructive"
+                          : "bg-background/60 text-muted-foreground",
+                    )}
+                  >
+                    {item.count}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
       </div>
 
       {/* Table */}
       <Card className="py-0">
         <CardContent className="p-0">
           {loading ? (
-            <div className="flex justify-center items-center py-16">
-              <Loader2 className="size-6 animate-spin text-primary" />
+            <div className="space-y-2 p-4" aria-busy="true">
+              <div className="h-9 w-full animate-pulse rounded-md bg-muted/60" />
+              {[0, 1, 2, 3, 4].map((i) => (
+                <div
+                  key={i}
+                  className="h-12 w-full animate-pulse rounded-md bg-muted/40"
+                />
+              ))}
             </div>
-          ) : proxies.length === 0 ? (
+          ) : filteredProxies.length === 0 ? (
             <div className="text-center py-16 text-muted-foreground">
               <Globe className="size-12 mx-auto mb-3 opacity-30" />
               <p className="text-sm font-medium">{t("proxies.noProxies")}</p>
@@ -1014,6 +1177,7 @@ export default function Proxies() {
               <div className="grid gap-3 p-3 lg:hidden">
                 {pagedProxies.map((p) => {
                   const isTesting = testingIds.has(p.id);
+                  const scheme = getProxyScheme(p.url);
                   return (
                     <div
                       key={p.id}
@@ -1033,7 +1197,15 @@ export default function Proxies() {
                         />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-start gap-2">
-                            <button
+                            <SchemeBadge scheme={scheme} />
+                            {p.label ? (
+                              <span className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                                {p.label}
+                              </span>
+                            ) : null}
+                            <Button
+                              variant="ghost"
+                              size="icon"
                               onClick={() => {
                                 setRevealedIds((prev) => {
                                   const next = new Set(prev);
@@ -1042,7 +1214,7 @@ export default function Proxies() {
                                   return next;
                                 });
                               }}
-                              className="flex size-9 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                              className="shrink-0 text-muted-foreground hover:text-foreground ml-auto"
                               title={
                                 revealedIds.has(p.id)
                                   ? t("proxies.hideProxyUrl")
@@ -1054,10 +1226,11 @@ export default function Proxies() {
                               ) : (
                                 <Eye className="size-3.5" />
                               )}
-                            </button>
-                            <span className="min-w-0 flex-1 break-all font-mono text-[12px] font-medium leading-relaxed text-foreground">
-                              {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
-                            </span>
+                            </Button>
+                          </div>
+
+                          <div className="mt-1.5 break-all font-mono text-[12px] font-medium leading-relaxed text-foreground">
+                            {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
                           </div>
 
                           <div className="mt-2.5 flex flex-wrap items-center gap-2">
@@ -1087,24 +1260,30 @@ export default function Proxies() {
                           </div>
 
                           <div className="mt-3 flex flex-wrap gap-1.5">
-                            <button
+                            <Button
+                              variant="outline"
+                              size="sm"
                               onClick={() => openBindModal(p)}
-                              className="inline-flex min-h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border border-primary/25 bg-primary/5 px-2.5 text-xs font-medium text-primary hover:bg-primary/10"
+                              className="min-h-9 flex-1 border-primary/25 bg-primary/5 text-primary hover:bg-primary/10 hover:text-primary dark:border-primary/25 dark:bg-primary/10 dark:hover:bg-primary/15"
                             >
                               <Link2 className="size-3.5" />
                               {t("proxies.bindAccounts")}
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
                               onClick={() => startEdit(p)}
-                              className="inline-flex min-h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 text-xs font-medium text-foreground hover:bg-muted/50"
+                              className="min-h-9 flex-1"
                             >
                               <Pencil className="size-3.5" />
                               {t("proxies.editProxy")}
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
                               onClick={() => handleTest(p)}
                               disabled={isTesting || cleaningErrors}
-                              className="inline-flex min-h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 text-xs font-medium text-foreground hover:bg-muted/50 disabled:opacity-50"
+                              className="min-h-9 flex-1"
                             >
                               {isTesting ? (
                                 <Loader2 className="size-3.5 animate-spin" />
@@ -1112,27 +1291,31 @@ export default function Proxies() {
                                 <Play className="size-3.5" />
                               )}
                               {t("proxies.test")}
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="sm"
                               onClick={() => handleToggle(p)}
-                              className={`inline-flex min-h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border px-2.5 text-xs font-medium transition-colors ${
+                              className={`min-h-9 flex-1 ${
                                 p.enabled
-                                  ? "border-amber-500/25 text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
-                                  : "border-emerald-500/25 text-emerald-600 hover:bg-emerald-500/10 dark:text-emerald-400"
+                                  ? "border-amber-500/25 text-amber-600 hover:bg-amber-500/10 hover:text-amber-600 dark:border-amber-500/25 dark:text-amber-400 dark:hover:bg-amber-500/10 dark:hover:text-amber-400"
+                                  : "border-emerald-500/25 text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-600 dark:border-emerald-500/25 dark:text-emerald-400 dark:hover:bg-emerald-500/10 dark:hover:text-emerald-400"
                               }`}
                             >
                               <Power className="size-3.5" />
                               {p.enabled
                                 ? t("proxies.disableAction")
                                 : t("proxies.enableAction")}
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
                               onClick={() => handleDelete(p.id)}
-                              className="inline-flex min-h-9 items-center justify-center rounded-lg px-2.5 text-destructive hover:bg-destructive/10"
+                              className="min-h-9 text-destructive hover:bg-destructive/10 hover:text-destructive dark:hover:bg-destructive/10"
                               title={t("common.delete")}
                             >
                               <Trash2 className="size-3.5" />
-                            </button>
+                            </Button>
                           </div>
                         </div>
                       </div>
@@ -1143,49 +1326,35 @@ export default function Proxies() {
 
               {/* Desktop table */}
               <div className="data-table-shell hidden lg:block">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-border text-left text-muted-foreground">
-                      <th className="p-3 w-10">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-10">
                         <input
                           type="checkbox"
                           checked={allSelected}
                           onChange={toggleSelectAll}
                           className="size-4 rounded"
                         />
-                      </th>
-                      <th className="p-3 font-semibold">
-                        {t("proxies.colUrl")}
-                      </th>
-                      <th className="p-3 font-semibold">
-                        {t("proxies.colStatus")}
-                      </th>
-                      <th className="p-3 font-semibold">
-                        {t("proxies.colBound")}
-                      </th>
-                      <th className="p-3 font-semibold">
-                        {t("proxies.colLocation")}
-                      </th>
-                      <th className="p-3 font-semibold">
-                        {t("proxies.colIp")}
-                      </th>
-                      <th className="p-3 font-semibold">
-                        {t("proxies.colLatency")}
-                      </th>
-                      <th className="p-3 font-semibold text-right">
+                      </TableHead>
+                      <TableHead>{t("proxies.colUrl")}</TableHead>
+                      <TableHead>{t("proxies.colStatus")}</TableHead>
+                      <TableHead>{t("proxies.colBound")}</TableHead>
+                      <TableHead>{t("proxies.colLocation")}</TableHead>
+                      <TableHead>{t("proxies.colIp")}</TableHead>
+                      <TableHead>{t("proxies.colLatency")}</TableHead>
+                      <TableHead className="text-right">
                         {t("proxies.colActions")}
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
                     {pagedProxies.map((p) => {
                       const isTesting = testingIds.has(p.id);
+                      const scheme = getProxyScheme(p.url);
                       return (
-                        <tr
-                          key={p.id}
-                          className="border-b border-border/50 hover:bg-muted/30 transition-colors"
-                        >
-                          <td className="p-3">
+                        <TableRow key={p.id}>
+                          <TableCell>
                             <input
                               type="checkbox"
                               checked={selected.has(p.id)}
@@ -1197,10 +1366,18 @@ export default function Proxies() {
                               }}
                               className="size-4 rounded"
                             />
-                          </td>
-                          <td className="p-3 max-w-[380px]">
+                          </TableCell>
+                          <TableCell className="max-w-[380px] whitespace-normal">
                             <div className="flex items-center gap-2">
-                              <button
+                              <SchemeBadge scheme={scheme} />
+                              {p.label ? (
+                                <span className="inline-flex rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-semibold text-primary">
+                                  {p.label}
+                                </span>
+                              ) : null}
+                              <Button
+                                variant="ghost"
+                                size="icon-xs"
                                 onClick={() => {
                                   setRevealedIds((prev) => {
                                     const next = new Set(prev);
@@ -1209,7 +1386,7 @@ export default function Proxies() {
                                     return next;
                                   });
                                 }}
-                                className="shrink-0 flex items-center justify-center size-6 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all"
+                                className="shrink-0 text-muted-foreground hover:text-foreground"
                                 title={
                                   revealedIds.has(p.id)
                                     ? t("proxies.hideProxyUrl")
@@ -1221,17 +1398,17 @@ export default function Proxies() {
                                 ) : (
                                   <Eye className="size-3.5" />
                                 )}
-                              </button>
+                              </Button>
                               <span className="font-mono text-[13px] font-medium break-all text-foreground">
                                 {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
                               </span>
                             </div>
-                          </td>
-                          <td className="p-3">
+                          </TableCell>
+                          <TableCell>
                             <ProxyStatusBadge proxy={p} />
-                          </td>
+                          </TableCell>
                           {/* Bound accounts */}
-                          <td className="p-3">
+                          <TableCell>
                             <button
                               type="button"
                               onClick={() => openBindModal(p)}
@@ -1243,9 +1420,9 @@ export default function Proxies() {
                                 {boundCountForProxy(p)}
                               </span>
                             </button>
-                          </td>
+                          </TableCell>
                           {/* Location */}
-                          <td className="p-3">
+                          <TableCell>
                             {isTesting ? (
                               <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                             ) : p.test_location ? (
@@ -1258,9 +1435,9 @@ export default function Proxies() {
                                 -
                               </span>
                             )}
-                          </td>
+                          </TableCell>
                           {/* IP */}
-                          <td className="p-3">
+                          <TableCell>
                             {p.test_ip ? (
                               <span className="text-[13px] font-mono font-medium text-foreground whitespace-nowrap">
                                 {p.test_ip}
@@ -1270,9 +1447,9 @@ export default function Proxies() {
                                 -
                               </span>
                             )}
-                          </td>
+                          </TableCell>
                           {/* Latency */}
-                          <td className="p-3">
+                          <TableCell>
                             {p.test_latency_ms > 0 ? (
                               <span
                                 className={`inline-flex px-2 py-0.5 rounded-full text-xs font-bold ${latencyColor(p.test_latency_ms)} ${latencyBg(p.test_latency_ms)}`}
@@ -1284,28 +1461,34 @@ export default function Proxies() {
                                 -
                               </span>
                             )}
-                          </td>
-                          <td className="p-3">
-                            <div className="flex items-center gap-1.5 justify-end">
-                              <button
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex items-center gap-1 justify-end">
+                              <Button
+                                variant="outline"
+                                size="sm"
                                 onClick={() => openBindModal(p)}
-                                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-primary/20 bg-primary/5 text-primary hover:bg-primary/10 transition-all"
+                                className="border-primary/20 bg-primary/5 text-primary hover:bg-primary/10 hover:text-primary dark:border-primary/25 dark:bg-primary/10 dark:hover:bg-primary/15"
                                 title={t("proxies.bindAccounts")}
                               >
                                 <Link2 className="size-3.5" />
                                 {t("proxies.bind")}
-                              </button>
-                              <button
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
                                 onClick={() => startEdit(p)}
-                                className="flex items-center justify-center size-7 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all"
+                                className="text-muted-foreground hover:text-foreground"
                                 title={t("proxies.editProxy")}
                               >
                                 <Pencil className="size-3.5" />
-                              </button>
-                              <button
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
                                 onClick={() => handleTest(p)}
                                 disabled={isTesting || cleaningErrors}
-                                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-border text-foreground hover:bg-muted/50 transition-all disabled:opacity-50"
+                                className="text-muted-foreground hover:text-foreground"
                                 title={t("proxies.testProxy")}
                               >
                                 {isTesting ? (
@@ -1313,15 +1496,16 @@ export default function Proxies() {
                                 ) : (
                                   <Play className="size-3.5" />
                                 )}
-                                {t("proxies.test")}
-                              </button>
-                              <button
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
                                 onClick={() => handleToggle(p)}
-                                className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all ${
+                                className={
                                   p.enabled
-                                    ? "border-amber-500/25 text-amber-600 hover:bg-amber-500/10 dark:text-amber-400"
-                                    : "border-emerald-500/25 text-emerald-600 hover:bg-emerald-500/10 dark:text-emerald-400"
-                                }`}
+                                    ? "text-amber-600 hover:bg-amber-500/10 hover:text-amber-600 dark:text-amber-400 dark:hover:bg-amber-500/10 dark:hover:text-amber-400"
+                                    : "text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-600 dark:text-emerald-400 dark:hover:bg-emerald-500/10 dark:hover:text-emerald-400"
+                                }
                                 title={
                                   p.enabled
                                     ? t("proxies.disableAction")
@@ -1329,24 +1513,23 @@ export default function Proxies() {
                                 }
                               >
                                 <Power className="size-3.5" />
-                                {p.enabled
-                                  ? t("proxies.disableAction")
-                                  : t("proxies.enableAction")}
-                              </button>
-                              <button
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
                                 onClick={() => handleDelete(p.id)}
-                                className="flex items-center justify-center size-7 rounded-lg text-destructive hover:bg-destructive/10 transition-all"
+                                className="text-destructive hover:bg-destructive/10 hover:text-destructive dark:hover:bg-destructive/10"
                                 title={t("common.delete")}
                               >
                                 <Trash2 className="size-3.5" />
-                              </button>
+                              </Button>
                             </div>
-                          </td>
-                        </tr>
+                          </TableCell>
+                        </TableRow>
                       );
                     })}
-                  </tbody>
-                </table>
+                  </TableBody>
+                </Table>
               </div>
 
               <div className="px-4 pb-3">
@@ -1354,7 +1537,7 @@ export default function Proxies() {
                   page={currentPage}
                   totalPages={totalPages}
                   onPageChange={setPage}
-                  totalItems={proxies.length}
+                  totalItems={filteredProxies.length}
                   pageSize={pageSize}
                   pageSizeOptions={pageSizeOptions}
                   onPageSizeChange={(nextPageSize) => {
@@ -1589,7 +1772,6 @@ export default function Proxies() {
       >
         {bindingProxy ? (
           <div className="flex flex-col">
-            {/* 目标代理摘要 */}
             <div className="border-b border-border bg-muted/20 px-5 py-3.5 sm:px-6">
               <div className="text-xs font-semibold text-muted-foreground">
                 {t("proxies.bindTargetProxy")}
@@ -1615,7 +1797,6 @@ export default function Proxies() {
               </p>
             </div>
 
-            {/* 搜索 + 筛选 */}
             <div className="space-y-3 border-b border-border px-5 py-3 sm:px-6">
               <div className="relative">
                 <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -1701,7 +1882,6 @@ export default function Proxies() {
               </div>
             </div>
 
-            {/* 账号列表 */}
             <div className="max-h-[min(420px,50dvh)] overflow-y-auto">
               {accountsLoading ? (
                 <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">

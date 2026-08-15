@@ -9,9 +9,14 @@ interface UseDataLoaderOptions<T> {
   initialData: T
   load: (options?: LoadOptions) => Promise<T>
   onError?: (message: string, error: unknown) => void
+  /**
+   * 为 false 时不自动加载(手动 reload 仍可用)。用于同一组件承载多个视图时,
+   * 让隐藏视图的数据链整体停摆,而不是在后台空转打请求。
+   */
+  enabled?: boolean
 }
 
-export function useDataLoader<T>({ initialData, load, onError }: UseDataLoaderOptions<T>) {
+export function useDataLoader<T>({ initialData, load, onError, enabled = true }: UseDataLoaderOptions<T>) {
   const [data, setData] = useState<T>(initialData)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -53,8 +58,9 @@ export function useDataLoader<T>({ initialData, load, onError }: UseDataLoaderOp
   }, [load, onError])
 
   useEffect(() => {
+    if (!enabled) return
     void run()
-  }, [run])
+  }, [run, enabled])
 
   const reload = useCallback(() => run(), [run])
   const reloadSilently = useCallback(() => run({ silent: true }), [run])

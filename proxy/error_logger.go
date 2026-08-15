@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -29,6 +30,9 @@ const defaultLogDir = "logs"
 const upstreamErrorLogBodyMaxBytes = 8 * 1024
 
 func upstreamErrorLogBody(body []byte) string {
+	if len(strings.TrimSpace(string(body))) > 0 && !json.Valid(body) {
+		return fmt.Sprintf("[non-JSON upstream body omitted; %d bytes]", len(body))
+	}
 	truncated := false
 	if len(body) > upstreamErrorLogBodyMaxBytes {
 		body = body[:upstreamErrorLogBodyMaxBytes]

@@ -1130,9 +1130,13 @@ func TestCleanErrorProxiesHandlerSynchronizesRuntimeAccounts(t *testing.T) {
 	db := newAdminProxyTestDB(t)
 	ctx := context.Background()
 	errorURL := "http://error.example:8080"
+	healthyURL := "http://healthy.example:8080"
 	errorID, err := db.InsertProxy(ctx, errorURL, "")
 	if err != nil {
 		t.Fatalf("InsertProxy(error) returned error: %v", err)
+	}
+	if _, err := db.InsertProxy(ctx, healthyURL, ""); err != nil {
+		t.Fatalf("InsertProxy(healthy) returned error: %v", err)
 	}
 	if err := db.UpdateProxyTestResult(ctx, errorID, errorURL, database.ProxyTestStatusError, "", "", 0); err != nil {
 		t.Fatalf("mark proxy error: %v", err)
@@ -1185,6 +1189,136 @@ func TestCleanErrorProxiesHandlerSynchronizesRuntimeAccounts(t *testing.T) {
 	defer store.Release(selected)
 	if proxyURL == errorURL {
 		t.Fatalf("session affinity reused cleaned proxy %q", proxyURL)
+	}
+	if got := store.ResolveProxyForAccount(selected); got != healthyURL {
+		t.Fatalf("unbound account proxy = %q, want remaining pool member %q", got, healthyURL)
+	}
+}
+
+func TestDeleteProxyUnbindsRuntimeAccountsImmediately(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newAdminProxyTestDB(t)
+	ctx := context.Background()
+	const retiredURL = "http://retired.example:8080"
+	id, err := db.InsertProxy(ctx, retiredURL, "")
+	if err != nil {
+		t.Fatalf("InsertProxy returned error: %v", err)
+	}
+	accountID, err := db.InsertAccount(ctx, "bound", "rt-bound", retiredURL)
+	if err != nil {
+		t.Fatalf("InsertAccount returned error: %v", err)
+	}
+
+	store := newAdminProxyTestStore(t, db)
+	store.AddAccount(&auth.Account{
+		DBID:        accountID,
+		AccessToken: "tok-bound",
+		ProxyURL:    retiredURL,
+		Status:      auth.StatusReady,
+	})
+	store.BindSessionAffinity("retired-proxy-session", store.FindByID(accountID), retiredURL)
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	ginCtx.Request = httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/api/admin/proxies/%d", id), nil)
+	handler.DeleteProxy(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	runtimeAccount := store.FindByID(accountID)
+	if runtimeAccount == nil {
+		t.Fatal("runtime account not found")
+	}
+	if got := runtimeAccount.GetProxyURL(); got != "" {
+		t.Fatalf("runtime account proxy = %q, want empty", got)
+	}
+	if got := store.NextProxy(); got == retiredURL {
+		t.Fatalf("NextProxy still returned retired URL %q", got)
+	}
+	selected, proxyURL := store.NextForSession("retired-proxy-session", 0, nil)
+	if selected != nil {
+		defer store.Release(selected)
+	}
+	if proxyURL == retiredURL {
+		t.Fatalf("session affinity reused deleted proxy %q", proxyURL)
+	}
+}
+
+func TestUpdateProxyDisableKeepsPinButStopsUsingIt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newAdminProxyTestDB(t)
+	ctx := context.Background()
+	const (
+		disabledURL = "http://disabled.example:8080"
+		enabledURL  = "http://enabled.example:8080"
+	)
+	disabledID, err := db.InsertProxy(ctx, disabledURL, "")
+	if err != nil {
+		t.Fatalf("InsertProxy(disabled) returned error: %v", err)
+	}
+	if _, err := db.InsertProxy(ctx, enabledURL, ""); err != nil {
+		t.Fatalf("InsertProxy(enabled) returned error: %v", err)
+	}
+	pinnedID, err := db.InsertAccount(ctx, "pinned", "rt-pinned", disabledURL)
+	if err != nil {
+		t.Fatalf("InsertAccount(pinned) returned error: %v", err)
+	}
+	unboundID, err := db.InsertAccount(ctx, "unbound", "rt-unbound", "")
+	if err != nil {
+		t.Fatalf("InsertAccount(unbound) returned error: %v", err)
+	}
+
+	store := newAdminProxyTestStore(t, db)
+	pinned := &auth.Account{DBID: pinnedID, AccessToken: "tok-pinned", ProxyURL: disabledURL, Status: auth.StatusReady}
+	unbound := &auth.Account{DBID: unboundID, AccessToken: "tok-unbound", Status: auth.StatusReady}
+	store.AddAccount(pinned)
+	store.AddAccount(unbound)
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", disabledID)}}
+	ginCtx.Request = httptest.NewRequest(
+		http.MethodPatch,
+		fmt.Sprintf("/api/admin/proxies/%d", disabledID),
+		strings.NewReader(`{"enabled":false}`),
+	)
+	ginCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateProxy(ginCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	if got := store.FindByID(pinnedID).GetProxyURL(); got != disabledURL {
+		t.Fatalf("disabled pin was cleared = %q, want kept %q", got, disabledURL)
+	}
+	if got := store.ResolveProxyForAccount(store.FindByID(pinnedID)); got != "" {
+		t.Fatalf("disabled pin still resolved = %q", got)
+	}
+	selected := store.NextExcludingWithFilter(0, nil, nil)
+	if selected == nil {
+		t.Fatal("expected unbound account to remain schedulable")
+	}
+	defer store.Release(selected)
+	if selected.DBID != unboundID {
+		t.Fatalf("selected account %d, want unbound %d", selected.DBID, unboundID)
+	}
+	if got := store.ResolveProxyForAccount(selected); got != enabledURL {
+		t.Fatalf("unbound proxy = %q, want remaining pool member %q", got, enabledURL)
+	}
+
+	enabled := true
+	if err := db.UpdateProxy(ctx, disabledID, nil, nil, &enabled); err != nil {
+		t.Fatalf("re-enable proxy: %v", err)
+	}
+	if err := store.ReloadProxyPool(); err != nil {
+		t.Fatalf("ReloadProxyPool after re-enable: %v", err)
+	}
+	if got := store.ResolveProxyForAccount(store.FindByID(pinnedID)); got != disabledURL {
+		t.Fatalf("re-enabled pin = %q, want original %q", got, disabledURL)
 	}
 }
 

@@ -12,6 +12,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// Windows 与无 zoneinfo 的精简环境没有 IANA 时区库,内嵌兜底让 TZ=Asia/Shanghai
+	// 这类名字仍可解析(系统自带 zoneinfo 时优先用系统的)。issue #498。
+	_ "time/tzdata"
 
 	"github.com/codex2api/admin"
 	"github.com/codex2api/api"
@@ -30,6 +33,11 @@ import (
 //go:embed frontend/dist/*
 var frontendFS embed.FS
 
+func migrateOnlyEnabled() bool {
+	value := strings.TrimSpace(os.Getenv("CODEX_MIGRATE_ONLY"))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Codex2API v2 启动中...")
@@ -39,7 +47,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
-	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label())
+	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s, tz=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label(), time.Local)
 
 	// 2. 初始化数据库
 	db, err := database.New(cfg.Database.Driver, cfg.Database.DSN(), cfg.Database.Schema)
@@ -47,6 +55,10 @@ func main() {
 		log.Fatalf("数据库初始化失败: %v", err)
 	}
 	defer db.Close()
+	if migrateOnlyEnabled() {
+		log.Println("数据库迁移完成，CODEX_MIGRATE_ONLY 已启用，进程退出")
+		return
+	}
 	switch cfg.Database.Driver {
 	case "sqlite":
 		log.Printf("%s 连接成功: %s", cfg.Database.Label(), cfg.Database.Path)
@@ -313,6 +325,10 @@ func main() {
 	adminHandler.StartAutoResetCredits(backgroundCtx)
 	// Grok 账号状态定期探测（默认关，由 grok 系统设置开关/间隔控制）
 	adminHandler.StartGrokStatusProbe(backgroundCtx)
+	// 官方结算用量按天快照：上游只保留 7 天，不落库就永久丢失，长期历史全靠这个任务。
+	adminHandler.StartWhamDailyUsageProbe(backgroundCtx)
+	// 官方模型价目轮询默认关闭；启用后只在网络解析完成后做一次短数据库写入。
+	adminHandler.StartOfficialPricingSync(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，

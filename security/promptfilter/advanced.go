@@ -133,11 +133,39 @@ type NewAPIConfig struct {
 }
 
 type EnforcementConfig struct {
-	TerminalCategories      []string `json:"terminal_categories"`
-	TerminalBypassModels    []string `json:"terminal_bypass_models"`
-	ConversationLockEnabled bool     `json:"conversation_lock_enabled"`
-	CYBStrikeEnabled        bool     `json:"cyb_strike_enabled"`
+	TerminalCategories       []string `json:"terminal_categories"`
+	TerminalBypassModels     []string `json:"terminal_bypass_models"`
+	ConversationLockEnabled  bool     `json:"conversation_lock_enabled"`
+	ConversationLockTTLHours int      `json:"conversation_lock_ttl_hours"`
+	UserCyberCooldownMinutes int      `json:"user_cyber_cooldown_minutes"`
+	CYBStrikeEnabled         bool     `json:"cyb_strike_enabled"`
+	// LocalSevereStrikeEnabled 决定本地判定的**最高置信度**严重违规
+	// (当前用户直接发出 + 敏感意图 + 终局 strict/category 命中)是否累计到
+	// NewAPI 用户身上,从而触发 NewAPI 侧的 CYB 累计与自动封号。
+	//
+	// 打开(默认)时,严重违规无需先到达上游产生真实 cyber_policy,即可在本地
+	// 扼杀的同时把一次 strike 记到人;会话锁保证同一会话不重复累计。误封面被
+	// 收敛到最高置信度那一档:低置信度拦截、工具输出、历史上下文都不累计。
+	//
+	// 关闭时,本地严重违规仍被拦截,但不再记 strike——拦截与封号解耦。
+	LocalSevereStrikeEnabled bool `json:"local_severe_strike_enabled"`
+	// AuthorizedPentestAllowed 决定是否承认请求里的"声明式授权"
+	// ("我有书面授权"、"我自己的服务器"、"with permission")。
+	//
+	// 授权声明是无法验证的自述:开启时,攻击者只要加一句就能让定向入侵终局规则
+	// 失效(实测 score 100 -> 20 放行)。关闭(默认)时这类声明不再具有豁免效力,
+	// 与 review.go 中 "Authorization is evidence, not an assumption" 的既定策略
+	// 保持一致。
+	//
+	// 仅当部署确实承载已授权渗透测试业务时才开启。
+	AuthorizedPentestAllowed bool `json:"authorized_pentest_allowed"`
 }
+
+const (
+	DefaultUserCyberCooldownMinutes = 30
+	MinUserCyberCooldownMinutes     = 1
+	MaxUserCyberCooldownMinutes     = 24 * 60
+)
 
 type NormalizationConfig struct {
 	Enabled           bool `json:"enabled"`
@@ -272,7 +300,7 @@ func DefaultAdvancedConfig() AdvancedConfig {
 		Output:          OutputConfig{BufferBytes: 4096, OverlapBytes: 512, StrictOnly: true},
 		Intelligence:    IntelligenceConfig{IntervalHours: 24, Queries: DefaultIntelligenceQueries(), MaxSearchResults: 20, Model: "gpt-5.4", MaxModelCalls: 1},
 		NewAPI:          NewAPIConfig{MaxClockSkewSeconds: 120},
-		Enforcement:     EnforcementConfig{TerminalBypassModels: []string{"codex-auto-review"}, ConversationLockEnabled: true, CYBStrikeEnabled: false},
+		Enforcement:     EnforcementConfig{TerminalBypassModels: []string{"codex-auto-review"}, ConversationLockEnabled: true, ConversationLockTTLHours: 168, UserCyberCooldownMinutes: DefaultUserCyberCooldownMinutes, CYBStrikeEnabled: false, LocalSevereStrikeEnabled: true},
 		Guard:           DefaultGuardConfig(),
 	}
 }
@@ -744,6 +772,18 @@ func NormalizeAdvancedConfig(cfg AdvancedConfig) AdvancedConfig {
 		}
 	}
 	cfg.Enforcement.TerminalBypassModels = normalizedBypassModels
+	if cfg.Enforcement.ConversationLockTTLHours <= 0 {
+		cfg.Enforcement.ConversationLockTTLHours = d.Enforcement.ConversationLockTTLHours
+	}
+	if cfg.Enforcement.ConversationLockTTLHours > 30*24 {
+		cfg.Enforcement.ConversationLockTTLHours = 30 * 24
+	}
+	if cfg.Enforcement.UserCyberCooldownMinutes < MinUserCyberCooldownMinutes {
+		cfg.Enforcement.UserCyberCooldownMinutes = d.Enforcement.UserCyberCooldownMinutes
+	}
+	if cfg.Enforcement.UserCyberCooldownMinutes > MaxUserCyberCooldownMinutes {
+		cfg.Enforcement.UserCyberCooldownMinutes = MaxUserCyberCooldownMinutes
+	}
 	if cfg.Normalization.MaxDecodeRuns <= 0 {
 		cfg.Normalization.MaxDecodeRuns = d.Normalization.MaxDecodeRuns
 	}

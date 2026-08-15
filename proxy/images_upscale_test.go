@@ -127,6 +127,20 @@ func TestCollectImagesResponseHonorsExplicitCustomSize(t *testing.T) {
 	}
 }
 
+func TestCollectImagesResponsePadsMismatchedSourceToExactCustomSize(t *testing.T) {
+	upstream := imagesCompletedSSE(sizedPNGBase64(t, 4, 4), "12x6")
+	plan := imageUpscalePlan{Scale: "2k", RequestedSize: "12x6"}
+
+	out, _, _, _, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2-2k", nil, plan)
+	if err != nil {
+		t.Fatalf("collectImagesResponse returned error: %v", err)
+	}
+	width, height := decodePNGSize(t, gjson.GetBytes(out, "data.0.b64_json").String())
+	if width != 12 || height != 6 {
+		t.Fatalf("physical size = %dx%d, want exact 12x6 canvas", width, height)
+	}
+}
+
 // 上游已达标时不重编码,原始字节原样返回。
 func TestApplyImageUpscalePlanSkipsWhenAlreadyAtTarget(t *testing.T) {
 	b64 := sizedPNGBase64(t, 2048, 2048)

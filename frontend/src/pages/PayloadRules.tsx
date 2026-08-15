@@ -1,6 +1,6 @@
 import type { ChangeEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { NavLink, useParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import {
   AlertTriangle,
@@ -31,6 +31,8 @@ import {
 import { api } from '@/api'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
+import { StatTile } from '../components/StatTile'
+import { SegmentedTabs } from '../components/SegmentedTabs'
 import ChipInput from '../components/ChipInput'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -425,16 +427,6 @@ function formStateToEntry(form: RuleFormState): RuleEntry | null {
 
 // ==================== 子组件 ====================
 
-function StatTile({ label, value, hint, accent }: { label: string; value: string; hint?: string; accent?: boolean }) {
-  return (
-    <div className="rounded-xl border border-border/80 bg-card/85 px-4 py-3 shadow-sm">
-      <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className={cn('mt-1 text-xl font-bold tabular-nums', accent ? 'text-primary' : 'text-foreground')}>{value}</div>
-      {hint ? <div className="mt-0.5 truncate text-[11px] text-muted-foreground">{hint}</div> : null}
-    </div>
-  )
-}
-
 function GateChips({ entry }: { entry: RuleEntry }) {
   const { t } = useTranslation()
   const chips: Array<{ key: string; label: string; mono?: boolean }> = []
@@ -824,12 +816,13 @@ export default function PayloadRules() {
             <StatTile
               label={t('payloadRules.statStatus')}
               value={entries.length > 0 ? t('payloadRules.statusActive') : t('payloadRules.statusEmpty')}
-              hint={dirty ? t('payloadRules.unsaved') : undefined}
-              accent={entries.length > 0}
+              sub={dirty ? t('payloadRules.unsaved') : undefined}
+              tone={entries.length > 0 ? 'success' : 'neutral'}
+              toneSurface={entries.length > 0}
             />
             <StatTile label={t('payloadRules.statTotal')} value={String(entries.length)} />
-            <StatTile label={t('payloadRules.statInstructions')} value={String(instructionsRuleCount)} hint={t('payloadRules.statInstructionsHint')} />
-            <StatTile label={t('payloadRules.statConditional')} value={String(conditionalRuleCount)} hint={t('payloadRules.statConditionalHint')} />
+            <StatTile label={t('payloadRules.statInstructions')} value={String(instructionsRuleCount)} sub={t('payloadRules.statInstructionsHint')} />
+            <StatTile label={t('payloadRules.statConditional')} value={String(conditionalRuleCount)} sub={t('payloadRules.statConditionalHint')} />
           </div>
 
           {/* 风险提示 */}
@@ -1349,33 +1342,16 @@ export default function PayloadRules() {
 
 function PayloadRulesTabs({ activeView }: { activeView: PayloadRulesView }) {
   const { t } = useTranslation()
-  const tabs = [
-    { view: 'editor' as const, label: t('payloadRules.views.editor'), to: '/payload-rules/editor' },
-    { view: 'docs' as const, label: t('payloadRules.views.docs'), to: '/payload-rules/docs' },
-  ]
-  const activeIndex = Math.max(0, tabs.findIndex((tab) => tab.view === activeView))
   return (
     <div className="mb-5 flex justify-center">
-      <div className="relative grid w-full max-w-[420px] grid-cols-2 rounded-2xl border border-border bg-background/80 p-1 shadow-sm backdrop-blur-lg" role="tablist">
-        <div
-          className="pointer-events-none absolute left-1 top-1 h-[calc(100%-0.5rem)] rounded-xl border border-primary/15 bg-primary/8 transition-transform duration-300 ease-out"
-          style={{ width: 'calc((100% - 0.5rem) / 2)', transform: `translateX(${activeIndex * 100}%)` }}
-        />
-        {tabs.map((tab) => (
-          <NavLink
-            key={tab.view}
-            to={tab.to}
-            role="tab"
-            aria-selected={activeView === tab.view}
-            className={cn(
-              'relative z-10 flex h-9 items-center justify-center rounded-xl px-3 text-sm font-semibold transition-colors',
-              activeView === tab.view ? 'text-primary' : 'text-muted-foreground hover:text-foreground',
-            )}
-          >
-            {tab.label}
-          </NavLink>
-        ))}
-      </div>
+      <SegmentedTabs
+        className="w-full max-w-[420px] backdrop-blur-lg"
+        tabs={[
+          { value: 'editor', label: t('payloadRules.views.editor'), to: '/payload-rules/editor' },
+          { value: 'docs', label: t('payloadRules.views.docs'), to: '/payload-rules/docs' },
+        ]}
+        value={activeView}
+      />
     </div>
   )
 }
@@ -1641,7 +1617,7 @@ function PayloadRulesDocsView() {
             </div>
             <div className="mt-1 text-sm font-semibold text-foreground">{t('payloadRules.docs.tocHint')}</div>
           </div>
-          <nav className="max-h-[min(70vh,720px)] space-y-4 overflow-y-auto p-3 [scrollbar-width:thin]">
+          <nav className="max-h-[180px] xl:max-h-[min(70vh,720px)] space-y-4 overflow-y-auto p-3 [scrollbar-width:thin]">
             {groups.map((group) => (
               <div key={group.id}>
                 <div className="mb-1.5 px-2 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground/80">

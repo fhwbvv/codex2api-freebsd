@@ -208,11 +208,15 @@ func (h *Handler) ListModelPricing(c *gin.Context) {
 	if s, err := h.db.GetSystemSettings(ctx); err == nil && s != nil {
 		syncURL = strings.TrimSpace(s.ModelPricingSyncURL)
 	}
+	officialCfg, _ := h.db.GetOfficialPricingSyncConfig(ctx)
 	c.JSON(http.StatusOK, gin.H{
-		"models":           rows,
-		"sync_url":         syncURL,
-		"default_sync_url": proxy.DefaultModelPricingSyncURL,
-		"models_dev_url":   proxy.ModelsDevPricingSyncURL,
+		"models":               rows,
+		"sync_url":             syncURL,
+		"default_sync_url":     proxy.DefaultModelPricingSyncURL,
+		"models_dev_url":       proxy.ModelsDevPricingSyncURL,
+		"official_openai_url":  proxy.OfficialOpenAIPricingURL,
+		"official_xai_url":     strings.TrimSuffix(proxy.OfficialXAIPricingURL, ".md"),
+		"official_sync_config": officialPricingConfigResponse(officialCfg),
 	})
 }
 
@@ -239,41 +243,24 @@ func (h *Handler) UpdateModelPricing(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	settings, err := h.db.GetSystemSettings(ctx)
-	if err != nil {
-		writeError(c, http.StatusInternalServerError, err.Error())
+	if !req.Reset && (req.Pricing == nil || req.Pricing.IsEmpty()) {
+		writeError(c, http.StatusBadRequest, "pricing 不能为空（或用 reset 清除）")
 		return
 	}
-	if settings == nil {
-		settings = &database.SystemSettings{}
-	}
-	overrides, err := database.ParseModelPricingOverridesJSON(settings.ModelPricingOverrides)
-	if err != nil {
-		overrides = map[string]database.ModelPricingOverride{}
-	}
-
-	if req.Reset {
-		delete(overrides, key)
-	} else {
-		if req.Pricing == nil || req.Pricing.IsEmpty() {
-			writeError(c, http.StatusBadRequest, "pricing 不能为空（或用 reset 清除）")
-			return
+	_, err := h.db.MutateModelPricingSettings(ctx, nil, func(overrides map[string]database.ModelPricingOverride) error {
+		if req.Reset {
+			delete(overrides, key)
+			return nil
 		}
 		ov := *req.Pricing
 		ov.Source = database.ModelPricingSourceCustom
 		overrides[key] = ov
-	}
-
-	blob, err := database.MarshalModelPricingOverridesJSON(overrides)
+		return nil
+	})
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := h.db.UpdateModelPricingSettings(ctx, blob, settings.ModelPricingSyncURL); err != nil {
-		writeError(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-	database.SetModelPricingOverrides(overrides)
 	c.JSON(http.StatusOK, gin.H{"model": key, "reset": req.Reset})
 }
 

@@ -222,6 +222,34 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	return credentials
 }
 
+// defaultCodexFingerprintModeForNewAccount 返回系统设置里配置的「新导入账号默认
+// 指纹收敛档位」（off/device/session/full，缺省 off）。
+func (h *Handler) defaultCodexFingerprintModeForNewAccount() string {
+	if h == nil || h.store == nil {
+		return auth.CodexFingerprintModeOff
+	}
+	return auth.NormalizeCodexFingerprintMode(h.store.GetCodexFingerprintDefaultMode())
+}
+
+// newCodexAccountCredentials 为新建/新导入的 Codex 账号生成 credentials，并盖上
+// 系统默认指纹收敛档位。仅用于插入新账号；更新已有账号凭证仍走 tokenCredentialMap，
+// 避免重新导入时覆盖用户在账号上手动调整过的档位。
+func (h *Handler) newCodexAccountCredentials(seed tokenCredentialSeed) map[string]interface{} {
+	credentials := tokenCredentialMap(seed)
+	if mode := h.defaultCodexFingerprintModeForNewAccount(); mode != auth.CodexFingerprintModeOff {
+		credentials[auth.CodexFingerprintModeCredentialKey] = mode
+	}
+	return credentials
+}
+
+// newCodexAccountFromSeed 构造刚插入账号的内存态，指纹档位与
+// newCodexAccountCredentials 落库内容保持一致（默认档位无需重载即生效）。
+func (h *Handler) newCodexAccountFromSeed(id int64, proxyURL string, seed tokenCredentialSeed) *auth.Account {
+	account := accountFromCredentialSeed(id, proxyURL, seed)
+	account.CodexFingerprintMode = h.defaultCodexFingerprintModeForNewAccount()
+	return account
+}
+
 func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSeed) *auth.Account {
 	seed = normalizeTokenCredentialSeed(seed)
 	account := &auth.Account{

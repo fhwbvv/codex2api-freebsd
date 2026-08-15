@@ -948,7 +948,11 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 			AND (LOWER(pri.external_user_id) LIKE $%d OR LOWER(pri.user_name) LIKE $%d OR LOWER(pri.user_email) LIKE $%d OR LOWER(pri.user_group) LIKE $%d)
 		))`, i, i, i, i, i, i, i, i, i, i))
 	}
-	rows, err := db.conn.QueryContext(ctx, `WITH filtered_events AS MATERIALIZED (
+	// Keep the shared filter inline. Materializing the full 30-day event rows
+	// duplicates a large TEXT-heavy working set before both aggregate passes;
+	// SQLite production databases with dense clean-review history can exhaust
+	// the admin request budget even though the final profile set is small.
+	rows, err := db.conn.QueryContext(ctx, `WITH filtered_events AS NOT MATERIALIZED (
 		SELECT * FROM prompt_risk_events WHERE `+strings.Join(clauses, " AND ")+`
 	), profile_aggregates AS (
 		SELECT subject_type, subject_key,

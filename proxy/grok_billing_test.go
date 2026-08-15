@@ -1,28 +1,33 @@
 package proxy
 
-import "testing"
+import (
+	"testing"
+	"time"
 
-func TestResolveGrokPlan(t *testing.T) {
-	cents := func(v float64) *float64 { return &v }
+	"github.com/codex2api/auth"
+)
 
-	cases := []struct {
-		name  string
-		limit *float64
-		want  string
-	}{
-		// 仅在 billing 月度配置成功返回时调用，故 nil/0 额度代表免费档。
-		{"nil limit is free", nil, "free"},
-		{"zero limit is free", cents(0), "free"},
-		{"supergrok", cents(grokSuperGrokCents), "supergrok"},
-		{"supergrok heavy", cents(grokSuperGrokHeavyCents), "supergrok_heavy"},
-		// 未知非零额度不臆断，保留占位。
-		{"unknown paid tier", cents(42_000), ""},
+func TestApplyGrokBillingDoesNotInferPlanOrQuotaWindows(t *testing.T) {
+	weekly, monthly := 100.0, 75.0
+	account := &auth.Account{PlanType: "archive-label"}
+	credentials := ApplyGrokBilling(nil, account, &GrokBillingSummary{
+		Plan: "supergrok", WeeklyPercent: &weekly, MonthlyPercent: &monthly,
+		WeeklyPeriodEnd:  time.Now().Add(time.Hour).Format(time.RFC3339),
+		MonthlyPeriodEnd: time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+	})
+	if got := account.GetPlanType(); got != "archive-label" {
+		t.Fatalf("plan_type mutated from billing: %q", got)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveGrokPlan(tc.limit); got != tc.want {
-				t.Fatalf("resolveGrokPlan(%v) = %q, want %q", tc.limit, got, tc.want)
-			}
-		})
+	if _, exists := credentials["plan_type"]; exists {
+		t.Fatal("billing credentials must not contain plan_type")
+	}
+	if _, _, ok := account.GetUsageSnapshot5h(); ok {
+		t.Fatal("weekly billing was copied into the generic 5h window")
+	}
+	if _, ok := account.GetUsagePercent7d(); ok {
+		t.Fatal("monthly billing was copied into the generic 7d window")
+	}
+	if _, ok := credentials["grok_billing_detail"]; !ok {
+		t.Fatal("legacy grok_billing_detail must still be dual-written")
 	}
 }

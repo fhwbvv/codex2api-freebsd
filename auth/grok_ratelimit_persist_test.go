@@ -39,3 +39,25 @@ func TestGrokRateLimitSnapshotDirtyLifecycle(t *testing.T) {
 		t.Fatal("restore must not mark dirty")
 	}
 }
+
+func TestGrokRateLimitSnapshotPeekRequiresSuccessfulConfirmation(t *testing.T) {
+	acc := &Account{UpstreamType: UpstreamGrok}
+	acc.SetGrokRateLimitSnapshot(GrokRateLimitSnapshot{LimitTokens: 100, RemainingTokens: 50, UpdatedAt: time.Now()})
+	_, version, dirty := acc.PeekGrokRateLimitSnapshotIfDirty()
+	if !dirty || version == 0 {
+		t.Fatalf("peek = version %d dirty %v", version, dirty)
+	}
+	if _, _, dirty = acc.PeekGrokRateLimitSnapshotIfDirty(); !dirty {
+		t.Fatal("failed persistence would have lost dirty state")
+	}
+	acc.SetGrokRateLimitSnapshot(GrokRateLimitSnapshot{LimitTokens: 100, RemainingTokens: 49, UpdatedAt: time.Now().Add(time.Second)})
+	acc.ConfirmGrokRateLimitSnapshotPersisted(version)
+	if _, _, dirty = acc.PeekGrokRateLimitSnapshotIfDirty(); !dirty {
+		t.Fatal("older confirmation cleared a newer observation")
+	}
+	_, latest, _ := acc.PeekGrokRateLimitSnapshotIfDirty()
+	acc.ConfirmGrokRateLimitSnapshotPersisted(latest)
+	if _, _, dirty = acc.PeekGrokRateLimitSnapshotIfDirty(); dirty {
+		t.Fatal("latest successful persistence did not acknowledge dirty state")
+	}
+}

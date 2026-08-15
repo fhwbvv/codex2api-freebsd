@@ -110,6 +110,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS usage_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			account_id INTEGER DEFAULT 0,
+			credential_generation INTEGER NOT NULL DEFAULT 0,
 			client_ip TEXT DEFAULT '',
 			client_user_agent TEXT DEFAULT '',
 			upstream_user_agent TEXT DEFAULT '',
@@ -264,7 +265,15 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					codex_ws_busy_acquire_max_wait_sec INTEGER DEFAULT 30,
 					codex_ws_busy_overflow_enabled INTEGER DEFAULT 0,
 					codex_ws_busy_patience_sec INTEGER DEFAULT 2,
+					codex_ws_stateless_slots INTEGER DEFAULT 8,
+					github_token TEXT DEFAULT '',
+					github_proxy_url TEXT DEFAULT '',
+					codex_overload_pause_enabled INTEGER DEFAULT 0,
+					codex_overload_threshold_percent INTEGER DEFAULT 20,
+					codex_overload_pause_minutes INTEGER DEFAULT 30,
+					codex_overload_window_minutes INTEGER DEFAULT 5,
 					overflow_auto_compact_enabled INTEGER DEFAULT 0,
+					compact_via_responses_enabled INTEGER DEFAULT 0,
 					codex_preflight_sse_passthrough_enabled INTEGER DEFAULT 0,
 					first_token_excludes_ws_acquire INTEGER DEFAULT 0,
 					codex_continue_thinking_enabled INTEGER DEFAULT 0,
@@ -280,6 +289,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					auto_reset_credits_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60,
 					utls_shutdown_timeout_minutes INTEGER DEFAULT 30,
+					codex_fingerprint_default_mode TEXT DEFAULT 'off',
 					response_cache_local_max_bytes INTEGER NOT NULL DEFAULT 67108864,
 					response_cache_local_max_entry_bytes INTEGER NOT NULL DEFAULT 8388608,
 					response_cache_reconstruct_max_bytes INTEGER NOT NULL DEFAULT 67108864,
@@ -470,6 +480,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "attempt_index", "INTEGER DEFAULT 0"},
 		{"usage_logs", "upstream_error_kind", "TEXT DEFAULT ''"},
 		{"usage_logs", "error_message", "TEXT DEFAULT ''"},
+		{"usage_logs", "credential_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"api_keys", "quota_limit", "REAL DEFAULT 0"},
 		{"api_keys", "quota_used", "REAL DEFAULT 0"},
 		{"api_keys", "total_used", "REAL DEFAULT 0"},
@@ -518,7 +529,15 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "codex_ws_busy_acquire_max_wait_sec", "INTEGER DEFAULT 30"},
 		{"system_settings", "codex_ws_busy_overflow_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_ws_busy_patience_sec", "INTEGER DEFAULT 2"},
+		{"system_settings", "codex_ws_stateless_slots", "INTEGER DEFAULT 8"},
+		{"system_settings", "github_token", "TEXT DEFAULT ''"},
+		{"system_settings", "github_proxy_url", "TEXT DEFAULT ''"},
+		{"system_settings", "codex_overload_pause_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "codex_overload_threshold_percent", "INTEGER DEFAULT 20"},
+		{"system_settings", "codex_overload_pause_minutes", "INTEGER DEFAULT 30"},
+		{"system_settings", "codex_overload_window_minutes", "INTEGER DEFAULT 5"},
 		{"system_settings", "overflow_auto_compact_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "compact_via_responses_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_preflight_sse_passthrough_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "first_token_excludes_ws_acquire", "INTEGER DEFAULT 0"},
 		{"system_settings", "codex_continue_thinking_enabled", "INTEGER DEFAULT 0"},
@@ -534,6 +553,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "auto_reset_credits_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_before_expiry_min", "INTEGER DEFAULT 60"},
 		{"system_settings", "utls_shutdown_timeout_minutes", "INTEGER DEFAULT 30"},
+		{"system_settings", "codex_fingerprint_default_mode", "TEXT DEFAULT 'off'"},
 		{"system_settings", "response_cache_local_max_bytes", "INTEGER NOT NULL DEFAULT 67108864"},
 		{"system_settings", "response_cache_local_max_entry_bytes", "INTEGER NOT NULL DEFAULT 8388608"},
 		{"system_settings", "response_cache_reconstruct_max_bytes", "INTEGER NOT NULL DEFAULT 67108864"},
@@ -656,6 +676,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_created_at ON usage_logs(account_id, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_generation_created_at ON usage_logs(account_id, credential_generation, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
@@ -740,6 +761,7 @@ func (db *DB) getTrafficSnapshotSQLite(ctx context.Context) (*TrafficSnapshot, e
 		SELECT created_at, total_tokens
 		FROM usage_logs
 		WHERE created_at >= $1
+		  AND TRIM(COALESCE(internal_reason, '')) = ''
 	`, db.timeArg(time.Now().Add(-5*time.Minute)))
 	if err != nil {
 		return nil, err
@@ -810,6 +832,7 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 		FROM usage_logs
 		WHERE created_at >= $1 AND created_at < $2
 		  AND status_code <> 499
+		  AND TRIM(COALESCE(internal_reason, '')) = ''
 	`
 	args := []interface{}{startArg, endArg, bucketMinutes}
 	if channel != "" {
@@ -842,7 +865,8 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 	}
 
 	modelQuery := `SELECT COALESCE(NULLIF(effective_model, ''), NULLIF(model, ''), 'unknown'), COUNT(*)
-		FROM usage_logs WHERE created_at >= $1 AND created_at < $2 AND status_code <> 499`
+		FROM usage_logs WHERE created_at >= $1 AND created_at < $2 AND status_code <> 499
+		  AND TRIM(COALESCE(internal_reason, '')) = ''`
 	modelArgs := []interface{}{startArg, endArg}
 	if channel != "" {
 		modelQuery += " AND channel = $3"
@@ -964,7 +988,8 @@ func (db *DB) getUsageStatsSQLite(ctx context.Context, rangeStart, rangeEnd time
 		COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0)
-	FROM usage_logs WHERE created_at >= $1 AND status_code <> 499`
+	FROM usage_logs WHERE created_at >= $1 AND status_code <> 499
+	  AND TRIM(COALESCE(internal_reason, '')) = ''`
 	args := []interface{}{db.timeArg(rangeStart), db.timeArg(minuteAgo)}
 	if !rangeEnd.IsZero() {
 		query += fmt.Sprintf(" AND created_at < $%d", len(args)+1)

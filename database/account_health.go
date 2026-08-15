@@ -47,6 +47,7 @@ func (db *DB) GetAccountsHealthBucketsByIDs(ctx context.Context, ids []int64, no
 		WHERE created_at >= $1 AND created_at <= $2
 		  AND status_code <> 499
 		  AND account_id > 0
+		  AND ` + db.endUserUsageLogPredicate() + `
 	`
 	args := []interface{}{startArg, endArg}
 	if len(ids) > 0 {
@@ -130,7 +131,8 @@ func (db *DB) getPostgresAccountHealthBuckets(ctx context.Context, ids []int64, 
 				)) AS bucket_index
 			FROM usage_logs
 			WHERE created_at >= $1 AND created_at <= $2
-			  AND status_code <> 499 AND account_id > 0` + idFilter + `
+			  AND status_code <> 499 AND account_id > 0
+			  AND ` + db.endUserUsageLogPredicate() + idFilter + `
 		) AS scoped_logs
 		GROUP BY account_id, bucket_index
 		ORDER BY account_id, bucket_index`

@@ -34,6 +34,10 @@ type fastSchedulerPosition struct {
 // 调度策略：调度优先级全局优先；同优先级内按健康层级分桶，
 // 桶内按调度分排序后 round-robin。
 // 验证过的账号只作为同分 tie-breaker，避免历史请求量盖过额度快重置优先级。
+//
+// fill_first 模式（issue #501）：同优先级内按 7d 用量降序排列并始终从队首
+// 取号，流量集中在剩余额度最少的账号上；该账号限流/耗尽后自然滑落到下一个，
+// 恢复后按最新用量重新排队。无用量数据的账号退化为固定顺序（dbID 升序）。
 type FastScheduler struct {
 	mu            sync.RWMutex
 	baseLimit     int64
@@ -99,7 +103,9 @@ func (s *FastScheduler) SetSchedulerMode(mode string) {
 		if len(entries) == 0 {
 			continue
 		}
-		if mode == "remaining_quota" {
+		if mode == "fill_first" {
+			sortEntriesFillFirst(entries)
+		} else if mode == "remaining_quota" {
 			sort.SliceStable(entries, func(i, j int) bool {
 				if entries[i].priority != entries[j].priority {
 					return entries[i].priority > entries[j].priority
@@ -203,7 +209,9 @@ func (s *FastScheduler) Rebuild(accounts []*Account) {
 		if len(entries) == 0 {
 			continue
 		}
-		if s.schedulerMode == "remaining_quota" {
+		if s.schedulerMode == "fill_first" {
+			sortEntriesFillFirst(entries)
+		} else if s.schedulerMode == "remaining_quota" {
 			sort.SliceStable(entries, func(i, j int) bool {
 				if entries[i].priority != entries[j].priority {
 					return entries[i].priority > entries[j].priority
@@ -331,7 +339,9 @@ func (s *FastScheduler) AcquireExcludingWithFilter(apiKeyID int64, exclude map[i
 
 				cursor := &s.cursors[tierIdx]
 				var zeroCursor atomic.Uint64
-				if s.schedulerMode == "remaining_quota" {
+				// remaining_quota / fill_first 不走轮询游标：每次都从排序后的
+				// 队首开始扫，保证严格按排序语义取号。
+				if s.schedulerMode == "remaining_quota" || s.schedulerMode == "fill_first" {
 					cursor = &zeroCursor
 				}
 				acc, stale := s.scanRangeLocked(tier, segStart, segEnd, cursor, baseLimit, now, apiKeyID, exclude, filter)
@@ -444,7 +454,9 @@ func (s *FastScheduler) insertLocked(acc *Account, now time.Time) {
 		proven:        proven,
 		priority:      acc.schedulerPriority(),
 	})
-	if s.schedulerMode == "remaining_quota" {
+	if s.schedulerMode == "fill_first" {
+		sortEntriesFillFirst(entries)
+	} else if s.schedulerMode == "remaining_quota" {
 		sort.SliceStable(entries, func(i, j int) bool {
 			if entries[i].priority != entries[j].priority {
 				return entries[i].priority > entries[j].priority
@@ -576,6 +588,25 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	}
 
 	return tier, score, limit, proven, available
+}
+
+// sortEntriesFillFirst 按 fill_first 语义排序：优先级降序 → 7d 用量降序
+// （剩余额度最少优先）→ 验证过的账号优先 → dbID 升序保证确定性。
+func sortEntriesFillFirst(entries []fastSchedulerEntry) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].priority != entries[j].priority {
+			return entries[i].priority > entries[j].priority
+		}
+		usageI := entries[i].acc.usagePercentForScheduling()
+		usageJ := entries[j].acc.usagePercentForScheduling()
+		if usageI == usageJ {
+			if entries[i].proven != entries[j].proven {
+				return entries[i].proven
+			}
+			return entries[i].dbID < entries[j].dbID
+		}
+		return usageI > usageJ
+	})
 }
 
 func tryAcquireAccount(acc *Account, limit int64) bool {

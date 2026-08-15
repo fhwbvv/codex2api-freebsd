@@ -968,7 +968,48 @@ function RecentLogsTable({
           <h3 className="text-base font-semibold text-foreground">{t('keyUsage.recent')}</h3>
           <span className="text-xs text-muted-foreground">{t('usage.recordsCount', { count: totalItems })}</span>
         </div>
-        <div className="data-table-shell">
+        <div className="grid gap-3 lg:hidden">
+          {logs.length > 0 ? logs.map((log) => (
+            <Card key={log.id} className="p-3.5 space-y-2">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                  <Badge variant="outline" className={`text-[12px] ${statusBadgeClass(log.status_code)}`}>{log.status_code}</Badge>
+                  <Badge variant="outline" className="text-[12px]">{log.model || '-'}</Badge>
+                  {log.effective_model && log.effective_model !== log.model ? (
+                    <Badge variant="outline" className="border-transparent bg-blue-500/10 text-[11px] font-medium text-blue-600 dark:bg-blue-500/20 dark:text-blue-400">→ {log.effective_model}</Badge>
+                  ) : null}
+                </div>
+                <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{formatBeijingTime(log.created_at)}</span>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="font-mono text-muted-foreground">{log.endpoint || '-'}</span>
+                <Badge
+                  variant="outline"
+                  className="text-[11px]"
+                  style={{ background: log.stream ? 'rgba(99, 102, 241, 0.12)' : 'rgba(107, 114, 128, 0.12)', color: log.stream ? '#6366f1' : '#6b7280', borderColor: 'transparent' }}
+                >
+                  {log.stream ? 'stream' : 'sync'}
+                </Badge>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-border/50 text-xs">
+                {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
+                  <div className="font-mono text-[12px] tabular-nums">
+                    <span className="text-blue-500">↓{formatNumber(log.input_tokens)}</span>
+                    <span className="mx-1 text-border">|</span>
+                    <span className="text-emerald-500">↑{formatNumber(log.output_tokens)}</span>
+                  </div>
+                ) : <span className="font-mono text-[12px] text-muted-foreground">-</span>}
+                <span className="font-mono text-[12px] text-muted-foreground">
+                  {log.duration_ms > 1000 ? `${(log.duration_ms / 1000).toFixed(1)}s` : `${log.duration_ms}ms`}
+                </span>
+              </div>
+            </Card>
+          )) : (
+            <div className="py-8 text-center text-sm text-muted-foreground">{t('keyUsage.noRows')}</div>
+          )}
+        </div>
+
+        <div className="data-table-shell hidden lg:block">
           <TooltipProvider>
           <Table>
             <TableHeader>

@@ -4,6 +4,7 @@ import test from 'node:test'
 
 const source = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8')
 const types = readFileSync(new URL('../types.ts', import.meta.url), 'utf8')
+const api = readFileSync(new URL('../api.ts', import.meta.url), 'utf8')
 
 test('CY incidents and local logs use independent pagination state', () => {
   assert.match(source, /usePersistedPageSize\('prompt_policy_incidents'/)
@@ -37,4 +38,16 @@ test('Prompt log tables show the complete API key name inside the fixed-width co
   assert.match(source, /const apiKeyLabel = log\.api_key_name \|\| log\.api_key_masked \|\| '-'/)
   assert.match(source, /className="whitespace-normal break-all font-mono text-\[11px\] leading-4 text-foreground" title=\{apiKeyLabel\}/)
   assert.doesNotMatch(source, /max-w-\[110px\] truncate[^\n]*api_key_name/)
+})
+
+test('CY audit chain has a read-only health check without generating incidents', () => {
+  assert.match(api, /getPromptPolicyAuditHealth/)
+  assert.match(api, /\/prompt-policy\/incidents\/health/)
+  assert.match(types, /export interface PromptPolicyAuditHealth/)
+  assert.match(source, /showAuditHealth/)
+  assert.match(source, /auditHealth\.queue\.failed \+ auditHealth\.queue\.dropped_high/)
+  assert.match(source, /auditHealth\.review_pool\.available/)
+  assert.match(source, /auditHealth\.review_fail_closed/)
+  assert.equal(typeof JSON.parse(readFileSync(new URL('../locales/zh.json', import.meta.url), 'utf8')).promptFilter.auditHealth.fallbackLocal, 'string')
+  assert.doesNotMatch(source, /createSyntheticPromptPolicyIncident/)
 })

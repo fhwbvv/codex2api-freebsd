@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +29,79 @@ type streamFlushWriter struct {
 	buffer        bytes.Buffer
 	outputScanner *promptfilter.OutputScanner
 	writtenBytes  atomic.Int64
+	diag          *streamPhaseDiagnostics
+}
+
+// streamPhaseDiagnostics 采集流阶段的断流现场判据。
+//
+// 上游 RST_STREAM（如 "INTERNAL_ERROR; received from peer"）有两类互斥成因，
+// 事后只看错误文本无法区分（issue #491）：
+//   - 下游背压：SSE 是在读上游的回调里同步写回下游的，客户端读得慢会让
+//     body.Read 停摆，HTTP/2 流控窗口不再补充，上游边缘可能因此重置该流。
+//     此时 writeBlockedNanos 会显著偏大。
+//   - 上游自身：后端被回收/长推理期间安静，边缘直接重置。此时下游写阻塞
+//     接近 0，而距上游末帧的间隔偏大。
+//
+// 两个计数器随断流信息一并落到用量日志，运维在错误明细页即可判读，无需加库表。
+type streamPhaseDiagnostics struct {
+	writeBlockedNanos   atomic.Int64
+	lastUpstreamFrameAt atomic.Int64 // UnixNano
+	upstreamFrames      atomic.Int64
+}
+
+func newStreamPhaseDiagnostics() *streamPhaseDiagnostics {
+	return &streamPhaseDiagnostics{}
+}
+
+// annotateStreamBreakDiagnostics 只给断流类失败追加现场判据。客户端主动断开
+// （499）与上游显式 response.failed 有各自明确的成因，不需要这两个数字。
+func annotateStreamBreakDiagnostics(outcome streamOutcome, diag *streamPhaseDiagnostics) streamOutcome {
+	if outcome.logStatusCode != logStatusUpstreamStreamBreak {
+		return outcome
+	}
+	summary := diag.summary()
+	if summary == "" {
+		return outcome
+	}
+	outcome.failureMessage = strings.TrimSpace(strings.TrimSpace(outcome.failureMessage) + " " + summary)
+	return outcome
+}
+
+// markUpstreamFrame 在每个上游 SSE 事件到达时打点。
+func (d *streamPhaseDiagnostics) markUpstreamFrame() {
+	if d == nil {
+		return
+	}
+	d.lastUpstreamFrameAt.Store(time.Now().UnixNano())
+	d.upstreamFrames.Add(1)
+}
+
+func (d *streamPhaseDiagnostics) addWriteBlocked(start time.Time) {
+	if d == nil || start.IsZero() {
+		return
+	}
+	d.writeBlockedNanos.Add(int64(time.Since(start)))
+}
+
+// summary 生成人类可读的现场判据；无任何上游帧时返回空串（连响应头都没读到，
+// 与背压无关，加了反而噪声）。
+func (d *streamPhaseDiagnostics) summary() string {
+	if d == nil {
+		return ""
+	}
+	frames := d.upstreamFrames.Load()
+	if frames == 0 {
+		return ""
+	}
+	blockedMs := time.Duration(d.writeBlockedNanos.Load()).Milliseconds()
+	sinceLastMs := int64(-1)
+	if last := d.lastUpstreamFrameAt.Load(); last > 0 {
+		sinceLastMs = time.Since(time.Unix(0, last)).Milliseconds()
+	}
+	if sinceLastMs < 0 {
+		return fmt.Sprintf("[上游帧 %d, 下游写阻塞 %dms]", frames, blockedMs)
+	}
+	return fmt.Sprintf("[上游帧 %d, 下游写阻塞 %dms, 距上游末帧 %dms]", frames, blockedMs, sinceLastMs)
 }
 
 func (h *Handler) newStreamFlushWriter(c *gin.Context, writer io.Writer, flusher http.Flusher) *streamFlushWriter {
@@ -108,7 +183,9 @@ func (w *streamFlushWriter) writeUnderlying(data []byte) error {
 	if w == nil || w.writer == nil || len(data) == 0 {
 		return nil
 	}
+	blockStart := w.diagnosticsClock()
 	written, err := w.writer.Write(data)
+	w.diag.addWriteBlocked(blockStart)
 	if written > 0 {
 		w.writtenBytes.Add(int64(written))
 	}
@@ -119,11 +196,21 @@ func (w *streamFlushWriter) writeUnderlyingString(data string) error {
 	if w == nil || w.writer == nil || data == "" {
 		return nil
 	}
+	blockStart := w.diagnosticsClock()
 	written, err := io.WriteString(w.writer, data)
+	w.diag.addWriteBlocked(blockStart)
 	if written > 0 {
 		w.writtenBytes.Add(int64(written))
 	}
 	return err
+}
+
+// diagnosticsClock 仅在挂了诊断器时取时间戳，未开启时零开销。
+func (w *streamFlushWriter) diagnosticsClock() time.Time {
+	if w == nil || w.diag == nil {
+		return time.Time{}
+	}
+	return time.Now()
 }
 
 func (w *streamFlushWriter) WriteString(data string) error {

@@ -16,6 +16,7 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../api'
 import OpsTabs from '../components/OpsTabs'
 import PageHeader from '../components/PageHeader'
+import { StatTile } from '../components/StatTile'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import type { RuntimeCheck, RuntimeHealthStatus, RuntimeStatusResponse } from '../types'
@@ -72,7 +73,7 @@ export default function RuntimeStatus() {
 
         {status ? (
           <>
-            <div className="mb-6 grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-4 sm:gap-4">
+            <div className="mb-6 grid grid-cols-2 gap-2.5 sm:gap-4 xl:grid-cols-4">
               <SummaryPill label={t('runtime.overall')} value={t(`runtime.status.${normalStatus(status.status)}`)} tone={normalStatus(status.status)} />
               <SummaryPill label={t('runtime.uptime')} value={formatUptime(status.service.uptime_seconds, t)} />
               <SummaryPill label={t('runtime.databaseCache')} value={`${status.database.label || status.database.driver} / ${status.cache.label || status.cache.driver}`} />
@@ -292,10 +293,12 @@ function StatusBadge({ status }: { status: RuntimeHealthStatus }) {
 function SummaryPill({ label, value, tone = 'ok' }: { label: string; value: string; tone?: RuntimeHealthStatus }) {
   const normalized = normalStatus(tone)
   return (
-    <div className={`rounded-lg border px-3 py-2.5 shadow-sm ${summaryToneClass(normalized)}`}>
-      <div className="text-[12px] font-bold uppercase text-muted-foreground">{label}</div>
-      <div className="mt-2 text-[20px] font-bold text-foreground">{value}</div>
-    </div>
+    <StatTile
+      label={label}
+      value={value}
+      tone={normalized === 'error' ? 'danger' : normalized === 'degraded' ? 'warning' : 'neutral'}
+      toneSurface
+    />
   )
 }
 
@@ -317,11 +320,6 @@ function dotToneClass(tone: StatusTone): string {
   return 'bg-emerald-500'
 }
 
-function summaryToneClass(tone: StatusTone): string {
-  if (tone === 'error') return 'border-destructive/20 bg-destructive/10'
-  if (tone === 'degraded') return 'border-amber-500/25 bg-amber-500/10'
-  return 'border-border bg-card/85'
-}
 
 function formatNumber(value: number): string {
   return value.toLocaleString()

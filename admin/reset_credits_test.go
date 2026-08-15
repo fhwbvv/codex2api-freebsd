@@ -523,6 +523,51 @@ func TestResetCreditsWaitsForUsageProbeBeforeResponding(t *testing.T) {
 	}
 }
 
+// 重置券不可退：客户端断开不得中断已经发出的消费。若消费挂在请求 context 上，
+// 断开会把「已经扣掉的券」报成失败，用户重试时另生成幂等键，同一张券被扣两次。
+func TestResetCreditsSurvivesClientDisconnect(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 23, AccountID: "workspace-23", AccessToken: "token", PlanType: "plus"}
+	account.SetRateLimitResetCredits(1)
+	store.AddAccount(account)
+
+	var consumeCtxErr error
+	consumes := 0
+	handler := &Handler{
+		store: store,
+		consumeResetCredit: func(ctx context.Context, _ *auth.Account, _, _ string) (*proxy.WhamResetResult, *http.Response, error) {
+			consumes++
+			// 上游往返期间客户端已经走了：这里的 context 不能是已取消的。
+			consumeCtxErr = ctx.Err()
+			return &proxy.WhamResetResult{WindowsReset: 1}, &http.Response{StatusCode: http.StatusOK}, nil
+		},
+		recordAccountEvent: func(int64, string, string) {},
+		probeUsage:         func(context.Context, *auth.Account) error { return nil },
+	}
+
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Params = gin.Params{{Key: "id", Value: "23"}}
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/23/reset-credits", nil)
+	// 客户端在网关发出上游请求之前就断开。
+	cancelledCtx, cancel := context.WithCancel(req.Context())
+	cancel()
+	c.Request = req.WithContext(cancelledCtx)
+
+	handler.ResetCredits(c)
+
+	if consumes != 1 {
+		t.Fatalf("consume calls = %d, want exactly 1", consumes)
+	}
+	if consumeCtxErr != nil {
+		t.Fatalf("consume ran with a cancelled context (%v) — an already-spent credit would be reported as failure and invite a double spend", consumeCtxErr)
+	}
+	if remaining, ok := account.GetRateLimitResetCredits(); !ok || remaining != 0 {
+		t.Fatalf("remaining credits = %d (ok=%v), want 0 after a completed consume", remaining, ok)
+	}
+}
+
 // 探针不可用时不能把请求挂住：usage_refreshed 报 false，让前端稍后补刷。
 func TestResetCreditsReportsUnrefreshedWhenProbeMissing(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})

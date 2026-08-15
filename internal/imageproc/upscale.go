@@ -25,6 +25,10 @@ const (
 	UpscaleNone = ""
 	Upscale2K   = "2k"
 	Upscale4K   = "4k"
+
+	ResizeFitInside = "inside"
+	ResizeFitPad    = "pad"
+	ResizeFitCover  = "cover"
 )
 
 var ErrUpscaleDecode = errors.New("image upscale: decode source failed")
@@ -118,6 +122,86 @@ func DoUpscaleTo(src []byte, targetWidth, targetHeight int, exact bool) ([]byte,
 		dw, dh = fitInsideDimensions(sw, sh, targetWidth, targetHeight)
 	}
 	return encodeUpscaled(srcImg, bounds, dw, dh)
+}
+
+// NormalizeResizeFit returns the supported resize policy. Strict resize calls
+// default to padding so the requested canvas is always exact without silently
+// cropping content; legacy calls keep the historical fit-inside behavior.
+func NormalizeResizeFit(value string, strict bool) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case ResizeFitCover:
+		return ResizeFitCover
+	case ResizeFitPad:
+		return ResizeFitPad
+	case ResizeFitInside:
+		if !strict {
+			return ResizeFitInside
+		}
+	}
+	if strict {
+		return ResizeFitPad
+	}
+	return ResizeFitInside
+}
+
+// DoResizeTo produces an exact target canvas. Pad preserves the complete
+// source and centers it on a transparent canvas; cover fills the canvas and
+// crops equally from the two overflowing sides. Inside remains available for
+// callers that explicitly need the legacy non-exact behavior.
+func DoResizeTo(src []byte, targetWidth, targetHeight int, fit string) ([]byte, string, error) {
+	if len(src) == 0 || targetWidth <= 0 || targetHeight <= 0 {
+		return src, "", nil
+	}
+
+	srcImg, _, err := stdimage.Decode(bytes.NewReader(src))
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrUpscaleDecode, err)
+	}
+	bounds := srcImg.Bounds()
+	sw, sh := bounds.Dx(), bounds.Dy()
+	if sw <= 0 || sh <= 0 {
+		return nil, "", ErrUpscaleDecode
+	}
+
+	fit = strings.ToLower(strings.TrimSpace(fit))
+	if fit != ResizeFitInside && fit != ResizeFitCover && fit != ResizeFitPad {
+		fit = ResizeFitPad
+	}
+	if sw == targetWidth && sh == targetHeight {
+		return src, "", nil
+	}
+	if fit == ResizeFitInside {
+		return DoUpscaleTo(src, targetWidth, targetHeight, false)
+	}
+
+	dst := stdimage.NewRGBA(stdimage.Rect(0, 0, targetWidth, targetHeight))
+	if fit == ResizeFitCover {
+		crop := bounds
+		sourceAspect := float64(sw) / float64(sh)
+		targetAspect := float64(targetWidth) / float64(targetHeight)
+		if sourceAspect > targetAspect {
+			cropWidth := max(1, int(float64(sh)*targetAspect+0.5))
+			left := bounds.Min.X + (sw-cropWidth)/2
+			crop = stdimage.Rect(left, bounds.Min.Y, left+cropWidth, bounds.Max.Y)
+		} else if sourceAspect < targetAspect {
+			cropHeight := max(1, int(float64(sw)/targetAspect+0.5))
+			top := bounds.Min.Y + (sh-cropHeight)/2
+			crop = stdimage.Rect(bounds.Min.X, top, bounds.Max.X, top+cropHeight)
+		}
+		draw.CatmullRom.Scale(dst, dst.Bounds(), srcImg, crop, draw.Src, nil)
+	} else {
+		dw, dh := fitInsideDimensions(sw, sh, targetWidth, targetHeight)
+		left := (targetWidth - dw) / 2
+		top := (targetHeight - dh) / 2
+		draw.CatmullRom.Scale(dst, stdimage.Rect(left, top, left+dw, top+dh), srcImg, bounds, draw.Src, nil)
+	}
+
+	var buf bytes.Buffer
+	encoder := png.Encoder{CompressionLevel: png.BestSpeed}
+	if err := encoder.Encode(&buf, dst); err != nil {
+		return nil, "", fmt.Errorf("image resize: png encode: %w", err)
+	}
+	return buf.Bytes(), "image/png", nil
 }
 
 func encodeUpscaled(srcImg stdimage.Image, bounds stdimage.Rectangle, dw, dh int) ([]byte, string, error) {

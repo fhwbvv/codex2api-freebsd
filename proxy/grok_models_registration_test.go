@@ -9,15 +9,21 @@ import (
 	"github.com/codex2api/database"
 )
 
-// 未声明 models 白名单的 Grok 账号应把默认 Grok 模型集(含 grok-4.5)注册进 /v1/models。
+// 未声明 models 白名单的 Grok 账号应把默认 Grok 模型集(含 grok-4.6)注册进 /v1/models。
 func TestSupportedModelIDsIncludesDefaultGrok(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
 	store.AddAccount(&auth.Account{DBID: 1, APIKey: "xai-1", UpstreamType: auth.UpstreamGrok})
 	h := NewHandler(store, nil, nil, nil)
 
 	ids := h.supportedModelIDs(context.Background())
+	if !containsFold(ids, "grok-4.6") {
+		t.Fatalf("grok-4.6 应出现在 /v1/models，实际: %v", ids)
+	}
 	if !containsFold(ids, "grok-4.5") {
 		t.Fatalf("grok-4.5 应出现在 /v1/models，实际: %v", ids)
+	}
+	if !containsFold(ids, "grok-4.6") {
+		t.Fatalf("grok-4.6 应出现在 /v1/models，实际: %v", ids)
 	}
 }
 
@@ -50,6 +56,7 @@ func containsFold(list []string, target string) bool {
 func TestRelayAccountSupportsModel_GrokDefaultSet(t *testing.T) {
 	undeclared := &auth.Account{DBID: 1, APIKey: "xai-1", UpstreamType: auth.UpstreamGrok}
 	declared := &auth.Account{DBID: 2, APIKey: "xai-2", UpstreamType: auth.UpstreamGrok, Models: []string{"grok-4"}}
+	declared.SetGrokRoutingState(auth.GrokRoutingState{Models: []auth.GrokModelRoute{{ModelID: "grok-4", APIBackend: auth.GrokProtocolResponses}}})
 	relay := &auth.Account{DBID: 3, APIKey: "sk-relay", BaseURL: "https://relay.example.com", UpstreamType: auth.UpstreamOpenAIResponses}
 
 	cases := []struct {
@@ -58,7 +65,8 @@ func TestRelayAccountSupportsModel_GrokDefaultSet(t *testing.T) {
 		model   string
 		want    bool
 	}{
-		{"undeclared grok serves default-set model", undeclared, "grok-4.5", true},
+		{"undeclared grok serves default-set model", undeclared, "grok-4.6", true},
+		{"undeclared grok serves grok-4.5", undeclared, "grok-4.5", true},
 		{"undeclared grok serves grok-4", undeclared, "grok-4", true},
 		{"undeclared grok rejects non-grok model", undeclared, "gpt-5.5", false},
 		{"declared grok honors whitelist hit", declared, "grok-4", true},

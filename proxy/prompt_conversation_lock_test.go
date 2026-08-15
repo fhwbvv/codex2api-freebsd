@@ -4,13 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func newPromptConversationLockTestHandler(t *testing.T) (*Handler, *database.DB) {
@@ -32,6 +39,17 @@ func newPromptConversationLockTestHandler(t *testing.T) (*Handler, *database.DB)
 	handler := NewHandler(store, db, nil, nil)
 	handler.SetRuntimeCache(cache.NewMemory(1))
 	return handler, db
+}
+
+func signedBoundPromptConversationContextWithRecorder(t *testing.T, requestID string, identity newAPIIdentity, body []byte, fingerprint string) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	c, recorder := signedNewAPIPolicyContextWithSecret(t, requestID, identity, "/v1/responses", body, "gateway-a-secret")
+	c.Set(contextAPIKeyID, int64(101))
+	addSignedNewAPIPolicyMetaWithSecret(t, c, newAPIPolicyMeta{
+		PlatformID: "gateway-a", Profile: "balanced", Mode: "enforce",
+		Provider: "openai", Protocol: "responses", SessionFingerprint: fingerprint,
+	}, true, "gateway-a-secret")
+	return c, recorder
 }
 
 func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
@@ -64,7 +82,7 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 		t.Fatalf("active lock = %#v err=%v", lock, err)
 	}
 
-	repeat := signedBoundNewAPIPolicyContext(t, "cyb-lock-repeat", identity, body, 101, "gateway-a", "gateway-a-secret", fingerprint)
+	repeat, repeatRecorder := signedBoundPromptConversationContextWithRecorder(t, "cyb-lock-repeat", identity, body, fingerprint)
 	setIngressRequestBodyIfAbsent(repeat, body)
 	if blocked := handler.inspectPromptFilterOpenAI(repeat, body, "/v1/responses", "gpt-5.5"); !blocked {
 		t.Fatal("locked conversation was forwarded")
@@ -76,16 +94,179 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 	if message := newAPIPolicyDecisionAPIError(repeatMetadata).Message; !strings.Contains(message, "不会重复累计") || !strings.Contains(message, "再次触发 CYB 可能会停用账号") {
 		t.Fatalf("locked retry message = %q", message)
 	}
+	if got := gjson.GetBytes(repeatRecorder.Body.Bytes(), "error.code").String(); got != promptConversationLockedReasonCode {
+		t.Fatalf("locked retry error code=%q body=%s", got, repeatRecorder.Body.String())
+	}
+	if got := gjson.GetBytes(repeatRecorder.Body.Bytes(), "error.details.restriction_scope").String(); got != database.PromptConversationRestrictionScopeConversation {
+		t.Fatalf("locked retry scope=%q body=%s", got, repeatRecorder.Body.String())
+	}
+	if got := gjson.GetBytes(repeatRecorder.Body.Bytes(), "error.details.retry_after_seconds").Int(); got <= 0 {
+		t.Fatalf("locked retry remaining=%d body=%s", got, repeatRecorder.Body.String())
+	}
+	if retryAfter := repeat.Writer.Header().Get("Retry-After"); retryAfter == "" {
+		t.Fatalf("locked retry missing Retry-After header: %v", repeat.Writer.Header())
+	}
+	if message := gjson.GetBytes(repeatRecorder.Body.Bytes(), "error.message").String(); !strings.Contains(message, "会话详情") || !strings.Contains(message, promptConversationLockedReasonCode) {
+		t.Fatalf("locked retry actionable message=%q", message)
+	}
 	lock, err = db.GetActivePromptConversationLock(t.Context(), lockIdentity.LockKey)
 	if err != nil || lock.TriggerCount != 1 {
 		t.Fatalf("locked retry changed CYB count: lock=%#v err=%v", lock, err)
 	}
 
 	otherFingerprint := "fedcba9876543210fedcba9876543210"
-	other := signedBoundNewAPIPolicyContext(t, "cyb-lock-other", identity, body, 101, "gateway-a", "gateway-a-secret", otherFingerprint)
+	other := signedBoundNewAPIPolicyContext(t, "cyb-lock-other", newAPIIdentity{UserID: "43", ClientIP: "203.0.113.9"}, body, 101, "gateway-a", "gateway-a-secret", otherFingerprint)
 	setIngressRequestBodyIfAbsent(other, body)
 	if blocked := handler.inspectPromptFilterOpenAI(other, body, "/v1/responses", "gpt-5.5"); blocked {
-		t.Fatal("new conversation was blocked by another conversation's CYB lock")
+		t.Fatal("different user was blocked by another user's CYB lock")
+	}
+}
+
+func TestUpstreamCYBCoolsVerifiedUserAcrossSessionChurn(t *testing.T) {
+	handler, _ := newPromptConversationLockTestHandler(t)
+	cfg := handler.store.GetPromptFilterConfig()
+	cfg.Advanced.Enforcement.UserCyberCooldownMinutes = 7
+	handler.store.SetPromptFilterConfig(cfg)
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	identity := newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}
+	first := signedBoundNewAPIPolicyContext(t, "cyb-cooldown-first", identity, body, 101, "gateway-a", "gateway-a-secret", "0123456789abcdef0123456789abcdef")
+	setIngressRequestBodyIfAbsent(first, body)
+	handler.logUpstreamCyberPolicy(first, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy"}}`))
+
+	churned, churnedRecorder := signedBoundPromptConversationContextWithRecorder(t, "cyb-cooldown-churned", identity, body, "fedcba9876543210fedcba9876543210")
+	setIngressRequestBodyIfAbsent(churned, body)
+	if blocked := handler.inspectPromptFilterOpenAI(churned, body, "/v1/responses", "gpt-5.5"); !blocked {
+		t.Fatal("verified user bypassed CYB cooldown by changing session fingerprint")
+	}
+	metadata := policyDecisionMetadataFromHeaders(churned.Writer.Header())
+	if metadata.ReasonCode != promptUserCyberCooldownReasonCode || metadata.StrikeEligible {
+		t.Fatalf("user cooldown metadata = %+v", metadata)
+	}
+	if message := newAPIPolicyDecisionAPIError(metadata).Message; !strings.Contains(message, "安全冷却期") || strings.Contains(message, "30 分钟") || !strings.Contains(message, "不会重复累计处罚") {
+		t.Fatalf("user cooldown message = %q", message)
+	}
+	if got := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.code").String(); got != promptUserCyberCooldownReasonCode {
+		t.Fatalf("user cooldown error code=%q body=%s", got, churnedRecorder.Body.String())
+	}
+	if got := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.details.restriction_scope").String(); got != database.PromptConversationRestrictionScopeUserCooldown {
+		t.Fatalf("user cooldown scope=%q body=%s", got, churnedRecorder.Body.String())
+	}
+	cooldownTTL := promptUserCyberCooldownTTL(handler.store.GetPromptFilterConfig())
+	if cooldownTTL != 7*time.Minute {
+		t.Fatalf("configured user cooldown TTL = %s, want 7m", cooldownTTL)
+	}
+	if got := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.details.retry_after_seconds").Int(); got <= 0 || got > int64(cooldownTTL/time.Second) {
+		t.Fatalf("user cooldown remaining=%d body=%s", got, churnedRecorder.Body.String())
+	}
+	if message := gjson.GetBytes(churnedRecorder.Body.Bytes(), "error.message").String(); !strings.Contains(message, "用户详情") || !strings.Contains(message, promptUserCyberCooldownReasonCode) {
+		t.Fatalf("user cooldown actionable message=%q", message)
+	}
+}
+
+func TestUpstreamCYBCoolsVerifiedUserWithoutSessionFingerprint(t *testing.T) {
+	handler, db := newPromptConversationLockTestHandler(t)
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	identity := newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}
+	first := signedBoundNewAPIPolicyContext(t, "cyb-cooldown-no-session-first", identity, body, 101, "gateway-a", "gateway-a-secret", "")
+	setIngressRequestBodyIfAbsent(first, body)
+	handler.logUpstreamCyberPolicy(first, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy"}}`))
+
+	metadata, delegated := newAPIUpstreamCyberPolicyDecision(first)
+	if !delegated || metadata.ConversationLocked {
+		t.Fatalf("CYB without session response metadata = %+v delegated=%t", metadata, delegated)
+	}
+	item, exact, err := db.GetActivePromptConversationRestriction(t.Context(), "", "gateway-a", "42", 24*time.Hour, 30*time.Minute)
+	if err != nil || exact || item.NewAPIUserID != "42" || item.SessionFingerprint != "" || item.SessionHash != "" {
+		t.Fatalf("sessionless user cooldown = %#v exact=%t err=%v", item, exact, err)
+	}
+
+	repeat := signedBoundNewAPIPolicyContext(t, "cyb-cooldown-no-session-repeat", identity, body, 101, "gateway-a", "gateway-a-secret", "")
+	setIngressRequestBodyIfAbsent(repeat, body)
+	if blocked := handler.inspectPromptFilterOpenAI(repeat, body, "/v1/responses", "gpt-5.5"); !blocked {
+		t.Fatal("verified user without session bypassed CYB cooldown")
+	}
+	repeatMetadata := policyDecisionMetadataFromHeaders(repeat.Writer.Header())
+	if repeatMetadata.ReasonCode != promptUserCyberCooldownReasonCode || repeatMetadata.StrikeEligible {
+		t.Fatalf("sessionless user cooldown metadata = %+v", repeatMetadata)
+	}
+
+	withSession := signedBoundNewAPIPolicyContext(t, "cyb-cooldown-session-after-sessionless", identity, body, 101, "gateway-a", "gateway-a-secret", "0123456789abcdef0123456789abcdef")
+	setIngressRequestBodyIfAbsent(withSession, body)
+	if blocked := handler.inspectPromptFilterOpenAI(withSession, body, "/v1/responses", "gpt-5.5"); !blocked {
+		t.Fatal("verified user escaped sessionless CYB cooldown by later adding a session fingerprint")
+	}
+}
+
+func TestConfiguredUserCyberCooldownExpiresAcrossSessionChurn(t *testing.T) {
+	handler, db := newPromptConversationLockTestHandler(t)
+	cfg := handler.store.GetPromptFilterConfig()
+	cfg.Advanced.Enforcement.UserCyberCooldownMinutes = 1
+	handler.store.SetPromptFilterConfig(cfg)
+
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	identity := newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}
+	first := signedBoundNewAPIPolicyContext(t, "cyb-short-cooldown-first", identity, body, 101, "gateway-a", "gateway-a-secret", "")
+	requestCfg := handler.promptFilterConfigForRequest(first)
+	policyContext, verified := handler.verifyNewAPIPolicyContext(first, requestCfg.Advanced.NewAPI, body)
+	lockIdentity, ok := verifiedPromptUserCooldownIdentity(first, policyContext)
+	if !verified || !ok {
+		t.Fatal("signed user identity unavailable")
+	}
+	if _, _, err := db.LockPromptConversation(t.Context(), database.PromptConversationLockInput{
+		LockKey: lockIdentity.LockKey, Platform: lockIdentity.Platform, NewAPIUserID: lockIdentity.NewAPIUserID,
+		IncidentID: "incident-short-cooldown", DecisionID: "decision-short-cooldown", ReasonCode: newAPIUpstreamCyberPolicyReasonCode,
+		LockedAt: time.Now().UTC().Add(-2 * time.Minute),
+	}); err != nil {
+		t.Fatalf("LockPromptConversation: %v", err)
+	}
+
+	repeat := signedBoundNewAPIPolicyContext(t, "cyb-short-cooldown-repeat", identity, body, 101, "gateway-a", "gateway-a-secret", "fedcba9876543210fedcba9876543210")
+	setIngressRequestBodyIfAbsent(repeat, body)
+	if blocked := handler.inspectPromptFilterOpenAI(repeat, body, "/v1/responses", "gpt-5.5"); blocked {
+		t.Fatal("expired configured user cooldown still blocked a new session")
+	}
+}
+
+func TestSessionlessUserCooldownBlocksConcurrentRetriesWithoutNewCYIncidents(t *testing.T) {
+	handler, db := newPromptConversationLockTestHandler(t)
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	identity := newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}
+	first := signedBoundNewAPIPolicyContext(t, "cyb-sessionless-concurrent-first", identity, body, 101, "gateway-a", "gateway-a-secret", "")
+	setIngressRequestBodyIfAbsent(first, body)
+	handler.logUpstreamCyberPolicy(first, "/v1/responses", "gpt-5.5", []byte(`{"error":{"code":"cyber_policy"}}`))
+	waitPromptFilterAuditIdle(t, db)
+
+	_, incidentTotalBefore, err := db.ListPromptPolicyIncidentsPage(t.Context(), database.PromptPolicyIncidentQuery{Page: 1, PageSize: 10})
+	if err != nil || incidentTotalBefore != 1 {
+		t.Fatalf("initial CY incidents total=%d err=%v", incidentTotalBefore, err)
+	}
+
+	const retries = 64
+	requests := make([]*gin.Context, 0, retries)
+	for index := 0; index < retries; index++ {
+		request := signedBoundNewAPIPolicyContext(t, "cyb-sessionless-concurrent-"+strconv.Itoa(index), identity, body, 101, "gateway-a", "gateway-a-secret", "")
+		setIngressRequestBodyIfAbsent(request, body)
+		requests = append(requests, request)
+	}
+	var blocked atomic.Int64
+	var wg sync.WaitGroup
+	for _, request := range requests {
+		wg.Add(1)
+		go func(c *gin.Context) {
+			defer wg.Done()
+			if handler.inspectPromptFilterOpenAI(c, body, "/v1/responses", "gpt-5.5") {
+				blocked.Add(1)
+			}
+		}(request)
+	}
+	wg.Wait()
+	if got := blocked.Load(); got != retries {
+		t.Fatalf("blocked concurrent retries=%d, want %d", got, retries)
+	}
+	waitPromptFilterAuditIdle(t, db)
+	_, incidentTotalAfter, err := db.ListPromptPolicyIncidentsPage(t.Context(), database.PromptPolicyIncidentQuery{Page: 1, PageSize: 10})
+	if err != nil || incidentTotalAfter != incidentTotalBefore {
+		t.Fatalf("concurrent retries created new CY incidents: before=%d after=%d err=%v", incidentTotalBefore, incidentTotalAfter, err)
 	}
 }
 
@@ -137,5 +318,36 @@ func TestConversationLockStorageFailureDoesNotClaimConversationWasLocked(t *test
 	}
 	if message := newAPIPolicyDecisionAPIError(metadata).Message; message != upstreamCyberPolicyUserMessage || strings.Contains(message, "已锁定当前对话") {
 		t.Fatalf("database failure CYB message = %q", message)
+	}
+}
+
+func TestExpiredConversationLockDoesNotBlockSignedConversation(t *testing.T) {
+	handler, db := newPromptConversationLockTestHandler(t)
+	cfg := handler.store.GetPromptFilterConfig()
+	cfg.Advanced.Enforcement.ConversationLockTTLHours = 1
+	handler.store.SetPromptFilterConfig(cfg)
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	fingerprint := "0123456789abcdef0123456789abcdef"
+	c := signedBoundNewAPIPolicyContext(t, "expired-lock", newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}, body, 101, "gateway-a", "gateway-a-secret", fingerprint)
+	setIngressRequestBodyIfAbsent(c, body)
+	requestConfig := handler.promptFilterConfigForRequest(c)
+	policyContext, verified := handler.verifyNewAPIPolicyContext(c, requestConfig.Advanced.NewAPI, body)
+	identity, ok := verifiedPromptConversationLockIdentity(c, policyContext)
+	if !verified || !ok {
+		t.Fatal("signed lock identity unavailable")
+	}
+	if _, _, err := db.LockPromptConversation(t.Context(), database.PromptConversationLockInput{
+		LockKey: identity.LockKey, Platform: identity.Platform, NewAPIUserID: identity.NewAPIUserID,
+		SessionFingerprint: identity.SessionFingerprint, SessionHash: identity.SessionHash,
+		IncidentID: "incident-expired", DecisionID: "decision-expired", ReasonCode: newAPIUpstreamCyberPolicyReasonCode,
+		LockedAt: time.Now().UTC().Add(-2 * time.Hour),
+	}); err != nil {
+		t.Fatalf("LockPromptConversation: %v", err)
+	}
+	if blocked := handler.inspectPromptFilterOpenAI(c, body, "/v1/responses", "gpt-5.5"); blocked {
+		t.Fatal("expired conversation lock blocked request")
+	}
+	if _, err := db.GetActivePromptConversationLockWithTTL(t.Context(), identity.LockKey, time.Hour); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expired conversation lock remained active: %v", err)
 	}
 }

@@ -25,11 +25,13 @@ var grokPlansByTier = map[string]GrokPlan{
 	"4": {Key: "x_premium_plus", Display: "X Premium+", Paid: true, Billing: true},
 	"5": {Key: "supergrok_heavy", Display: "SuperGrok Heavy", Paid: true, Billing: true},
 	"6": {Key: "supergrok_lite", Display: "SuperGrok Lite", Paid: true, Billing: true},
+	"7": {Key: "supergrok_plus", Display: "SuperGrok Plus", Paid: true, Billing: true},
 }
 
 var grokPlanAliases = map[string]string{
 	"free":            "0",
 	"supergrok":       "1",
+	"grokpro":         "1",
 	"x_basic":         "2",
 	"xbasic":          "2",
 	"x_premium":       "3",
@@ -39,8 +41,11 @@ var grokPlanAliases = map[string]string{
 	"xpremiumplus":    "4",
 	"supergrok_heavy": "5",
 	"supergrokheavy":  "5",
+	"supergrokpro":    "5",
 	"supergrok_lite":  "6",
 	"supergroklite":   "6",
+	"supergrok_plus":  "7",
+	"supergrokplus":   "7",
 }
 
 // GrokPlanFromTier maps the numeric tier claim carried by Grok OAuth access
@@ -85,6 +90,23 @@ func ResolveGrokPlan(value any) (GrokPlan, bool) {
 		return GrokPlan{}, false
 	}
 	return GrokPlanFromTier(value)
+}
+
+// CanonicalGrokLivePlanFilter maps the live /user.subscriptionTier label to
+// the stable value accepted by API-key plan_allow. The raw live value remains
+// persisted for diagnostics; only this projection is used for authorization.
+// Unknown future labels are normalized, not guessed from a fixed entitlement
+// matrix, so operators can adopt a new label without a binary downgrade to
+// Free or an unrelated known plan.
+func CanonicalGrokLivePlanFilter(value string) string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return ""
+	}
+	if plan, ok := ResolveGrokPlan(raw); ok {
+		return plan.Key
+	}
+	return normalizeGrokPlanAlias(raw)
 }
 
 // GrokPlanFromAccessToken reads the unverified JWT payload already used for

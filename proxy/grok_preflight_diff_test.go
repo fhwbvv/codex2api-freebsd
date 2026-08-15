@@ -113,6 +113,11 @@ func grokDiffCorpus() []struct {
 		{"reasoning.effort high 不变", `{"model":"grok-4.5","reasoning":{"effort":"high"}}`},
 		{"reasoning.effort 未知不动", `{"model":"grok-4.5","reasoning":{"effort":"weird"}}`},
 		{"reasoning_effort 顶层形态", `{"model":"grok-4.5","reasoning_effort":"xhigh"}`},
+		{"4.6 reasoning.effort xhigh 放行", `{"model":"grok-4.6","reasoning":{"effort":"xhigh","summary":"detailed"}}`},
+		{"4.6 reasoning.effort max→xhigh", `{"model":"grok-4.6","reasoning":{"effort":"max"}}`},
+		{"4.6 reasoning 在 model 前", `{"reasoning":{"effort":"xhigh"},"model":"grok-4.6"}`},
+		{"4.6 reasoning_effort 顶层形态", `{"model":"grok-4.6","reasoning_effort":"xhigh"}`},
+		{"4.20-multi-agent xhigh 放行", `{"model":"grok-4.20-multi-agent","reasoning":{"effort":"xhigh"}}`},
 		{"reasoning 非对象", `{"model":"grok-4.5","reasoning":"xhigh"}`},
 		{"未知历史项类型", `{"model":"grok-4.5","input":[{"type":"totally_unknown","foo":"bar","baz":null}]}`},
 		{"input 非数组", `{"model":"grok-4.5","input":"hi"}`},
@@ -239,7 +244,7 @@ func TestGrokPreflightPreservesUntouchedBody(t *testing.T) {
 // TestGrokPrepareHistoryItemMatchesMapRebuild 逐项守护 raw 拼接重建与 map 版
 // rebuildGrokHistoryItem 的等价性：改写与否的判定必须一致，改写结果必须语义相同。
 func TestGrokPrepareHistoryItemMatchesMapRebuild(t *testing.T) {
-	register := func(ns, name string) string { return ns + "__" + name }
+	register := func(ns, name string, _, _ bool) string { return ns + "__" + name }
 	for _, tc := range grokDiffCorpus() {
 		input := gjson.Get(tc.body, "input")
 		if !input.IsArray() {

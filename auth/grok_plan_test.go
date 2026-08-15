@@ -22,8 +22,9 @@ func TestGrokPlanFromTier(t *testing.T) {
 		{"x premium plus", 4, GrokPlan{Key: "x_premium_plus", Display: "X Premium+", Paid: true, Billing: true}, true},
 		{"supergrok heavy", 5, GrokPlan{Key: "supergrok_heavy", Display: "SuperGrok Heavy", Paid: true, Billing: true}, true},
 		{"supergrok lite", 6, GrokPlan{Key: "supergrok_lite", Display: "SuperGrok Lite", Paid: true, Billing: true}, true},
+		{"supergrok plus", 7, GrokPlan{Key: "supergrok_plus", Display: "SuperGrok Plus", Paid: true, Billing: true}, true},
 		{"numeric string", "6", GrokPlan{Key: "supergrok_lite", Display: "SuperGrok Lite", Paid: true, Billing: true}, true},
-		{"future positive tier", 7, GrokPlan{Key: "7", Display: "7", Paid: true, Billing: true}, true},
+		{"future positive tier", 8, GrokPlan{Key: "8", Display: "8", Paid: true, Billing: true}, true},
 		{"future decimal tier", json.Number("7.5"), GrokPlan{Key: "7.5", Display: "7.5", Paid: true, Billing: true}, true},
 		{"negative tier", -1, GrokPlan{}, false},
 		{"missing tier", nil, GrokPlan{}, false},
@@ -52,12 +53,15 @@ func TestResolveGrokPlanAliases(t *testing.T) {
 	tests := map[string]string{
 		"free":            "free",
 		"SuperGrok":       "supergrok",
+		"GrokPro":         "supergrok",
 		"X Basic":         "x_basic",
 		"x_premium":       "x_premium",
 		"X Premium+":      "x_premium_plus",
 		"X Premium Plus":  "x_premium_plus",
 		"SuperGrok Heavy": "supergrok_heavy",
+		"SuperGrokPro":    "supergrok_heavy",
 		"supergrok_lite":  "supergrok_lite",
+		"SuperGrokPlus":   "supergrok_plus",
 		"6":               "supergrok_lite",
 	}
 	for input, wantKey := range tests {
@@ -77,6 +81,18 @@ func TestResolveGrokPlanAliases(t *testing.T) {
 	for _, input := range []any{"api", "unknown", "", "-2", nil} {
 		if got, ok := ResolveGrokPlan(input); ok {
 			t.Fatalf("ResolveGrokPlan(%v) = %#v, want invalid", input, got)
+		}
+	}
+}
+
+func TestCanonicalGrokLivePlanFilter(t *testing.T) {
+	t.Parallel()
+	for input, want := range map[string]string{
+		"GrokPro": "supergrok", "SuperGrokPro": "supergrok_heavy",
+		"SuperGrokPlus": "supergrok_plus", "Future Ultra": "future_ultra",
+	} {
+		if got := CanonicalGrokLivePlanFilter(input); got != want {
+			t.Fatalf("CanonicalGrokLivePlanFilter(%q) = %q, want %q", input, got, want)
 		}
 	}
 }

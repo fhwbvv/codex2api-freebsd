@@ -160,6 +160,85 @@ func TestSetGroupProxyURLsHotUpdate(t *testing.T) {
 	}
 }
 
+func TestResolveProxyForAccountSkipsDisabledManagedPin(t *testing.T) {
+	const (
+		disabledURL = "http://disabled.example:8080"
+		enabledURL  = "http://enabled.example:8080"
+	)
+	store := &Store{
+		proxyPoolEnabled: true,
+		proxyPool:        []string{enabledURL},
+		proxyPoolSet:     buildProxyPoolSet([]string{enabledURL}),
+		managedProxySet:  buildProxyPoolSet([]string{disabledURL, enabledURL}),
+		globalProxy:      "http://global-proxy:8080",
+	}
+	pinned := &Account{DBID: 1, ProxyURL: disabledURL}
+	if got := store.ResolveProxyForAccount(pinned); got != "" {
+		t.Fatalf("pinned disabled proxy = %q, want empty fail-closed", got)
+	}
+	if store.AccountHasUsableEgress(pinned) {
+		t.Fatal("pinned disabled proxy should not be schedulable while the pool is on")
+	}
+
+	unbound := &Account{DBID: 2}
+	if got := store.ResolveProxyForAccount(unbound); got != enabledURL {
+		t.Fatalf("unbound proxy = %q, want remaining pool member %q", got, enabledURL)
+	}
+}
+
+func TestResolveProxyForAccountKeepsCustomProxyOutsidePool(t *testing.T) {
+	store := &Store{
+		proxyPoolEnabled: true,
+		proxyPool:        []string{"http://pool.example:8080"},
+		proxyPoolSet:     buildProxyPoolSet([]string{"http://pool.example:8080"}),
+		managedProxySet:  buildProxyPoolSet([]string{"http://pool.example:8080"}),
+	}
+	custom := "http://custom.example:8080"
+	got := store.ResolveProxyForAccount(&Account{DBID: 1, ProxyURL: custom})
+	if got != custom {
+		t.Fatalf("custom proxy = %q, want %q", got, custom)
+	}
+}
+
+func TestNextSkipsPinnedDisabledProxyWhenPoolEnabled(t *testing.T) {
+	const (
+		disabledURL = "http://disabled.example:8080"
+		enabledURL  = "http://enabled.example:8080"
+	)
+	store := &Store{
+		maxConcurrency:   2,
+		proxyPoolEnabled: true,
+		proxyPool:        []string{enabledURL},
+		proxyPoolSet:     buildProxyPoolSet([]string{enabledURL}),
+		managedProxySet:  buildProxyPoolSet([]string{disabledURL, enabledURL}),
+	}
+	store.AddAccount(&Account{DBID: 1, AccessToken: "tok-pinned", ProxyURL: disabledURL})
+	store.AddAccount(&Account{DBID: 2, AccessToken: "tok-unbound"})
+
+	selected := store.NextExcludingWithFilter(0, nil, nil)
+	if selected == nil {
+		t.Fatal("expected unbound account to remain schedulable")
+	}
+	defer store.Release(selected)
+	if selected.DBID != 2 {
+		t.Fatalf("selected account %d, want unbound 2", selected.DBID)
+	}
+	if got := store.ResolveProxyForAccount(selected); got != enabledURL {
+		t.Fatalf("selected proxy = %q, want %q", got, enabledURL)
+	}
+}
+
+func TestNextReturnsNilWhenPoolEnabledAndNoUsableProxy(t *testing.T) {
+	store := &Store{
+		maxConcurrency:   2,
+		proxyPoolEnabled: true,
+	}
+	store.AddAccount(&Account{DBID: 1, AccessToken: "tok-1"})
+	if selected := store.NextExcludingWithFilter(0, nil, nil); selected != nil {
+		t.Fatalf("selected account %d, want none when pool is on and empty", selected.DBID)
+	}
+}
+
 // 粘性会话校验:组代理变更后,粘住旧代理的绑定要判失效触发重绑。
 func TestAffinityProxyStillValidTracksGroupProxy(t *testing.T) {
 	store := &Store{}

@@ -4,23 +4,32 @@ import (
 	"context"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
+	"github.com/codex2api/proxy"
 )
 
-// grokProbeRunGuard 单轮探测的整体超时兜底,避免异常账号把整轮卡死。
-const grokProbeRunGuard = 15 * time.Minute
+const (
+	// The shortest persisted fact TTL is 30 seconds (hot/exhausted billing), so
+	// the read-only scanner must wake at least this often. It does no inference
+	// generation and is intentionally independent from the operator probe switch.
+	grokFreshnessScanInterval = 30 * time.Second
+	// grokProbeRunGuard 单轮探测的整体超时兜底,避免异常账号把整轮卡死。
+	grokProbeRunGuard = 15 * time.Minute
+)
 
-// StartGrokStatusProbe 启动 Grok 账号状态定期探测的常驻后台任务。
+// StartGrokStatusProbe starts two independent maintenance loops:
+//   - an always-on, read-only 30-second freshness scan for control-plane facts
+//     and model catalogs, followed by a one-time native capability rebuild when
+//     the current credential generation has no fresh capability facts;
+//   - the historical inference connectivity probe, still governed by the
+//     operator's GrokProbeEnabled switch and configured interval.
 //
-// 背景:账号的限流/冷却状态虽已持久化并在重启时恢复,但上游是滚动窗口——账号可能在网关
-// 无流量期间耗尽或恢复,状态就会与真实情况脱节。该任务按 grok 系统设置里的间隔,对所有
-// 未停用的 Grok 账号复跑一次连通性测试(复用批量测试的写状态 testFn):200→清冷却转可用,
-// 429→按 Grok 语义落权威用量快照并标 usage_limited。开关默认关,由设置页控制。
-//
-// 采用 1 分钟粗粒度轮询 + lastRun 判定间隔,使设置变更(开/关/改间隔)在一分钟内生效,
-// 无需重启或额外的唤醒信号通道。
+// This separation is security-relevant: disabling generation probes must not
+// let a live plan, allow_access gate, balance, or catalog remain stale forever.
 func (h *Handler) StartGrokStatusProbe(ctx context.Context) {
 	if h == nil || h.store == nil {
 		return
@@ -28,6 +37,26 @@ func (h *Handler) StartGrokStatusProbe(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Refresh once at startup, then at the shortest fact freshness. The worker
+	// only selects expired observations, so a hot billing row does not cause
+	// user/settings/catalog requests every 30 seconds.
+	h.startDBBackgroundTaskWithParent(ctx, func(ctx context.Context) {
+		h.runGrokFreshnessScan(ctx)
+		ticker := time.NewTicker(grokFreshnessScanInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				h.runGrokFreshnessScan(ctx)
+			}
+		}
+	})
+
+	// Generation/connectivity remains optional and retains the coarser settings
+	// cadence. Keeping it in a separate loop prevents a disabled probe switch or
+	// a slow generation attempt from suppressing freshness maintenance.
 	h.startDBBackgroundTaskWithParent(ctx, func(ctx context.Context) {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -51,21 +80,16 @@ func (h *Handler) StartGrokStatusProbe(ctx context.Context) {
 	})
 }
 
-// grokImportProbeSlots 限制导入后探针的并发:每号要做 AT 刷新 + billing 探针 +
-// 连通性测试(最多 3 个上游请求),批量导入几千个文件时不设闸会同时打爆上游/代理。
+// grokImportProbeSlots bounds read-only post-import control-plane/catalog
+// synchronization so a large archive cannot fan out thousands of requests.
 var grokImportProbeSlots = make(chan struct{}, 4)
 
-// triggerGrokUsageProbe schedules the post-import probe chain under the
-// database lifecycle so it cannot outlive account persistence on shutdown.
-//
-// 导入后的号要能直接在列表上看到套餐与用量进度条,需要三步:
-//  1. AT 缺失或已过期先强刷一次——导入的 auth.json 常带过期 AT(文件躺了几小时),
-//     拿它打 billing 会 401,套餐拿不到还可能被误标 unauthorized 冷却;
-//  2. billing 探针:拉套餐/周月额度(套餐列、额度上限);
-//  3. 连通性测试:写账号状态(active/限流),真实请求带回 x-ratelimit-* 头、
-//     429 时解析权威用量,用量进度条由此点亮。
+// triggerGrokUsageProbe keeps its historical import-call-site name. It first
+// performs the fenced control-plane/catalog synchronization and then schedules
+// the required three minimal native capability probes. The latter are bounded
+// globally and serialised per account by runGrokCapabilityProbe.
 func (h *Handler) triggerGrokUsageProbe(accountID int64) {
-	if h == nil || h.store == nil || h.probeUsage == nil {
+	if h == nil || h.store == nil || h.db == nil || accountID <= 0 {
 		return
 	}
 	h.startDBBackgroundTask(func(parent context.Context) {
@@ -76,47 +100,174 @@ func (h *Handler) triggerGrokUsageProbe(accountID int64) {
 		}
 		defer func() { <-grokImportProbeSlots }()
 
-		account := h.store.FindByID(accountID)
-		if account == nil {
+		syncCtx, cancel := context.WithTimeout(parent, 2*time.Minute)
+		if _, err := h.syncGrokAccountState(syncCtx, accountID); err != nil {
+			log.Printf("[账号 %d] 导入后 Grok 只读状态同步失败: %v", accountID, err)
+			cancel()
 			return
 		}
-
-		if account.GrokAuthKind() == auth.GrokAuthKindOAuth && grokAccessTokenStale(account) {
-			refreshCtx, cancel := context.WithTimeout(parent, 30*time.Second)
-			if err := h.store.RefreshSingle(refreshCtx, account.DBID); err != nil {
-				log.Printf("[账号 %d] 导入后 AT 刷新失败(探针继续): %v", account.DBID, err)
-			}
-			cancel()
+		cancel()
+		if _, err := h.runGrokCapabilityProbe(parent, accountID, false); err != nil {
+			log.Printf("[账号 %d] 导入后 Grok 协议能力探针失败: %v", accountID, err)
 		}
-
-		probeCtx, cancel := context.WithTimeout(parent, 25*time.Second)
-		_ = h.probeUsage(probeCtx, account)
-		cancel()
-
-		testCtx, cancel := context.WithTimeout(parent, batchTestAccountTimeout+5*time.Second)
-		h.runSingleBatchTest(testCtx, account)
-		cancel()
 	})
 }
 
-// grokAccessTokenStale 判断账号的 access_token 是否缺失或已过期/临期(2 分钟余量)。
-// ExpiresAt 未知时保守视为可用,交给 billing 探针的 401 分支兜底。
-func grokAccessTokenStale(account *auth.Account) bool {
+func grokPersistedStateRefreshSelection(account *auth.Account, state *database.GrokAccountState, now time.Time) grokStateSyncSelection {
 	if account == nil {
-		return true
+		return grokStateSyncSelection{}
 	}
-	account.Mu().RLock()
-	defer account.Mu().RUnlock()
-	if strings.TrimSpace(account.AccessToken) == "" {
-		return true
+	generation := account.GetCredentialGeneration()
+	if generation <= 0 {
+		generation = 1
 	}
-	if account.ExpiresAt.IsZero() {
-		return false
+	if state == nil || state.CredentialGeneration != generation {
+		return fullGrokStateSyncSelection()
 	}
-	return time.Now().Add(2 * time.Minute).After(account.ExpiresAt)
+	selection := grokStateSyncSelection{FactKinds: map[proxy.GrokControlPlaneFactKind]struct{}{}}
+	if account.GrokAuthKind() == auth.GrokAuthKindOAuth {
+		for _, item := range []struct {
+			persisted string
+			kind      proxy.GrokControlPlaneFactKind
+		}{
+			{database.GrokFactUser, proxy.GrokControlPlaneUser},
+			{database.GrokFactSettings, proxy.GrokControlPlaneSettings},
+			{database.GrokFactBilling, proxy.GrokControlPlaneBilling},
+			{database.GrokFactAutoTopup, proxy.GrokControlPlaneAutoTopup},
+		} {
+			fact, ok := state.Facts[item.persisted]
+			if !ok || fact.CredentialGeneration != state.CredentialGeneration || !now.Before(fact.ExpiresAt) {
+				selection.FactKinds[item.kind] = struct{}{}
+			}
+		}
+	}
+	origin, _ := account.GrokCredentials()
+	origin = strings.TrimRight(strings.TrimSpace(origin), "/")
+	for _, catalog := range state.Catalogs {
+		snapshot := catalog.Snapshot
+		if snapshot.CredentialGeneration == state.CredentialGeneration &&
+			strings.EqualFold(strings.TrimRight(strings.TrimSpace(snapshot.Origin), "/"), origin) &&
+			snapshot.Status == "ok" && now.Before(snapshot.ExpiresAt) {
+			return selection
+		}
+	}
+	selection.Catalog = true
+	return selection
 }
 
-// runGrokStatusProbe 对所有未停用的 Grok 账号跑一轮写状态的连通性测试。
+func grokPersistedStateNeedsRefresh(account *auth.Account, state *database.GrokAccountState, now time.Time) bool {
+	return !grokPersistedStateRefreshSelection(account, state, now).empty()
+}
+
+// refreshStaleGrokControlPlane keeps user/settings/billing/catalog snapshots at
+// their declared freshness without consuming account reservations or dispatch
+// counters. It is intentionally independent from GrokProbeEnabled.
+func (h *Handler) refreshStaleGrokControlPlane(ctx context.Context, accounts []*auth.Account) (refreshed, failed int) {
+	if h == nil || h.db == nil {
+		return 0, 0
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, account := range accounts {
+		if account == nil || account.ID() <= 0 {
+			continue
+		}
+		state, err := h.db.GetGrokAccountState(ctx, account.ID())
+		selection := grokPersistedStateRefreshSelection(account, state, time.Now())
+		if err == nil && selection.empty() {
+			continue
+		}
+		if err != nil {
+			selection = fullGrokStateSyncSelection()
+		}
+		accountID := account.ID()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case grokImportProbeSlots <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-grokImportProbeSlots }()
+			syncCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			_, syncErr := h.syncGrokAccountStateSelected(syncCtx, accountID, selection)
+			cancel()
+			mu.Lock()
+			if syncErr != nil {
+				failed++
+			} else {
+				refreshed++
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return refreshed, failed
+}
+
+func (h *Handler) runGrokFreshnessScan(ctx context.Context) {
+	accounts := h.store.EnabledGrokAccounts()
+	if len(accounts) == 0 {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, grokProbeRunGuard)
+	defer cancel()
+	start := time.Now()
+	refreshed, refreshFailed := h.refreshStaleGrokControlPlane(probeCtx, accounts)
+	capabilityRebuilt, capabilityFailed := h.rebuildMissingGrokCapabilities(probeCtx, accounts)
+	if refreshed > 0 || refreshFailed > 0 {
+		log.Printf("[grok-freshness] 只读状态刷新完成: refreshed=%d failed=%d 耗时=%s",
+			refreshed, refreshFailed, time.Since(start).Round(time.Millisecond))
+	}
+	if capabilityRebuilt > 0 || capabilityFailed > 0 {
+		log.Printf("[grok-capabilities] generation 能力重建完成: rebuilt=%d failed=%d 耗时=%s",
+			capabilityRebuilt, capabilityFailed, time.Since(start).Round(time.Millisecond))
+	}
+}
+
+// rebuildMissingGrokCapabilities is independent from GrokProbeEnabled. The
+// operator switch controls recurring connectivity tests, not the one-time
+// three-protocol facts required to route a newly imported/rotated generation.
+// runGrokCapabilityProbe supplies global concurrency 4, per-account
+// serialization and per-(generation,model,origin,protocol) deduplication.
+func (h *Handler) rebuildMissingGrokCapabilities(ctx context.Context, accounts []*auth.Account) (rebuilt, failed int) {
+	if h == nil || h.db == nil {
+		return 0, 0
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, account := range accounts {
+		if account == nil || account.ID() <= 0 {
+			continue
+		}
+		generation := account.GetCredentialGeneration()
+		if generation <= 0 {
+			generation = 1
+		}
+		state, err := h.db.GetGrokAccountState(ctx, account.ID())
+		if err == nil && !grokGenerationNeedsCapabilityProbe(account, state, generation, time.Now()) {
+			continue
+		}
+		accountID := account.ID()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, probeErr := h.runGrokCapabilityProbe(ctx, accountID, false)
+			mu.Lock()
+			if probeErr != nil {
+				failed++
+			} else {
+				rebuilt++
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return rebuilt, failed
+}
+
+// runGrokStatusProbe performs only the optional generation connectivity check.
 func (h *Handler) runGrokStatusProbe(ctx context.Context) {
 	accounts := h.store.EnabledGrokAccounts()
 	if len(accounts) == 0 {
@@ -126,6 +277,6 @@ func (h *Handler) runGrokStatusProbe(ctx context.Context) {
 	defer cancel()
 	start := time.Now()
 	counts := h.runBatchTest(probeCtx, accounts, 0, h.runSingleBatchTest, nil)
-	log.Printf("[grok-probe] 定期探测完成: total=%d success=%d rate_limited=%d banned=%d failed=%d 耗时=%s",
+	log.Printf("[grok-probe] 定期生成探测完成: total=%d success=%d rate_limited=%d banned=%d failed=%d 耗时=%s",
 		counts.Total, counts.Success, counts.RateLimited, counts.Banned, counts.Failed, time.Since(start).Round(time.Millisecond))
 }

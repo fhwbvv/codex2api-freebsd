@@ -13,80 +13,57 @@ import {
   Sparkles,
   Wand2,
   X,
+  ChevronsUpDown,
+  AlertCircle,
+  Undo2,
 } from 'lucide-react'
 
 import { api } from '@/api'
 import ModelLogo from '../components/ModelLogo'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
+import { StatTile } from '../components/StatTile'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { useToast } from '../hooks/useToast'
 import { getErrorMessage } from '../utils/error'
-import type { ModelPricingOverride } from '@/types'
+import type { ModelPricingOverride, OfficialPricingSyncConfig } from '@/types'
 
 type Row = { model: string; source: string; pricing: ModelPricingOverride }
-type SourceFilter = 'all' | 'custom' | 'synced' | 'default'
+type SourceFilter = 'all' | 'custom' | 'synced' | 'default' | 'unsaved'
 
 type FieldDef = {
   key: keyof ModelPricingOverride
   labelKey: string
   shortKey: string
-  tone: 'sky' | 'cyan' | 'violet' | 'amber' | 'orange' | 'emerald' | 'teal'
+  tone: 'neutral' | 'accent'
 }
 
 const PRIMARY_FIELDS: FieldDef[] = [
-  { key: 'input', labelKey: 'settings.pricing.input', shortKey: 'settings.pricing.shortInput', tone: 'sky' },
-  { key: 'cached_input', labelKey: 'settings.pricing.cached', shortKey: 'settings.pricing.shortCached', tone: 'cyan' },
-  { key: 'output', labelKey: 'settings.pricing.output', shortKey: 'settings.pricing.shortOutput', tone: 'violet' },
+  { key: 'input', labelKey: 'settings.pricing.input', shortKey: 'settings.pricing.shortInput', tone: 'neutral' },
+  { key: 'cached_input', labelKey: 'settings.pricing.cached', shortKey: 'settings.pricing.shortCached', tone: 'neutral' },
+  { key: 'output', labelKey: 'settings.pricing.output', shortKey: 'settings.pricing.shortOutput', tone: 'neutral' },
 ]
 
 const ADVANCED_FIELDS: FieldDef[] = [
-  { key: 'input_priority', labelKey: 'settings.pricing.inputPriority', shortKey: 'settings.pricing.shortInputPriority', tone: 'amber' },
-  { key: 'output_priority', labelKey: 'settings.pricing.outputPriority', shortKey: 'settings.pricing.shortOutputPriority', tone: 'orange' },
-  { key: 'input_long', labelKey: 'settings.pricing.inputLong', shortKey: 'settings.pricing.shortInputLong', tone: 'emerald' },
-  { key: 'output_long', labelKey: 'settings.pricing.outputLong', shortKey: 'settings.pricing.shortOutputLong', tone: 'teal' },
+  { key: 'input_priority', labelKey: 'settings.pricing.inputPriority', shortKey: 'settings.pricing.shortInputPriority', tone: 'accent' },
+	{ key: 'cached_input_priority', labelKey: 'settings.pricing.cachedInputPriority', shortKey: 'settings.pricing.shortCachedInputPriority', tone: 'accent' },
+  { key: 'output_priority', labelKey: 'settings.pricing.outputPriority', shortKey: 'settings.pricing.shortOutputPriority', tone: 'accent' },
+  { key: 'input_long', labelKey: 'settings.pricing.inputLong', shortKey: 'settings.pricing.shortInputLong', tone: 'accent' },
+	{ key: 'cached_input_long', labelKey: 'settings.pricing.cachedInputLong', shortKey: 'settings.pricing.shortCachedInputLong', tone: 'accent' },
+  { key: 'output_long', labelKey: 'settings.pricing.outputLong', shortKey: 'settings.pricing.shortOutputLong', tone: 'accent' },
+	{ key: 'input_long_priority', labelKey: 'settings.pricing.inputLongPriority', shortKey: 'settings.pricing.shortInputLongPriority', tone: 'accent' },
+	{ key: 'cached_input_long_priority', labelKey: 'settings.pricing.cachedInputLongPriority', shortKey: 'settings.pricing.shortCachedInputLongPriority', tone: 'accent' },
+	{ key: 'output_long_priority', labelKey: 'settings.pricing.outputLongPriority', shortKey: 'settings.pricing.shortOutputLongPriority', tone: 'accent' },
 ]
 
 const ALL_FIELDS = [...PRIMARY_FIELDS, ...ADVANCED_FIELDS]
 
-const TONE_STYLES: Record<FieldDef['tone'], { dot: string; ring: string; soft: string }> = {
-  sky: {
-    dot: 'bg-sky-500',
-    ring: 'focus-within:border-sky-500/40 focus-within:ring-sky-500/15',
-    soft: 'bg-sky-500/10 text-sky-700 dark:text-sky-300',
-  },
-  cyan: {
-    dot: 'bg-cyan-500',
-    ring: 'focus-within:border-cyan-500/40 focus-within:ring-cyan-500/15',
-    soft: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
-  },
-  violet: {
-    dot: 'bg-violet-500',
-    ring: 'focus-within:border-violet-500/40 focus-within:ring-violet-500/15',
-    soft: 'bg-violet-500/10 text-violet-700 dark:text-violet-300',
-  },
-  amber: {
-    dot: 'bg-amber-500',
-    ring: 'focus-within:border-amber-500/40 focus-within:ring-amber-500/15',
-    soft: 'bg-amber-500/10 text-amber-700 dark:text-amber-300',
-  },
-  orange: {
-    dot: 'bg-orange-500',
-    ring: 'focus-within:border-orange-500/40 focus-within:ring-orange-500/15',
-    soft: 'bg-orange-500/10 text-orange-700 dark:text-orange-300',
-  },
-  emerald: {
-    dot: 'bg-emerald-500',
-    ring: 'focus-within:border-emerald-500/40 focus-within:ring-emerald-500/15',
-    soft: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
-  },
-  teal: {
-    dot: 'bg-teal-500',
-    ring: 'focus-within:border-teal-500/40 focus-within:ring-teal-500/15',
-    soft: 'bg-teal-500/10 text-teal-700 dark:text-teal-300',
-  },
+const TONE_DOT: Record<FieldDef['tone'], string> = {
+  neutral: 'bg-muted-foreground/40',
+  accent: 'bg-primary',
 }
 
 function normalizePrice(value: unknown): number {
@@ -101,14 +78,25 @@ function isDirty(draft: ModelPricingOverride | undefined, saved: ModelPricingOve
   return false
 }
 
+function isAdvancedDirty(draft: ModelPricingOverride | undefined, saved: ModelPricingOverride | undefined): boolean {
+  for (const field of ADVANCED_FIELDS) {
+    if (normalizePrice(draft?.[field.key]) !== normalizePrice(saved?.[field.key])) return true
+  }
+  return false
+}
+
 function formatPriceDisplay(value: number): string {
   if (!Number.isFinite(value) || value === 0) return '0'
   if (Number.isInteger(value)) return String(value)
-  const fixed = value.toFixed(4).replace(/\.?0+$/, '')
-  return fixed
+  return value.toFixed(4).replace(/\.?0+$/, '')
 }
 
-/** 定价列表置顶：gpt-5.6-sol → terra → luna。 */
+function getOutputMultiplier(input: number, output: number): string | null {
+  if (input <= 0 || output <= 0) return null
+  const ratio = output / input
+  return `${ratio.toFixed(1).replace(/\.0$/, '')}x`
+}
+
 const PREFERRED_MODEL_ORDER = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'] as const
 
 function modelPreferredRank(model: string): number {
@@ -122,22 +110,16 @@ function modelPreferredRank(model: string): number {
   return -1
 }
 
-/** 从模型名提取数字段（gpt-5.6-luna → [5,6]），用于新→旧排序。 */
 function modelVersionParts(model: string): number[] {
   const matches = model.match(/\d+/g)
   if (!matches) return []
   return matches.map((m) => Number(m)).filter((n) => Number.isFinite(n))
 }
 
-/**
- * 模型家族分组：Codex(gpt-*) 在前、Grok 在后。两家版本号各走各的（grok-4.5 与
- * gpt-5.4 直接比数字没有意义），先按家族分块，块内再比版本。
- */
 function modelFamilyRank(model: string): number {
   return model.trim().toLowerCase().startsWith('grok') ? 1 : 0
 }
 
-/** 比较模型名：Codex 在前 Grok 在后，块内置顶 sol/terra/luna，其余版本号高的在前；同版本再按字典序。 */
 function compareModelsNewestFirst(a: string, b: string): number {
   if (a === b) return 0
   const fa = modelFamilyRank(a)
@@ -189,40 +171,52 @@ function sourceMeta(source: string): { labelKey: string; className: string; dot:
 function PriceField({
   field,
   value,
+  savedValue,
   changed,
   dense,
   onChange,
+  onRevert,
 }: {
   field: FieldDef
   value: number
+  savedValue?: number
   changed: boolean
   dense?: boolean
   onChange: (next: string) => void
+  onRevert?: () => void
 }) {
   const { t } = useTranslation()
-  const tone = TONE_STYLES[field.tone]
 
   return (
     <label
       className={cn(
-        'group relative flex min-w-0 flex-col rounded-2xl border bg-background/80 transition-all duration-200',
+        'group relative flex min-w-0 flex-col rounded-xl border bg-background/80 transition-all',
         dense ? 'gap-1.5 p-2.5 sm:p-3' : 'gap-2 p-3 sm:p-3.5',
         changed
-          ? 'border-amber-500/35 bg-amber-500/[0.04] shadow-[0_0_0_3px_hsl(38_92%_50%/0.08)]'
-          : 'border-border/80 hover:border-border hover:bg-card hover:shadow-sm',
-        'focus-within:ring-[3px]',
-        tone.ring,
+          ? 'border-amber-500/40 bg-amber-500/5 ring-1 ring-amber-500/30'
+          : 'border-border/80 hover:border-border hover:bg-card',
+        'focus-within:border-primary/40 focus-within:ring-[3px] focus-within:ring-primary/15',
       )}
     >
-      <div className="flex items-center justify-between gap-2">
-        <span className="flex min-w-0 items-center gap-1.5">
-          <span className={cn('size-1.5 shrink-0 rounded-full', tone.dot)} aria-hidden />
+      <div className="flex items-center justify-between gap-1.5">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className={cn('size-1.5 shrink-0 rounded-full', TONE_DOT[field.tone])} aria-hidden />
           <span className="truncate text-[11px] font-semibold tracking-wide text-muted-foreground">
             {t(field.labelKey)}
           </span>
-        </span>
-        {changed ? (
-          <span className="size-1.5 shrink-0 rounded-full bg-amber-500 shadow-[0_0_0_3px_hsl(38_92%_50%/0.18)]" />
+        </div>
+        {changed && onRevert ? (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault()
+              onRevert()
+            }}
+            title={savedValue !== undefined ? `还原为 $${savedValue}` : '还原'}
+            className="flex size-5 items-center justify-center rounded-md text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
+          >
+            <Undo2 className="size-3" />
+          </button>
         ) : null}
       </div>
       <div className="relative">
@@ -247,47 +241,6 @@ function PriceField({
   )
 }
 
-function MetricChip({
-  label,
-  value,
-  active,
-  onClick,
-  accent,
-}: {
-  label: string
-  value: number
-  active?: boolean
-  onClick?: () => void
-  accent?: string
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'group relative min-w-0 flex-1 overflow-hidden rounded-2xl border px-3.5 py-3 text-left transition-all duration-200',
-        active
-          ? 'border-primary/35 bg-primary/[0.07] shadow-[0_8px_24px_-12px_color-mix(in_oklab,var(--color-primary)_45%,transparent)]'
-          : 'border-white/10 bg-white/5 hover:border-white/20 hover:bg-white/10 dark:border-white/8',
-      )}
-    >
-      <div className="text-[11px] font-semibold uppercase tracking-[0.08em] text-white/55">
-        {label}
-      </div>
-      <div className="mt-1.5 flex items-baseline gap-1.5">
-        <span className="text-2xl font-semibold tabular-nums tracking-tight text-white sm:text-[1.75rem]">
-          {value}
-        </span>
-      </div>
-      <span
-        aria-hidden
-        className="pointer-events-none absolute -right-3 -top-3 size-14 rounded-full opacity-40 blur-2xl transition-opacity group-hover:opacity-70"
-        style={{ background: accent || 'hsl(var(--color-primary))' }}
-      />
-    </button>
-  )
-}
-
 export default function ModelPricing() {
   const { t } = useTranslation()
   const { showToast } = useToast()
@@ -296,9 +249,20 @@ export default function ModelPricing() {
   const [syncUrl, setSyncUrl] = useState('')
   const [defaultUrl, setDefaultUrl] = useState('')
   const [modelsDevUrl, setModelsDevUrl] = useState('')
+  const [officialOpenAIUrl, setOfficialOpenAIUrl] = useState('')
+  const [officialXAIUrl, setOfficialXAIUrl] = useState('')
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
+  const [bulkSaving, setBulkSaving] = useState(false)
+  const [officialSyncing, setOfficialSyncing] = useState(false)
+  const [officialSaving, setOfficialSaving] = useState(false)
+  const [officialConfig, setOfficialConfig] = useState<OfficialPricingSyncConfig>({
+    enabled: false,
+    interval_minutes: 1440,
+    include_openai: true,
+    include_grok: true,
+  })
   const [savingModel, setSavingModel] = useState('')
   const [query, setQuery] = useState('')
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
@@ -313,7 +277,10 @@ export default function ModelPricing() {
       setRows(res.models)
       setDefaultUrl(res.default_sync_url)
       setModelsDevUrl(res.models_dev_url)
+      setOfficialOpenAIUrl(res.official_openai_url)
+      setOfficialXAIUrl(res.official_xai_url)
       setSyncUrl(res.sync_url || '')
+      setOfficialConfig(res.official_sync_config)
       const d: Record<string, ModelPricingOverride> = {}
       for (const r of res.models) d[r.model] = { ...r.pricing }
       setDrafts(d)
@@ -338,6 +305,16 @@ export default function ModelPricing() {
     }))
   }
 
+  const revertField = (model: string, key: keyof ModelPricingOverride) => {
+    const row = rows.find((r) => r.model === model)
+    if (!row) return
+    const origVal = row.pricing[key] ?? 0
+    setDrafts((prev) => ({
+      ...prev,
+      [model]: { ...prev[model], [key]: origVal },
+    }))
+  }
+
   const save = async (model: string) => {
     setSavingModel(model)
     try {
@@ -349,6 +326,28 @@ export default function ModelPricing() {
     } finally {
       setSavingModel('')
     }
+  }
+
+  const saveAllDirty = async () => {
+    setBulkSaving(true)
+    try {
+      const dirtyModels = rows.filter((r) => isDirty(drafts[r.model], r.pricing))
+      for (const r of dirtyModels) {
+        await api.updateModelPricing({ model: r.model, pricing: drafts[r.model] })
+      }
+      showToast(t('settings.pricing.saved', { model: `${dirtyModels.length}` }))
+      await load()
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setBulkSaving(false)
+    }
+  }
+
+  const discardAllChanges = () => {
+    const resetDrafts: Record<string, ModelPricingOverride> = {}
+    for (const r of rows) resetDrafts[r.model] = { ...r.pricing }
+    setDrafts(resetDrafts)
   }
 
   const reset = async (model: string) => {
@@ -377,6 +376,42 @@ export default function ModelPricing() {
     }
   }
 
+  const toggleAllAdvanced = () => {
+    const allExpanded = rows.every((r) => expandedAdvanced[r.model])
+    const nextState: Record<string, boolean> = {}
+    for (const r of rows) nextState[r.model] = !allExpanded
+    setExpandedAdvanced(nextState)
+  }
+
+  const saveOfficialConfig = async () => {
+    setOfficialSaving(true)
+    try {
+      const saved = await api.updateOfficialPricingSyncConfig(officialConfig)
+      setOfficialConfig(saved)
+      showToast(t('settings.pricing.officialConfigSaved'))
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setOfficialSaving(false)
+    }
+  }
+
+  const syncOfficial = async () => {
+    setOfficialSyncing(true)
+    try {
+      const result = await api.syncOfficialModelPricing({
+        include_openai: officialConfig.include_openai,
+        include_grok: officialConfig.include_grok,
+      })
+      showToast(t('settings.pricing.officialSyncDone', { applied: result.applied, skipped: result.skipped }))
+      await load()
+    } catch (error) {
+      showToast(`${t('settings.pricing.syncFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setOfficialSyncing(false)
+    }
+  }
+
   const activePreset = useMemo(() => {
     const url = syncUrl.trim()
     if (url === '' || url === defaultUrl) return 'default'
@@ -388,43 +423,50 @@ export default function ModelPricing() {
     let custom = 0
     let synced = 0
     let defaults = 0
+    let unsaved = 0
     for (const r of rows) {
       if (r.source === 'custom') custom += 1
       else if (r.source === 'synced') synced += 1
       else defaults += 1
-    }
-    return { total: rows.length, custom, synced, defaults }
-  }, [rows])
 
-  const dirtyCount = useMemo(() => {
-    let n = 0
-    for (const r of rows) {
-      if (isDirty(drafts[r.model], r.pricing)) n += 1
+      if (isDirty(drafts[r.model], r.pricing)) unsaved += 1
     }
-    return n
+    return { total: rows.length, custom, synced, defaults, unsaved }
   }, [drafts, rows])
+
+  const dirtyCount = counts.unsaved
 
   const filteredRows = useMemo(() => {
     const q = query.trim().toLowerCase()
     return rows
       .filter((r) => {
-        if (sourceFilter !== 'all' && r.source !== sourceFilter) return false
+        if (sourceFilter === 'unsaved') {
+          if (!isDirty(drafts[r.model], r.pricing)) return false
+        } else if (sourceFilter !== 'all' && r.source !== sourceFilter) {
+          return false
+        }
         if (q && !r.model.toLowerCase().includes(q)) return false
         return true
       })
       .slice()
       .sort((a, b) => compareModelsNewestFirst(a.model, b.model))
-  }, [query, rows, sourceFilter])
+  }, [drafts, query, rows, sourceFilter])
 
   const sourceFilters: Array<{ id: SourceFilter; label: string; count: number }> = [
     { id: 'all', label: t('settings.pricing.filterAll'), count: counts.total },
     { id: 'custom', label: t('settings.pricing.source.custom'), count: counts.custom },
     { id: 'synced', label: t('settings.pricing.source.synced'), count: counts.synced },
     { id: 'default', label: t('settings.pricing.source.default'), count: counts.defaults },
+    { id: 'unsaved', label: t('settings.pricing.filterUnsaved'), count: counts.unsaved },
   ]
 
+  const isAllAdvancedExpanded = useMemo(() => {
+    if (rows.length === 0) return false
+    return rows.every((r) => expandedAdvanced[r.model])
+  }, [expandedAdvanced, rows])
+
   return (
-    <div className="w-full min-w-0">
+    <div className="relative pb-16 w-full min-w-0">
       <PageHeader
         title={t('settings.pricing.title')}
         description={t('settings.pricing.desc')}
@@ -450,88 +492,36 @@ export default function ModelPricing() {
         onRetry={() => void load()}
       >
         <div className="space-y-5 sm:space-y-6">
-          {/* Hero metrics */}
-          <section className="relative overflow-hidden rounded-[28px] border border-border/60 bg-[hsl(222_28%_12%)] text-white shadow-[0_24px_60px_-28px_rgba(15,23,42,0.55)] dark:bg-[hsl(222_20%_10%)]">
-            <div
-              aria-hidden
-              className="pointer-events-none absolute inset-0 opacity-90"
-              style={{
-                background:
-                  'radial-gradient(ellipse 80% 70% at 0% 0%, hsl(214 84% 54% / 0.45), transparent 55%), radial-gradient(ellipse 60% 50% at 100% 20%, hsl(262 70% 58% / 0.28), transparent 50%), radial-gradient(ellipse 50% 40% at 70% 100%, hsl(190 70% 45% / 0.2), transparent 45%)',
-              }}
+          {/* Source metrics */}
+          <div className="grid grid-cols-2 gap-2.5 sm:gap-4 xl:grid-cols-4">
+            <StatTile
+              label={t('settings.pricing.statTotal')}
+              value={counts.total}
+              sub={t('settings.pricing.unitHint')}
+              active={sourceFilter === 'all'}
+              onClick={() => setSourceFilter('all')}
             />
-            <div
-              aria-hidden
-              className="pointer-events-none absolute inset-0 opacity-[0.12]"
-              style={{
-                backgroundImage:
-                  'linear-gradient(to right, rgba(255,255,255,0.08) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.08) 1px, transparent 1px)',
-                backgroundSize: '28px 28px',
-                maskImage: 'linear-gradient(to bottom, black, transparent 90%)',
-              }}
+            <StatTile
+              label={t('settings.pricing.statCustom')}
+              value={counts.custom}
+              active={sourceFilter === 'custom'}
+              onClick={() => setSourceFilter('custom')}
             />
+            <StatTile
+              label={t('settings.pricing.statSynced')}
+              value={counts.synced}
+              active={sourceFilter === 'synced'}
+              onClick={() => setSourceFilter('synced')}
+            />
+            <StatTile
+              label={t('settings.pricing.statDefault')}
+              value={counts.defaults}
+              active={sourceFilter === 'default'}
+              onClick={() => setSourceFilter('default')}
+            />
+          </div>
 
-            <div className="relative z-10 p-5 sm:p-7">
-              <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
-                <div className="max-w-xl">
-                  <div className="inline-flex items-center gap-1.5 rounded-full border border-white/12 bg-white/8 px-2.5 py-1 text-[11px] font-semibold tracking-wide text-white/80 backdrop-blur-sm">
-                    <Sparkles className="size-3" />
-                    {t('settings.pricing.heroBadge')}
-                  </div>
-                  <h3 className="mt-3 text-[1.65rem] font-semibold leading-tight tracking-tight text-white sm:text-[2rem]">
-                    {t('settings.pricing.heroTitle')}
-                  </h3>
-                  <p className="mt-2 max-w-lg text-sm leading-relaxed text-white/65">
-                    {t('settings.pricing.heroDesc')}
-                  </p>
-                </div>
-                <div className="flex flex-wrap items-center gap-2 text-[12px] text-white/60">
-                  <span className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1">
-                    <span className="size-1.5 rounded-full bg-emerald-400" />
-                    {t('settings.pricing.unitHint')}
-                  </span>
-                  {dirtyCount > 0 ? (
-                    <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/25 bg-amber-400/10 px-2.5 py-1 text-amber-100">
-                      {t('settings.pricing.unsavedCount', { count: dirtyCount })}
-                    </span>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="mt-6 grid grid-cols-2 gap-2.5 lg:grid-cols-4">
-                <MetricChip
-                  label={t('settings.pricing.statTotal')}
-                  value={counts.total}
-                  active={sourceFilter === 'all'}
-                  onClick={() => setSourceFilter('all')}
-                  accent="hsl(214 84% 56%)"
-                />
-                <MetricChip
-                  label={t('settings.pricing.statCustom')}
-                  value={counts.custom}
-                  active={sourceFilter === 'custom'}
-                  onClick={() => setSourceFilter('custom')}
-                  accent="hsl(214 90% 60%)"
-                />
-                <MetricChip
-                  label={t('settings.pricing.statSynced')}
-                  value={counts.synced}
-                  active={sourceFilter === 'synced'}
-                  onClick={() => setSourceFilter('synced')}
-                  accent="hsl(190 80% 50%)"
-                />
-                <MetricChip
-                  label={t('settings.pricing.statDefault')}
-                  value={counts.defaults}
-                  active={sourceFilter === 'default'}
-                  onClick={() => setSourceFilter('default')}
-                  accent="hsl(40 90% 55%)"
-                />
-              </div>
-            </div>
-          </section>
-
-          {/* Sync panel (collapsible) */}
+          {/* Sync panel */}
           <div
             className={cn(
               'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
@@ -539,10 +529,10 @@ export default function ModelPricing() {
             )}
           >
             <div className="min-h-0 overflow-hidden">
-              <section className="rounded-3xl border border-border/80 bg-card p-4 shadow-sm sm:p-5">
+              <section className="rounded-xl border border-border/80 bg-card p-4 shadow-sm sm:p-5">
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
                   <div className="flex min-w-0 flex-1 gap-3">
-                    <div className="flex size-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-primary/15 to-primary/5 text-primary ring-1 ring-primary/15">
+                    <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary ring-1 ring-inset ring-primary/15">
                       <CloudDownload className="size-5" />
                     </div>
                     <div className="min-w-0">
@@ -574,6 +564,66 @@ export default function ModelPricing() {
                 </div>
 
                 <div className="mt-5 space-y-3">
+					<div className="rounded-xl border border-primary/20 bg-primary/[0.03] p-4">
+						<div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+							<div>
+								<div className="flex flex-wrap items-center gap-2">
+									<h4 className="text-sm font-semibold text-foreground">{t('settings.pricing.officialTitle')}</h4>
+									<span className="rounded-full bg-emerald-500/10 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:text-emerald-300">{t('settings.pricing.authoritative')}</span>
+								</div>
+								<p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t('settings.pricing.officialDesc')}</p>
+								<div className="mt-2 flex flex-wrap gap-3 text-[11px] font-semibold">
+									<a href={officialOpenAIUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-primary hover:underline">OpenAI <ArrowUpRight className="size-3" /></a>
+									<a href={officialXAIUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-primary hover:underline">xAI <ArrowUpRight className="size-3" /></a>
+								</div>
+							</div>
+							<Button className="shrink-0" onClick={() => void syncOfficial()} disabled={officialSyncing || (!officialConfig.include_openai && !officialConfig.include_grok)}>
+								{officialSyncing ? <Loader2 className="size-3.5 animate-spin" /> : <CloudDownload className="size-3.5" />}
+								{officialSyncing ? t('settings.pricing.syncing') : t('settings.pricing.officialSyncNow')}
+							</Button>
+						</div>
+						<div className="mt-4 grid gap-3 sm:grid-cols-2">
+							<label className="flex items-center justify-between gap-3 rounded-lg border border-border bg-background/80 px-3 py-2.5">
+								<span className="text-sm font-medium">OpenAI / Codex</span>
+								<Switch checked={officialConfig.include_openai} onCheckedChange={(checked) => setOfficialConfig((cfg) => ({ ...cfg, include_openai: checked }))} />
+							</label>
+							<label className="flex items-center justify-between gap-3 rounded-lg border border-border bg-background/80 px-3 py-2.5">
+								<span className="text-sm font-medium">xAI / Grok</span>
+								<Switch checked={officialConfig.include_grok} onCheckedChange={(checked) => setOfficialConfig((cfg) => ({ ...cfg, include_grok: checked }))} />
+							</label>
+						</div>
+						<div className="mt-3 flex flex-col gap-3 rounded-lg border border-border bg-background/80 p-3 sm:flex-row sm:items-center">
+							<label className="flex flex-1 items-center justify-between gap-3">
+								<span>
+									<span className="block text-sm font-medium">{t('settings.pricing.autoOfficialSync')}</span>
+									<span className="block text-[11px] text-muted-foreground">{t('settings.pricing.autoOfficialSyncHint')}</span>
+								</span>
+								<Switch checked={officialConfig.enabled} onCheckedChange={(enabled) => setOfficialConfig((cfg) => ({ ...cfg, enabled }))} />
+							</label>
+							<label className="flex items-center gap-2 text-xs text-muted-foreground">
+								{t('settings.pricing.intervalMinutes')}
+								<Input
+									type="number"
+									min={60}
+									max={10080}
+									className="h-9 w-28"
+									value={officialConfig.interval_minutes}
+									onChange={(event) => setOfficialConfig((cfg) => ({ ...cfg, interval_minutes: Number(event.target.value) }))}
+								/>
+							</label>
+							<Button variant="outline" size="sm" onClick={() => void saveOfficialConfig()} disabled={officialSaving || (!officialConfig.include_openai && !officialConfig.include_grok)}>
+								{officialSaving ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
+								{t('common.save')}
+							</Button>
+						</div>
+						{officialConfig.last_success_at ? (
+							<p className="mt-2 text-[11px] text-muted-foreground">{t('settings.pricing.lastOfficialSuccess')}: {new Date(officialConfig.last_success_at).toLocaleString()}</p>
+						) : null}
+						{officialConfig.last_error ? <p className="mt-1 break-all text-[11px] text-destructive">{officialConfig.last_error}</p> : null}
+						{officialConfig.last_warning ? <p className="mt-1 break-all text-[11px] text-amber-700 dark:text-amber-300">{t('settings.pricing.lastWarning')}: {officialConfig.last_warning}</p> : null}
+					</div>
+
+					<div className="pt-1 text-xs font-semibold text-muted-foreground">{t('settings.pricing.referenceTitle')}</div>
                   <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center">
                     <div className="relative min-w-0 flex-1">
                       <Link2 className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -631,7 +681,7 @@ export default function ModelPricing() {
                     </button>
                   </div>
 
-                  <p className="rounded-2xl border border-dashed border-border/80 bg-muted/25 px-3.5 py-3 text-[12px] leading-relaxed text-muted-foreground">
+                  <p className="rounded-xl border border-dashed border-border/80 bg-muted/25 px-3.5 py-3 text-[12px] leading-relaxed text-muted-foreground">
                     {t('settings.pricing.hint')}
                   </p>
                 </div>
@@ -641,15 +691,29 @@ export default function ModelPricing() {
 
           {/* Sticky toolbar */}
           <div className="sticky top-2 z-20 -mx-1 px-1">
-            <div className="flex flex-col gap-3 rounded-2xl border border-border/80 bg-card/90 p-2.5 shadow-[0_8px_30px_-18px_rgba(15,23,42,0.35)] backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between sm:p-2 sm:pl-3">
-              <div className="relative min-w-0 flex-1 sm:max-w-xs">
-                <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  className="h-9 border-transparent bg-muted/40 pl-9 text-sm shadow-none focus-visible:bg-background"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder={t('settings.pricing.searchPlaceholder')}
-                />
+            <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-card/95 p-2.5 shadow-sm backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between sm:p-2 sm:pl-3">
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <div className="relative min-w-0 flex-1 sm:max-w-xs">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    className="h-9 border-transparent bg-muted/40 pl-9 text-sm shadow-none focus-visible:bg-background"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder={t('settings.pricing.searchPlaceholder')}
+                  />
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={toggleAllAdvanced}
+                  className="h-9 shrink-0 gap-1.5 px-2.5 text-xs text-muted-foreground hover:text-foreground"
+                  title={isAllAdvancedExpanded ? t('settings.pricing.collapseAllAdvanced') : t('settings.pricing.expandAllAdvanced')}
+                >
+                  <ChevronsUpDown className="size-3.5" />
+                  <span className="hidden min-[540px]:inline">
+                    {isAllAdvancedExpanded ? t('settings.pricing.collapseAllAdvanced') : t('settings.pricing.expandAllAdvanced')}
+                  </span>
+                </Button>
               </div>
 
               <div
@@ -666,7 +730,7 @@ export default function ModelPricing() {
                       aria-selected={active}
                       onClick={() => setSourceFilter(item.id)}
                       className={cn(
-                        'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[10px] px-2.5 text-xs font-semibold transition-all',
+                        'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold transition-all',
                         active
                           ? 'bg-background text-foreground shadow-sm'
                           : 'text-muted-foreground hover:text-foreground',
@@ -676,7 +740,13 @@ export default function ModelPricing() {
                       <span
                         className={cn(
                           'tabular-nums rounded-md px-1 py-px text-[10px] font-bold',
-                          active ? 'bg-primary/10 text-primary' : 'bg-background/60 text-muted-foreground',
+                          active
+                            ? item.id === 'unsaved' && item.count > 0
+                              ? 'bg-amber-500/20 text-amber-600 dark:text-amber-400'
+                              : 'bg-primary/10 text-primary'
+                            : item.id === 'unsaved' && item.count > 0
+                              ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                              : 'bg-background/60 text-muted-foreground',
                         )}
                       >
                         {item.count}
@@ -703,42 +773,44 @@ export default function ModelPricing() {
             </StateShell>
           ) : (
             <div className="space-y-3.5">
-              <div className="flex items-center justify-between px-1">
+              <div className="flex flex-wrap items-center justify-between gap-2 px-1">
                 <p className="text-xs font-medium text-muted-foreground">
                   {t('settings.pricing.listCount', {
                     shown: filteredRows.length,
                     total: counts.total,
                   })}
                 </p>
+                {dirtyCount > 0 ? (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-300">
+                    {t('settings.pricing.unsavedCount', { count: dirtyCount })}
+                  </span>
+                ) : null}
               </div>
 
               {filteredRows.map((r) => {
                 const draft = drafts[r.model] ?? {}
                 const dirty = isDirty(draft, r.pricing)
-                const busy = savingModel === r.model
+                const advDirty = isAdvancedDirty(draft, r.pricing)
+                const busy = savingModel === r.model || bulkSaving
                 const source = sourceMeta(r.source)
                 const advancedOpen = expandedAdvanced[r.model] ?? false
-                const advancedDirty = ADVANCED_FIELDS.some(
-                  (f) => normalizePrice(draft[f.key]) !== normalizePrice(r.pricing[f.key]),
-                )
                 const inputVal = normalizePrice(draft.input)
                 const outputVal = normalizePrice(draft.output)
+                const multiplier = getOutputMultiplier(inputVal, outputVal)
 
                 return (
                   <article
                     key={r.model}
                     className={cn(
-                      'group/card relative overflow-hidden rounded-[24px] border bg-card transition-all duration-300',
-                      dirty
-                        ? 'border-primary/30 shadow-[0_18px_50px_-28px_color-mix(in_oklab,var(--color-primary)_55%,transparent)] ring-1 ring-primary/10'
-                        : 'border-border/80 shadow-[0_1px_0_rgba(15,23,42,0.03)] hover:border-border hover:shadow-[0_16px_40px_-28px_rgba(15,23,42,0.28)]',
+                      'group/card relative overflow-hidden rounded-xl border bg-card shadow-sm transition-all hover:border-border',
+                      dirty ? 'border-amber-500/30' : 'border-border/80',
                     )}
                   >
                     <div className="p-4 sm:p-5">
                       {/* Header */}
                       <div className="flex flex-col gap-3.5 sm:flex-row sm:items-start sm:justify-between">
                         <div className="flex min-w-0 items-start gap-3.5">
-                          <ModelLogo model={r.model} size={44} variant="ring" className="rounded-2xl" />
+                          <ModelLogo model={r.model} size={44} variant="ring" className="rounded-xl" />
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
                               <h4 className="truncate font-mono text-[15px] font-semibold tracking-tight text-foreground sm:text-base">
@@ -754,8 +826,8 @@ export default function ModelPricing() {
                                 {t(source.labelKey)}
                               </span>
                               {dirty ? (
-                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/12 px-2 py-0.5 text-[10px] font-bold text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-300">
-                                  <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-300">
+                                  <span className="size-1.5 rounded-full bg-amber-500" />
                                   {t('settings.pricing.unsaved')}
                                 </span>
                               ) : (
@@ -765,18 +837,25 @@ export default function ModelPricing() {
                                 </span>
                               )}
                             </div>
-                            <p className="mt-1 text-[12px] text-muted-foreground">
-                              <span className="font-medium text-foreground/80">
-                                ${formatPriceDisplay(inputVal)}
+                            <div className="mt-1 flex flex-wrap items-center gap-2 text-[12px] text-muted-foreground">
+                              <span>
+                                <span className="font-semibold tabular-nums text-foreground">
+                                  ${formatPriceDisplay(inputVal)}
+                                </span>
+                                <span className="mx-1 text-border">→</span>
+                                <span className="font-semibold tabular-nums text-foreground">
+                                  ${formatPriceDisplay(outputVal)}
+                                </span>
+                                <span className="ml-1 text-muted-foreground/80">
+                                  {t('settings.pricing.perMillion')}
+                                </span>
                               </span>
-                              <span className="mx-1.5 text-border">→</span>
-                              <span className="font-medium text-foreground/80">
-                                ${formatPriceDisplay(outputVal)}
-                              </span>
-                              <span className="ml-1.5 text-muted-foreground/80">
-                                {t('settings.pricing.perMillion')}
-                              </span>
-                            </p>
+                              {multiplier ? (
+                                <span className="rounded bg-muted/60 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-muted-foreground">
+                                  {t('settings.pricing.multiplier', { ratio: multiplier })}
+                                </span>
+                              ) : null}
+                            </div>
                           </div>
                         </div>
 
@@ -795,12 +874,7 @@ export default function ModelPricing() {
                           ) : null}
                           <Button
                             size="sm"
-                            className={cn(
-                              'h-9 min-w-[96px] rounded-xl transition-all',
-                              dirty
-                                ? 'shadow-[0_8px_20px_-10px_color-mix(in_oklab,var(--color-primary)_70%,transparent)]'
-                                : '',
-                            )}
+                            className="h-9 min-w-[96px] rounded-xl"
                             disabled={busy || !dirty}
                             onClick={() => void save(r.model)}
                           >
@@ -821,10 +895,12 @@ export default function ModelPricing() {
                             key={field.key}
                             field={field}
                             value={normalizePrice(draft[field.key])}
+                            savedValue={normalizePrice(r.pricing[field.key])}
                             changed={
                               normalizePrice(draft[field.key]) !== normalizePrice(r.pricing[field.key])
                             }
                             onChange={(next) => setField(r.model, field.key, next)}
+                            onRevert={() => revertField(r.model, field.key)}
                           />
                         ))}
                       </div>
@@ -849,9 +925,10 @@ export default function ModelPricing() {
                               )}
                             />
                             {t('settings.pricing.advancedRates')}
-                            {advancedDirty ? (
-                              <span className="rounded-full bg-amber-500/12 px-1.5 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300">
-                                {t('settings.pricing.unsaved')}
+                            {!advancedOpen && advDirty ? (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-600 dark:text-amber-400">
+                                <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+                                {t('settings.pricing.hasAdvancedDirty')}
                               </span>
                             ) : null}
                           </span>
@@ -874,11 +951,13 @@ export default function ModelPricing() {
                                   field={field}
                                   dense
                                   value={normalizePrice(draft[field.key])}
+                                  savedValue={normalizePrice(r.pricing[field.key])}
                                   changed={
                                     normalizePrice(draft[field.key]) !==
                                     normalizePrice(r.pricing[field.key])
                                   }
                                   onChange={(next) => setField(r.model, field.key, next)}
+                                  onRevert={() => revertField(r.model, field.key)}
                                 />
                               ))}
                             </div>
@@ -893,6 +972,47 @@ export default function ModelPricing() {
           )}
         </div>
       </StateShell>
+
+      {/* 底部未保存批量操作悬浮条 */}
+      {dirtyCount > 0 ? (
+        <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 px-4 max-w-lg w-full animate-in fade-in slide-in-from-bottom-4 duration-200">
+          <div className="flex items-center justify-between gap-3 rounded-2xl border border-amber-500/30 bg-card/95 p-3 shadow-xl backdrop-blur-xl ring-1 ring-amber-500/20">
+            <div className="flex items-center gap-2.5 pl-1 min-w-0">
+              <span className="relative flex size-2.5 shrink-0">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-400 opacity-75" />
+                <span className="relative inline-flex size-2.5 rounded-full bg-amber-500" />
+              </span>
+              <span className="truncate text-xs font-semibold text-foreground">
+                {t('settings.pricing.unsavedFloatingBar', { count: dirtyCount })}
+              </span>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-8 rounded-xl px-2.5 text-xs text-muted-foreground hover:text-foreground"
+                onClick={discardAllChanges}
+                disabled={bulkSaving}
+              >
+                {t('settings.pricing.discardAll')}
+              </Button>
+              <Button
+                size="sm"
+                className="h-8 rounded-xl px-3.5 text-xs font-semibold"
+                onClick={() => void saveAllDirty()}
+                disabled={bulkSaving}
+              >
+                {bulkSaving ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : (
+                  <Save className="size-3" />
+                )}
+                {bulkSaving ? t('settings.pricing.savingAll') : t('settings.pricing.saveAll')}
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

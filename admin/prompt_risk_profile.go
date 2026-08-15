@@ -224,14 +224,56 @@ func (h *Handler) attachPromptConversationLocks(ctx context.Context, profiles []
 	if h == nil || h.db == nil {
 		return
 	}
+	lockTTL := time.Duration(promptfilter.DefaultAdvancedConfig().Enforcement.ConversationLockTTLHours) * time.Hour
+	userCooldownTTL := time.Duration(promptfilter.DefaultAdvancedConfig().Enforcement.UserCyberCooldownMinutes) * time.Minute
+	if h.store != nil {
+		cfg := h.store.GetPromptFilterConfig()
+		normalized := promptfilter.NormalizeAdvancedConfig(cfg.Advanced)
+		lockTTL = time.Duration(normalized.Enforcement.ConversationLockTTLHours) * time.Hour
+		userCooldownTTL = time.Duration(normalized.Enforcement.UserCyberCooldownMinutes) * time.Minute
+	}
 	for _, profile := range profiles {
-		if profile == nil || profile.SubjectType != database.PromptRiskSubjectSession || strings.TrimSpace(profile.SubjectKey) == "" {
+		if profile == nil {
 			continue
 		}
-		item, err := h.db.GetActivePromptConversationLockBySessionHash(ctx, profile.SubjectKey)
-		if err == nil {
-			profile.ConversationLock = item
+		switch profile.SubjectType {
+		case database.PromptRiskSubjectSession:
+			if strings.TrimSpace(profile.SubjectKey) == "" {
+				continue
+			}
+			item, err := h.db.GetActivePromptConversationLockBySessionHashWithTTL(ctx, profile.SubjectKey, lockTTL)
+			if err == nil {
+				decoratePromptConversationRestriction(item, database.PromptConversationRestrictionScopeConversation, lockTTL)
+				profile.ConversationLock = item
+			}
+		case database.PromptRiskSubjectNewAPIUser:
+			if strings.TrimSpace(profile.Platform) == "" || strings.TrimSpace(profile.NewAPIUserID) == "" {
+				continue
+			}
+			item, _, err := h.db.GetActivePromptConversationRestriction(
+				ctx, "", profile.Platform, profile.NewAPIUserID, lockTTL, userCooldownTTL,
+			)
+			if err == nil {
+				decoratePromptConversationRestriction(item, database.PromptConversationRestrictionScopeUserCooldown, userCooldownTTL)
+				profile.ConversationLock = item
+			}
 		}
+	}
+}
+
+func decoratePromptConversationRestriction(item *database.PromptConversationLock, scope string, ttl time.Duration) {
+	if item == nil {
+		return
+	}
+	item.RestrictionScope = scope
+	if ttl <= 0 || item.LockedAt.IsZero() {
+		return
+	}
+	expiresAt := item.LockedAt.UTC().Add(ttl)
+	item.ExpiresAt = &expiresAt
+	remaining := time.Until(expiresAt)
+	if remaining > 0 {
+		item.RemainingSeconds = int64((remaining + time.Second - 1) / time.Second)
 	}
 }
 

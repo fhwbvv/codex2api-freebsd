@@ -23,6 +23,116 @@ func TestNormalizeServiceTierField(t *testing.T) {
 	}
 }
 
+func TestTranslateRequestRejectsOrphanToolMessage(t *testing.T) {
+	_, err := TranslateRequest([]byte(`{"model":"grok-4.5","messages":[{"role":"tool","content":"result"}]}`))
+	if err == nil || !strings.Contains(err.Error(), "tool_call_id") {
+		t.Fatalf("orphan tool message error = %v", err)
+	}
+}
+
+func TestTranslateRequestRejectsUnknownToolCallID(t *testing.T) {
+	raw := []byte(`{
+		"model":"grok-4.5",
+		"messages":[
+			{"role":"assistant","tool_calls":[{"id":"call_known","type":"function","function":{"name":"lookup","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_unknown","content":"result"}
+		]
+	}`)
+	_, err := TranslateRequest(raw)
+	if err == nil || !strings.Contains(err.Error(), `unknown tool_call_id "call_unknown"`) {
+		t.Fatalf("unknown tool call error = %v", err)
+	}
+}
+
+func TestTranslateRequestAcceptsParallelToolResults(t *testing.T) {
+	raw := []byte(`{
+		"model":"grok-4.5",
+		"messages":[
+			{"role":"assistant","tool_calls":[
+				{"id":"call_a","type":"function","function":{"name":"first","arguments":"{}"}},
+				{"id":"call_b","type":"function","function":{"name":"second","arguments":"{}"}}
+			]},
+			{"role":"tool","tool_call_id":"call_b","content":"B"},
+			{"role":"tool","tool_call_id":"call_a","content":"A"}
+		]
+	}`)
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("parallel tool results should be valid: %v", err)
+	}
+	count := 0
+	for _, item := range gjson.GetBytes(got, "input").Array() {
+		if item.Get("type").String() == "function_call_output" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("function_call_output count = %d, want 2; body=%s", count, got)
+	}
+}
+
+func TestTranslateChatToResponsesForGrokPreservesControls(t *testing.T) {
+	raw := []byte(`{
+		"model":"grok-4.5",
+		"messages":[{"role":"user","content":"hello"}],
+		"temperature":0.25,
+		"top_p":0.8,
+		"max_tokens":111,
+		"max_completion_tokens":222,
+		"stop":["END","DONE"],
+		"seed":17,
+		"presence_penalty":0.2,
+		"frequency_penalty":-0.1,
+		"parallel_tool_calls":false,
+		"tools":[{"type":"function","function":{"name":"lookup","description":"Lookup","parameters":{"type":"object","uniqueItems":true}}}],
+		"tool_choice":{"type":"function","function":{"name":"lookup"}},
+		"response_format":{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","uniqueItems":true}}}
+	}`)
+	got, err := TranslateChatToResponsesForGrok(raw)
+	if err != nil {
+		t.Fatalf("TranslateChatToResponsesForGrok: %v", err)
+	}
+	checks := map[string]string{
+		"temperature":             "0.25",
+		"top_p":                   "0.8",
+		"max_output_tokens":       "222",
+		"stop.0":                  "END",
+		"stop.1":                  "DONE",
+		"seed":                    "17",
+		"presence_penalty":        "0.2",
+		"frequency_penalty":       "-0.1",
+		"tool_choice.type":        "function",
+		"tool_choice.name":        "lookup",
+		"text.format.type":        "json_schema",
+		"text.format.name":        "answer",
+		"tools.0.parameters.type": "object",
+	}
+	for path, want := range checks {
+		if value := gjson.GetBytes(got, path); value.String() != want {
+			t.Fatalf("%s = %q, want %q; body=%s", path, value.String(), want, got)
+		}
+	}
+	if value := gjson.GetBytes(got, "parallel_tool_calls"); !value.Exists() || value.Bool() {
+		t.Fatalf("parallel_tool_calls should preserve explicit false; body=%s", got)
+	}
+	if !gjson.GetBytes(got, "tools.0.parameters.uniqueItems").Bool() || !gjson.GetBytes(got, "text.format.schema.uniqueItems").Bool() {
+		t.Fatalf("Grok canonical conversion must not apply Codex schema stripping; body=%s", got)
+	}
+}
+
+func TestTranslateRequestRemainsCodexSafeWhenChatControlsPresent(t *testing.T) {
+	raw := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"temperature":0.25,"max_tokens":10,"stop":"END","tool_choice":"none"}`)
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"temperature", "max_output_tokens", "stop", "tool_choice"} {
+		if gjson.GetBytes(got, field).Exists() {
+			t.Fatalf("Codex converter unexpectedly retained %s; body=%s", field, got)
+		}
+	}
+}
+
 func TestResolveServiceTier(t *testing.T) {
 	if got := resolveServiceTier("fast", "default"); got != "fast" {
 		t.Fatalf("expected actual tier to win, got %q", got)
@@ -214,6 +324,74 @@ func TestPrepareResponsesBody_DropsUnsupportedClientServiceTier(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_BridgesToolMessageImage(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[
+			{"role":"user","content":"look"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shot","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":[
+				{"type":"text","text":"here it is"},
+				{"type":"image_url","image_url":{"url":"data:image/png;base64,QQQ"}}
+			]}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	out := gjson.GetBytes(got, `input.#(type=="function_call_output").output`).String()
+	if out != "here it is" {
+		t.Fatalf("function_call_output.output = %q, want text only", out)
+	}
+	if strings.Contains(out, "data:image") {
+		t.Fatalf("function_call_output leaked image: %q", out)
+	}
+	// 定位带 input_image 的合成 user 消息（可能不是第一条 user 消息）。
+	var found bool
+	for _, item := range gjson.GetBytes(got, "input").Array() {
+		if item.Get("role").String() != "user" {
+			continue
+		}
+		img := item.Get(`content.#(type=="input_image").image_url`).String()
+		if strings.Contains(img, "data:image/png;base64,QQQ") {
+			found = true
+			attr := item.Get(`content.#(type=="input_text").text`).String()
+			if !strings.Contains(attr, "Tool output image for call call_1") {
+				t.Fatalf("attribution text = %q, want call_1 attribution", attr)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("synthesized user message missing input_image; body=%s", got)
+	}
+}
+
+func TestTranslateRequest_ToolMessageWithoutImageUnchanged(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"shot","arguments":"{}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"plain string result"}
+		]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+	out := gjson.GetBytes(got, `input.#(type=="function_call_output").output`).String()
+	if out != "plain string result" {
+		t.Fatalf("function_call_output.output = %q, want unchanged string", out)
+	}
+	// tool 消息无图片时不产生合成 user 消息（只有原始的 assistant/function_call）。
+	if gjson.GetBytes(got, `input.#(type=="message")#|#(role=="user")`).Exists() {
+		t.Fatalf("unexpected synthesized user message; body=%s", got)
+	}
+}
+
 func TestTranslateRequest_NormalizesReasoningEffortAliases(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -299,6 +477,243 @@ func TestTranslateRequest_DropsInvalidRequiredInToolSchema(t *testing.T) {
 	nestedRequired := gjson.GetBytes(got, "tools.0.parameters.properties.metadata.required")
 	if nestedRequired.Raw != `["kind"]` {
 		t.Fatalf("nested required should keep only string entries, got %s; body=%s", nestedRequired.Raw, got)
+	}
+}
+
+// 显式为 null 的 parameters.type 上游必拒。function 工具补成 object，
+// 非 function 工具至少要把 null 摘掉（坏 schema 沉进多轮历史会每轮必 400）。
+func TestPrepareResponsesBodyFixesNullParametersType(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[
+			{"type":"function","name":"automation_update","parameters":{"type":null,"properties":{}}},
+			{"type":"tool_search","parameters":{"type":null}}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("null schema type survived: %s", got)
+	}
+	if typ := gjson.GetBytes(got, `tools.#(name=="automation_update").parameters.type`).String(); typ != "object" {
+		t.Fatalf("function tool parameters.type = %q, want object; body=%s", typ, got)
+	}
+	if gjson.GetBytes(got, `tools.#(type=="tool_search").parameters.type`).Exists() {
+		t.Fatalf("non-function tool should have the null type dropped; body=%s", got)
+	}
+}
+
+// 嵌套在 properties/items 里的 null type 同样要清掉。
+func TestPrepareResponsesBodyFixesNestedNullSchemaType(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{
+			"a":{"type":null},
+			"b":{"type":"array","items":{"type":null}}
+		}}}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("nested null schema type survived: %s", got)
+	}
+}
+
+// Responses Lite 把工具搬进 input[].additional_tools.tools[]，那里的坏 schema
+// 过去完全绕过顶层 tools[] 的全部修正直达上游。
+func TestPrepareResponsesBodyNormalizesAdditionalToolsSchemas(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"additional_tools","tools":[
+				{"type":"function","name":"automation_update","parameters":{"type":null,"properties":{}}}
+			]}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("null type inside additional_tools survived: %s", got)
+	}
+	var fixed bool
+	for _, item := range gjson.GetBytes(got, "input").Array() {
+		if item.Get("type").String() != "additional_tools" {
+			continue
+		}
+		if typ := item.Get(`tools.#(name=="automation_update").parameters.type`).String(); typ == "object" {
+			fixed = true
+		}
+	}
+	if !fixed {
+		t.Fatalf("additional_tools function schema was not normalized to object; body=%s", got)
+	}
+}
+
+// 保留工具（collaboration.*）必须逐字透传，清洗不得碰它（issue #342）。
+func TestPrepareResponsesBodyLeavesReservedToolsUntouched(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"additional_tools","tools":[
+				{"type":"function","name":"collaboration.create_task","parameters":{"type":null}}
+			]}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if !strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("reserved tool schema must pass through verbatim, even a null type; body=%s", got)
+	}
+}
+
+// additional_tools 里的工具常按 OpenAI SDK 惯例省掉顶层 type。补 type 的前置处理
+// 过去只跑在顶层 tools[]，于是这里的工具被判成非 function，parameters 只被摘掉
+// null 而拿不到 object 兜底，上游照旧回 `got 'type: "None"'`。
+func TestPrepareResponsesBodyNormalizesAdditionalToolsMissingType(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"additional_tools","tools":[
+				{"name":"automation_update","parameters":{"type":null,"properties":{}}}
+			]}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	var checked bool
+	for _, item := range gjson.GetBytes(got, "input").Array() {
+		if item.Get("type").String() != "additional_tools" {
+			continue
+		}
+		tool := item.Get(`tools.#(name=="automation_update")`)
+		if tool.Get("type").String() != "function" {
+			t.Fatalf("missing tool type was not filled in; tool=%s", tool.Raw)
+		}
+		if typ := tool.Get("parameters.type").String(); typ != "object" {
+			t.Fatalf("parameters.type = %q, want object; tool=%s", typ, tool.Raw)
+		}
+		checked = true
+	}
+	if !checked {
+		t.Fatalf("additional_tools carrier missing from output; body=%s", got)
+	}
+}
+
+// additional_tools 里的 Chat 形态嵌套 function 子对象过去完全不摊平，坏 schema
+// 连同 function 子对象一起原样送到上游。
+func TestPrepareResponsesBodyFlattensAdditionalToolsNestedFunction(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+			{"type":"additional_tools","tools":[
+				{"type":"function","function":{"name":"automation_update","parameters":{"type":null,"properties":{}}}}
+			]}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("null type survived inside additional_tools nested function; body=%s", got)
+	}
+	if strings.Contains(string(got), `"function":{`) {
+		t.Fatalf("nested function object was not flattened; body=%s", got)
+	}
+}
+
+// definitions 是 draft-07 的定义容器（pydantic v1、旧版 zod-to-json-schema 都生成
+// 它而不是 $defs）。递归下钻过去只认 $defs，藏在这里的坏 schema 全部放行。
+func TestSanitizeSchemaRecursesIntoDefinitions(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[{"type":"function","name":"f","parameters":{
+			"type":"object",
+			"properties":{"a":{"$ref":"#/definitions/A"}},
+			"definitions":{"A":{"type":null,"pattern":"^x$"}}
+		}}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("null type survived inside definitions; body=%s", got)
+	}
+	if strings.Contains(string(got), `"pattern"`) {
+		t.Fatalf("unsupported key survived inside definitions; body=%s", got)
+	}
+}
+
+// Chat Completions 路径共用同一套 sanitizer，definitions 缺口在那里同样存在。
+func TestTranslateRequestRecursesIntoDefinitions(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"f","parameters":{
+			"type":"object",
+			"properties":{"a":{"$ref":"#/definitions/A"}},
+			"definitions":{"A":{"type":null,"minLength":3}}
+		}}}]
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest: %v", err)
+	}
+	if strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("null type survived inside definitions on chat path; body=%s", got)
+	}
+	if strings.Contains(string(got), `"minLength"`) {
+		t.Fatalf("unsupported key survived inside definitions on chat path; body=%s", got)
+	}
+}
+
+// draft-07 的 tuple 校验把 items 写成数组，旧的下钻只对 map 形态生效。
+func TestSanitizeSchemaRecursesIntoTupleItems(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[{"type":"function","name":"f","parameters":{
+			"type":"object",
+			"properties":{"a":{"type":"array","items":[{"type":null},{"type":"string","pattern":"^x$"}]}}
+		}}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("null type survived inside tuple items; body=%s", got)
+	}
+	if strings.Contains(string(got), `"pattern"`) {
+		t.Fatalf("unsupported key survived inside tuple items; body=%s", got)
+	}
+}
+
+// 组合类关键字下的子 schema 同样要清洗，否则坏 schema 换个位置就能绕过。
+func TestSanitizeSchemaRecursesIntoCompositionKeywords(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[{"type":"function","name":"f","parameters":{
+			"type":"object",
+			"properties":{
+				"a":{"type":"array","prefixItems":[{"type":null}]},
+				"b":{"type":"object","patternProperties":{"^x":{"type":null}}},
+				"c":{"not":{"type":null}},
+				"d":{"if":{"type":null},"then":{"type":null},"else":{"type":null}},
+				"e":{"type":"object","propertyNames":{"type":null}},
+				"f":{"type":"array","contains":{"type":null}},
+				"g":{"type":"object","dependentSchemas":{"x":{"type":null}}}
+			}
+		}}]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	if strings.Contains(string(got), `"type":null`) {
+		t.Fatalf("null type survived under a composition keyword; body=%s", got)
 	}
 }
 
@@ -881,6 +1296,53 @@ func TestPrepareResponsesBody_SanitizesTextFormatJSONSchema(t *testing.T) {
 	}
 	if items := gjson.GetBytes(got, "text.format.schema.properties.steps.items"); !items.Exists() || items.Type != gjson.JSON {
 		t.Fatalf("array items should be injected in structured output schema, got %s; body=%s", items.Raw, got)
+	}
+}
+
+func TestPrepareResponsesBody_AlignsRequiredWithProperties(t *testing.T) {
+	// 复现上游报错：In context=('properties','candidates','items'),
+	// required 里出现了 properties 中不存在的 'title'，同时漏掉了已声明的 key。
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":"test",
+		"text":{
+			"format":{
+				"type":"json_schema",
+				"name":"codex_output_schema",
+				"strict":true,
+				"schema":{
+					"type":"object",
+					"properties":{
+						"candidates":{
+							"type":"array",
+							"items":{
+								"type":"object",
+								"properties":{
+									"name":{"type":"string"},
+									"score":{"type":"number"}
+								},
+								"required":["name","title"]
+							}
+						}
+					}
+				}
+			}
+		}
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	itemsRequired := gjson.GetBytes(got, "text.format.schema.properties.candidates.items.required")
+	var names []string
+	for _, v := range itemsRequired.Array() {
+		names = append(names, v.String())
+	}
+	if len(names) != 2 || names[0] != "name" || names[1] != "score" {
+		t.Fatalf("items.required should drop extra 'title' and backfill 'score', got %v; body=%s", names, got)
+	}
+	rootRequired := gjson.GetBytes(got, "text.format.schema.required")
+	if len(rootRequired.Array()) != 1 || rootRequired.Array()[0].String() != "candidates" {
+		t.Fatalf("root required should be backfilled to all property keys, got %s; body=%s", rootRequired.Raw, got)
 	}
 }
 
@@ -2117,6 +2579,53 @@ func TestInvalidEncryptedContentErrorDetection(t *testing.T) {
 	}
 }
 
+func TestIsPreviousResponseNotFoundBody(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{
+			name:    "http error body",
+			payload: `{"error":{"code":"previous_response_not_found","type":"invalid_request_error","message":"Previous response with id 'resp_1' not found."}}`,
+			want:    true,
+		},
+		{
+			name:    "response.failed frame",
+			payload: `{"type":"response.failed","response":{"status":"failed","error":{"code":"previous_response_not_found","type":"invalid_request_error","message":"Previous response with id 'resp_1' not found."}}}`,
+			want:    true,
+		},
+		{
+			name:    "bare error frame",
+			payload: `{"type":"error","code":"previous_response_not_found","message":"Previous response with id 'resp_1' not found."}`,
+			want:    true,
+		},
+		{
+			name:    "message only",
+			payload: `{"error":{"type":"invalid_request_error","message":"Previous response with id 'resp_1' not found."}}`,
+			want:    true,
+		},
+		{
+			name:    "unrelated upstream error",
+			payload: `{"error":{"code":"rate_limit_exceeded","type":"rate_limit_error","message":"slow down"}}`,
+			want:    false,
+		},
+		{
+			name:    "empty payload",
+			payload: ``,
+			want:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPreviousResponseNotFoundBody([]byte(tc.payload)); got != tc.want {
+				t.Fatalf("isPreviousResponseNotFoundBody(%s) = %v, want %v", tc.payload, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -2143,6 +2652,69 @@ func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 	}
 	if strings.Contains(string(got), "encrypted_content") {
 		t.Fatalf("encrypted_content should be removed from retry body: %s", got)
+	}
+}
+
+// 压缩项的 encrypted_content 是必填字段：只摘字段会留下 {"type":"compaction"}
+// 空壳，上游转而以 missing_required_parameter 再拒一次，而重试闸已经用掉。
+// 带密文的压缩项必须整项丢弃，与 reasoning 分支对称。
+func TestStripInvalidEncryptedContentDropsEncryptedCompactionItems(t *testing.T) {
+	for _, itemType := range []string{"compaction", "context_compaction", "compaction_summary"} {
+		t.Run(itemType, func(t *testing.T) {
+			raw := []byte(`{
+				"model":"gpt-5.4",
+				"input":[
+					{"type":"message","role":"user","content":"hello"},
+					{"type":"` + itemType + `","encrypted_content":"gAAA","summary":"stale"},
+					{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
+				]
+			}`)
+
+			got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
+			if !changed {
+				t.Fatalf("expected body to be changed")
+			}
+			items := gjson.GetBytes(got, "input").Array()
+			if len(items) != 2 {
+				t.Fatalf("expected encrypted %s item to be dropped whole, got %d items: %s", itemType, len(items), got)
+			}
+			// 不能留下空壳：改写后不应再出现该 type。
+			if strings.Contains(string(got), itemType) {
+				t.Fatalf("%s shell survived the strip: %s", itemType, got)
+			}
+			if strings.Contains(string(got), "encrypted_content") {
+				t.Fatalf("encrypted_content should be gone: %s", got)
+			}
+			if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call" {
+				t.Fatalf("function call should remain, got %q; body=%s", typ, got)
+			}
+		})
+	}
+}
+
+// 不带密文的压缩项没有账号绑定，原样保留（避免误伤正常压缩历史）。
+func TestStripInvalidEncryptedContentKeepsPlainCompactionItems(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"compaction","summary":"plain compaction, no ciphertext"},
+			{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"}
+		]
+	}`)
+
+	got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
+	if !changed {
+		t.Fatalf("expected body to be changed by the reasoning item")
+	}
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 1 {
+		t.Fatalf("plain compaction should survive, got %d items: %s", len(items), got)
+	}
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "compaction" {
+		t.Fatalf("input.0.type = %q, want compaction preserved; body=%s", typ, got)
+	}
+	if summary := gjson.GetBytes(got, "input.0.summary").String(); summary == "" {
+		t.Fatalf("plain compaction summary should be untouched; body=%s", got)
 	}
 }
 
@@ -2215,6 +2787,7 @@ func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
 func TestConvertMessagesToInput_ToolRole(t *testing.T) {
 	raw := []byte(`{
 		"messages":[
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"weather","arguments":"{}"}}]},
 			{"role":"tool","tool_call_id":"call_abc","content":"{\"temp\":72}"}
 		]
 	}`)
@@ -2228,7 +2801,7 @@ func TestConvertMessagesToInput_ToolRole(t *testing.T) {
 		t.Fatal("input should be an array")
 	}
 
-	item := input.Array()[0]
+	item := input.Array()[1]
 	if item.Get("type").String() != "function_call_output" {
 		t.Fatalf("expected type function_call_output, got %q", item.Get("type").String())
 	}
@@ -2551,6 +3124,22 @@ func TestFinalChunk_AlwaysCarriesEmptyDeltaObject(t *testing.T) {
 		t.Fatalf("stateful tool: finish_reason = %q, want tool_calls", got)
 	}
 	assertDelta(t, "stateful tool", toolChunk)
+}
+
+func TestChatStreamTranslationDistinguishesFailedTerminal(t *testing.T) {
+	failed := NewStreamTranslator("chatcmpl-test", "grok-4.5", 0).TranslateParsedResult(gjson.Parse(
+		`{"type":"response.failed","response":{"error":{"message":"boom"}}}`,
+	))
+	if !failed.Terminal || !failed.Failed || !gjson.GetBytes(failed.Chunk, "error").Exists() {
+		t.Fatalf("failed translation = %#v, chunk=%s", failed, failed.Chunk)
+	}
+
+	completed := NewStreamTranslator("chatcmpl-test", "grok-4.5", 0).TranslateParsedResult(gjson.Parse(
+		`{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}`,
+	))
+	if !completed.Terminal || completed.Failed {
+		t.Fatalf("completed translation = %#v", completed)
+	}
 }
 
 func TestStreamTranslator_TextOnly(t *testing.T) {

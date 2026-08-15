@@ -12,6 +12,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 )
 
@@ -91,6 +92,67 @@ func TestPromptPolicyIncidentListAndDetailAPI(t *testing.T) {
 	}
 	if err := json.Unmarshal(detailRecorder.Body.Bytes(), &detail); err != nil || detail.Incident.IncidentID != "incident-admin" || len(detail.Matches) != 1 || detail.Candidate == nil || detail.Evidence == nil {
 		t.Fatalf("detail response=%s err=%v", detailRecorder.Body.String(), err)
+	}
+}
+
+func TestPromptPolicyAuditHealthAPI(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "admin-policy-health.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+	store := auth.NewStore(db, nil, &database.SystemSettings{})
+	t.Cleanup(store.Stop)
+	cfg := promptfilter.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Review.Enabled = true
+	cfg.Review.APIKey = "health-test-key"
+	cfg.Advanced.Enforcement.ConversationLockEnabled = true
+	store.SetPromptFilterConfig(cfg)
+	h := &Handler{db: db, store: store}
+	router := gin.New()
+	router.GET("/api/admin/prompt-policy/incidents/health", h.GetPromptPolicyAuditHealth)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/admin/prompt-policy/incidents/health", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("health status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		StorageReady  bool   `json:"storage_ready"`
+		Status        string `json:"status"`
+		IncidentCount int    `json:"incident_count"`
+		ReviewPool    struct {
+			Configured int `json:"configured"`
+			Available  int `json:"available"`
+		} `json:"review_pool"`
+		Queue struct {
+			DroppedHigh uint64 `json:"dropped_high"`
+			Failed      uint64 `json:"failed"`
+		} `json:"queue"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || !response.StorageReady || response.Status != "healthy" || response.IncidentCount != 0 || response.ReviewPool.Configured != 1 || response.ReviewPool.Available != 1 || response.Queue.DroppedHigh != 0 || response.Queue.Failed != 0 {
+		t.Fatalf("health response=%s err=%v", recorder.Body.String(), err)
+	}
+
+	// 管理员主动关闭审查/会话锁属于配置选择,不应报 degraded。
+	cfg.Review.Enabled = false
+	cfg.Advanced.Enforcement.ConversationLockEnabled = false
+	store.SetPromptFilterConfig(cfg)
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/admin/prompt-policy/incidents/health", nil))
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Status != "healthy" {
+		t.Fatalf("disabled-feature health response=%s err=%v", recorder.Body.String(), err)
+	}
+
+	// 审查启用但 key 池为空才是真实故障。
+	cfg.Review.Enabled = true
+	cfg.Review.APIKey = ""
+	store.SetPromptFilterConfig(cfg)
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/admin/prompt-policy/incidents/health", nil))
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Status != "degraded" {
+		t.Fatalf("empty-pool health response=%s err=%v", recorder.Body.String(), err)
 	}
 }
 

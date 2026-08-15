@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +52,10 @@ const (
 	// EnvGrokOAuthClientID 沿用既有 grokEnv 覆盖约定（类比 proxy 包的 GROK_CLIENT_VERSION / GROK_CLIENT_IDENTIFIER）：
 	// 留空回退到 GrokDefaultOAuthClientID，默认行为零变化。服务于多 client_id 部署、灰度对照与端点测试。
 	EnvGrokOAuthClientID = "GROK_OAUTH_CLIENT_ID"
+	// EnvGrokOAuthHostAllowlist 是部署侧显式允许的额外 OAuth issuer/token
+	// endpoint 主机列表（逗号分隔）。导入文件本身无权扩大该列表，避免恶意
+	// auth.json 把 refresh token 或服务端请求导向任意主机。
+	EnvGrokOAuthHostAllowlist = "GROK_OAUTH_HOST_ALLOWLIST"
 )
 
 // EffectiveGrokOAuthClientID 返回生效的 OAuth client_id，优先级从高到低：
@@ -213,6 +220,7 @@ func (a *Account) setGrokRateLimitSnapshot(snap GrokRateLimitSnapshot, markDirty
 	a.grokRateLimit = &copied
 	if markDirty {
 		a.grokRateLimitDirty = true
+		a.grokRateLimitVersion++
 	}
 }
 
@@ -229,6 +237,32 @@ func (a *Account) TakeGrokRateLimitSnapshotIfDirty() (GrokRateLimitSnapshot, boo
 	}
 	a.grokRateLimitDirty = false
 	return *a.grokRateLimit, true
+}
+
+// PeekGrokRateLimitSnapshotIfDirty does not acknowledge persistence. The
+// caller must invoke ConfirmGrokRateLimitSnapshotPersisted after a successful
+// database commit; failures retain dirty state for the next flush.
+func (a *Account) PeekGrokRateLimitSnapshotIfDirty() (GrokRateLimitSnapshot, uint64, bool) {
+	if a == nil {
+		return GrokRateLimitSnapshot{}, 0, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.grokRateLimitDirty || a.grokRateLimit == nil {
+		return GrokRateLimitSnapshot{}, 0, false
+	}
+	return *a.grokRateLimit, a.grokRateLimitVersion, true
+}
+
+func (a *Account) ConfirmGrokRateLimitSnapshotPersisted(version uint64) {
+	if a == nil || version == 0 {
+		return
+	}
+	a.mu.Lock()
+	if a.grokRateLimitVersion == version {
+		a.grokRateLimitDirty = false
+	}
+	a.mu.Unlock()
 }
 
 // GetGrokRateLimitSnapshot 返回配额余量快照；无观测时 ok=false。
@@ -300,8 +334,9 @@ func (a *Account) GetGrokFreeQuotaSnapshot() (GrokFreeQuotaSnapshot, bool) {
 	return *a.grokFreeQuota, true
 }
 
-// GrokChannelSupportsModel 判断 Grok 账号能否服务指定模型（grok 渠道 Key 专用）：
-// Models 未声明 = 放行全部模型（请求模型直接透传上游），声明了则按白名单精确匹配。
+// GrokChannelSupportsModel 判断 Grok 账号能否服务指定模型（grok 渠道 Key 专用）。
+// 显式 Models 白名单优先；没有白名单时使用富目录的可见模型，尚未同步目录才使用
+// 按凭据类型区分的保守默认集。空列表绝不再表示任意模型透传。
 func (a *Account) GrokChannelSupportsModel(model string) bool {
 	if a == nil {
 		return false
@@ -311,11 +346,30 @@ func (a *Account) GrokChannelSupportsModel(model string) bool {
 	if !a.isGrokAPILocked() {
 		return false
 	}
-	if len(a.Models) == 0 {
-		return true
-	}
 	model = strings.TrimSpace(model)
-	for _, candidate := range a.Models {
+	// 不复用 a.Models 的底层数组做 append:len==0 但 cap>0 时,两个并发请求会
+	// 在共享 RLock 下向同一空闲容量写入,构成写-写竞态。目录分支从 nil 开始。
+	var candidates []string
+	if len(a.Models) > 0 {
+		candidates = a.Models
+	} else if a.grokRouting != nil && a.grokRouting.CatalogKnown {
+		for _, route := range a.grokRouting.Models {
+			if route.Hidden || (a.GrokAuthKindLocked() == GrokAuthKindAPIKey && route.SupportedInAPI != nil && !*route.SupportedInAPI) {
+				continue
+			}
+			candidates = append(candidates, route.ModelID)
+		}
+	}
+	// A successfully fetched empty catalog is authoritative. It must not be
+	// confused with "catalog has never been fetched" and reopen defaults.
+	if len(candidates) == 0 && (a.grokRouting == nil || !a.grokRouting.CatalogKnown) {
+		if a.GrokAuthKindLocked() == GrokAuthKindAPIKey {
+			candidates = GrokAPIKeyDefaultModelIDs()
+		} else {
+			candidates = GrokOAuthDefaultModelIDs()
+		}
+	}
+	for _, candidate := range candidates {
 		if strings.EqualFold(strings.TrimSpace(candidate), model) {
 			return true
 		}
@@ -323,7 +377,8 @@ func (a *Account) GrokChannelSupportsModel(model string) bool {
 	return false
 }
 
-// GrokModels 返回 Grok 账号声明的模型白名单（空 = 放行全部模型）。
+// GrokModels 返回 Grok 账号显式声明的模型白名单；空表示交由富目录/保守默认，
+// 不表示任意模型透传。
 func (a *Account) GrokModels() []string {
 	if a == nil {
 		return nil
@@ -374,18 +429,25 @@ func NormalizeGrokBaseURL(raw string) (string, error) {
 
 // GrokImportedCredential 是从 Grok CLI auth.json 解析出的一条逻辑凭据。
 type GrokImportedCredential struct {
-	AccessToken   string
-	RefreshToken  string
-	APIKey        string
-	PlanType      string
-	ClientID      string
-	TokenEndpoint string
-	OIDCIssuer    string
-	Subject       string
-	Email         string
-	PrincipalType string
-	PrincipalID   string
-	ExpiresAt     time.Time
+	AccessToken  string
+	RefreshToken string
+	APIKey       string
+	// PlanType 是首版双写兼容字段：优先为导入文件的 archive label，文件未
+	// 声明时回退到未验签 JWT tier。安全筛选不得读取它；live plan 另行保存。
+	PlanType        string
+	ArchivePlanType string
+	JWTPlanType     string
+	JWTPlanTrusted  bool
+	Disabled        bool
+	DisabledPresent bool
+	ClientID        string
+	TokenEndpoint   string
+	OIDCIssuer      string
+	Subject         string
+	Email           string
+	PrincipalType   string
+	PrincipalID     string
+	ExpiresAt       time.Time
 }
 
 // AuthKind 返回该凭据的类型（api_key / oauth）。
@@ -441,7 +503,10 @@ func ParseGrokAuthJSON(raw []byte) ([]*GrokImportedCredential, error) {
 
 	result := make([]*GrokImportedCredential, 0, len(candidates))
 	for _, cand := range candidates {
-		cred, err := parseGrokCredentialNode(cand.scope, cand.node)
+		// disabled/plan_type 是 CPA/Grok 归档文件的顶层元数据；tokens 或
+		// scope 包装不应令它们在解析逻辑凭据时丢失。子节点显式值优先。
+		node := grokInheritArchiveMetadata(cand.node, root)
+		cred, err := parseGrokCredentialNode(cand.scope, node)
 		if err != nil {
 			return nil, err
 		}
@@ -458,20 +523,34 @@ func parseGrokCredentialNode(scope string, node map[string]any) (*GrokImportedCr
 	}
 
 	scopeNorm := strings.ToLower(strings.TrimSpace(scope))
-	authMode := strings.ToLower(grokFirstString(node, "auth_mode", "authMode"))
+	authMode := strings.ToLower(grokFirstString(node, "auth_mode", "authMode", "auth_kind", "authKind"))
 	isAPIKey := authMode == "api_key" || authMode == "apikey" || authMode == "api-key" ||
 		strings.Contains(scopeNorm, "api_key")
 
 	claims := grokJWTClaims(access)
+	archivePlan := strings.TrimSpace(grokFirstString(node, "plan_type", "planType"))
+	jwtPlan := GrokPlanTypeFromAccessToken(access)
+	legacyPlan := archivePlan
+	if legacyPlan == "" {
+		legacyPlan = jwtPlan
+	}
+	disabled, disabledPresent := grokOptionalBool(node, "disabled")
 	cred := &GrokImportedCredential{
-		AccessToken:   access,
-		RefreshToken:  refresh,
-		PlanType:      GrokPlanTypeFromAccessToken(access),
-		ClientID:      grokFirstString(node, "client_id", "clientId", "oidc_client_id", "oidcClientId"),
-		TokenEndpoint: grokFirstString(node, "token_endpoint", "tokenEndpoint"),
-		OIDCIssuer:    strings.TrimRight(grokFirstString(node, "oidc_issuer", "oidcIssuer", "issuer"), "/"),
-		PrincipalType: grokFirstString(node, "principal_type", "principalType"),
-		PrincipalID:   grokFirstString(node, "principal_id", "principalId", "team_id", "teamId"),
+		AccessToken:     access,
+		RefreshToken:    refresh,
+		PlanType:        legacyPlan,
+		ArchivePlanType: archivePlan,
+		JWTPlanType:     jwtPlan,
+		// JWT payload parsing here is intentionally unverified. It remains useful
+		// as a display hint, never as an authorization or plan-routing fact.
+		JWTPlanTrusted:  false,
+		Disabled:        disabled,
+		DisabledPresent: disabledPresent,
+		ClientID:        grokFirstString(node, "client_id", "clientId", "oidc_client_id", "oidcClientId"),
+		TokenEndpoint:   grokFirstString(node, "token_endpoint", "tokenEndpoint"),
+		OIDCIssuer:      strings.TrimRight(grokFirstString(node, "oidc_issuer", "oidcIssuer", "issuer"), "/"),
+		PrincipalType:   grokFirstString(node, "principal_type", "principalType"),
+		PrincipalID:     grokFirstString(node, "principal_id", "principalId", "team_id", "teamId"),
 	}
 	if isAPIKey {
 		cred.APIKey = access
@@ -521,6 +600,97 @@ func parseGrokCredentialNode(scope string, node map[string]any) (*GrokImportedCr
 		return nil, fmt.Errorf("OAuth 凭据缺少 refresh_token，无法长期使用（如为 API Key 请设置 auth_mode=api_key）")
 	}
 	return cred, nil
+}
+
+func grokInheritArchiveMetadata(node, root map[string]any) map[string]any {
+	if node == nil || root == nil {
+		return node
+	}
+	result := make(map[string]any, len(node)+2)
+	for key, value := range node {
+		result[key] = value
+	}
+	for _, key := range []string{"disabled", "plan_type", "planType"} {
+		if _, exists := result[key]; exists {
+			continue
+		}
+		if value, exists := root[key]; exists {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+func grokOptionalBool(node map[string]any, key string) (bool, bool) {
+	value, ok := node[key]
+	if !ok || value == nil {
+		return false, ok
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+		return parsed, err == nil
+	default:
+		return false, true
+	}
+}
+
+// GrokCredentialFamilyID derives a stable, irreversible family identifier from
+// identity attributes which survive AT/RT rotation. It deliberately excludes
+// model/configuration fields. A token hash is only a last-resort fallback for
+// malformed legacy credentials lacking a principal.
+func GrokCredentialFamilyID(cred *GrokImportedCredential, baseURL string) string {
+	if cred == nil {
+		return ""
+	}
+	authKind := cred.AuthKind()
+	issuer := strings.ToLower(strings.TrimRight(strings.TrimSpace(cred.OIDCIssuer), "/"))
+	if issuer == "" && authKind == GrokAuthKindOAuth {
+		issuer = GrokDefaultOIDCIssuer
+	}
+	origin := grokCredentialOrigin(baseURL, authKind)
+	principal := firstNonEmptyTrimmed(cred.PrincipalID, cred.Subject)
+	identity := strings.Join([]string{
+		"grok-credential-family-v1",
+		authKind,
+		issuer,
+		strings.TrimSpace(cred.ClientID),
+		strings.ToLower(strings.TrimSpace(cred.PrincipalType)),
+		strings.TrimSpace(principal),
+		origin,
+	}, "\x00")
+	if principal == "" {
+		fallback := firstNonEmptyTrimmed(cred.APIKey, cred.RefreshToken, cred.AccessToken)
+		if fallback == "" {
+			return ""
+		}
+		identity += "\x00fallback\x00" + fallback
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:])
+}
+
+func grokCredentialOrigin(raw, authKind string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		if authKind == GrokAuthKindAPIKey {
+			raw = GrokDefaultAPIBaseURL
+		} else {
+			raw = GrokDefaultChatProxyBaseURL
+		}
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() == "" {
+		return strings.ToLower(strings.TrimRight(raw, "/"))
+	}
+	host := strings.ToLower(parsed.Hostname())
+	port := parsed.Port()
+	if port != "" && port != "443" && port != "80" {
+		host += ":" + port
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + host
 }
 
 // grokParseTime 解析 Grok 上游的时间字符串（RFC3339 及带纳秒变体），失败返回零值。
@@ -837,15 +1007,78 @@ var grokDiscoveryCache = struct {
 	at       time.Time
 })}
 
-func grokAllowedTokenEndpoint(u *url.URL) bool {
-	return u != nil && u.Hostname() != "" && u.Scheme == "https"
+func grokAllowedOAuthURL(u *url.URL) bool {
+	if u == nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" || u.User != nil {
+		return false
+	}
+	hostname := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if hostname == "auth.x.ai" {
+		return u.Port() == "" || u.Port() == "443"
+	}
+	for _, raw := range strings.Split(os.Getenv(EnvGrokOAuthHostAllowlist), ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		allowedHost := raw
+		allowedPort := ""
+		if parsed, err := url.Parse(raw); err == nil && parsed.Hostname() != "" {
+			if !strings.EqualFold(parsed.Scheme, "https") {
+				continue
+			}
+			allowedHost = parsed.Hostname()
+			allowedPort = parsed.Port()
+		} else if parsed, err := url.Parse("https://" + raw); err == nil && parsed.Hostname() != "" {
+			allowedHost = parsed.Hostname()
+			allowedPort = parsed.Port()
+		}
+		if hostname != strings.ToLower(strings.TrimSuffix(allowedHost, ".")) {
+			continue
+		}
+		// A configured port is exact. A host-only allowlist permits the normal
+		// HTTPS port only, rather than silently opening arbitrary services on it.
+		if allowedPort != "" {
+			if u.Port() == allowedPort {
+				return true
+			}
+			continue
+		}
+		if u.Port() == "" || u.Port() == "443" {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateGrokOAuthEndpoints enforces the deployment-owned OAuth host policy.
+// Imported JSON may select a path on an allowed host, but cannot introduce a
+// new network destination. Empty values resolve to the official xAI issuer.
+func ValidateGrokOAuthEndpoints(tokenEndpoint, issuer string) error {
+	if tokenEndpoint = strings.TrimSpace(tokenEndpoint); tokenEndpoint != "" {
+		parsed, err := url.Parse(tokenEndpoint)
+		if err != nil || !grokAllowedOAuthURL(parsed) {
+			return fmt.Errorf("grok token_endpoint 必须使用官方 xAI 主机或服务端 OAuth allowlist 中的 HTTPS 主机")
+		}
+	}
+	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+	if issuer == "" {
+		issuer = GrokDefaultOIDCIssuer
+	}
+	parsed, err := url.Parse(issuer)
+	if err != nil || !grokAllowedOAuthURL(parsed) || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("grok oidc_issuer 必须使用官方 xAI 主机或服务端 OAuth allowlist 中的 HTTPS origin")
+	}
+	return nil
 }
 
 func grokResolveTokenEndpoint(ctx context.Context, client *http.Client, tokenURL, issuer string) (string, error) {
+	if err := ValidateGrokOAuthEndpoints(tokenURL, issuer); err != nil {
+		return "", err
+	}
 	if tokenURL = strings.TrimSpace(tokenURL); tokenURL != "" {
 		parsed, err := url.Parse(tokenURL)
-		if err != nil || !grokAllowedTokenEndpoint(parsed) {
-			return "", fmt.Errorf("grok token_endpoint 无效: %s", tokenURL)
+		if err != nil || !grokAllowedOAuthURL(parsed) {
+			return "", fmt.Errorf("grok token_endpoint 无效")
 		}
 		return parsed.String(), nil
 	}
@@ -881,7 +1114,7 @@ func grokResolveTokenEndpoint(ctx context.Context, client *http.Client, tokenURL
 		return "", fmt.Errorf("grok OIDC discovery 响应解析失败: %w", err)
 	}
 	endpointURL, parseErr := url.Parse(document.TokenEndpoint)
-	if document.TokenEndpoint == "" || parseErr != nil || !grokAllowedTokenEndpoint(endpointURL) {
+	if document.TokenEndpoint == "" || parseErr != nil || !grokAllowedOAuthURL(endpointURL) {
 		return "", fmt.Errorf("grok OIDC discovery 未返回可用的 token_endpoint")
 	}
 	grokDiscoveryCache.Lock()
@@ -1024,9 +1257,8 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 	oidcIssuer := acc.GrokOIDCIssuer
 	principalType := acc.GrokPrincipalType
 	principalID := acc.GrokPrincipalID
-	cooldownUntil := acc.CooldownUtil
-	cooldownReason := acc.CooldownReason
-	activeCooldown := acc.Status == StatusCooldown && time.Now().Before(acc.CooldownUtil)
+	generation := acc.CredentialGeneration
+	familyID := acc.CredentialFamilyID
 	acc.mu.RUnlock()
 
 	if authKindIsAPIKey {
@@ -1035,12 +1267,67 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 	if strings.TrimSpace(rt) == "" {
 		return fmt.Errorf("grok refresh_token 为空")
 	}
+	if generation <= 0 {
+		generation = 1
+	}
 
-	// 跨进程刷新锁（复用 Codex 的 tokenCache 锁语义）
-	if s.tokenCache != nil {
+	// A stable family lease covers the whole RT rotation boundary. Re-read the
+	// complete credential document after acquiring it: another instance may
+	// already have advanced generation while this caller was waiting.
+	if strings.TrimSpace(familyID) == "" && s.db != nil {
+		ensured, ensureErr := s.db.EnsureAccountCredentialFamilyID(ctx, dbID, "")
+		if ensureErr != nil {
+			return fmt.Errorf("grok credential family 初始化失败: %w", ensureErr)
+		}
+		familyID = ensured
+		if strings.TrimSpace(familyID) == "" {
+			return fmt.Errorf("grok credential family 初始化失败: family id 为空")
+		}
+	}
+	var refreshLocks *grokOAuthRefreshLocks
+	if familyID != "" {
+		locks, leaseErr := s.acquireGrokOAuthRefreshLocks(ctx, dbID, familyID)
+		if leaseErr != nil {
+			return leaseErr
+		}
+		refreshLocks = locks
+		defer refreshLocks.Release()
+		ctx = refreshLocks.Context()
+		// Always reload after both rolling-upgrade locks are held. Old versions
+		// write rotated AT/RT without advancing credential_generation, so checking
+		// generation alone cannot detect that they refreshed while this instance
+		// was waiting on the legacy account-id lock.
+		if changed, usable, reloadErr := s.reloadGrokCredentialsAfterFamilyLease(ctx, acc, generation); reloadErr != nil {
+			return reloadErr
+		} else if changed && usable {
+			// A forced caller that waited for an already-completed rotation belongs
+			// to the same refresh batch. Reusing the freshly committed AT prevents a
+			// second forced call from immediately consuming the newly rotated RT.
+			s.finishReloadedOAuthRefresh(ctx, acc)
+			return nil
+		}
+		acc.mu.RLock()
+		authKindIsAPIKey = strings.TrimSpace(acc.APIKey) != ""
+		rt, clientID, tokenEndpoint, oidcIssuer = acc.RefreshToken, acc.GrokClientID, acc.GrokTokenEndpoint, acc.GrokOIDCIssuer
+		principalType, principalID, generation = acc.GrokPrincipalType, acc.GrokPrincipalID, acc.CredentialGeneration
+		acc.mu.RUnlock()
+		if authKindIsAPIKey {
+			return nil
+		}
+	}
+	if strings.TrimSpace(rt) == "" {
+		return fmt.Errorf("grok refresh_token 为空")
+	}
+
+	// Legacy account-id lock is retained only when a stable family cannot be
+	// established (for example a transient test account without a DB row).
+	if refreshLocks == nil && s.tokenCache != nil {
 		acquired, lockErr := s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
 		if lockErr != nil {
-			log.Printf("[账号 %d] 获取 grok 刷新锁失败: %v", dbID, lockErr)
+			if s.tokenCache.SharedAcrossInstances() {
+				return fmt.Errorf("获取 Grok 跨实例刷新锁失败: %w", lockErr)
+			}
+			log.Printf("[账号 %d] 获取 grok 本地刷新锁失败: %v", dbID, lockErr)
 		}
 		if !acquired && lockErr == nil {
 			token, waitErr := s.tokenCache.WaitForRefreshComplete(ctx, dbID, 30*time.Second)
@@ -1055,7 +1342,8 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 				} else {
 					acc.ExpiresAt = time.Now().Add(30 * time.Minute)
 				}
-				if !activeCooldown {
+				// 以当前状态判定冷却,不用入口快照:等待期间可能新设了冷却。
+				if !(acc.Status == StatusCooldown && time.Now().Before(acc.CooldownUtil)) {
 					acc.Status = StatusReady
 				}
 				acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
@@ -1072,6 +1360,17 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 		}
 	}
 
+	// 从这里起进入 RT 消费临界区:上游一旦完成 RT 轮换,调用方取消(浏览器断开、
+	// 管理端短超时)会让新 RT 在"响应未读完/CAS 未提交"窗口内永久丢失,账号被
+	// 错误打成 error 且只能人工重导。切换到不随调用方取消、仅受 lease hold
+	// 期限约束的 ctx,保证交换与落库原子完成。
+	if refreshLocks != nil {
+		ctx = refreshLocks.CriticalContext()
+	}
+	proxyURL := s.ResolveProxyForAccount(acc)
+	if strings.TrimSpace(proxyURL) == "" && s.GetProxyPoolEnabled() {
+		return fmt.Errorf("账号 %d 代理池已启用但无可用代理，已拒绝直连刷新", dbID)
+	}
 	td, err := RefreshGrokAccessToken(ctx, GrokRefreshParams{
 		RefreshToken:  rt,
 		ClientID:      clientID,
@@ -1079,10 +1378,18 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 		OIDCIssuer:    oidcIssuer,
 		PrincipalType: principalType,
 		PrincipalID:   principalID,
-		ProxyURL:      s.ResolveProxyForAccount(acc),
+		ProxyURL:      proxyURL,
 	})
 	if err != nil {
 		if IsGrokRefreshPermanentError(err) {
+			// A concurrent rotation can make an old RT return invalid_grant. Only
+			// mark the account invalid if generation is still the one requested.
+			if s.db != nil {
+				if current, _, readErr := s.db.GetAccountCredentialState(ctx, dbID); readErr == nil && current != generation {
+					_, _, _ = s.reloadGrokCredentialsAfterFamilyLease(ctx, acc, generation)
+					return nil
+				}
+			}
 			acc.mu.Lock()
 			acc.Status = StatusError
 			acc.ErrorMsg = err.Error()
@@ -1095,7 +1402,34 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 		return err
 	}
 
+	newGeneration := generation
+	if s.db != nil {
+		credentials := grokRefreshedCredentialUpdates(td)
+		var applied bool
+		var casErr error
+		newGeneration, applied, casErr = s.db.UpdateAccountCredentialsCAS(ctx, dbID, generation, credentials)
+		if casErr != nil {
+			return fmt.Errorf("grok 刷新凭据 CAS 写库失败: %w", casErr)
+		}
+		if !applied {
+			_, _, reloadErr := s.reloadGrokCredentialsAfterFamilyLease(ctx, acc, generation)
+			if reloadErr != nil {
+				return reloadErr
+			}
+			return nil
+		}
+		_ = s.db.ClearError(ctx, dbID)
+	} else {
+		// Transient accounts used by connectivity tests have no durable identity
+		// row; keep their generation stable while preserving DB-first semantics
+		// for every persisted account.
+		newGeneration = generation
+	}
+
+	// Publish only after the CAS commit. This prevents an unpersisted rotated RT
+	// from becoming the sole live copy when a database write fails.
 	acc.mu.Lock()
+	acc.invalidateGrokPersistentStateLocked(newGeneration)
 	acc.AccessToken = td.AccessToken
 	if td.PlanType != "" {
 		acc.PlanType = td.PlanType
@@ -1105,11 +1439,9 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 	}
 	acc.ExpiresAt = td.ExpiresAt
 	acc.ErrorMsg = ""
-	if activeCooldown {
-		acc.Status = StatusCooldown
-		acc.CooldownUtil = cooldownUntil
-		acc.CooldownReason = cooldownReason
-	} else {
+	// 冷却判定基于当前内存状态:入口快照到这里可能隔了近 10 分钟(等 lease +
+	// HTTP 刷新),期间设置/延长的冷却是更新的事实,AT 续期成功不代表限流解除。
+	if !(acc.Status == StatusCooldown && time.Now().Before(acc.CooldownUtil)) {
 		acc.Status = StatusReady
 		acc.CooldownUtil = time.Time{}
 		acc.CooldownReason = ""
@@ -1120,34 +1452,118 @@ func (s *Store) refreshGrokAccount(ctx context.Context, acc *Account, forceRefre
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
-
+	if s.db != nil {
+		// CAS 已把上一代目录/能力/事实随代盖章,重新投影回内存,避免刷新后
+		// 路由退化为保守默认集并等 30 秒扫描兜底。失败不致命。
+		if reloadErr := s.ReloadGrokPersistentState(ctx, dbID); reloadErr != nil {
+			log.Printf("[账号 %d] 刷新后重载 Grok 持久状态失败: %v", dbID, reloadErr)
+		}
+	}
 	if s.tokenCache != nil {
 		if ttl := time.Until(td.ExpiresAt) - 5*time.Minute; ttl > 0 {
 			_ = s.tokenCache.SetAccessToken(ctx, dbID, td.AccessToken, ttl)
 		}
 	}
-
-	if s.db != nil {
-		credentials := map[string]interface{}{
-			"access_token": td.AccessToken,
-			"expires_at":   td.ExpiresAt.Format(time.RFC3339),
-		}
-		if td.PlanType != "" {
-			credentials["plan_type"] = td.PlanType
-		}
-		if td.RefreshToken != "" {
-			credentials["refresh_token"] = td.RefreshToken
-		}
-		if td.IDToken != "" {
-			credentials["id_token"] = td.IDToken
-		}
-		if err := s.db.UpdateCredentials(ctx, dbID, credentials); err != nil {
-			log.Printf("[账号 %d] grok 刷新后写库失败: %v", dbID, err)
-		} else {
-			_ = s.db.ClearError(ctx, dbID)
-		}
-	}
 	return nil
+}
+
+// grokRefreshedCredentialUpdates keeps the legacy runtime plan_type projection
+// in sync with its real source. A refreshed access-token tier is an unverified
+// JWT display hint, never an archive label or an authorization fact. The
+// archive_plan_type field is intentionally absent so token rotation cannot
+// overwrite import-file metadata.
+func grokRefreshedCredentialUpdates(td *GrokTokenData) map[string]interface{} {
+	credentials := map[string]interface{}{
+		"access_token":     td.AccessToken,
+		"expires_at":       td.ExpiresAt.Format(time.RFC3339),
+		"jwt_plan_type":    td.PlanType,
+		"jwt_plan_trusted": false,
+	}
+	if td.PlanType != "" {
+		credentials["plan_type"] = td.PlanType
+	}
+	if td.RefreshToken != "" {
+		credentials["refresh_token"] = td.RefreshToken
+	}
+	if td.IDToken != "" {
+		credentials["id_token"] = td.IDToken
+	}
+	return credentials
+}
+
+func (s *Store) reloadGrokCredentialsAfterFamilyLease(ctx context.Context, acc *Account, expectedGeneration int64) (changed, usable bool, err error) {
+	if s == nil || s.db == nil || acc == nil || acc.DBID <= 0 {
+		return false, false, nil
+	}
+	row, err := s.db.GetAccountByID(ctx, acc.DBID)
+	if err != nil {
+		return false, false, err
+	}
+	// Compare the complete persisted identity even when generation is unchanged:
+	// a legacy binary can rotate AT/RT through UpdateCredentials without knowing
+	// about credential_generation. The rolling-upgrade bridge lock guarantees it
+	// is no longer writing while this snapshot is applied.
+	acc.mu.Lock()
+	previousGeneration := acc.CredentialGeneration
+	previousFamilyID := acc.CredentialFamilyID
+	previousRefreshToken := acc.RefreshToken
+	previousAccessToken := acc.AccessToken
+	previousAPIKey := acc.APIKey
+	previousUpstreamType := acc.UpstreamType
+	previousBaseURL := acc.BaseURL
+	previousClientID := acc.GrokClientID
+	previousTokenEndpoint := acc.GrokTokenEndpoint
+	previousIssuer := acc.GrokOIDCIssuer
+	previousPrincipalType := acc.GrokPrincipalType
+	previousPrincipalID := acc.GrokPrincipalID
+	previousAccountID := acc.AccountID
+	previousEmail := acc.Email
+	previousPlanType := acc.PlanType
+	previousExpiresAt := acc.ExpiresAt
+	if row.CredentialGeneration != acc.CredentialGeneration {
+		acc.invalidateGrokPersistentStateLocked(row.CredentialGeneration)
+	}
+	acc.CredentialFamilyID = row.CredentialFamilyID
+	acc.RefreshToken = strings.TrimSpace(row.GetCredential("refresh_token"))
+	acc.AccessToken = strings.TrimSpace(row.GetCredential("access_token"))
+	acc.APIKey = strings.TrimSpace(row.GetCredential("api_key"))
+	acc.UpstreamType = strings.TrimSpace(row.GetCredential("upstream_type"))
+	acc.BaseURL = strings.TrimRight(strings.TrimSpace(row.GetCredential("base_url")), "/")
+	acc.GrokClientID = row.GetCredential("grok_client_id")
+	acc.GrokTokenEndpoint = row.GetCredential("grok_token_endpoint")
+	acc.GrokOIDCIssuer = row.GetCredential("grok_oidc_issuer")
+	acc.GrokPrincipalType = row.GetCredential("grok_principal_type")
+	acc.GrokPrincipalID = row.GetCredential("grok_principal_id")
+	acc.AccountID = row.GetCredential("account_id")
+	acc.Email = row.GetCredential("email")
+	if acc.APIKey != "" {
+		acc.PlanType = "api"
+	} else if plan := row.GetCredential("plan_type"); plan != "" {
+		acc.PlanType = plan
+	} else {
+		acc.PlanType = GrokPlanTypeFromAccessToken(acc.AccessToken)
+	}
+	acc.ExpiresAt = parseOAuthCredentialExpiry(row.GetCredential("expires_at"))
+	changed = previousGeneration != acc.CredentialGeneration ||
+		previousFamilyID != acc.CredentialFamilyID ||
+		previousRefreshToken != acc.RefreshToken ||
+		previousAccessToken != acc.AccessToken ||
+		previousAPIKey != acc.APIKey ||
+		previousUpstreamType != acc.UpstreamType ||
+		strings.TrimRight(strings.TrimSpace(previousBaseURL), "/") != acc.BaseURL ||
+		previousClientID != acc.GrokClientID ||
+		previousTokenEndpoint != acc.GrokTokenEndpoint ||
+		previousIssuer != acc.GrokOIDCIssuer ||
+		previousPrincipalType != acc.GrokPrincipalType ||
+		previousPrincipalID != acc.GrokPrincipalID ||
+		previousAccountID != acc.AccountID ||
+		previousEmail != acc.Email ||
+		previousPlanType != acc.PlanType ||
+		!previousExpiresAt.Equal(acc.ExpiresAt)
+	usable = acc.AccessToken != "" && (acc.ExpiresAt.IsZero() || time.Until(acc.ExpiresAt) > 5*time.Minute)
+	acc.mu.Unlock()
+	_ = expectedGeneration // retained for call-site compatibility and audit logs.
+	return changed, usable, nil
 }
 
 func grokAccessTokenExpiry(token string) time.Time {
@@ -1165,11 +1581,79 @@ func (s *Store) ApplyGrokConfig(dbID int64, baseURL, apiKey string, models []str
 	if acc == nil {
 		return false
 	}
+	// UpdateGrokAccount persists credentials before calling this method. Reload
+	// the authoritative identity fence so an in-process account cannot keep
+	// routing with observations from the previous credential generation. This
+	// also covers identity changes other than api_key (for example base_url),
+	// which the old in-memory-only comparison missed.
+	type persistedGrokIdentity struct {
+		loaded                                                         bool
+		generation                                                     int64
+		familyID, upstreamType, baseURL, apiKey, accessToken           string
+		refreshToken, clientID, tokenEndpoint, issuer                  string
+		principalType, principalID, accountID, email, planType, expiry string
+	}
+	persisted := persistedGrokIdentity{}
+	if s.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if row, err := s.db.GetAccountByID(ctx, dbID); err == nil {
+			persisted = persistedGrokIdentity{
+				loaded: true, generation: row.CredentialGeneration, familyID: row.CredentialFamilyID,
+				upstreamType: row.GetCredential("upstream_type"), baseURL: row.GetCredential("base_url"),
+				apiKey: row.GetCredential("api_key"), accessToken: row.GetCredential("access_token"),
+				refreshToken: row.GetCredential("refresh_token"), clientID: row.GetCredential("grok_client_id"),
+				tokenEndpoint: row.GetCredential("grok_token_endpoint"), issuer: row.GetCredential("grok_oidc_issuer"),
+				principalType: row.GetCredential("grok_principal_type"), principalID: row.GetCredential("grok_principal_id"),
+				accountID: row.GetCredential("account_id"), email: row.GetCredential("email"),
+				planType: row.GetCredential("plan_type"), expiry: row.GetCredential("expires_at"),
+			}
+		}
+		cancel()
+	}
+	normalizedBaseURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if persisted.loaded {
+		normalizedBaseURL = strings.TrimRight(strings.TrimSpace(persisted.baseURL), "/")
+	}
 	acc.mu.Lock()
-	acc.UpstreamType = UpstreamGrok
-	acc.BaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if strings.TrimSpace(apiKey) != "" {
-		acc.APIKey = strings.TrimSpace(apiKey)
+	identityChanged := normalizedBaseURL != strings.TrimRight(strings.TrimSpace(acc.BaseURL), "/") ||
+		(strings.TrimSpace(apiKey) != "" && strings.TrimSpace(apiKey) != strings.TrimSpace(acc.APIKey))
+	if persisted.generation > 0 && persisted.generation != acc.CredentialGeneration {
+		acc.invalidateGrokPersistentStateLocked(persisted.generation)
+		identityChanged = false // invalidation was already performed above.
+	}
+	if persisted.loaded {
+		acc.CredentialFamilyID = persisted.familyID
+		acc.UpstreamType = persisted.upstreamType
+		acc.APIKey = strings.TrimSpace(persisted.apiKey)
+		acc.AccessToken = strings.TrimSpace(persisted.accessToken)
+		acc.RefreshToken = strings.TrimSpace(persisted.refreshToken)
+		acc.GrokClientID = persisted.clientID
+		acc.GrokTokenEndpoint = persisted.tokenEndpoint
+		acc.GrokOIDCIssuer = persisted.issuer
+		acc.GrokPrincipalType = persisted.principalType
+		acc.GrokPrincipalID = persisted.principalID
+		acc.AccountID = persisted.accountID
+		acc.Email = persisted.email
+		if persisted.planType != "" {
+			acc.PlanType = persisted.planType
+		}
+		acc.ExpiresAt = parseOAuthCredentialExpiry(persisted.expiry)
+	} else {
+		acc.UpstreamType = UpstreamGrok
+		if strings.TrimSpace(apiKey) != "" {
+			acc.APIKey = strings.TrimSpace(apiKey)
+		}
+	}
+	acc.BaseURL = normalizedBaseURL
+	if identityChanged {
+		// The database updater is responsible for the authoritative generation;
+		// discard any runtime observations immediately so old facts cannot route
+		// the newly configured key before the account is reloaded.
+		acc.GrokLivePlanKnown = false
+		acc.GrokAccessAllowed = nil
+		acc.GrokBillingExhausted = false
+		acc.GrokFactsGeneration = 0
+		acc.grokRouting = nil
 	}
 	acc.Models = normalizeModelList(models)
 	acc.ModelMapping = strings.TrimSpace(modelMapping)

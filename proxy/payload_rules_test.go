@@ -57,6 +57,37 @@ func TestPayloadRulesAppendInstructions(t *testing.T) {
 	}
 }
 
+func TestPayloadRulesAppendIdempotentOnReentry(t *testing.T) {
+	// 重试/续想等路径若带着已应用过规则的 body 重入规则引擎，append 不得
+	// 重复堆叠追加文本（体积膨胀且改变提示词语义），第二次应用须是幂等的。
+	withPayloadRules(t, `{"append":[{"params":{"instructions":"extra guard text"}}]}`)
+	once := ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, nil)
+	want := "official prompt\n\nextra guard text"
+	if got := gjson.GetBytes(once, "instructions").String(); got != want {
+		t.Fatalf("首次应用 instructions = %q, want %q", got, want)
+	}
+	twice := ApplyPayloadRulesToBody(once, "gpt-5.6-sol", nil, nil)
+	if got := gjson.GetBytes(twice, "instructions").String(); got != want {
+		t.Fatalf("重入后 instructions = %q, want %q（只追加一次）", got, want)
+	}
+
+	// 原字段缺失：首次直写，重入不重复
+	once = ApplyPayloadRulesToBody([]byte(`{"model":"gpt-5.6-sol"}`), "gpt-5.6-sol", nil, nil)
+	twice = ApplyPayloadRulesToBody(once, "gpt-5.6-sol", nil, nil)
+	if got := gjson.GetBytes(twice, "instructions").String(); got != "extra guard text" {
+		t.Fatalf("重入后 instructions(missing) = %q, want extra guard text", got)
+	}
+
+	// 同路径多条 append 规则：重入后每条追加块各自仍只出现一次
+	withPayloadRules(t, `{"append":[{"params":{"instructions":"guard A"}},{"params":{"instructions":"guard B"}}]}`)
+	once = ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, nil)
+	twice = ApplyPayloadRulesToBody(once, "gpt-5.6-sol", nil, nil)
+	want = "official prompt\n\nguard A\n\nguard B"
+	if got := gjson.GetBytes(twice, "instructions").String(); got != want {
+		t.Fatalf("多规则重入后 instructions = %q, want %q", got, want)
+	}
+}
+
 func TestPayloadRulesConditionalEffortMapping(t *testing.T) {
 	withPayloadRules(t, `{"override":[{"models":["gpt-*"],"match":{"reasoning.effort":"medium"},"params":{"reasoning.effort":"high"}}]}`)
 	out := ApplyPayloadRulesToBody([]byte(payloadTestBody), "gpt-5.6-sol", nil, nil)

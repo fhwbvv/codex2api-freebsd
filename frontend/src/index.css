@@ -1089,6 +1089,14 @@
   animation: none;
   mix-blend-mode: normal;
 }
+
+/* 切换期间冻结元素级过渡：新画面成为静态图层，扫过动画只做纹理合成。
+   （不影响 ::view-transition-new 上的 clip-path 动画——那是 WAAPI 驱动的。） */
+.theme-switching *,
+.theme-switching *::before,
+.theme-switching *::after {
+  transition: none !important;
+}
 ::view-transition-old(root) {
   z-index: 1;
 }
@@ -1267,4 +1275,70 @@
 /* Dark mode shadow softening */
 .dark [class*="shadow-"] {
   --tw-shadow-color: hsl(0 0% 0% / 0.22);
+}
+
+/* 账号状态遮罩：霜面 + 细斜纹淡化内容，徽章保持清晰。
+   不用行级 opacity（会把徽章一起冲淡），也不用 filter（会破坏 tr 定位包含块）。
+   悬停时霜面退让，便于阅读和点击启用 / 恢复等操作。 */
+.account-state-surface {
+  isolation: isolate;
+}
+
+.account-state-overlay__scrim {
+  background-color: color-mix(in oklab, var(--color-background) 54%, transparent);
+  background-image:
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--color-background) 10%, transparent),
+      color-mix(in oklab, var(--color-foreground) 3.5%, transparent)
+    ),
+    repeating-linear-gradient(
+      -22deg,
+      transparent 0 9px,
+      color-mix(in oklab, var(--color-muted-foreground) 7%, transparent) 9px 10px
+    );
+  transition: opacity 180ms ease;
+}
+
+.account-state-overlay--overload .account-state-overlay__scrim {
+  background-color: color-mix(
+    in oklab,
+    hsl(28 86% 52%) 16%,
+    color-mix(in oklab, var(--color-background) 50%, transparent)
+  );
+  background-image:
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, hsl(32 90% 56%) 8%, transparent),
+      color-mix(in oklab, var(--color-foreground) 3%, transparent)
+    ),
+    repeating-linear-gradient(
+      -22deg,
+      transparent 0 9px,
+      color-mix(in oklab, hsl(24 80% 42%) 10%, transparent) 9px 10px
+    );
+}
+
+.account-state-overlay__mark {
+  transition: opacity 180ms ease;
+}
+
+.account-state-surface:hover .account-state-overlay__scrim {
+  opacity: 0.32;
+}
+
+.account-state-surface:hover .account-state-overlay--disabled .account-state-overlay__mark {
+  opacity: 0.58;
+}
+
+.dark .account-state-overlay__scrim {
+  background-color: color-mix(in oklab, var(--color-background) 48%, transparent);
+}
+
+.dark .account-state-overlay--overload .account-state-overlay__scrim {
+  background-color: color-mix(
+    in oklab,
+    hsl(28 70% 42%) 18%,
+    color-mix(in oklab, var(--color-background) 46%, transparent)
+  );
 }

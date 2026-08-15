@@ -307,41 +307,42 @@ export default function Dashboard() {
         {/* 渠道切换时整块内容淡入过渡（key 变化触发重播） */}
         <div key={channel || 'all'} className="animate-channel-switch-in">
         {/* Hero summary */}
-        <div className="relative mb-5 overflow-hidden rounded-2xl border border-border/80 bg-card p-4 shadow-sm sm:mb-6 sm:p-5">
+        <div className="relative mb-5 overflow-hidden rounded-xl border border-border/80 bg-gradient-to-r from-primary/5 via-card to-card p-5 shadow-2xs sm:mb-6 sm:p-6">
           <div
             aria-hidden
-            className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top_left,color-mix(in_oklab,var(--color-primary)_12%,transparent),transparent_55%)]"
+            className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top_left,color-mix(in_oklab,var(--color-primary)_10%,transparent),transparent_60%)]"
           />
           <div className="relative z-10 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="min-w-0">
-              <div className="text-[11px] font-bold uppercase tracking-wide text-muted-foreground">
+            <div className="min-w-0 space-y-2">
+              <div className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground/90">
                 {t('dashboard.heroLabel')}
               </div>
-              <div className="mt-1 flex flex-wrap items-end gap-x-3 gap-y-1">
-                <div className="text-3xl font-bold tabular-nums tracking-tight text-foreground sm:text-4xl">
+              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                <div className="text-3xl font-extrabold tabular-nums tracking-tight text-foreground sm:text-4xl">
                   {available}
-                  <span className="text-lg font-semibold text-muted-foreground sm:text-xl">/{total}</span>
+                  <span className="text-lg font-bold text-muted-foreground/80 sm:text-xl">/{total}</span>
                 </div>
-                <div className="pb-1 text-sm text-muted-foreground">
+                <div className="pb-0.5 text-sm font-semibold text-muted-foreground">
                   {t('dashboard.heroAvailable')}
                 </div>
               </div>
-              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/12 px-2.5 py-1 font-semibold text-emerald-700 dark:text-emerald-300">
-                  <span className="size-1.5 rounded-full bg-emerald-500" />
+              <div className="flex flex-wrap items-center gap-2 pt-1 text-xs text-muted-foreground">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/12 px-3 py-1 text-xs font-bold text-emerald-700 dark:text-emerald-300 ring-1 ring-emerald-500/20">
+                  <span className="size-1.5 rounded-full bg-emerald-500 animate-pulse" />
                   {total > 0
                     ? t('dashboard.heroAvailability', {
                         rate: Math.round((available / Math.max(total, 1)) * 100),
                       })
                     : t('dashboard.heroNoAccounts')}
                 </span>
-                <span className="inline-flex items-center rounded-full bg-muted/80 px-2.5 py-1 font-medium">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-muted/80 px-3 py-1 font-semibold text-foreground ring-1 ring-border/50">
+                  <Activity className="size-3 text-primary" />
                   {t('dashboard.heroTodayRequests', { count: todayRequests })}
                 </span>
                 {channelBreakdown.map(({ key, counts }) => (
                   <span
                     key={key}
-                    className="inline-flex items-center gap-1.5 rounded-full bg-muted/80 px-2.5 py-1 font-medium"
+                    className="inline-flex items-center gap-1.5 rounded-full bg-muted/80 px-3 py-1 font-semibold text-foreground ring-1 ring-border/50"
                     title={t('dashboard.heroChannelTitle', {
                       channel: key === 'grok' ? 'Grok' : 'Codex',
                       available: counts.available,
@@ -353,33 +354,33 @@ export default function Dashboard() {
                     <span className="tabular-nums">
                       {counts.available}/{counts.total}
                     </span>
-                    <span className="text-muted-foreground/70">·</span>
+                    <span className="text-muted-foreground/60">·</span>
                     <span className="tabular-nums">{counts.today_requests}</span>
                   </span>
                 ))}
                 {errorCount > 0 ? (
-                  <span className="inline-flex items-center rounded-full bg-destructive/12 px-2.5 py-1 font-semibold text-destructive">
+                  <span className="inline-flex items-center rounded-full bg-destructive/12 px-3 py-1 font-bold text-destructive ring-1 ring-destructive/20">
                     {t('dashboard.heroErrors', { count: errorCount })}
                   </span>
                 ) : null}
                 {rateLimited > 0 ? (
-                  <span className="inline-flex items-center rounded-full bg-amber-500/12 px-2.5 py-1 font-semibold text-amber-700 dark:text-amber-300">
+                  <span className="inline-flex items-center rounded-full bg-amber-500/12 px-3 py-1 font-bold text-amber-700 dark:text-amber-300 ring-1 ring-amber-500/20">
                     {t('dashboard.heroRateLimited', { count: rateLimited })}
                   </span>
                 ) : null}
               </div>
             </div>
             {total === 0 ? (
-              <div className="rounded-xl border border-dashed border-border bg-background/70 px-4 py-3 text-left text-sm text-muted-foreground lg:max-w-sm">
-                <div className="font-semibold text-foreground">{t('dashboard.heroEmptyTitle')}</div>
-                <p className="mt-1 leading-relaxed">{t('dashboard.heroEmptyDesc')}</p>
+              <div className="rounded-xl border border-dashed border-border bg-background/80 px-4 py-3.5 text-left text-sm text-muted-foreground lg:max-w-sm shadow-2xs">
+                <div className="font-bold text-foreground">{t('dashboard.heroEmptyTitle')}</div>
+                <p className="mt-1 leading-relaxed text-xs">{t('dashboard.heroEmptyDesc')}</p>
               </div>
             ) : null}
           </div>
         </div>
 
         {/* Account status */}
-        <div className="mb-6 grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-5 sm:gap-4">
+        <div className="mb-6 grid grid-cols-2 gap-2.5 sm:gap-4 md:grid-cols-3 xl:grid-cols-5">
           <StatCard icon={icons.total} iconClass="blue" label={t('dashboard.totalAccounts')} value={total} />
           <StatCard
             icon={icons.available}
@@ -394,7 +395,7 @@ export default function Dashboard() {
             value={rateLimited}
           />
           <StatCard icon={icons.error} iconClass="red" label={t('dashboard.error')} value={errorCount} />
-          <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} />
+          <StatCard icon={icons.requests} iconClass="purple" label={t('dashboard.todayRequests')} value={todayRequests} className="col-span-2 min-[420px]:col-span-1 md:col-span-1" />
         </div>
 
         {/* Pool runway（可开关）+ system health */}

@@ -195,7 +195,7 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
 	req.Header.Set("Originator", Originator)
 	// 用 EffectiveAccountID:自定义头覆盖了工作区 ID 时,额度必须查覆盖后的空间,
 	// 否则进度条/自动暂停/智能配速统计的是与实际流量不同的空间。
@@ -309,7 +309,7 @@ func queryWhamResetCreditsWithURL(ctx context.Context, account *auth.Account, pr
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
 	req.Header.Set("Originator", Originator)
 	// 与 wham 查询一致,重置券按自定义头覆盖后的空间查询。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
@@ -396,7 +396,7 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
 	req.Header.Set("Originator", Originator)
 	// 与 wham 查询一致,重置额度也作用于自定义头覆盖后的空间。
 	if accountID := account.EffectiveAccountID(); accountID != "" {

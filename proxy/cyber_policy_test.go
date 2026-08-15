@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -317,21 +318,159 @@ func TestPromptPolicyIncidentUsesStableFingerprintWhenPromptUnavailable(t *testi
 	}
 	defer db.Close()
 	handler := NewHandler(auth.NewStore(nil, nil, &database.SystemSettings{PromptFilterEnabled: true}), db, nil, nil)
+	incidentIDs := make([]string, 0, 2)
+	for _, requestID := range []string{"unavailable-one", "unavailable-two"} {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		ctx.Request.Header.Set("X-Request-ID", requestID)
+		incidentID, accepted := handler.logUpstreamCyberPolicy(ctx, "/v1/responses", "gpt-5.6-sol", []byte(`{"error":{"code":"cyber_policy"}}`))
+		if !accepted || incidentID == "" {
+			t.Fatalf("incident enqueue accepted=%t id=%q", accepted, incidentID)
+		}
+		incidentIDs = append(incidentIDs, incidentID)
+	}
+	waitPromptFilterAuditIdle(t, db)
+	want := promptfilter.StableEvidenceFingerprint("cyber-insufficient", "/v1/responses\x00\x00\x00cyber_policy")
+	for _, incidentID := range incidentIDs {
+		incident, err := db.GetPromptPolicyIncident(context.Background(), incidentID)
+		if err != nil {
+			t.Fatalf("GetPromptPolicyIncident: %v", err)
+		}
+		if incident.PromptFingerprint != want {
+			t.Fatalf("unavailable prompt fingerprint = %q, want %q", incident.PromptFingerprint, want)
+		}
+	}
+	candidate, err := db.GetPromptRuleCandidateByFingerprint(context.Background(), want)
+	if err != nil {
+		t.Fatalf("GetPromptRuleCandidateByFingerprint: %v", err)
+	}
+	if candidate.EvidenceCount != 2 || candidate.SamplePreview != "" {
+		t.Fatalf("insufficient evidence quarantine candidate=%#v", candidate)
+	}
+	evidence, err := db.ListPromptRuleCandidateEvidence(context.Background(), candidate.ID, 10)
+	if err != nil || len(evidence) != 2 {
+		t.Fatalf("ListPromptRuleCandidateEvidence len=%d err=%v", len(evidence), err)
+	}
+	for _, row := range evidence {
+		if !strings.Contains(row.MetadataJSON, `"evidence_quality":"insufficient"`) || !strings.Contains(row.MetadataJSON, `"quality":"insufficient"`) {
+			t.Fatalf("insufficient evidence quality metadata missing: %s", row.MetadataJSON)
+		}
+	}
+}
+
+func TestPromptPolicyLearningEvidenceIncludesBoundedContextAndReview(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "cyber-learning-bundle.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	handler := NewHandler(auth.NewStore(nil, nil, &database.SystemSettings{PromptFilterEnabled: true}), db, nil, nil)
 	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
-
-	incidentID, accepted := handler.logUpstreamCyberPolicy(ctx, "/v1/responses", "gpt-5.6-sol", []byte(`{"error":{"code":"cyber_policy"}}`))
-	if !accepted || incidentID == "" {
-		t.Fatalf("incident enqueue accepted=%t id=%q", accepted, incidentID)
+	handler.capturePromptRuleLearningEvidence(ctx, "/v1/responses", "gpt-5.6-sol", promptGuardEvaluation{
+		Envelope: promptfilter.RequestEnvelope{Protocol: promptfilter.ProtocolResponses, ModelFamily: promptfilter.ModelFamilyOpenAI, Segments: []promptfilter.Segment{
+			{Origin: promptfilter.OriginHistory, Role: "user", Text: "linked defensive context", Linked: true, Trust: promptfilter.SegmentTrustClientSupplied},
+			{Origin: promptfilter.OriginCurrentUser, Role: "user", Text: "current security request", Trust: promptfilter.SegmentTrustClientSupplied},
+			{Origin: promptfilter.OriginSystem, Role: "system", Text: "fixed application boilerplate", Trust: promptfilter.SegmentTrustServerInjected},
+		}},
+		Decision: promptfilter.Decision{Action: promptfilter.ActionAllow, PrimaryOrigin: promptfilter.OriginCurrentUser},
+		Verdict:  promptfilter.Verdict{Enabled: true, Action: promptfilter.ActionAllow, ReviewModel: "review-model", ReviewError: "review timeout"},
+	})
+	incidentID, accepted := handler.logUpstreamCyberPolicy(ctx, "/v1/responses", "gpt-5.6-sol", []byte(`{"error":{"code":"cyber_policy","message":"blocked evidence"}}`))
+	if !accepted {
+		t.Fatal("learning evidence was not enqueued")
 	}
 	waitPromptFilterAuditIdle(t, db)
 	incident, err := db.GetPromptPolicyIncident(context.Background(), incidentID)
 	if err != nil {
-		t.Fatalf("GetPromptPolicyIncident: %v", err)
+		t.Fatal(err)
 	}
-	want := promptfilter.StableEvidenceFingerprint("cyber-unavailable", incident.RequestCorrelationID+"\x00/v1/responses\x00gpt-5.6-sol")
-	if incident.PromptFingerprint != want {
-		t.Fatalf("unavailable prompt fingerprint = %q, want %q", incident.PromptFingerprint, want)
+	evidence, err := db.ListPromptRuleCandidateEvidence(context.Background(), incident.CandidateID, 10)
+	if err != nil || len(evidence) != 1 {
+		t.Fatalf("evidence len=%d err=%v", len(evidence), err)
+	}
+	metadata := evidence[0].MetadataJSON
+	for _, expected := range []string{`"evidence_quality":"complete"`, `"prompt_text":"current security request"`, `"linked defensive context"`, `"review_model":"review-model"`, `"review_error":"review timeout"`, `"upstream_error"`} {
+		if !strings.Contains(metadata, expected) {
+			t.Fatalf("learning evidence metadata missing %s: %s", expected, metadata)
+		}
+	}
+	if strings.Contains(metadata, "fixed application boilerplate") {
+		t.Fatalf("server-injected boilerplate leaked into learning evidence: %s", metadata)
+	}
+}
+
+func TestPromptPolicyRedactedLearningTextHonorsByteBudget(t *testing.T) {
+	got := promptPolicyRedactedLearningText(strings.Repeat("测试🙂", 10000), 20000, 20000)
+	if len(got) > 20000 {
+		t.Fatalf("learning text bytes = %d, want <= 20000", len(got))
+	}
+	if !utf8.ValidString(got) {
+		t.Fatal("learning text was truncated inside a UTF-8 rune")
+	}
+	// 预算刻意落在多字节字符中间,验证按字节截断会回退到字符起点。
+	got = promptPolicyRedactedLearningText(strings.Repeat("测试🙂", 10000), 20000, 20001)
+	if len(got) > 20001 || !utf8.ValidString(got) {
+		t.Fatalf("mid-rune budget: bytes=%d valid=%t", len(got), utf8.ValidString(got))
+	}
+	if got = promptPolicyRedactedLearningText(strings.Repeat("🙂", 10), 100, 5); got != "🙂" {
+		t.Fatalf("mid-rune budget 5 over 4-byte runes = %q, want single 🙂", got)
+	}
+	if got = promptPolicyRedactedLearningText("text", 100, 0); got != "" {
+		t.Fatalf("zero byte budget = %q, want empty", got)
+	}
+}
+
+// TestMarshalPromptPolicyEvidenceMetadataSurvivesEscapeInflation 复现 JSON
+// HTML 转义膨胀:20000 字节的 < 编码后约 120 KB,若不按编码后体积收缩,
+// 元数据会被 64 KiB 校验拒绝并连带丢弃整条事件记录。
+func TestMarshalPromptPolicyEvidenceMetadataSurvivesEscapeInflation(t *testing.T) {
+	bundle := promptPolicyLearningBundle{
+		Version: 1, Quality: promptPolicyEvidenceQualityComplete,
+		PromptText: strings.Repeat("<", promptPolicyLearningPromptBytes),
+		Context: []promptPolicyLearningContextSegment{
+			{Origin: "history", Text: strings.Repeat("&", 6000), Linked: true},
+			{Origin: "tool_output", Text: strings.Repeat(">", 6000)},
+		},
+		UpstreamError: strings.Repeat("<", promptPolicyLearningUpstreamErrorBytes),
+	}
+	fields := map[string]any{
+		"incident_id":       "escape-inflation",
+		"local_matches":     []promptfilter.Match{{Name: "x", Weight: 1}},
+		"evidence_quality":  bundle.Quality,
+		"learning_evidence": bundle,
+	}
+	encoded := marshalPromptPolicyEvidenceMetadata(fields, bundle, 1)
+	if len(encoded) > promptPolicyLearningMetadataBytes {
+		t.Fatalf("metadata bytes = %d, want <= %d", len(encoded), promptPolicyLearningMetadataBytes)
+	}
+	if !json.Valid(encoded) {
+		t.Fatal("shrunk metadata is not valid JSON")
+	}
+	parsed := map[string]any{}
+	if err := json.Unmarshal(encoded, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := parsed["incident_id"]; !ok {
+		t.Fatal("incident fields must survive shrinking")
+	}
+	if _, ok := parsed["local_matches_count"]; !ok {
+		t.Fatal("match count must replace dropped local_matches")
+	}
+	if learning, ok := parsed["learning_evidence"].(map[string]any); ok {
+		if text, _ := learning["prompt_text"].(string); len(text) >= promptPolicyLearningPromptBytes {
+			t.Fatalf("prompt_text was not shrunk: %d bytes", len(text))
+		}
+	}
+	// 小体积元数据必须原样通过。
+	small := map[string]any{"incident_id": "small", "learning_evidence": promptPolicyLearningBundle{Version: 1, Quality: "complete", PromptText: "hello"}}
+	if encoded := marshalPromptPolicyEvidenceMetadata(small, promptPolicyLearningBundle{Version: 1, PromptText: "hello"}, 0); !json.Valid(encoded) {
+		t.Fatal("small metadata must marshal untouched")
+	} else if parsed := map[string]any{}; json.Unmarshal(encoded, &parsed) == nil {
+		if _, ok := parsed["local_matches_count"]; ok {
+			t.Fatal("small metadata must not trigger match-count fallback")
+		}
 	}
 }
 

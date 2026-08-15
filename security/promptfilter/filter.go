@@ -73,7 +73,30 @@ type PatternConfig struct {
 	AllPatterns     []string `json:"all_patterns,omitempty"`
 	AnyPatterns     []string `json:"any_patterns,omitempty"`
 	ExcludePatterns []string `json:"exclude_patterns,omitempty"`
-	MinMatches      int      `json:"min_matches,omitempty"`
+	// AuthorizationExcludePatterns 是"声明式授权"豁免条件,只在
+	// Advanced.Enforcement.AuthorizedPentestAllowed 打开时才并入 ExcludePatterns。
+	// 与普通排除条件分开存放,使"是否承认无法验证的授权自述"成为显式的部署策略,
+	// 而不是硬编码在规则里的隐含行为。
+	AuthorizationExcludePatterns []string `json:"authorization_exclude_patterns,omitempty"`
+	MinMatches                   int      `json:"min_matches,omitempty"`
+}
+
+// resolveAuthorizationExcludes 依据部署策略决定声明式授权是否具有豁免效力。
+// 返回的 PatternConfig 始终持有独立的切片,避免污染进程级的 defaultPatternConfigs。
+func resolveAuthorizationExcludes(pattern PatternConfig, allowed bool) PatternConfig {
+	if len(pattern.AuthorizationExcludePatterns) == 0 {
+		return pattern
+	}
+	authorization := pattern.AuthorizationExcludePatterns
+	pattern.AuthorizationExcludePatterns = nil
+	if !allowed {
+		return pattern
+	}
+	merged := make([]string, 0, len(pattern.ExcludePatterns)+len(authorization))
+	merged = append(merged, pattern.ExcludePatterns...)
+	merged = append(merged, authorization...)
+	pattern.ExcludePatterns = merged
+	return pattern
 }
 
 type Match struct {
@@ -329,9 +352,11 @@ func NewEngine(cfg Config) (*Engine, error) {
 	builtinCount := len(defaultPatternConfigs)
 
 	patterns := make([]compiledPattern, 0, len(merged))
+	authorizedPentestAllowed := cfg.Advanced.Enforcement.AuthorizedPentestAllowed
 patternLoop:
 	for index, pattern := range merged {
 		custom := index >= builtinCount
+		pattern = resolveAuthorizationExcludes(pattern, authorizedPentestAllowed)
 		pattern.Name = strings.TrimSpace(pattern.Name)
 		pattern.Pattern = strings.TrimSpace(pattern.Pattern)
 		pattern.Category = strings.TrimSpace(pattern.Category)

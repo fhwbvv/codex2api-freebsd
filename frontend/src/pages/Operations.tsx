@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -11,10 +11,13 @@ import {
   Server,
   Users,
   Zap,
+  Gauge,
+  Layers,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
+import { StatTile } from '../components/StatTile'
 import OpsTabs from '../components/OpsTabs'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
@@ -35,10 +38,23 @@ export default function Operations() {
     load: loadOperationsData,
   })
 
+  const [countdown, setCountdown] = useState(15)
+
+  const triggerManualReload = useCallback(async () => {
+    setCountdown(15)
+    await reload()
+  }, [reload])
+
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void reloadSilently()
-    }, 15000)
+      setCountdown((prev) => {
+        if (prev <= 1) {
+          void reloadSilently()
+          return 15
+        }
+        return prev - 1
+      })
+    }, 1000)
 
     return () => window.clearInterval(timer)
   }, [reloadSilently])
@@ -50,7 +66,7 @@ export default function Operations() {
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => void reload()}
+      onRetry={() => void triggerManualReload()}
       loadingTitle={t('ops.loadingTitle')}
       loadingDescription={t('ops.loadingDesc')}
       errorTitle={t('ops.errorTitle')}
@@ -61,10 +77,19 @@ export default function Operations() {
           description={t('ops.description')}
           actions={
             <div className="flex items-center gap-3 max-sm:w-full max-sm:flex-col max-sm:items-stretch">
-              <span className="text-sm text-muted-foreground max-sm:text-center">{t('ops.lastUpdated', { time: updatedLabel })}</span>
-              <Button variant="outline" onClick={() => void reload()}>
-                <RefreshCw className="size-3.5" />
-                {t('common.refresh')}
+              <div className="flex items-center gap-2 rounded-md border border-border/60 bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground max-sm:justify-center">
+                <span className="relative flex size-2">
+                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+                </span>
+                <span>{t('ops.autoRefreshing', { sec: countdown })}</span>
+              </div>
+              <span className="text-xs text-muted-foreground max-sm:text-center">
+                {t('ops.lastUpdated', { time: updatedLabel })}
+              </span>
+              <Button variant="outline" size="sm" onClick={() => void triggerManualReload()} disabled={loading}>
+                <RefreshCw className={cn('size-3.5', loading && 'animate-spin')} />
+                {loading ? t('ops.refreshing') : t('common.refresh')}
               </Button>
             </div>
           }
@@ -74,35 +99,54 @@ export default function Operations() {
         {overview ? (
           <>
             <div className="mb-6 grid grid-cols-1 gap-3 min-[420px]:grid-cols-2 xl:grid-cols-4 sm:gap-4">
-              <SummaryPill label={t('ops.uptime')} value={formatUptime(overview.uptime_seconds, t)} />
-              <SummaryPill label={t('ops.accountPool')} value={`${overview.runtime.available_accounts} / ${overview.runtime.total_accounts}`} />
-              <SummaryPill label={t('ops.todayRequests')} value={formatNumber(overview.traffic.today_requests)} />
-              <SummaryPill label={t('ops.todayErrorRate')} value={`${overview.traffic.error_rate.toFixed(1)}%`} />
+              <StatTile
+                label={t('ops.uptime')}
+                value={formatUptime(overview.uptime_seconds, t)}
+                icon={<Clock3 className="size-4" />}
+                tone="neutral"
+              />
+              <StatTile
+                label={t('ops.accountPool')}
+                value={`${overview.runtime.available_accounts} / ${overview.runtime.total_accounts}`}
+                icon={<Users className="size-4" />}
+                tone="info"
+              />
+              <StatTile
+                label={t('ops.todayRequests')}
+                value={formatNumber(overview.traffic.today_requests)}
+                icon={<BarChart3 className="size-4" />}
+                tone="info"
+              />
+              <StatTile
+                label={t('ops.todayErrorRate')}
+                value={`${overview.traffic.error_rate.toFixed(1)}%`}
+                icon={<AlertTriangle className="size-4" />}
+                tone={overview.traffic.error_rate >= 5 ? 'danger' : overview.traffic.error_rate > 0 ? 'warning' : 'success'}
+              />
             </div>
 
-            <Card>
-              <CardContent className="p-6">
-                <div className="mb-5 flex items-center justify-between gap-4">
-                  <div>
-                    <h3 className="text-base font-semibold text-foreground">{t('ops.overview')}</h3>
-                    <p className="mt-1 text-sm text-muted-foreground">{t('ops.overviewDesc')}</p>
-                  </div>
+            <div className="space-y-6">
+              {/* 分组 1：基础硬件与依赖 */}
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                  <Cpu className="size-4 text-primary" />
+                  <span>{t('ops.sections.infrastructure')}</span>
                 </div>
-
-                <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,17rem),1fr))] gap-4">
+                <div className="grid grid-cols-1 gap-4 min-[420px]:grid-cols-2 lg:grid-cols-4">
                   <OpsMetricCard
                     label={t('ops.cpu')}
                     value={`${overview.cpu.percent.toFixed(1)}%`}
                     sub={t('ops.cpuCores', { count: overview.cpu.cores })}
                     icon={<Cpu className="size-5" />}
                     tone={getPercentTone(overview.cpu.percent, 70, 90)}
+                    progressPercent={overview.cpu.percent}
                     t={t}
                   />
                   <OpsMetricCard
                     label={t('ops.memory')}
                     value={`${overview.memory.percent.toFixed(1)}%`}
                     sub={
-                      <dl className="flex flex-wrap gap-x-4 gap-y-1.5">
+                      <dl className="grid grid-cols-2 gap-x-2 gap-y-1 text-xs">
                         <MemoryDetail
                           label={t('ops.memorySystem')}
                           value={`${formatIECBytes(overview.memory.used_bytes)} / ${formatIECBytes(overview.memory.total_bytes)}`}
@@ -135,6 +179,7 @@ export default function Operations() {
                     }
                     icon={<HardDrive className="size-5" />}
                     tone={getPercentTone(overview.memory.percent, 75, 90)}
+                    progressPercent={overview.memory.percent}
                     t={t}
                   />
                   <OpsMetricCard
@@ -143,6 +188,7 @@ export default function Operations() {
                     sub={t('ops.pgConn', { open: overview.postgres.open, max: overview.postgres.max_open || '∞' })}
                     icon={<Database className="size-5" />}
                     tone={getDatabaseTone(overview)}
+                    progressPercent={overview.database_driver === 'sqlite' ? undefined : overview.postgres.usage_percent}
                     t={t}
                   />
                   <OpsMetricCard
@@ -151,24 +197,19 @@ export default function Operations() {
                     sub={t('ops.redisConn', { open: overview.redis.total_conns, max: overview.redis.pool_size || '-' })}
                     icon={<Server className="size-5" />}
                     tone={getCacheTone(overview)}
+                    progressPercent={overview.cache_driver === 'memory' ? undefined : overview.redis.usage_percent}
                     t={t}
                   />
-                  <OpsMetricCard
-                    label={t('ops.activeRequests')}
-                    value={formatNumber(overview.requests.active)}
-                    sub={t('ops.totalRequestsAccum', { count: formatNumber(overview.requests.total) })}
-                    icon={<Activity className="size-5" />}
-                    tone={overview.requests.active >= Math.max(50, overview.runtime.total_accounts * 0.5) ? 'warning' : 'normal'}
-                    t={t}
-                  />
-                  <OpsMetricCard
-                    label={t('ops.goroutines')}
-                    value={formatNumber(overview.runtime.goroutines)}
-                    sub={t('ops.goroutinesPool', { available: overview.runtime.available_accounts, total: overview.runtime.total_accounts })}
-                    icon={<Users className="size-5" />}
-                    tone={overview.runtime.goroutines >= Math.max(1000, overview.runtime.total_accounts * 3) ? 'danger' : overview.runtime.goroutines >= Math.max(500, overview.runtime.total_accounts * 1.5) ? 'warning' : 'normal'}
-                    t={t}
-                  />
+                </div>
+              </div>
+
+              {/* 分组 2：流量与吞吐表现 */}
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                  <Gauge className="size-4 text-primary" />
+                  <span>{t('ops.sections.traffic')}</span>
+                </div>
+                <div className="grid grid-cols-1 gap-4 min-[420px]:grid-cols-2 lg:grid-cols-4">
                   <OpsMetricCard
                     label={t('ops.qps')}
                     value={overview.traffic.qps.toFixed(1)}
@@ -191,6 +232,7 @@ export default function Operations() {
                     sub={overview.traffic.rpm_limit > 0 ? t('ops.rpmLimit', { value: formatNumber(overview.traffic.rpm_limit) }) : t('ops.rpmNoLimit')}
                     icon={<Clock3 className="size-5" />}
                     tone={overview.traffic.rpm_limit > 0 && overview.traffic.rpm >= overview.traffic.rpm_limit * 0.8 ? 'warning' : 'normal'}
+                    progressPercent={overview.traffic.rpm_limit > 0 ? (overview.traffic.rpm / overview.traffic.rpm_limit) * 100 : undefined}
                     t={t}
                   />
                   <OpsMetricCard
@@ -202,8 +244,35 @@ export default function Operations() {
                     t={t}
                   />
                 </div>
-              </CardContent>
-            </Card>
+              </div>
+
+              {/* 分组 3：并发与运行时负载 */}
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+                  <Layers className="size-4 text-primary" />
+                  <span>{t('ops.sections.concurrency')}</span>
+                </div>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <OpsMetricCard
+                    label={t('ops.activeRequests')}
+                    value={formatNumber(overview.requests.active)}
+                    sub={t('ops.totalRequestsAccum', { count: formatNumber(overview.requests.total) })}
+                    icon={<Activity className="size-5" />}
+                    tone={overview.requests.active >= Math.max(50, overview.runtime.total_accounts * 0.5) ? 'warning' : 'normal'}
+                    t={t}
+                  />
+                  <OpsMetricCard
+                    label={t('ops.goroutines')}
+                    value={formatNumber(overview.runtime.goroutines)}
+                    sub={t('ops.goroutinesPool', { available: overview.runtime.available_accounts, total: overview.runtime.total_accounts })}
+                    icon={<Users className="size-5" />}
+                    tone={overview.runtime.goroutines >= Math.max(1000, overview.runtime.total_accounts * 3) ? 'danger' : overview.runtime.goroutines >= Math.max(500, overview.runtime.total_accounts * 1.5) ? 'warning' : 'normal'}
+                    t={t}
+                  />
+                </div>
+              </div>
+            </div>
+
             <ResponseCacheCard cache={overview.response_cache} t={t} />
           </>
         ) : null}
@@ -254,6 +323,9 @@ function ResponseCacheCard({
     danger: 'bg-destructive/10 text-destructive',
     info: 'bg-primary/10 text-primary',
   }[syncTone]
+
+  const localHitRate = calculateHitRatePercent(cache.local_hits, cache.local_misses)
+  const remoteHitRate = calculateHitRatePercent(cache.remote_hits, cache.remote_misses)
 
   return (
     <Card className="mt-6">
@@ -328,11 +400,25 @@ function ResponseCacheCard({
             label={t('ops.responseCache.localLookup')}
             value={`${formatNumber(cache.local_hits)} / ${formatNumber(cache.local_misses)}`}
             sub={t('ops.responseCache.hitMiss')}
+            badge={
+              localHitRate !== null ? (
+                <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[11px] font-semibold text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400">
+                  {t('ops.hitRate', { rate: localHitRate })}
+                </span>
+              ) : undefined
+            }
           />
           <CacheMetricTile
             label={t('ops.responseCache.remoteLookup')}
             value={`${formatNumber(cache.remote_hits)} / ${formatNumber(cache.remote_misses)}`}
             sub={t('ops.responseCache.hitMiss')}
+            badge={
+              remoteHitRate !== null ? (
+                <span className="rounded bg-blue-500/10 px-1.5 py-0.5 text-[11px] font-semibold text-blue-600 dark:bg-blue-500/20 dark:text-blue-400">
+                  {t('ops.hitRate', { rate: remoteHitRate })}
+                </span>
+              ) : undefined
+            }
           />
           <CacheMetricTile
             label={t('ops.responseCache.expirations')}
@@ -352,9 +438,11 @@ function ResponseCacheCard({
           <CacheMetricTile
             label={t('ops.responseCache.unavailableErrors')}
             value={formatNumber(cache.known_unavailable_errors)}
-            sub={cache.last_config_sync_at
-              ? t('ops.responseCache.lastSync', { time: formatDateTimeLabel(cache.last_config_sync_at) })
-              : t('ops.responseCache.neverSynced')}
+            sub={
+              cache.last_config_sync_at
+                ? t('ops.responseCache.lastSync', { time: formatDateTimeLabel(cache.last_config_sync_at) })
+                : t('ops.responseCache.neverSynced')
+            }
           />
         </div>
 
@@ -372,14 +460,19 @@ function CacheMetricTile({
   label,
   value,
   sub,
+  badge,
 }: {
   label: string
   value: string
   sub: string
+  badge?: React.ReactNode
 }) {
   return (
-    <div className="rounded-lg border border-border/70 bg-card px-3.5 py-3">
-      <div className="text-xs font-semibold text-muted-foreground">{label}</div>
+    <div className="rounded-lg border border-border/70 bg-card px-3.5 py-3 transition-colors hover:border-primary/30">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs font-semibold text-muted-foreground">{label}</div>
+        {badge}
+      </div>
       <div className="mt-2 text-lg font-bold tabular-nums text-foreground">{value}</div>
       <div className="mt-1 text-xs leading-relaxed text-muted-foreground">{sub}</div>
     </div>
@@ -388,9 +481,9 @@ function CacheMetricTile({
 
 function MemoryDetail({ label, value }: { label: string; value: string }) {
   return (
-    <div className="inline-flex min-w-0 items-baseline gap-1.5 whitespace-nowrap">
-      <dt className="text-[11px] font-medium text-muted-foreground">{label}</dt>
-      <dd className="font-medium tabular-nums text-foreground/80">{value}</dd>
+    <div className="inline-flex min-w-0 items-baseline gap-1 overflow-hidden whitespace-nowrap">
+      <dt className="text-[11px] font-medium text-muted-foreground">{label}:</dt>
+      <dd className="truncate text-[11px] font-semibold tabular-nums text-foreground/90">{value}</dd>
     </div>
   )
 }
@@ -401,6 +494,7 @@ function OpsMetricCard({
   sub,
   icon,
   tone,
+  progressPercent,
   t,
 }: {
   label: string
@@ -408,6 +502,7 @@ function OpsMetricCard({
   sub: React.ReactNode
   icon: React.ReactNode
   tone: MetricTone
+  progressPercent?: number
   t: (key: string) => string
 }) {
   const toneStyle = {
@@ -438,39 +533,42 @@ function OpsMetricCard({
   }[tone]
 
   return (
-    <Card className="py-0 transition-all duration-150 hover:-translate-y-0.5 hover:shadow-md">
+    <Card className="py-0 transition-all duration-200 hover:border-primary/30 hover:shadow-sm">
       <CardContent className="p-4">
         <div className="flex items-center justify-between gap-3">
           <span className="text-[13px] font-semibold text-muted-foreground">{label}</span>
-          <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[12px] font-semibold ${toneStyle.badge}`}>
-            <span className={`size-2 rounded-full ${toneStyle.dot}`} />
-            {toneStyle.label}
-          </span>
+          {tone !== 'normal' ? (
+            <span className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[12px] font-semibold ${toneStyle.badge}`}>
+              <span className={`size-2 rounded-full ${toneStyle.dot}`} />
+              {toneStyle.label}
+            </span>
+          ) : null}
         </div>
 
-        <div className="mt-5">
+        <div className="mt-4">
           <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0 text-[32px] font-bold leading-none tabular-nums text-foreground">{value}</div>
+            <div className="min-w-0 text-[28px] font-bold leading-none tracking-tight tabular-nums text-foreground">{value}</div>
             <div
-              className={`flex size-11 shrink-0 items-center justify-center rounded-lg ${toneStyle.icon}`}
+              className={`flex size-10 shrink-0 items-center justify-center rounded-lg ${toneStyle.icon}`}
               aria-hidden="true"
             >
               {icon}
             </div>
           </div>
-          <div className="mt-3 min-w-0 text-[13px] leading-relaxed text-muted-foreground">{sub}</div>
+
+          {typeof progressPercent === 'number' && !Number.isNaN(progressPercent) ? (
+            <div className="mt-3.5 h-1.5 w-full overflow-hidden rounded-full bg-muted/60">
+              <div
+                className={cn('h-full rounded-full transition-all duration-500', toneStyle.dot)}
+                style={{ width: `${Math.min(100, Math.max(0, progressPercent))}%` }}
+              />
+            </div>
+          ) : null}
+
+          <div className="mt-3 min-w-0 text-[12px] leading-relaxed text-muted-foreground">{sub}</div>
         </div>
       </CardContent>
     </Card>
-  )
-}
-
-function SummaryPill({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg border border-border bg-card/85 px-3 py-2.5 shadow-sm">
-      <div className="text-[12px] font-bold uppercase text-muted-foreground">{label}</div>
-      <div className="mt-2 text-[20px] font-bold text-foreground">{value}</div>
-    </div>
   )
 }
 
@@ -490,6 +588,12 @@ function getCacheTone(overview: OpsOverviewResponse): MetricTone {
   if (!overview.redis.healthy) return 'danger'
   if (overview.cache_driver === 'memory') return 'normal'
   return getPercentTone(overview.redis.usage_percent, 70, 90)
+}
+
+function calculateHitRatePercent(hits: number, misses: number): string | null {
+  const total = hits + misses
+  if (total === 0) return null
+  return ((hits / total) * 100).toFixed(1)
 }
 
 function formatNumber(value: number): string {

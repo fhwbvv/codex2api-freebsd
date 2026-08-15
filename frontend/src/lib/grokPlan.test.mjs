@@ -16,6 +16,7 @@ test("Grok tier mapping preserves key, display, paid, and billing metadata", () 
     [4, { key: "x_premium_plus", display: "X Premium+", paid: true, billing: true }],
     [5, { key: "supergrok_heavy", display: "SuperGrok Heavy", paid: true, billing: true }],
     [6, { key: "supergrok_lite", display: "SuperGrok Lite", paid: true, billing: true }],
+    [7, { key: "supergrok_plus", display: "SuperGrok Plus", paid: true, billing: true }],
   ];
 
   for (const [tier, expected] of cases) {
@@ -25,6 +26,9 @@ test("Grok tier mapping preserves key, display, paid, and billing metadata", () 
 
 test("Grok plans normalize persisted keys, legacy displays, and numeric tiers", () => {
   assert.equal(resolveGrokPlan("SuperGrok Heavy")?.key, "supergrok_heavy");
+  assert.equal(resolveGrokPlan("GrokPro")?.key, "supergrok");
+  assert.equal(resolveGrokPlan("SuperGrokPro")?.key, "supergrok_heavy");
+  assert.equal(resolveGrokPlan("SuperGrokPlus")?.key, "supergrok_plus");
   assert.equal(resolveGrokPlan("X Premium+")?.key, "x_premium_plus");
   assert.equal(resolveGrokPlan("x_premium_plus")?.display, "X Premium+");
   assert.equal(resolveGrokPlan("6")?.display, "SuperGrok Lite");

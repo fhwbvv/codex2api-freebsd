@@ -540,6 +540,9 @@ function runThemeTransition(e: MouseEvent | undefined, apply: () => void) {
   )
 
   if (document.startViewTransition) {
+    // 冻结元素级颜色过渡：View Transition 的"新画面"是活文档,若放任全页
+    // 几千个 200ms transition-colors 同时跑,扫过期间会逐帧重绘导致卡顿。
+    root.classList.add('theme-switching')
     const transition = document.startViewTransition(() => {
       apply()
     })
@@ -552,12 +555,14 @@ function runThemeTransition(e: MouseEvent | undefined, apply: () => void) {
           ],
         },
         {
-          duration: 500,
+          duration: 400,
           easing: 'ease-out',
           pseudoElement: '::view-transition-new(root)',
         },
       )
     })
+    const cleanup = () => root.classList.remove('theme-switching')
+    transition.finished.then(cleanup, cleanup)
   } else {
     apply()
   }

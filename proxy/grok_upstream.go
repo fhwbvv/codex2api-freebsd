@@ -227,16 +227,27 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 	return resp, nil
 }
 
-// recordGrokUpstreamObservations 采集上游逐请求返回的运行时观测：配额余量头
-// （x-ratelimit-*）与上下文窗口（x-grok-context-window）。两者互不依赖，
-// 缺一个不影响另一个。
+// recordGrokUpstreamObservations 采集上游逐请求返回的运行时观测：配额余量头、
+// context window，以及 opaque 模型目录刷新提示。持久化 sink 是 generation
+// fenced 且 DB-first；这里不等待后台刷新，也不会把 hint 当成 HTTP ETag。
 func recordGrokUpstreamObservations(account *auth.Account, header http.Header) {
+	recordGrokUpstreamObservationsAtOrigin(account, header, "")
+}
+
+func recordGrokUpstreamObservationsAtOrigin(account *auth.Account, header http.Header, origin string) {
 	if account == nil || header == nil {
 		return
 	}
 	recordGrokRateLimitHeaders(account, header)
 	if window := parseGrokPositiveHeader(header, "x-grok-context-window"); window > 0 {
 		account.SetGrokContextWindow(window)
+	}
+	if hint := strings.TrimSpace(header.Get("x-models-etag")); hint != "" {
+		persistGrokRuntimeObservation(account, auth.GrokRuntimeFactObservation{
+			ModelsETagHint: hint,
+			Origin:         origin,
+			ObservedAt:     time.Now(),
+		})
 	}
 }
 
@@ -274,7 +285,7 @@ func recordGrokRateLimitHeaders(account *auth.Account, header http.Header) {
 	remainTokens, ok2 := parse("x-ratelimit-remaining-tokens")
 	limitReqs, ok3 := parse("x-ratelimit-limit-requests")
 	remainReqs, ok4 := parse("x-ratelimit-remaining-requests")
-	if !ok1 && !ok2 && !ok3 && !ok4 {
+	if !ok1 || !ok2 || !ok3 || !ok4 {
 		return
 	}
 	account.SetGrokRateLimitSnapshot(auth.GrokRateLimitSnapshot{
@@ -324,11 +335,21 @@ func dropGrokToolChoiceWithoutTools(body []byte) []byte {
 	return body
 }
 
-// mapGrokReasoningEffort 把思考强度映射到 Grok build 支持的档位（只有 low/medium/high）：
-// Codex 侧更高的 xhigh/max → high、更低的 minimal → low；low/medium/high 原样；其它未知不动。
-func mapGrokReasoningEffort(effort string) (string, bool) {
+// mapGrokReasoningEffort 把思考强度映射到当前 Grok 模型支持的档位。
+// grok-4.6 起（含 grok-4.20-multi-agent）支持 xhigh；更旧的 build 只有 low/medium/high。
+// Codex 的 max 在支持 xhigh 的模型上落到 xhigh，否则落到 high；minimal 一律落到 low。
+// 无模型上下文时按旧 build 处理，避免 grok-4.5 / grok-3 收到不认的档位。
+func mapGrokReasoningEffort(effort, model string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "xhigh", "max":
+	case "xhigh":
+		if grokSupportsXHighReasoningEffort(model) {
+			return effort, false
+		}
+		return "high", true
+	case "max":
+		if grokSupportsXHighReasoningEffort(model) {
+			return "xhigh", true
+		}
 		return "high", true
 	case "minimal":
 		return "low", true
@@ -337,15 +358,46 @@ func mapGrokReasoningEffort(effort string) (string, bool) {
 	}
 }
 
+// grokSupportsXHighReasoningEffort 判断模型是否接受 reasoning.effort=xhigh。
+// xAI 文档：grok-4.6 支持；grok-4.5 等不支持的模型会把 xhigh 当成 high。
+// 版本线按 grok-4.6 起放行（grok-4.6-beta / grok-4.6-build / grok-4.20-multi-agent 同样识别）。
+func grokSupportsXHighReasoningEffort(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if !strings.HasPrefix(model, "grok-") {
+		return false
+	}
+	version := strings.TrimPrefix(model, "grok-")
+	if dash := strings.IndexByte(version, '-'); dash >= 0 {
+		version = version[:dash]
+	}
+	parts := strings.Split(version, ".")
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return false
+	}
+	if major > 4 {
+		return true
+	}
+	if major != 4 || len(parts) < 2 {
+		return false
+	}
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return false
+	}
+	return minor >= 6
+}
+
 // clampGrokReasoningEffort 规范化发给 Grok 上游的思考强度：同时覆盖 Responses
-// （reasoning.effort）与 Chat（reasoning_effort）两种形态，避免 Grok 不认的档位报错。
+// （reasoning.effort）与 Chat（reasoning_effort）两种形态，避免旧 Grok 不认的档位报错。
 func clampGrokReasoningEffort(body []byte) []byte {
+	model := gjson.GetBytes(body, "model").String()
 	for _, path := range []string{"reasoning.effort", "reasoning_effort"} {
 		v := gjson.GetBytes(body, path)
 		if !v.Exists() {
 			continue
 		}
-		mapped, changed := mapGrokReasoningEffort(v.String())
+		mapped, changed := mapGrokReasoningEffort(v.String(), model)
 		if !changed {
 			continue
 		}
@@ -383,97 +435,35 @@ func relayUpstreamEndpointForAccount(account *auth.Account) string {
 // proxyURL 由调用方解析(建议 store.ResolveProxyForAccount,与主请求路径同一套
 // 三级回退),避免未绑定代理的账号在探测时直连同一出口 IP。
 func FetchGrokModelIDs(ctx context.Context, account *auth.Account, proxyURL string) ([]string, error) {
-	baseURL, bearer := account.GrokCredentials()
-	if baseURL == "" || bearer == "" {
-		return nil, fmt.Errorf("grok 账号缺少可用凭据")
-	}
-	isAPIKey := account.GrokAuthKind() == auth.GrokAuthKindAPIKey
-
-	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	catalog, err := FetchGrokModelCatalog(ctx, account, proxyURL, "")
 	if err != nil {
 		return nil, err
 	}
-	applyGrokRequestHeaders(req, account, bearer, nil)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := getPooledClient(account, proxyURL).Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("请求 Grok 模型列表失败: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
-		if message == "" {
-			message = truncateForLog(body, 200)
-		}
-		return nil, fmt.Errorf("Grok 模型列表返回 %d: %s", resp.StatusCode, message)
-	}
-
-	seen := make(map[string]struct{})
-	var models []string
-	collect := func(items gjson.Result) {
-		if !items.IsArray() {
-			return
-		}
-		items.ForEach(func(_, item gjson.Result) bool {
-			id := ""
-			if item.Type == gjson.String {
-				id = strings.TrimSpace(item.String())
-			} else if item.IsObject() {
-				if item.Get("hidden").Bool() {
-					return true
-				}
-				if isAPIKey {
-					if supported := item.Get("supported_in_api"); supported.Exists() && !supported.Bool() {
-						return true
-					}
-					if supported := item.Get("supportedInApi"); supported.Exists() && !supported.Bool() {
-						return true
-					}
-				}
-				id = strings.TrimSpace(item.Get("id").String())
-				if id == "" {
-					id = strings.TrimSpace(item.Get("model").String())
-				}
-			}
-			if id != "" {
-				if _, exists := seen[strings.ToLower(id)]; !exists {
-					seen[strings.ToLower(id)] = struct{}{}
-					models = append(models, id)
-				}
-			}
-			return true
-		})
-	}
-	parsed := gjson.ParseBytes(body)
-	collect(parsed.Get("data"))
-	collect(parsed.Get("models"))
-	if len(models) == 0 {
-		return nil, fmt.Errorf("Grok 上游返回了空模型目录")
-	}
-	return auth.NormalizeAccountModels(models), nil
+	models := VisibleGrokModelIDs(catalog.Models, account.GrokAuthKind())
+	// A successful empty catalog is authoritative and must close routing rather
+	// than being mistaken for "not yet synced" and reopening built-in defaults.
+	// Temporary account probes are safe; persisted accounts will subsequently
+	// publish the same fenced snapshot from the database.
+	account.SetGrokRoutingState(auth.GrokRoutingState{
+		CatalogKnown: true,
+		Models:       grokCatalogToRoutingModels(catalog.Models),
+		ObservedAt:   catalog.ObservedAt,
+		ExpiresAt:    catalog.ObservedAt.Add(5 * time.Minute),
+	})
+	return models, nil
 }
 
 // ==================== 错误分类与冷却映射 ====================
 
-// Grok 账号未声明 models 白名单时的默认可用文本模型集，用于注册进 /v1/models
-// 与放行调度。账号显式声明 models 后以其白名单为准，不再补默认集。
-//
-// 两条通道的目录并不相同，必须分开取：
-//   - OAuth 走 cli-chat-proxy，目录由 CLI 通道决定。实测 supergrok_heavy 与 free
-//     两种套餐的 GET /v1/models 都只返回 grok-4.5，不含 grok-3 / grok-2。
-//   - API Key 走 xAI 公开 API，目录更宽。
-//
-// 默认集只是探测不到时的兜底：账号导入或连通性测试跑过 FetchGrokModelIDs 后，
-// 应以探到的真实目录为准。
+// 默认模型集的权威定义在 auth 包(auth.GrokOAuthDefaultModelIDs /
+// auth.GrokAPIKeyDefaultModelIDs),授权门与注册/调度面共用同一来源,
+// 这里只做包内转发。详见 auth/grok_default_models.go 的注释。
 func grokOAuthDefaultModelIDs() []string {
-	return []string{"grok-4.5"}
+	return auth.GrokOAuthDefaultModelIDs()
 }
 
 func grokAPIKeyDefaultModelIDs() []string {
-	return []string{"grok-4.5", "grok-4", "grok-3-fast", "grok-3", "grok-2"}
+	return auth.GrokAPIKeyDefaultModelIDs()
 }
 
 // DefaultGrokModelIDsForAccount 按账号的凭据类型返回默认可用文本模型集。
@@ -523,10 +513,17 @@ func parseGrokFreeQuotaModel(body []byte) string {
 
 var grokFreeQuotaModelPattern = regexp.MustCompile(`(?i)for\s+model\s+([a-z0-9._-]+)`)
 
-// IsGrokSpendingLimitError 识别账号级超支限制。
+// IsGrokSpendingLimitError 识别明确的账号级超支/余额耗尽。百分比本身不在
+// 这里出现，也绝不能把单独的 100% 用量百分比升级为硬禁用。
 func IsGrokSpendingLimitError(body []byte) bool {
 	lower := bytes.ToLower(body)
-	return bytes.Contains(lower, []byte("spending-limit")) || bytes.Contains(lower, []byte("spending limit"))
+	return bytes.Contains(lower, []byte("spending-limit")) ||
+		bytes.Contains(lower, []byte("spending limit")) ||
+		bytes.Contains(lower, []byte("usage balance exhausted")) ||
+		bytes.Contains(lower, []byte("balance_exhausted")) ||
+		bytes.Contains(lower, []byte("balance-exhausted")) ||
+		bytes.Contains(lower, []byte("credit balance is too low")) ||
+		bytes.Contains(lower, []byte("ran out of credits"))
 }
 
 // IsGrokPermanentDenialError 识别权限性永久拒绝（凭据对该端点无访问权）。
@@ -540,8 +537,11 @@ func IsGrokPermanentDenialError(body []byte) bool {
 //     错误体里的 tokens (actual/limit) 作为权威用量快照落库供前端展示；
 //   - 超支限制 → 账号冷却 24h；
 //   - 429 → Retry-After 或 1 分钟，上限 15 分钟；
-//   - 401 → 短冷却 + 异步强刷 AT（RT 失效时刷新路径会自行标 error）；
-//   - 403 权限拒绝 → 账号标错误。
+//   - 401 → 短隔离 + 异步强刷 AT（RT 失效时刷新路径会自行标 error）；
+//   - 402 → 仅明确余额耗尽时硬隔离，否则保持 unknown；
+//   - 403 → 已鉴权的权限/套餐拒绝，绝不触发 token refresh；
+//   - 426 → version_required 短隔离，由调用方刷新 settings 后换号/重试；
+//   - 429 → 独立 rate_limited 冷却。
 func (h *Handler) applyGrokCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
 	if h == nil {
 		return codex429Decision{}
@@ -581,13 +581,18 @@ func applyGrokCooldown(store *auth.Store, account *auth.Account, statusCode int,
 		log.Printf("Grok 账号 %d 模型 %s 免费额度耗尽，冷却到 %s", account.ID(), cooldownModel, cooldown.ResetAt.Format(time.RFC3339))
 		return codex429Decision{Scope: rateLimitScopeModel, Reason: "usage_limited", Model: cooldownModel, ResetAt: cooldown.ResetAt, Cooldown: time.Until(cooldown.ResetAt)}
 	}
-	if IsGrokSpendingLimitError(body) {
+	if IsGrokSpendingLimitError(body) && (statusCode == http.StatusPaymentRequired || statusCode == http.StatusTooManyRequests) {
+		observeGrokExplicitBillingExhaustion(account, statusCode, body)
 		store.MarkCooldown(account, 24*time.Hour, "usage_limited")
 		log.Printf("Grok 账号 %d 触发超支限制，账号冷却 24h", account.ID())
 		return codex429Decision{Reason: "usage_limited", Cooldown: 24 * time.Hour}
 	}
 
 	switch statusCode {
+	case http.StatusPaymentRequired:
+		// A bare/unknown 402 is not sufficient evidence of an exhausted balance.
+		// Keep it out of durable billing gates and let the request surface normally.
+		return codex429Decision{Reason: "payment_required_unknown"}
 	case http.StatusTooManyRequests:
 		cooldown := time.Minute
 		if resp != nil {
@@ -601,18 +606,27 @@ func applyGrokCooldown(store *auth.Store, account *auth.Account, statusCode int,
 		store.MarkCooldown(account, cooldown, "rate_limited")
 		log.Printf("Grok 账号 %d 被限速，冷却 %s", account.ID(), cooldown)
 		return codex429Decision{Reason: "rate_limited", Cooldown: cooldown}
-	case http.StatusUnauthorized, http.StatusForbidden:
-		if IsGrokPermanentDenialError(body) {
-			log.Printf("Grok 账号 %d 权限被永久拒绝，标记为错误", account.ID())
-			store.MarkError(account, upstreamAccountErrorMessage(statusCode, body))
-			return codex429Decision{}
-		}
-		// OAuth AT 可能过期/被吊销：短冷却挡住并发，异步强刷；RT 失效由刷新路径转 error。
-		store.MarkCooldown(account, time.Minute, "unauthorized")
+	case http.StatusUnauthorized:
+		// OAuth AT may be expired/revoked. A one-minute neutral cooldown prevents
+		// a refresh stampede without marking the account's health tier banned.
+		store.MarkCooldown(account, time.Minute, "credential_refresh")
 		if account.GrokAuthKind() == auth.GrokAuthKindOAuth {
 			store.RefreshSingleAsync(account.ID())
 		}
 		return codex429Decision{Reason: "unauthorized", Cooldown: time.Minute}
+	case http.StatusForbidden:
+		if IsGrokPermanentDenialError(body) {
+			log.Printf("Grok 账号 %d 权限被永久拒绝，标记为错误", account.ID())
+			store.MarkError(account, upstreamAccountErrorMessage(statusCode, body))
+			return codex429Decision{Reason: "forbidden"}
+		}
+		// 403 means the credential was accepted but lacks endpoint/model policy.
+		// Isolate briefly so another account can be tried; never consume a RT.
+		store.MarkCooldown(account, 5*time.Minute, "forbidden")
+		return codex429Decision{Reason: "forbidden", Cooldown: 5 * time.Minute}
+	case http.StatusUpgradeRequired:
+		store.MarkCooldown(account, time.Minute, "version_required")
+		return codex429Decision{Reason: "version_required", Cooldown: time.Minute}
 	}
 	return codex429Decision{}
 }

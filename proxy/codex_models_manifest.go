@@ -21,28 +21,61 @@ import (
 // 用一个可调度的 ChatGPT OAuth 账号的凭据实时转发，响应体与 ETag 原样透传。
 // 上游失败时 fast-fail 返回错误、不伪造列表——Codex 客户端自身会回落本地缓存。
 func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
-	apiKeyID := requestAPIKeyID(c)
-	// 清单端点只存在于 ChatGPT 后端,relay/Grok 账号无从代答。
-	account := h.store.NextExcludingWithFilter(apiKeyID, nil, func(a *auth.Account) bool {
-		return !a.IsRelayStyle()
-	})
+	row := apiKeyRowFromContext(c)
+	// 清单端点只存在于 ChatGPT 后端。选择账号时读取与普通模型列表相同的
+	// Key/channel/group/plan/reverse-ACL 硬门，但不占 reservation、并发或 dispatch
+	// count；Grok-only / relay-only Key 因而稳定返回 503。
+	account := h.scopedCodexManifestAccount(row)
 	if account == nil {
 		api.SendError(c, api.ErrServiceUnavailable)
 		return
 	}
-	defer h.store.Release(account)
+	restrictManifest := codexManifestNeedsFiltering(row, account)
+	ifNoneMatch := c.GetHeader("If-None-Match")
+	if restrictManifest {
+		// Restricted responses use a gateway ETag derived from the filtered
+		// representation. It is not an upstream validator, and forwarding it can
+		// produce a body-less 304 that cannot be filtered safely.
+		ifNoneMatch = ""
+	}
 
 	manifest, err := FetchCodexModelsManifest(
 		c.Request.Context(),
 		account,
 		h.store.ResolveProxyForAccount(account),
 		c.Query("client_version"),
-		c.GetHeader("If-None-Match"),
+		ifNoneMatch,
 	)
 	if err != nil {
 		api.SendErrorWithStatus(c,
 			api.NewAPIError(api.ErrCodeUpstreamError, fmt.Sprintf("codex models manifest: %v", err), api.ErrorTypeUpstream),
 			http.StatusBadGateway)
+		return
+	}
+
+	if restrictManifest {
+		if manifest.NotModified {
+			api.SendErrorWithStatus(c,
+				api.NewAPIError(api.ErrCodeUpstreamError, "codex models manifest returned an unusable 304", api.ErrorTypeUpstream),
+				http.StatusBadGateway)
+			return
+		}
+		body, etag, filterErr := filterCodexManifest(manifest.Body, manifest.ETag, func(slug string) bool {
+			return codexManifestModelAllowed(row, account, slug)
+		})
+		if filterErr != nil {
+			api.SendErrorWithStatus(c,
+				api.NewAPIError(api.ErrCodeUpstreamError, fmt.Sprintf("codex models manifest: %v", filterErr), api.ErrorTypeUpstream),
+				http.StatusBadGateway)
+			return
+		}
+		c.Header("ETag", etag)
+		if etagHeaderMatches(c.GetHeader("If-None-Match"), etag) {
+			c.Status(http.StatusNotModified)
+			return
+		}
+		h.learnManifestModelsAsync(manifest.Body)
+		c.Data(http.StatusOK, "application/json", body)
 		return
 	}
 
@@ -72,7 +105,13 @@ const manifestLearnCacheTTL = 10 * time.Minute
 // learnManifestModelsAsync 判断清单里是否有缓存未见过的 slug，有则后台学习。
 // 学习失败只记日志，绝不影响清单透传本身。
 func (h *Handler) learnManifestModelsAsync(manifestBody []byte) {
-	if h == nil || h.db == nil || len(manifestBody) == 0 {
+	if len(manifestBody) == 0 {
+		return
+	}
+	// lite 能力学习不依赖 DB：清单每次透传都刷新 use_responses_lite 真值，
+	// 供发出前剥离"非 lite 模型 + lite 信号"的必死组合。
+	RecordResponsesLiteSupportFromManifest(manifestBody)
+	if h == nil || h.db == nil {
 		return
 	}
 	slugs := ExtractManifestModelSlugs(manifestBody)
@@ -175,7 +214,9 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", defaultCodexCLIUserAgent)
+	// UA 版本段与 Version 头、client_version query 三者保持同一版本，
+	// 避免出站身份自相矛盾（UA 钉内置常量、Version 跟随同步值）。
+	req.Header.Set("User-Agent", replaceCodexUserAgentVersion(defaultCodexCLIUserAgent, clientVersion))
 	req.Header.Set("Originator", Originator)
 	req.Header.Set("Version", clientVersion)
 	if ifNoneMatch = strings.TrimSpace(ifNoneMatch); ifNoneMatch != "" {

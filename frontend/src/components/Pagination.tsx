@@ -54,15 +54,15 @@ export default function Pagination({
   const end = Math.min(currentPage * pageSize, totalItems)
 
   return (
-    <div className="mt-3.5 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3.5">
-      <span className="text-xs text-muted-foreground">
+    <div className="mt-3.5 flex flex-col gap-2.5 border-t border-border pt-3.5 sm:flex-row sm:items-center sm:justify-between">
+      <span className="text-xs text-muted-foreground max-sm:text-center">
         {t('common.showingRange', { start, end, total: totalItems })}
       </span>
-      <div className="flex flex-wrap items-center justify-end gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 max-sm:w-full sm:justify-end">
         {onPageSizeChange && selectOptions.length > 0 ? (
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5">
             <span className="text-xs font-medium text-muted-foreground">{t('common.pageSize')}</span>
-            <div className="w-[108px]">
+            <div className="w-[96px] sm:w-[108px]">
               <Select
                 value={String(pageSize)}
                 onValueChange={(value) => onPageSizeChange(Number(value))}
@@ -73,16 +73,20 @@ export default function Pagination({
           </div>
         ) : null}
         {normalizedTotalPages > 1 ? (
-          <div className="flex flex-wrap items-center justify-end gap-2">
+          <div className="flex items-center gap-1.5 max-sm:ml-auto">
             <Button
               variant="outline"
               size="sm"
               disabled={currentPage <= 1}
               onClick={() => onPageChange(currentPage - 1)}
+              className="px-2.5 sm:px-3"
             >
               {t('common.prev')}
             </Button>
-            <div className="flex items-center gap-1">
+            <span className="px-1 text-xs font-semibold tabular-nums text-foreground sm:hidden">
+              {currentPage} / {normalizedTotalPages}
+            </span>
+            <div className="hidden items-center gap-1 sm:flex">
               {pagerItems.map((item) => {
                 if (typeof item !== 'number') {
                   return (
@@ -115,6 +119,7 @@ export default function Pagination({
               size="sm"
               disabled={currentPage >= normalizedTotalPages}
               onClick={() => onPageChange(currentPage + 1)}
+              className="px-2.5 sm:px-3"
             >
               {t('common.next')}
             </Button>

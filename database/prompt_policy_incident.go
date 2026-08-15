@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -484,13 +485,164 @@ func reconcileStoredPromptPolicyIncidentFromShadowTx(ctx context.Context, tx *sq
 		input.AuditScore, input.ReasonCode, input.PrimaryOrigin, input.MatchedPatterns, strings.TrimSpace(input.RequestCorrelationID)); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE prompt_risk_events SET
+	rows, err := tx.QueryContext(ctx, `SELECT evidence.id, evidence.metadata_json
+		FROM prompt_rule_candidate_evidence evidence
+		JOIN prompt_policy_incidents incident ON incident.incident_id=evidence.prompt_policy_incident_id
+		WHERE incident.request_correlation_id=$1 AND incident.upstream_error_code='cyber_policy'
+		  AND evidence.source_kind=$2`, strings.TrimSpace(input.RequestCorrelationID), PromptRuleCandidateSourceUpstreamCyberPolicy)
+	if err != nil {
+		return err
+	}
+	type evidenceMetadataUpdate struct {
+		id       int64
+		metadata string
+	}
+	updates := make([]evidenceMetadataUpdate, 0, 2)
+	for rows.Next() {
+		var id int64
+		var raw string
+		if scanErr := rows.Scan(&id, &raw); scanErr != nil {
+			rows.Close()
+			return scanErr
+		}
+		updated, updateErr := mergePromptPolicyCandidateEvidenceMetadata(raw, PromptPolicyOutcomeAuditHit, PromptPolicyComparisonLocalDetected,
+			input.AuditScore, input.ReasonCode, input.PrimaryOrigin, input.MatchedPatterns)
+		if updateErr != nil {
+			rows.Close()
+			return updateErr
+		}
+		updates = append(updates, evidenceMetadataUpdate{id: id, metadata: updated})
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, update := range updates {
+		if _, err = tx.ExecContext(ctx, `UPDATE prompt_rule_candidate_evidence SET metadata_json=$1 WHERE id=$2`, update.metadata, update.id); err != nil {
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE prompt_risk_events SET
 		event_kind='upstream_cy_local_detected', request_risk_score=28, evidence_confidence=85,
 		local_outcome=$1, local_comparison=$2, reason_code=$3
 		WHERE source_type=$4 AND source_id IN (
 			SELECT incident_id FROM prompt_policy_incidents WHERE request_correlation_id=$5 AND upstream_error_code='cyber_policy'
 		)`, PromptPolicyOutcomeAuditHit, PromptPolicyComparisonLocalDetected, input.ReasonCode, promptRiskSourceIncident, strings.TrimSpace(input.RequestCorrelationID))
 	return err
+}
+
+func mergePromptPolicyCandidateEvidenceMetadata(raw, outcome, comparison string, auditScore int, reasonCode, primaryOrigin, matchedPatterns string) (string, error) {
+	metadata := map[string]any{}
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+			return "", err
+		}
+	}
+	var matches any = []any{}
+	if strings.TrimSpace(matchedPatterns) != "" {
+		if err := json.Unmarshal([]byte(matchedPatterns), &matches); err != nil {
+			return "", err
+		}
+	}
+	metadata["local_outcome"] = outcome
+	metadata["local_comparison"] = comparison
+	metadata["local_audit_score"] = auditScore
+	metadata["local_reason_code"] = reasonCode
+	metadata["local_primary_origin"] = primaryOrigin
+	metadata["local_matches"] = matches
+	learning, _ := metadata["learning_evidence"].(map[string]any)
+	if learning == nil {
+		learning = map[string]any{"version": 1}
+	}
+	learning["shadow_audit"] = map[string]any{
+		"audit_score": auditScore, "reason_code": reasonCode,
+		"primary_origin": primaryOrigin, "matches": matches,
+	}
+	metadata["learning_evidence"] = learning
+	matchCount := 0
+	if values, ok := matches.([]any); ok {
+		matchCount = len(values)
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+	if len(encoded) > 64*1024 {
+		delete(metadata, "local_matches")
+		metadata["local_matches_count"] = matchCount
+		learning["shadow_audit"] = map[string]any{
+			"audit_score": auditScore, "reason_code": reasonCode,
+			"primary_origin": primaryOrigin, "match_count": matchCount,
+		}
+		encoded, err = json.Marshal(metadata)
+		if err != nil {
+			return "", err
+		}
+	}
+	if len(encoded) > 64*1024 {
+		// Old evidence may already sit at the portable metadata ceiling. Keep the
+		// durable learning bundle and the reconciled decision, while dropping
+		// redundant incident fields that remain available from the incident row.
+		metadata = map[string]any{
+			"evidence_quality":     metadata["evidence_quality"],
+			"learning_evidence":    learning,
+			"local_outcome":        outcome,
+			"local_comparison":     comparison,
+			"local_audit_score":    auditScore,
+			"local_reason_code":    reasonCode,
+			"local_primary_origin": primaryOrigin,
+			"local_matches_count":  matchCount,
+		}
+		encoded, err = json.Marshal(metadata)
+		if err != nil {
+			return "", err
+		}
+	}
+	// JSON 转义(<>& 与控制字符→\u00XX)可把学习包的原始字节预算膨胀至 6 倍,
+	// 上面的降级无法保证收敛;继续按编码后体积收缩学习包正文,最终兜底丢弃
+	// 学习包。对账与持久化永远不因体积失败——报错会回滚整个日志事务,连带
+	// 丢掉安全遥测。
+	for len(encoded) > 64*1024 {
+		if text, ok := learning["prompt_text"].(string); ok && text != "" {
+			if len(text) > 256 {
+				learning["prompt_text"] = truncateEvidenceBytesRuneSafe(text, len(text)/2)
+			} else {
+				delete(learning, "prompt_text")
+			}
+		} else if _, ok := learning["context"]; ok {
+			delete(learning, "context")
+		} else if text, ok := learning["upstream_error"].(string); ok && text != "" {
+			if len(text) > 256 {
+				learning["upstream_error"] = truncateEvidenceBytesRuneSafe(text, len(text)/2)
+			} else {
+				delete(learning, "upstream_error")
+			}
+		} else if _, ok := metadata["learning_evidence"]; ok {
+			delete(metadata, "learning_evidence")
+		} else {
+			return "", errors.New("reconciled candidate evidence metadata exceeds 64 KiB")
+		}
+		encoded, err = json.Marshal(metadata)
+		if err != nil {
+			return "", err
+		}
+	}
+	return string(encoded), nil
+}
+
+func truncateEvidenceBytesRuneSafe(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(value[:cut])
 }
 
 func (db *DB) PersistPromptPolicyIncident(ctx context.Context, rawIncident PromptPolicyIncidentInput, rawCandidate PromptRuleCandidateInput, rawEvidence PromptRuleCandidateEvidenceInput) error {
@@ -543,6 +695,11 @@ func (db *DB) PersistPromptPolicyIncident(ctx context.Context, rawIncident Promp
 		}
 		if shadowEvidence != nil {
 			mergePromptPolicyShadowEvidence(&incident, shadowEvidence)
+			evidence.MetadataJSON, err = mergePromptPolicyCandidateEvidenceMetadata(evidence.MetadataJSON, incident.LocalOutcome,
+				incident.LocalComparison, *incident.LocalAuditScore, incident.LocalReasonCode, incident.LocalPrimaryOrigin, incident.LocalMatchedPatterns)
+			if err != nil {
+				return err
+			}
 			if _, execErr := tx.ExecContext(ctx, `UPDATE prompt_policy_incidents SET
 				local_comparison=$1, local_outcome=$2, local_audit_score=$3,
 				local_reason_code=$4, local_primary_origin=$5, local_matched_patterns=$6

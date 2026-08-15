@@ -67,6 +67,9 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
 	}
+	// 在发往上游供应商之前锁定会话:本次已被拦下,后续绕过本地规则的等价变形
+	// 也不再有机会打到上游。
+	h.lockPromptConversationOnLocalBlock(c, cfg, signedBody, endpoint, model, evaluation.Decision.ReasonCode)
 	if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, rawBody, endpoint, model, signedBody) {
 		return true
 	}
@@ -105,6 +108,7 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
 	}
+	h.lockPromptConversationOnLocalBlock(c, cfg, ingressRequestBody(c, nil), endpoint, model, evaluation.Decision.ReasonCode)
 	if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, []byte(text), endpoint, model, ingressRequestBody(c, nil)) {
 		return true
 	}
@@ -139,6 +143,7 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		c.Header("X-Prompt-Filter-Warning", promptFilterWarningMessage(evaluation))
 	}
 	if verdict.Action == promptfilter.ActionBlock {
+		h.lockPromptConversationOnLocalBlock(c, cfg, signedBody, endpoint, model, evaluation.Decision.ReasonCode)
 		if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, rawBody, endpoint, model, signedBody) {
 			return true
 		}

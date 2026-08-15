@@ -143,7 +143,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 
 	// 准备请求头
-	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders)
+	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody)
 	// Record the attempted handshake UA immediately so failed handshakes are
 	// still auditable. A reused connection replaces this below with the UA that
 	// was actually sent when that connection was established.
@@ -188,7 +188,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 	if wc == nil {
 		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {
-			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, StatelessConnectionSlots, headers, proxyOverride)
+			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, statelessConnectionSlots(), headers, proxyOverride)
 		} else {
 			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
 		}
@@ -293,7 +293,7 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 }
 
 // prepareWebsocketHeaders 准备 WebSocket 请求头
-func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Account, accountID, sessionID, apiKey string, deviceCfg *proxy.DeviceProfileConfig, ginHeaders http.Header) http.Header {
+func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Account, accountID, sessionID, apiKey string, deviceCfg *proxy.DeviceProfileConfig, ginHeaders http.Header, wsBody []byte) http.Header {
 	headers := http.Header{}
 
 	// 认证头
@@ -337,6 +337,10 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 			headers.Set(name, value)
 		}
 	}
+	// 指纹收敛：在透传之后覆盖客户端原值，在账号自定义头之前保留运维覆盖优先级。
+	// 握手头是逐连接冻结的，复用连接沿用建连时的取值；收敛值按账号恒定，正好与
+	// 这一语义相容。off 档为空操作。
+	proxy.ApplyCodexFingerprintHeaders(headers, account, ginHeaders)
 
 	// Account ID
 	if accountID != "" {
@@ -353,6 +357,10 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 		}
 		headers.Set(name, value)
 	}
+
+	// routing hint 由网关按最终 WS 帧体合成，在账号自定义头之后设置。
+	// 握手头逐连接冻结：复用连接沿用建连时的 hint，语义为拨号期软亲和。
+	proxy.ApplyCodexRoutingHint(headers, account, wsBody)
 
 	return headers
 }
@@ -602,7 +610,7 @@ func (r *WsResponse) Close() error {
 	//     * 下游写入失败 / ctx 取消 / 上游正常关闭 / 握手失败后未读流 → 流没消费到边界，
 	//       上游可能仍在推送残留帧，复用会串会话(issue #308)。
 	if r.conn != nil {
-		if !r.connBroken && r.streamCompleted {
+		if !r.connBroken && r.streamCompleted && !r.shouldDiscardOneShotConn() {
 			r.manager.ReleaseConnection(r.conn)
 		} else {
 			r.manager.DiscardConnection(r.conn)
@@ -610,6 +618,21 @@ func (r *WsResponse) Close() error {
 	}
 
 	return nil
+}
+
+// shouldDiscardOneShotConn 一次性池键连接在响应正常收尾后是否直接销毁。
+// 这类连接的池键每请求唯一，归还池后不可能再被按键复用，只会占用账号连接名额
+// 直到空闲超时；唯一的保留价值是 response_id 续链亲和（上游无服务端存储时，
+// previous_response_id 的上下文只存活在产出响应的那条连接里），因此有存活绑定时
+// 仍归还池。CODEX_WS_STATELESS_ONESHOT 模式显式承诺用完即毁，无条件销毁。
+func (r *WsResponse) shouldDiscardOneShotConn() bool {
+	if r.conn == nil || r.conn.session == nil || !proxy.IsStatelessWebsocketSessionID(r.conn.session.ID) {
+		return false
+	}
+	if statelessOneShotEnabled() {
+		return true
+	}
+	return r.manager == nil || !r.manager.hasLiveResponseBinding(r.conn)
 }
 
 // HTTPResponse 返回 HTTP 握手响应

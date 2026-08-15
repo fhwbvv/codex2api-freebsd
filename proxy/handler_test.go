@@ -500,6 +500,283 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	}
 }
 
+func TestResponsesWebSocketContinuationKeepsBoundAccountPastBoundedLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+	})
+
+	var store *auth.Store
+	var mu sync.Mutex
+	responseOwners := make(map[string]int64)
+	responseSequence := 0
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		previousResponseID := gjson.GetBytes(requestBody, "previous_response_id").String()
+		if ownerID := responseOwners[previousResponseID]; previousResponseID != "" && ownerID != account.ID() {
+			body := fmt.Sprintf(`{"error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Previous response with id '%s' not found."}}`, previousResponseID)
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		}
+
+		responseSequence++
+		responseID := fmt.Sprintf("resp_%d", responseSequence)
+		responseOwners[responseID] = account.ID()
+		if responseSequence == 1 {
+			priority := int64(20)
+			if !store.ApplyAccountSchedulerPriority(2, &priority) {
+				t.Fatal("failed to raise fallback account scheduler priority")
+			}
+		}
+		sse := fmt.Sprintf(`data: {"type":"response.completed","response":{"id":"%s","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n", responseID)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}
+
+	store = auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	primary := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "plus", AccountID: "acct-1"}
+	primary.SetSchedulerPriority(10)
+	store.AddAccount(primary)
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", PlanType: "plus", AccountID: "acct-2"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	previousResponseID := ""
+	for turn := 1; turn <= 52; turn++ {
+		payload := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","input":"turn-%d"}`, turn)
+		if previousResponseID != "" {
+			payload = fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"%s","input":"turn-%d"}`, previousResponseID, turn)
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+			t.Fatalf("turn %d write request: %v", turn, err)
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, event, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("turn %d read event: %v", turn, err)
+		}
+		if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
+			t.Fatalf("turn %d event type = %q, want response.completed; body=%s", turn, eventType, event)
+		}
+		previousResponseID = gjson.GetBytes(event, "response.id").String()
+		if previousResponseID == "" {
+			t.Fatalf("turn %d response.id missing: %s", turn, event)
+		}
+	}
+}
+
+// 上游认不出续链 id 时（换号、上游未落库、跨实例等），网关应剥离
+// previous_response_id 降级重试一次，而不是把 400 甩给客户端（issue #400）。
+func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousResponse(t *testing.T) {
+	previousResponseNotFoundBody := `{"error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Previous response with id 'resp_stale' not found."}}`
+	completedSSE := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_new\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+
+	cases := []struct {
+		name     string
+		rejected func() *http.Response
+	}{
+		{
+			name: "http status rejection",
+			rejected: func() *http.Response {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(previousResponseNotFoundBody)),
+				}
+			},
+		},
+		{
+			// WS 上游把同一个错误发成流内先导 error 帧 + response.failed。
+			name: "in-stream response.failed",
+			rejected: func() *http.Response {
+				sse := "data: {\"type\":\"error\",\"code\":\"previous_response_not_found\",\"message\":\"Previous response with id 'resp_stale' not found.\"}\n\n" +
+					"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"previous_response_not_found\",\"message\":\"Previous response with id 'resp_stale' not found.\"}}}\n\n"
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(sse)),
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+
+			previousExec := WebsocketExecuteFunc
+			t.Cleanup(func() {
+				WebsocketExecuteFunc = previousExec
+			})
+
+			var mu sync.Mutex
+			attempts := 0
+			retriedWithoutContinuation := false
+			WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				attempts++
+				if gjson.GetBytes(requestBody, "previous_response_id").String() != "" {
+					return tc.rejected(), nil
+				}
+				retriedWithoutContinuation = true
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(completedSSE)),
+				}, nil
+			}
+
+			store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+			store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "plus", AccountID: "acct-1"})
+			handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+			router := gin.New()
+			handler.RegisterRoutes(router)
+			server := httptest.NewServer(router)
+			defer server.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+			conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				if resp != nil {
+					t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+				}
+				t.Fatalf("dial websocket failed: %v", err)
+			}
+			defer conn.Close()
+
+			payload := `{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"resp_stale","input":"continue"}`
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+				t.Fatalf("write request: %v", err)
+			}
+
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			_, event, err := conn.ReadMessage()
+			if err != nil {
+				t.Fatalf("read event: %v", err)
+			}
+			if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
+				t.Fatalf("event type = %q, want response.completed; body=%s", eventType, event)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if !retriedWithoutContinuation {
+				t.Fatal("gateway never retried without previous_response_id")
+			}
+			if attempts != 2 {
+				t.Fatalf("upstream attempts = %d, want 2 (rejected + degraded retry)", attempts)
+			}
+		})
+	}
+}
+
+// 绑定账号被本次请求硬排除（限流等）后，续链请求不应死等它 30 秒再整轮失败：
+// 剥离 previous_response_id 后换号继续。
+func TestResponsesWebSocketContinuationDegradesWhenBoundAccountExcluded(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+	})
+
+	var mu sync.Mutex
+	var servedAccounts []int64
+	var strippedOnAccount int64
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		servedAccounts = append(servedAccounts, account.ID())
+		if gjson.GetBytes(requestBody, "previous_response_id").String() != "" {
+			// 绑定账号（1 号）被限流：硬排除后本次请求不会再选到它。
+			return &http.Response{
+				StatusCode: http.StatusTooManyRequests,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)),
+			}, nil
+		}
+		strippedOnAccount = account.ID()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_new\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	primary := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "plus", AccountID: "acct-1"}
+	primary.SetSchedulerPriority(10)
+	store.AddAccount(primary)
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", PlanType: "plus", AccountID: "acct-2"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := `{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"resp_stale","input":"continue"}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	// 降级必须在等待窗口（30s）之前发生，否则这一轮会超时。
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, event, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read event: %v", err)
+	}
+	if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
+		t.Fatalf("event type = %q, want response.completed; body=%s", eventType, event)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(servedAccounts) != 2 {
+		t.Fatalf("upstream attempts = %v, want 2 (rate-limited bound account + degraded retry)", servedAccounts)
+	}
+	if strippedOnAccount == 0 || strippedOnAccount == servedAccounts[0] {
+		t.Fatalf("degraded retry account = %d, want a different account than %d", strippedOnAccount, servedAccounts[0])
+	}
+}
+
 func TestResponsesWebSocketSuccessPreservesNewerUsageLimitCooldown(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -849,7 +1126,7 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 	defer conn.Close()
 
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{
-		"model":"gpt-5.4",
+		"model":"gpt-5.6-sol",
 		"input":[{"type":"function_call","name":"run","namespace":"code_tools","arguments":"{}","call_id":"call_1"}],
 		"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}
 	}`)); err != nil {
@@ -971,7 +1248,7 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	store.AddAccount(secondary)
 	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
 
-	body := []byte(`{"model":"gpt-5.4","input":"hello","stream":true}`)
+	body := []byte(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Codex2API-Affinity-Key", "tenant-user-42")
@@ -1624,6 +1901,41 @@ func TestUsageLogErrorMessageExtractsStructuredError(t *testing.T) {
 	}
 }
 
+func TestUsageLogAndClientErrorsOmitUnstructuredUpstreamBodies(t *testing.T) {
+	body := []byte(`<html><body>secret request-id and internal route</body></html>`)
+	if got := usageLogErrorMessage(http.StatusBadGateway, body); got != "HTTP 502" {
+		t.Fatalf("usageLogErrorMessage() = %q", got)
+	}
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	(&Handler{}).sendUpstreamError(ctx, http.StatusBadGateway, body)
+	if strings.Contains(recorder.Body.String(), "secret request-id") || strings.Contains(recorder.Body.String(), "internal route") {
+		t.Fatalf("unstructured upstream body leaked to client: %s", recorder.Body.String())
+	}
+}
+
+func TestUsageLogFailureMessageKeepsGatewayDiagnostics(t *testing.T) {
+	// 断流类诊断是网关自产纯文本，必须保留原文而不是退化成裸状态码（issue #524）。
+	diag := "上游流读取失败: stream error: stream ID 277; INTERNAL_ERROR; received from peer [上游帧 147, 下游写阻塞 0ms, 距上游末帧 52484ms]"
+	got := usageLogFailureMessage(logStatusUpstreamStreamBreak, diag)
+	if !strings.Contains(got, "INTERNAL_ERROR") || !strings.Contains(got, "stream ID 277") {
+		t.Fatalf("usageLogFailureMessage() dropped diagnostics: %q", got)
+	}
+
+	// 诊断文本包含上游 JSON 错误帧时仍走结构化提取。
+	jsonDiag := `{"error":{"code":"rate_limit_exceeded","message":"Too many requests"}}`
+	if got := usageLogFailureMessage(http.StatusTooManyRequests, jsonDiag); got != "rate_limit_exceeded · Too many requests" {
+		t.Fatalf("usageLogFailureMessage() json path = %q", got)
+	}
+
+	// 空文本仍回落裸状态码。
+	if got := usageLogFailureMessage(http.StatusBadGateway, "  "); got != "HTTP 502" {
+		t.Fatalf("usageLogFailureMessage() empty = %q", got)
+	}
+}
+
 func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1909,14 +2221,14 @@ func TestResponsesCompactCodexReadErrorRetryReturnsBadGatewayAndSyncsUsage(t *te
 	account := &auth.Account{
 		DBID:        1,
 		AccessToken: "at-1",
-		Models:      []string{"gpt-5.4"},
+		Models:      []string{"gpt-5.6-sol"},
 		PlanType:    "team",
 		Status:      auth.StatusReady,
 	}
 	store.AddAccount(account)
 	handler := NewHandler(store, nil, nil, nil)
 
-	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+	body := []byte(`{"model":"gpt-5.6-sol","input":"hello"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(codexResponsesLiteHeader, "true")
@@ -2805,6 +3117,19 @@ func TestAccountFilterForModelRespectsAccountModelWhitelist(t *testing.T) {
 	}
 	if !accountFilterForModel("")(restricted) {
 		t.Fatal("无模型信息的请求不应被白名单拦截")
+	}
+}
+
+func TestCodexOnlyTransportsExcludeGrokAccounts(t *testing.T) {
+	grok := &auth.Account{
+		DBID: 99, UpstreamType: auth.UpstreamGrok, AccessToken: "grok-at",
+		Models: []string{"gpt-5.6-sol", "grok-4.5"},
+	}
+	if accountFilterForModel("gpt-5.6-sol")(grok) {
+		t.Fatal("Responses WebSocket/Realtime Codex filter admitted a Grok account")
+	}
+	if accountFilterForCompactResponsesModelWithOriginal("grok-4.5", "grok-4.5", false)(grok) {
+		t.Fatal("Responses Compact filter admitted a Grok account")
 	}
 }
 

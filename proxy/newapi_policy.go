@@ -715,6 +715,8 @@ func newAPIPolicyDecisionAPIError(metadata newAPIPolicyDecisionMetadata) *api.AP
 		}
 	} else if metadata.ReasonCode == promptConversationLockedReasonCode {
 		message = promptConversationLockedMessage
+	} else if metadata.ReasonCode == promptUserCyberCooldownReasonCode {
+		message = promptUserCyberCooldownMessage
 	}
 	apiErr := api.NewAPIError(api.ErrorCode("request_policy_violation"), message, api.ErrorTypeInvalidRequest)
 	apiErr.Details = newAPIPolicyDecisionDetails(metadata)
@@ -785,6 +787,36 @@ type newAPIPolicyDecisionMetadata struct {
 	ConversationLocked bool
 }
 
+// strikeEligibleForDecision reports whether a decision may accrue toward a
+// NewAPI account ban (an irreversible consequence), and is the single source of
+// truth for that boundary.
+//
+// Two paths can accrue a strike, both requiring an actual block:
+//   - An explicit upstream cyber_policy response — the authoritative signal,
+//     gated by CYBStrikeEnabled (unchanged behavior).
+//   - A local highest-confidence severe violation — a current-user, sensitive,
+//     terminal strict/category hit (guard pipeline sets decision.StrikeEligible
+//     under exactly that conjunction) that is also terminal — gated by
+//     LocalSevereStrikeEnabled. This lets a locally strangled request still
+//     accrue toward the ban without first reaching the upstream, while keeping
+//     the false-ban surface at the highest-confidence tier only.
+//
+// A conversation-lock repeat is explicitly excluded: once a conversation is
+// locked, every later attempt would otherwise re-accrue and drive a single
+// violation straight to the ban threshold.
+func strikeEligibleForDecision(decision promptfilter.Decision, cfg promptfilter.Config) bool {
+	if decision.Action != promptfilter.ActionBlock {
+		return false
+	}
+	if decision.ReasonCode == promptConversationLockedReasonCode {
+		return false
+	}
+	if decision.ReasonCode == newAPIUpstreamCyberPolicyReasonCode {
+		return decision.StrikeEligible
+	}
+	return cfg.Advanced.Enforcement.LocalSevereStrikeEnabled && decision.StrikeEligible && decision.Terminal
+}
+
 func buildNewAPIPolicyDecisionMetadataWithSecret(identity newAPIIdentity, decision promptfilter.Decision, verdict promptfilter.Verdict, cfg promptfilter.Config, body []byte, endpoint string, model string, eventID string, verificationSecret string) newAPIPolicyDecisionMetadata {
 	evidence := strings.TrimSpace(verdict.FullText)
 	if evidence == "" {
@@ -832,10 +864,10 @@ func buildNewAPIPolicyDecisionMetadataWithSecret(identity newAPIIdentity, decisi
 		Profile:    decision.Profile,
 		ReasonCode: decision.ReasonCode,
 		Severity:   severity,
-		// Only an explicit upstream CYB response may become a NewAPI strike.
-		// Local Guard and external-review decisions remain signed audit events but
-		// can never disable a user account.
-		StrikeEligible: decision.StrikeEligible && decision.Action == promptfilter.ActionBlock && decision.ReasonCode == newAPIUpstreamCyberPolicyReasonCode,
+		// Strike eligibility (whether this decision may accrue toward a NewAPI
+		// account ban) is centralized in strikeEligibleForDecision so the
+		// irreversible-consequence boundary has one testable source of truth.
+		StrikeEligible: strikeEligibleForDecision(decision, cfg),
 		RuleVersion:    ruleVersion,
 		EvidenceSHA256: hex.EncodeToString(evidenceDigest[:]),
 	}

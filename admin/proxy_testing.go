@@ -311,6 +311,16 @@ func (h *Handler) removeProxyURLsFromRuntime(proxyURLs []string) {
 	}
 }
 
+func (h *Handler) applyRetiredProxiesToRuntime(proxyURLs []string, unboundAccountIDs []int64) error {
+	if h.store != nil {
+		for _, accountID := range unboundAccountIDs {
+			h.store.ClearAccountProxyURLIfMatches(accountID, proxyURLs)
+		}
+		h.removeProxyURLsFromRuntime(proxyURLs)
+	}
+	return h.reloadProxyPool()
+}
+
 func (h *Handler) sendProxyBatchTestEvent(c *gin.Context, event proxyBatchTestEvent) bool {
 	if h.proxyBatchEventSender != nil {
 		return h.proxyBatchEventSender(c, event)

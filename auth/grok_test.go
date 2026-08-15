@@ -46,6 +46,33 @@ func TestParseGrokAuthJSONFlatOAuth(t *testing.T) {
 	}
 }
 
+func TestGrokRefreshedCredentialUpdatesSeparateJWTAndArchivePlans(t *testing.T) {
+	updates := grokRefreshedCredentialUpdates(&GrokTokenData{
+		AccessToken: "rotated-at", RefreshToken: "rotated-rt", IDToken: "rotated-id",
+		PlanType: "supergrok_plus", ExpiresAt: time.Unix(12345, 0).UTC(),
+	})
+	if got := updates["plan_type"]; got != "supergrok_plus" {
+		t.Fatalf("legacy plan_type = %#v, want JWT tier", got)
+	}
+	if got := updates["jwt_plan_type"]; got != "supergrok_plus" {
+		t.Fatalf("jwt_plan_type = %#v, want synchronized JWT tier", got)
+	}
+	if trusted, ok := updates["jwt_plan_trusted"].(bool); !ok || trusted {
+		t.Fatalf("jwt_plan_trusted = %#v, want explicit false", updates["jwt_plan_trusted"])
+	}
+	if _, exists := updates["archive_plan_type"]; exists {
+		t.Fatal("refresh updates must never overwrite archive_plan_type")
+	}
+
+	withoutTier := grokRefreshedCredentialUpdates(&GrokTokenData{AccessToken: "at-without-tier", ExpiresAt: time.Unix(23456, 0).UTC()})
+	if got, exists := withoutTier["jwt_plan_type"]; !exists || got != "" {
+		t.Fatalf("missing JWT tier must clear its display hint, got %#v present=%v", got, exists)
+	}
+	if _, exists := withoutTier["plan_type"]; exists {
+		t.Fatal("missing JWT tier must not overwrite the legacy/archive compatibility label")
+	}
+}
+
 func TestParseGrokAuthJSONAPIKeyByScope(t *testing.T) {
 	raw := []byte(`{"tokens":{"xai::api_key":{"key":"xai-secret-key"}}}`)
 	creds, err := ParseGrokAuthJSON(raw)
@@ -186,11 +213,11 @@ func TestBuildGrokAuthorizationURLRequiresState(t *testing.T) {
 
 func TestParseGrokAuthorizationInput(t *testing.T) {
 	cases := []struct {
-		name          string
-		raw           string
-		wantCode      string
-		wantState     string
-		wantRequires  bool
+		name         string
+		raw          string
+		wantCode     string
+		wantState    string
+		wantRequires bool
 	}{
 		{
 			name:         "full callback url",

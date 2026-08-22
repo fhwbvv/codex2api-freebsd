@@ -6,6 +6,7 @@ import {
   type AccountOperationResult,
   type AccountOperationResultsState,
 } from "../lib/accountOperationResults";
+import { operationProgressMessage } from "../lib/operationProgressMessage";
 
 // 批量操作（测试/删除/刷新）的流式进度：SSE 读取 + 右上角进度浮层状态机。
 // 从 Codex 账号页抽出，供 Codex / Grok 账号页共用，确保两处进度条一致。
@@ -16,7 +17,8 @@ export type BatchOperationAction =
   | "batch_test"
   | "batch_delete"
   | "batch_refresh"
-  | "grok_import";
+  | "grok_import"
+  | "clean";
 
 export interface BatchOperationEvent {
   type: "start" | "progress" | "complete";
@@ -36,6 +38,8 @@ export interface BatchOperationEvent {
   message?: string;
   error?: string;
 }
+
+export { operationProgressMessage } from "../lib/operationProgressMessage";
 
 export interface OperationProgressState {
   show: boolean;
@@ -192,7 +196,7 @@ export function useOperationProgress(
         rateLimited: event.rate_limited ?? prev?.rateLimited ?? 0,
         deleted: event.deleted ?? prev?.deleted ?? 0,
         done: event.type === "complete",
-        message: event.error || event.message || prev?.message,
+        message: operationProgressMessage(event, prev?.message),
       }));
       if (event.type === "complete") {
         if (

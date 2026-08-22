@@ -23,3 +23,22 @@ func GrokOAuthDefaultModelIDs() []string {
 func GrokAPIKeyDefaultModelIDs() []string {
 	return []string{"grok-4.6", "grok-4.5", "grok-4", "grok-3-fast", "grok-3", "grok-2"}
 }
+
+// 媒体（生图/生视频）模型集与文本模型集刻意分开:文本调度准入
+// (grokAccountSupportsVisibleModel)以文本集/账号目录为准,媒体端点走独立的
+// 准入(grokMediaModelsForAccount),互不放大对方的可路由范围。
+// 媒体模型不出现在上游 /models 目录里,因此没有"目录同步后以目录为准"的回退,
+// 默认集就是权威候选;账号声明的 models 白名单中出现 grok-imagine 条目时,
+// 以声明为准收窄。
+
+// GrokImageDefaultModelIDs 返回 Grok 账号默认可用的生图模型集。
+func GrokImageDefaultModelIDs() []string {
+	return []string{"grok-imagine-image", "grok-imagine-image-quality"}
+}
+
+// GrokVideoDefaultModelIDs 返回 Grok 账号默认可用的生视频模型集。
+// grok-imagine-video-1.5 在 xAI 公开 API 上以 -preview 后缀发布,两个名字
+// 都接受,转发时按上游 profile 归一(mapGrokMediaModelForProfile)。
+func GrokVideoDefaultModelIDs() []string {
+	return []string{"grok-imagine-video", "grok-imagine-video-1.5", "grok-imagine-video-1.5-preview"}
+}

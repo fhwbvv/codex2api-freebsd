@@ -889,7 +889,7 @@ func TestAcquireConnectionDial401ReturnsTypedHandshakeError(t *testing.T) {
 		t.Fatalf("StatusCode = %d, want 401", hs.StatusCode)
 	}
 
-	resp, ok := handshakeUnauthorizedHTTPResponse(err)
+	resp, ok := handshakeAccountErrorHTTPResponse(err)
 	if !ok {
 		t.Fatal("expected 401 handshake error to convert to HTTP response")
 	}
@@ -900,6 +900,40 @@ func TestAcquireConnectionDial401ReturnsTypedHandshakeError(t *testing.T) {
 	got, _ := io.ReadAll(resp.Body)
 	// readHTTPErrorBody 会重排 JSON 键序，按字段断言。
 	if !strings.Contains(string(got), `"code":"token_expired"`) || strings.Contains(string(got), "websocket handshake failed") {
+		t.Fatalf("converted body should be raw upstream json, got %q", got)
+	}
+}
+
+// 402(deactivated_workspace)与 401 同理:结构化握手错误穿透传播链后被还原成
+// 真实状态码响应,进入账号标错/换号链路,而不是以 transport/500 漏给下游。
+func TestAcquireConnectionDial402DeactivatedWorkspaceConverts(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"detail":{"code":"deactivated_workspace"}}`))
+	}))
+	defer upstream.Close()
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	account := &auth.Account{DBID: 43}
+	wsURL := strings.Replace(upstream.URL, "http://", "ws://", 1)
+
+	_, _, err := manager.AcquireConnection(context.Background(), account, wsURL, "session-402", http.Header{}, "")
+	if err == nil {
+		t.Fatal("expected handshake error")
+	}
+	resp, ok := handshakeAccountErrorHTTPResponse(err)
+	if !ok {
+		t.Fatalf("expected 402 handshake error to convert, got %T: %v", err, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPaymentRequired {
+		t.Fatalf("converted StatusCode = %d, want 402", resp.StatusCode)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(got), `"deactivated_workspace"`) || strings.Contains(string(got), "websocket handshake failed") {
 		t.Fatalf("converted body should be raw upstream json, got %q", got)
 	}
 }

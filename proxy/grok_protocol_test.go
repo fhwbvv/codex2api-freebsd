@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +54,233 @@ func TestExecuteGrokProtocolRequestUsesCatalogBackend(t *testing.T) {
 	}
 }
 
+func TestExecuteGrokProtocolRequestBridgesResponsesToolsThroughChat(t *testing.T) {
+	var captured []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		captured, _ = io.ReadAll(r.Body)
+		aliases := make(map[string]string)
+		for _, tool := range gjson.GetBytes(captured, "tools").Array() {
+			if tool.Get("type").String() != "function" || tool.Get("function.name").String() == "" {
+				t.Errorf("non-function Chat tool leaked upstream: %s", tool.Raw)
+				continue
+			}
+			description := tool.Get("function.description").String()
+			switch {
+			case description == "synthetic custom tool":
+				aliases["custom"] = tool.Get("function.name").String()
+			case description == "synthetic namespace function":
+				aliases["namespace"] = tool.Get("function.name").String()
+			case description == "synthetic deferred custom tool":
+				aliases["deferred"] = tool.Get("function.name").String()
+			case strings.HasPrefix(description, "Search and load Codex tools"):
+				aliases["tool_search"] = tool.Get("function.name").String()
+			}
+		}
+		for _, name := range []string{"custom", "namespace", "deferred", "tool_search"} {
+			if aliases[name] == "" {
+				t.Errorf("%s tool was not converted: %s", name, captured)
+			}
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeEvent := func(event any) {
+			encoded, err := json.Marshal(event)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(encoded)
+			_, _ = w.Write([]byte("\n\n"))
+		}
+		writeEvent(map[string]any{
+			"id": "chatcmpl_test", "model": "grok-4.5",
+			"choices": []any{map[string]any{
+				"delta": map[string]any{"tool_calls": []any{
+					map[string]any{"index": 0, "id": "call_custom", "type": "function", "function": map[string]any{}},
+				}},
+				"finish_reason": nil,
+			}},
+		})
+		writeEvent(map[string]any{
+			"id": "chatcmpl_test", "model": "grok-4.5",
+			"choices": []any{map[string]any{
+				"delta": map[string]any{"tool_calls": []any{
+					map[string]any{"index": 0, "function": map[string]any{"name": aliases["custom"], "arguments": `{"input":"patch text"}`}},
+					map[string]any{"index": 1, "id": "call_namespace", "type": "function", "function": map[string]any{"name": aliases["namespace"], "arguments": `{"path":"README.md"}`}},
+					map[string]any{"index": 2, "id": "call_search", "type": "function", "function": map[string]any{"name": aliases["tool_search"], "arguments": `{"query":"files","limit":2}`}},
+				}},
+				"finish_reason": nil,
+			}},
+		})
+		writeEvent(map[string]any{
+			"id":      "chatcmpl_test",
+			"choices": []any{map[string]any{"delta": map[string]any{}, "finish_reason": "tool_calls"}},
+			"usage":   map[string]any{"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+		})
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+
+	account := &auth.Account{
+		UpstreamType: auth.UpstreamGrok,
+		APIKey:       "test",
+		BaseURL:      server.URL + "/v1",
+		ModelMapping: `{"gpt-5.5":"grok-4.5"}`,
+	}
+	account.SetGrokRoutingState(auth.GrokRoutingState{Models: []auth.GrokModelRoute{{ModelID: "grok-4.5", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolChatCompletions}}})
+	body := []byte(`{
+		"model":"gpt-5.5","stream":true,
+		"tools":[
+			{"type":"custom","name":"run_patch","description":"synthetic custom tool"},
+			{"type":"namespace","name":"workspace","tools":[{"type":"function","name":"read_file","description":"synthetic namespace function","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]},
+			{"type":"tool_search"}
+		],
+		"input":[
+			{"type":"additional_tools","tools":[{"type":"custom","name":"deferred_run","description":"synthetic deferred custom tool"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"use the tools"}]}
+		]
+	}`)
+	handler := NewHandler(nil, nil, nil, nil)
+	mappedBody, mappedModel, mapped := handler.applyAccountModelMappingToBody(body, account)
+	if !mapped || mappedModel != "grok-4.5" {
+		t.Fatalf("mapped model = %q, applied=%t", mappedModel, mapped)
+	}
+	resp, err := ExecuteGrokProtocolRequest(context.Background(), account, GrokProtocolResponses, body, mappedBody, "", nil)
+	if err != nil {
+		t.Fatalf("ExecuteGrokProtocolRequest: %v", err)
+	}
+	defer resp.Body.Close()
+	stream, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(captured, []byte(`"additional_tools"`)) || gjson.GetBytes(captured, "messages.#").Int() != 1 {
+		t.Fatalf("additional_tools was not lifted before Chat conversion: %s", captured)
+	}
+	if got := gjson.GetBytes(captured, "tools.#").Int(); got != 4 {
+		t.Fatalf("converted tool count = %d, want 4; body=%s", got, captured)
+	}
+	if got := gjson.GetBytes(captured, "model").String(); got != "grok-4.5" {
+		t.Fatalf("mapped upstream model = %q, want grok-4.5; body=%s", got, captured)
+	}
+
+	events := grokResponseSSEEvents(stream)
+	eventIndex := func(eventType, callID string) int {
+		for i, event := range events {
+			if event.Get("type").String() != eventType {
+				continue
+			}
+			gotCallID := event.Get("call_id").String()
+			if gotCallID == "" {
+				gotCallID = event.Get("item.call_id").String()
+			}
+			if callID == "" || gotCallID == callID {
+				return i
+			}
+		}
+		return -1
+	}
+	customAdded := eventIndex("response.output_item.added", "call_custom")
+	customInputDone := eventIndex("response.custom_tool_call_input.done", "call_custom")
+	customDone := eventIndex("response.output_item.done", "call_custom")
+	namespaceArgsDone := eventIndex("response.function_call_arguments.done", "call_namespace")
+	namespaceDone := eventIndex("response.output_item.done", "call_namespace")
+	searchDone := eventIndex("response.output_item.done", "call_search")
+	completedIndex := eventIndex("response.completed", "")
+	if customAdded < 0 || customInputDone <= customAdded || customDone <= customInputDone ||
+		namespaceArgsDone < 0 || namespaceDone <= namespaceArgsDone || searchDone < 0 || completedIndex <= searchDone {
+		t.Fatalf("restored tool lifecycle is incomplete or out of order: %s", stream)
+	}
+	if eventIndex("response.function_call_arguments.done", "call_search") >= 0 {
+		t.Fatalf("tool_search arguments.done leaked downstream: %s", stream)
+	}
+	if got := events[customAdded].Get("item.type").String(); got != "custom_tool_call" {
+		t.Fatalf("custom added type = %q", got)
+	}
+	if got := events[customInputDone].Get("input").String(); got != "patch text" {
+		t.Fatalf("custom input = %q", got)
+	}
+	if got := events[namespaceDone].Get("item.name").String(); got != "read_file" || events[namespaceDone].Get("item.namespace").String() != "workspace" {
+		t.Fatalf("namespace call was not restored: %s", events[namespaceDone].Raw)
+	}
+	if got := events[searchDone].Get("item.type").String(); got != "tool_search_call" || events[searchDone].Get("item.execution").String() != "client" || events[searchDone].Get("item.arguments.query").String() != "files" {
+		t.Fatalf("tool_search call was not restored: %s", events[searchDone].Raw)
+	}
+	completed := events[completedIndex]
+	if completed.Get(`response.output.#(call_id=="call_custom").type`).String() != "custom_tool_call" ||
+		completed.Get(`response.output.#(call_id=="call_namespace").namespace`).String() != "workspace" ||
+		completed.Get(`response.output.#(call_id=="call_search").type`).String() != "tool_search_call" {
+		t.Fatalf("completed output lost restored tool identities: %s", completed.Raw)
+	}
+}
+
+func TestExecuteGrokProtocolRequestBridgesCustomToolThroughMessages(t *testing.T) {
+	var captured []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		captured, _ = io.ReadAll(r.Body)
+		alias := gjson.GetBytes(captured, "tools.0.name").String()
+		if alias == "" || gjson.GetBytes(captured, "tools.0.input_schema.required.0").String() != "input" {
+			t.Errorf("custom tool was not converted for Messages: %s", captured)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeEvent := func(event any) {
+			encoded, err := json.Marshal(event)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(encoded)
+			_, _ = w.Write([]byte("\n\n"))
+		}
+		writeEvent(map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_test", "model": "grok-4.5", "usage": map[string]any{"input_tokens": 2}}})
+		writeEvent(map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "tool_use", "id": "call_messages", "name": alias}})
+		writeEvent(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "input_json_delta", "partial_json": `{"input":"message patch"}`}})
+		writeEvent(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "tool_use"}, "usage": map[string]any{"output_tokens": 1}})
+		writeEvent(map[string]any{"type": "message_stop"})
+	}))
+	defer server.Close()
+
+	account := &auth.Account{UpstreamType: auth.UpstreamGrok, APIKey: "test", BaseURL: server.URL + "/v1"}
+	account.SetGrokRoutingState(auth.GrokRoutingState{Models: []auth.GrokModelRoute{{ModelID: "grok-4.5", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolMessages}}})
+	body := []byte(`{
+		"model":"grok-4.5","stream":true,
+		"tools":[{"type":"custom","name":"run_patch","description":"synthetic custom tool"}],
+		"input":[{"type":"message","role":"user","content":"use the tool"}]
+	}`)
+	resp, err := ExecuteGrokProtocolRequest(context.Background(), account, GrokProtocolResponses, nil, body, "", nil)
+	if err != nil {
+		t.Fatalf("ExecuteGrokProtocolRequest: %v", err)
+	}
+	defer resp.Body.Close()
+	stream, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := grokResponseSSEEvents(stream)
+	var inputDone, itemDone, completed gjson.Result
+	for _, event := range events {
+		switch event.Get("type").String() {
+		case "response.custom_tool_call_input.done":
+			inputDone = event
+		case "response.output_item.done":
+			itemDone = event
+		case "response.completed":
+			completed = event
+		}
+	}
+	if inputDone.Get("input").String() != "message patch" || itemDone.Get("item.type").String() != "custom_tool_call" || completed.Get("response.output.0.type").String() != "custom_tool_call" {
+		t.Fatalf("Messages custom tool was not restored: %s", stream)
+	}
+}
+
 func TestPrepareRoutedGrokResponsesPreservesInboundChatControlsAndMappedModel(t *testing.T) {
 	route := GrokUpstreamRoute{Model: "mapped-grok", Protocol: GrokProtocolResponses}
 	inbound := []byte(`{
@@ -84,6 +313,7 @@ func TestPrepareRoutedGrokResponsesPreservesInboundMessagesControls(t *testing.T
 	inbound := []byte(`{
 		"model":"claude-alias","max_tokens":91,"messages":[{"role":"user","content":"hello"}],
 		"temperature":0.4,"top_p":0.7,"stop_sequences":["END"],
+		"tools":[{"name":"lookup","input_schema":{"type":"object"}}],
 		"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}}}
 	}`)
 	body, err := prepareRoutedGrokProtocolBody(route, GrokProtocolMessages, inbound, []byte(`{"model":"mapped-grok"}`))
@@ -98,6 +328,9 @@ func TestPrepareRoutedGrokResponsesPreservesInboundMessagesControls(t *testing.T
 		"stop.0":            "END",
 		"text.format.type":  "json_schema",
 		"reasoning.effort":  "high",
+		"reasoning.summary": "detailed",
+		"include.0":         "reasoning.encrypted_content",
+		"include.1":         "no_inline_citations",
 	}
 	for path, want := range checks {
 		if got := gjson.GetBytes(body, path).String(); got != want {
@@ -111,16 +344,51 @@ func TestPrepareRoutedGrokResponsesPreservesInboundMessagesControls(t *testing.T
 	}
 }
 
-func TestResolveGrokRouteFreshCapabilityOverridesCatalog(t *testing.T) {
+func TestResolveGrokRouteKeepsCatalogResponsesWhenMessagesProbeIsFresh(t *testing.T) {
 	now := time.Now()
 	account := &auth.Account{UpstreamType: auth.UpstreamGrok, AccessToken: "at", BaseURL: "https://default.example/v1"}
 	account.SetGrokRoutingState(auth.GrokRoutingState{
-		Models:       []auth.GrokModelRoute{{ModelID: "grok-4.5", APIBackend: auth.GrokProtocolResponses}},
+		Models:       []auth.GrokModelRoute{{ModelID: "grok-4.5", BaseURL: "https://default.example/v1", APIBackend: auth.GrokProtocolResponses}},
 		Capabilities: []auth.GrokProtocolCapability{{ModelID: "grok-4.5", Origin: "https://default.example/v1", Protocol: auth.GrokProtocolMessages, Status: auth.GrokCapabilityOK, ExpiresAt: now.Add(time.Hour)}},
 	})
 	route := ResolveGrokUpstreamRoute(account, "grok-4.5", GrokProtocolMessages, now)
-	if route.Protocol != GrokProtocolMessages || !route.Native || route.Endpoint != "https://default.example/v1/messages" {
-		t.Fatalf("route = %#v", route)
+	if route.Protocol != GrokProtocolResponses || route.Native || route.Endpoint != "https://default.example/v1/responses" {
+		t.Fatalf("Claude Code Messages inbound must stay on catalog Responses: %#v", route)
+	}
+}
+
+func TestExecuteGrokProtocolRequestReusesConversationHeaders(t *testing.T) {
+	var sessions []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		sessions = append(sessions, r.Header.Get("x-grok-session-id"))
+		if r.Header.Get("x-grok-session-id") == "" || r.Header.Get("x-grok-session-id") != r.Header.Get("x-grok-conv-id") {
+			t.Fatalf("session=%q conv=%q", r.Header.Get("x-grok-session-id"), r.Header.Get("x-grok-conv-id"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")
+	}))
+	defer server.Close()
+
+	account := &auth.Account{UpstreamType: auth.UpstreamGrok, AccessToken: "at", BaseURL: server.URL + "/v1"}
+	account.SetGrokRoutingState(auth.GrokRoutingState{
+		Models: []auth.GrokModelRoute{{ModelID: "grok-4.6", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolResponses}},
+	})
+	turn1 := []byte(`{"model":"grok-4.6","system":"rules","messages":[{"role":"user","content":"分析项目"}]}`)
+	turn2 := []byte(`{"model":"grok-4.6","system":"rules","messages":[{"role":"user","content":"分析项目"},{"role":"assistant","content":"ok"},{"role":"user","content":"继续"}]}`)
+	stub := []byte(`{"model":"grok-4.6"}`)
+	for _, inbound := range [][]byte{turn1, turn2} {
+		resp, err := ExecuteGrokProtocolRequest(context.Background(), account, GrokProtocolMessages, inbound, stub, "", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if len(sessions) != 2 || sessions[0] == "" || sessions[0] != sessions[1] {
+		t.Fatalf("session headers = %#v", sessions)
 	}
 }
 
@@ -187,7 +455,7 @@ func TestExecuteGrokProtocolRequestNativePreservesInboundBody(t *testing.T) {
 	account := &auth.Account{UpstreamType: auth.UpstreamGrok, APIKey: "xai", BaseURL: server.URL + "/v1", CredentialGeneration: 1}
 	account.SetGrokRoutingState(auth.GrokRoutingState{
 		CredentialGeneration: 1,
-		Models:               []auth.GrokModelRoute{{ModelID: "mapped-model", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolResponses}},
+		Models:               []auth.GrokModelRoute{{ModelID: "mapped-model", BaseURL: server.URL + "/v1", APIBackend: auth.GrokProtocolChatCompletions}},
 		Capabilities:         []auth.GrokProtocolCapability{{ModelID: "mapped-model", Origin: server.URL + "/v1", Protocol: auth.GrokProtocolChatCompletions, Status: auth.GrokCapabilityOK, ExpiresAt: now.Add(time.Hour)}},
 	})
 	inbound := []byte(`{"model":"client-alias","messages":[{"role":"user","content":"hi"}],"stream":false,"future_standard_field":{"keep":true}}`)
@@ -432,7 +700,10 @@ func TestMessagesAdapterRequiresMessageStopAndKeepsSparseTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(data, []byte(`"call_id":"call3"`)) || !bytes.Contains(data, []byte(`"type":"response.completed"`)) {
+	if !bytes.Contains(data, []byte(`"call_id":"call3"`)) ||
+		!bytes.Contains(data, []byte(`"type":"response.function_call_arguments.done"`)) ||
+		!bytes.Contains(data, []byte(`"type":"response.output_item.done"`)) ||
+		!bytes.Contains(data, []byte(`"type":"response.completed"`)) {
 		t.Fatalf("sparse tool terminal lost: %s", data)
 	}
 
@@ -445,6 +716,24 @@ func TestMessagesAdapterRequiresMessageStopAndKeepsSparseTools(t *testing.T) {
 	}
 	if bytes.Contains(data, []byte(`"type":"response.completed"`)) || !bytes.Contains(data, []byte(ErrorCodeUpstreamStreamBreak)) {
 		t.Fatalf("missing message_stop was treated as success: %s", data)
+	}
+
+	truncated := io.NopCloser(bytes.NewBufferString(
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"grok\",\"usage\":{\"input_tokens\":1}}}\n\n" +
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_partial\",\"name\":\"lookup\"}}\n\n" +
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\"}}\n\n" +
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":1}}\n\n" +
+			"data: {\"type\":\"message_stop\"}\n\n"))
+	data, err = io.ReadAll(newMessagesToResponsesReader(truncated, "grok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"type":"response.function_call_arguments.done"`)) || bytes.Contains(data, []byte(`"type":"response.output_item.done"`)) {
+		t.Fatalf("truncated Messages tool input was marked complete: %s", data)
+	}
+	completed := completedGrokResponseEvent(t, data)
+	if got := gjson.GetBytes(completed, "response.output.0.status").String(); got != "incomplete" {
+		t.Fatalf("truncated Messages tool status = %q, want incomplete: %s", got, completed)
 	}
 }
 
@@ -527,17 +816,48 @@ func TestChatAdapterFinishWithoutUsageChunkStillCompletesAtEOF(t *testing.T) {
 	}
 }
 
+func TestChatAdapterDoesNotCompleteTruncatedToolInput(t *testing.T) {
+	source := io.NopCloser(bytes.NewBufferString(
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_partial\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\"}}]},\"finish_reason\":null}]}\n\n" +
+			"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n"))
+	stream, err := io.ReadAll(newChatToResponsesReader(source, "grok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(stream, []byte(`"status":"incomplete"`)) {
+		t.Fatalf("truncated response did not remain incomplete: %s", stream)
+	}
+	if bytes.Contains(stream, []byte(`"type":"response.function_call_arguments.done"`)) || bytes.Contains(stream, []byte(`"type":"response.output_item.done"`)) {
+		t.Fatalf("truncated tool input was marked complete: %s", stream)
+	}
+	completed := completedGrokResponseEvent(t, stream)
+	if got := gjson.GetBytes(completed, "response.output.0.status").String(); got != "incomplete" {
+		t.Fatalf("truncated tool item status = %q, want incomplete: %s", got, completed)
+	}
+}
+
 func completedGrokResponseEvent(t *testing.T, stream []byte) []byte {
 	t.Helper()
-	for _, frame := range bytes.Split(stream, []byte("\n\n")) {
-		payload := bytes.TrimSpace(frame)
-		payload = bytes.TrimSpace(bytes.TrimPrefix(payload, []byte("data:")))
-		if gjson.GetBytes(payload, "type").String() == "response.completed" {
-			return append([]byte(nil), payload...)
+	for _, event := range grokResponseSSEEvents(stream) {
+		if event.Get("type").String() == "response.completed" {
+			return []byte(event.Raw)
 		}
 	}
 	t.Fatalf("response.completed missing from stream: %s", stream)
 	return nil
+}
+
+func grokResponseSSEEvents(stream []byte) []gjson.Result {
+	var events []gjson.Result
+	for _, frame := range bytes.Split(stream, []byte("\n\n")) {
+		payload := bytes.TrimSpace(frame)
+		payload = bytes.TrimSpace(bytes.TrimPrefix(payload, []byte("data:")))
+		if !gjson.ValidBytes(payload) {
+			continue
+		}
+		events = append(events, gjson.ParseBytes(append([]byte(nil), payload...)))
+	}
+	return events
 }
 
 func TestChatAdapterFinalOutputPreservesFirstEventOrderAndToolIdentity(t *testing.T) {

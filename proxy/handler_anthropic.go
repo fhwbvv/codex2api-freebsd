@@ -99,6 +99,66 @@ func (h *Handler) applyMessagesModelMapping(codexBody []byte, supportedModels []
 	return codexBody
 }
 
+// resolveMessagesRoutingBody 用廉价 stub 完成模型映射与 effort/tier 提取，
+// 避免在选号前把整段 Anthropic messages 转成有损 Codex Responses。
+func (h *Handler) resolveMessagesRoutingBody(rawBody []byte, requestedModel string, supportedModels []string) []byte {
+	mappingJSON := ""
+	if h != nil && h.store != nil {
+		mappingJSON = h.store.GetModelMapping()
+	}
+	mapped := resolveAnthropicModel(requestedModel, mappingJSON, supportedModels)
+	stub, err := sjson.SetBytes([]byte(`{}`), "model", mapped)
+	if err != nil {
+		stub = []byte(`{"model":"` + mapped + `"}`)
+	}
+	if effort := strings.TrimSpace(gjson.GetBytes(rawBody, "output_config.effort").String()); effort != "" {
+		stub, _ = sjson.SetBytes(stub, "reasoning.effort", normalizeReasoningEffortForModel(effort, mapped))
+	} else {
+		stub, _ = sjson.SetBytes(stub, "reasoning.effort", resolveReasoningEffort(nil, mapped))
+	}
+	if shouldUseCodexPriorityForAnthropicSpeed(gjson.GetBytes(rawBody, "speed").String()) {
+		if upstreamTier, ok := upstreamServiceTier("priority"); ok {
+			stub, _ = sjson.SetBytes(stub, "service_tier", upstreamTier)
+		}
+	}
+	return h.applyMessagesModelMapping(stub, supportedModels)
+}
+
+type anthropicCodexTranslation struct {
+	body []byte
+	err  error
+	done bool
+}
+
+func (h *Handler) translateAnthropicMessagesToCodexOnce(state *anthropicCodexTranslation, rawBody []byte, supportedModels []string) ([]byte, error) {
+	if state == nil {
+		mappingJSON := ""
+		if h != nil && h.store != nil {
+			mappingJSON = h.store.GetModelMapping()
+		}
+		body, _, err := TranslateAnthropicToCodexWithModels(rawBody, mappingJSON, supportedModels)
+		if err != nil {
+			return nil, err
+		}
+		return h.applyMessagesModelMapping(body, supportedModels), nil
+	}
+	if state.done {
+		return state.body, state.err
+	}
+	state.done = true
+	mappingJSON := ""
+	if h != nil && h.store != nil {
+		mappingJSON = h.store.GetModelMapping()
+	}
+	body, _, err := TranslateAnthropicToCodexWithModels(rawBody, mappingJSON, supportedModels)
+	if err != nil {
+		state.err = err
+		return nil, err
+	}
+	state.body = h.applyMessagesModelMapping(body, supportedModels)
+	return state.body, nil
+}
+
 // ==================== /v1/messages Handler ====================
 
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
@@ -144,17 +204,15 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 
-	// 2. 翻译请求: Anthropic → Codex
-	modelMappingJSON := h.store.GetModelMapping()
-	codexBody, originalModel, err := TranslateAnthropicToCodexWithModels(rawBody, modelMappingJSON, h.supportedModelIDs(c.Request.Context()))
-	if err != nil {
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+err.Error())
-		return
-	}
-	codexBody = h.applyMessagesModelMapping(codexBody, h.supportedModelIDs(c.Request.Context()))
-	effectiveModel := effectiveRequestModel(codexBody, model)
-	if isImageOnlyModel(effectiveModel) {
-		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))
+	// 2. 选号前只解析模型/effort/tier，不把整段 Messages 转成有损 Codex 体。
+	// Grok 账号选中后再走一次 TranslateAnthropicToResponsesForGrok；
+	// Codex / OpenAI 中转仍按需翻译成 Codex-safe Responses。
+	supportedModels := h.supportedModelIDs(c.Request.Context())
+	routingBody := h.resolveMessagesRoutingBody(rawBody, model, supportedModels)
+	originalModel := model
+	effectiveModel := effectiveRequestModel(routingBody, model)
+	if isMediaOnlyModel(effectiveModel) {
+		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on %s", effectiveModel, mediaOnlyModelEndpoints(effectiveModel)))
 		return
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
@@ -177,11 +235,11 @@ func (h *Handler) Messages(c *gin.Context) {
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
-	// 提取 reasoning effort（从翻译后的 codex body 中）
-	reasoningEffort := extractReasoningEffort(codexBody)
-	serviceTier := extractServiceTier(codexBody)
+	reasoningEffort := extractReasoningEffort(routingBody)
+	serviceTier := extractServiceTier(routingBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
-	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
+	var codexTranslation anthropicCodexTranslation
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
@@ -271,13 +329,30 @@ func (h *Handler) Messages(c *gin.Context) {
 		var resp *http.Response
 		var reqErr error
 		if isRelayAccount {
-			upstreamBody := codexBody
+			upstreamBody := routingBody
+			if !account.IsGrokAPI() {
+				var translateErr error
+				upstreamBody, translateErr = h.translateAnthropicMessagesToCodexOnce(&codexTranslation, rawBody, supportedModels)
+				if translateErr != nil {
+					ttftGuard.Stop()
+					h.store.Release(account)
+					sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+translateErr.Error())
+					return
+				}
+			}
 			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBody(upstreamBody, account); ok {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 			}
 			resp, reqErr = ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolMessages, rawBody, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
+			codexBody, translateErr := h.translateAnthropicMessagesToCodexOnce(&codexTranslation, rawBody, supportedModels)
+			if translateErr != nil {
+				ttftGuard.Stop()
+				h.store.Release(account)
+				sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+translateErr.Error())
+				return
+			}
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
 			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
 			resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
@@ -486,7 +561,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		if isStream {
 			// 流式响应：逐事件翻译为 Anthropic SSE
-			c.Header("Content-Type", "text/event-stream")
+			c.Header("Content-Type", "text/event-stream; charset=utf-8")
 			c.Header("Cache-Control", "no-cache")
 			c.Header("Connection", "keep-alive")
 			c.Header("X-Accel-Buffering", "no")
@@ -531,7 +606,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 
 				// 提取 usage
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
@@ -596,7 +671,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					if shouldDefer {
 						pendingFirstTokenEvents.WriteString(payloadString)
 						if pendingFirstTokenEvents.Len() <= 1024*1024 {
-							return eventType != "response.completed" && eventType != "response.failed"
+							return !isResponsesTerminalEvent(eventType)
 						}
 						payloadString = pendingFirstTokenEvents.String()
 						pendingFirstTokenEvents.Reset()
@@ -611,7 +686,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					wroteAnyBody = true
 				}
 
-				return eventType != "response.completed" && eventType != "response.failed"
+				return !isResponsesTerminalEvent(eventType)
 			})
 			// 仅在真的写过 body 时才做收尾 flush：flusher.Flush 会先提交 HTTP 200 header，
 			// 零写入时提前 flush 会让循环外按真实错误码返回的 JSON 失效（status 已定型为 200）。
@@ -651,7 +726,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
-				if eventType == "response.completed" {
+				if isResponsesSuccessTerminalEvent(eventType) {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier

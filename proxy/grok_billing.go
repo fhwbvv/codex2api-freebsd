@@ -300,7 +300,7 @@ func fetchGrokBillingOnce(ctx context.Context, client *http.Client, account *aut
 		return nil, err
 	}
 	// 复用 Grok CLI 头契约；billing GET 也需要 x-xai-token-auth。
-	applyGrokRequestHeaders(req, account, bearer, nil)
+	applyGrokRequestHeaders(req, account, bearer, nil, nil)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Del("Accept") // re-set clean
 	req.Header.Set("Accept", "application/json")

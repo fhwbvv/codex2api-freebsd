@@ -106,6 +106,16 @@ func TestAPIKeyLimitsIsZeroCoversScopeLimits(t *testing.T) {
 	}
 }
 
+func TestAPIKeyLimitsIsZeroCoversAllowLive(t *testing.T) {
+	limits := APIKeyLimits{AllowLive: true}
+	if limits.IsZero() {
+		t.Fatal("allow_live must keep API key limits out of the empty-limits short circuit")
+	}
+	if encoded := encodeAPIKeyLimits(limits); encoded == "{}" {
+		t.Fatalf("encoded limits = %q, want allow_live persisted", encoded)
+	}
+}
+
 func TestAPIKeyLimitsIsZeroCoversNoAffinityGroups(t *testing.T) {
 	limits := APIKeyLimits{NoAffinityGroupIDs: []int64{20}}
 	if limits.IsZero() {

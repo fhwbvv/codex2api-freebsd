@@ -21,7 +21,7 @@ export default function OperationProgressToast({
         )
       : 0;
   const metrics =
-    progress.action === "batch_delete"
+    progress.action === "batch_delete" || progress.action === "clean"
       ? [
           {
             label: t("accounts.operationProgressDeleted"),

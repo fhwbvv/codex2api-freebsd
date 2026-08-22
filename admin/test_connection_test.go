@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -96,12 +97,122 @@ func TestFormatUsageLimitedTestErrorAcceptsSuccessfulProbeWhenIgnored(t *testing
 	}
 }
 
+func TestClassifyResponsesTerminalEvent(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+		want    responsesTerminalOutcome
+	}{
+		{
+			name:    "completed",
+			payload: `{"type":"response.completed","response":{"status":"completed"}}`,
+			want:    responsesTerminalSuccess,
+		},
+		{
+			name:    "usage limited failure",
+			payload: `{"type":"response.failed","response":{"status_details":{"error":{"type":"usage_limit_reached"}}}}`,
+			want:    responsesTerminalUsageLimited,
+		},
+		{
+			name:    "generic failure",
+			payload: `{"type":"response.failed","response":{"error":{"type":"server_error"}}}`,
+			want:    responsesTerminalFailed,
+		},
+		{
+			name:    "non terminal",
+			payload: `{"type":"response.output_text.delta","delta":"pong"}`,
+			want:    responsesTerminalUnknown,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyResponsesTerminalEvent([]byte(tt.payload)); got != tt.want {
+				t.Fatalf("classifyResponsesTerminalEvent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyResponsesUsageLimitFailureMarksAuthoritativeCooldown(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		TestConcurrency:        1,
+		TestModel:              "gpt-5.4",
+		IgnoreUsageLimitStatus: true,
+	})
+	account := &auth.Account{DBID: 44, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	payload := []byte(`{"type":"response.failed","response":{"status_details":{"error":{"type":"usage_limit_reached","resets_in_seconds":1800}}}}`)
+
+	if !handler.applyResponsesUsageLimitFailure(account, &http.Response{Header: make(http.Header)}, "gpt-5.4", payload) {
+		t.Fatal("usage_limit_reached terminal event was not handled")
+	}
+	if !account.HasActiveCooldown() || account.IsAvailable() {
+		t.Fatal("usage_limit_reached terminal event did not block the account")
+	}
+	if reason := account.GetCooldownReason(); reason != auth.ResponsesRateLimitedCooldownReason {
+		t.Fatalf("CooldownReason = %q, want %q", reason, auth.ResponsesRateLimitedCooldownReason)
+	}
+}
+
 func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upstreamBody := `{"error":{"message":"Your authentication token has been invalidated.","code":"token_invalidated"},"status":401}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "sk-test",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	router := gin.New()
+	router.GET("/api/admin/accounts/:id/test", handler.TestConnection)
+
+	beforeGeneration := handler.accountCachesGen.Load()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/accounts/42/test", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "token_invalidated") {
+		t.Fatalf("SSE response %q does not contain token_invalidated", recorder.Body.String())
+	}
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "token_invalidated") {
+		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	}
+	if got := handler.accountCachesGen.Load(); got <= beforeGeneration {
+		t.Fatalf("account cache generation = %d, want > %d after stateful connection test", got, beforeGeneration)
+	}
+}
+
+func TestConnectionPaymentRequiredMarksError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstreamBody := `{"detail":{"code":"deactivated_workspace"}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
 		_, _ = w.Write([]byte(upstreamBody))
 	}))
 	defer server.Close()
@@ -128,17 +239,50 @@ func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", recorder.Code)
 	}
-	if !strings.Contains(recorder.Body.String(), "token_invalidated") {
-		t.Fatalf("SSE response %q does not contain token_invalidated", recorder.Body.String())
-	}
-	if got := account.RuntimeStatus(); got != "unauthorized" {
-		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	if got := account.RuntimeStatus(); got != "error" {
+		t.Fatalf("RuntimeStatus() = %q, want error", got)
 	}
 	account.Mu().RLock()
 	errorMsg := account.ErrorMsg
 	account.Mu().RUnlock()
-	if !strings.Contains(errorMsg, "token_invalidated") {
-		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	if !strings.Contains(errorMsg, "402") {
+		t.Fatalf("ErrorMsg = %q, want 402", errorMsg)
+	}
+}
+
+func TestConnectionBarePaymentRequiredMarksError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		_, _ = w.Write([]byte(`{"detail":"Payment Required"}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         43,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "sk-test",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	router := gin.New()
+	router.GET("/api/admin/accounts/:id/test", handler.TestConnection)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/admin/accounts/43/test", nil)
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if got := account.RuntimeStatus(); got != "error" {
+		t.Fatalf("RuntimeStatus() = %q, want error", got)
 	}
 }
 

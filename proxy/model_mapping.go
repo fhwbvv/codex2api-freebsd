@@ -207,17 +207,37 @@ func (h *Handler) applyConfiguredModelMappingToBody(rawBody []byte, supportedMod
 	return updatedBody, originalModel, effectiveModel, mappingApplied
 }
 
+// accountModelMappingTargetModels returns the concrete upstream models that an
+// account-level mapping may target. Grok accounts use their visible catalog
+// (or conservative defaults before the first catalog sync), narrowed by an
+// explicit Models whitelist. This keeps aliases from reviving hidden or
+// catalog-absent models while allowing undeclared Grok accounts to expose GPT
+// compatibility aliases.
+func accountModelMappingTargetModels(account *auth.Account) []string {
+	if account == nil {
+		return nil
+	}
+	if !account.IsGrokAPI() {
+		return account.OpenAIResponsesModels()
+	}
+	targets := GrokVisibleModelIDsForAccount(account)
+	if declared := account.GrokModels(); len(declared) > 0 {
+		targets = intersectModelIDs(targets, declared)
+	}
+	return targets
+}
+
 func resolveAccountModelMapping(account *auth.Account, model string) (string, bool) {
 	model = strings.TrimSpace(model)
 	if account == nil || model == "" {
 		return model, false
 	}
-	accountModels := account.OpenAIResponsesModels()
+	accountModels := accountModelMappingTargetModels(account)
 	if len(accountModels) == 0 {
 		return model, false
 	}
 	mappedModel, ok := resolveConfiguredModelMapping(model, account.OpenAIResponsesModelMapping(), accountModels)
-	if !ok || mappedModel == "" {
+	if !ok || mappedModel == "" || !modelIDInList(mappedModel, accountModels) {
 		return model, false
 	}
 	return mappedModel, true
@@ -250,7 +270,7 @@ func accountModelMappingAliases(account *auth.Account) []string {
 	if account == nil {
 		return nil
 	}
-	accountModels := account.OpenAIResponsesModels()
+	accountModels := accountModelMappingTargetModels(account)
 	if len(accountModels) == 0 {
 		return nil
 	}

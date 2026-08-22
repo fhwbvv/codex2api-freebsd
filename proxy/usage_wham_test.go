@@ -854,9 +854,15 @@ func TestApplyWhamUsage_IgnoredUsageStatusRemainsMetadataOnly(t *testing.T) {
 	if result.Premium5hRateLimited || result.Usage7dRateLimited {
 		t.Fatalf("WHAM metadata created a cooldown: %+v", result)
 	}
-	if !account.IsAvailable() {
-		t.Fatal("WHAM 100% metadata must not remove an account from scheduling")
+	if account.IsAvailable() {
+		t.Fatal("WHAM 100% metadata must fence the account from fresh scheduling")
 	}
+	store.BindSessionAffinity("working-turn", account, "")
+	continued, _ := store.NextForContinuationWithFilter("working-turn", 0, nil, nil)
+	if continued != account {
+		t.Fatal("WHAM 100% metadata prevented the existing turn from continuing")
+	}
+	store.Release(continued)
 	if pct5h, _, ok := account.GetUsageSnapshot5h(); !ok || pct5h != 100 {
 		t.Fatalf("5h snapshot = (%v, %v), want 100 and valid", pct5h, ok)
 	}
@@ -1280,5 +1286,133 @@ func TestQueryWhamResetCreditsRoutesThroughResin(t *testing.T) {
 	}
 	if gotResinAccount != "13" {
 		t.Fatalf("X-Resin-Account = %q, want %q", gotResinAccount, "13")
+	}
+}
+
+func TestApplyWhamUsage_PersistsIndependentSparkSnapshot(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "spark-wham", map[string]interface{}{
+		"access_token": "at",
+		"plan_type":    "pro",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "pro", Status: auth.StatusReady}
+
+	now := time.Now()
+	reset5h := now.Add(2 * time.Hour).Unix()
+	resetSpark := now.Add(4 * time.Hour).Unix()
+	usage := &WhamUsage{PlanType: "pro"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 18000, ResetAt: reset5h}
+	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 20, LimitWindowSeconds: 604800, ResetAt: now.Add(6 * 24 * time.Hour).Unix()}
+	usage.AdditionalRateLimits = []WhamAdditionalRateLimit{{
+		LimitName: "spark",
+		RateLimit: &WhamRateLimitInfo{
+			PrimaryWindow: &WhamUsageWindow{UsedPercent: 40, LimitWindowSeconds: 18000, ResetAt: resetSpark},
+		},
+	}}
+
+	result := ApplyWhamUsage(store, account, usage)
+	if !result.Premium5hRateLimited {
+		t.Fatal("main 5h=100% should still mark the account rate limited")
+	}
+	if !account.IsPremium5hRateLimited() {
+		t.Fatal("account should stay in premium 5h rate-limited state")
+	}
+	pct, resetAt, ok := account.GetUsageSnapshotSpark()
+	if !ok {
+		t.Fatal("spark snapshot missing")
+	}
+	if pct != 40 {
+		t.Fatalf("spark percent = %v, want 40", pct)
+	}
+	if resetAt.Unix() != resetSpark {
+		t.Fatalf("spark reset = %d, want %d", resetAt.Unix(), resetSpark)
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("codex_spark_used_percent"); got != "40" {
+		t.Fatalf("persisted spark percent = %q, want 40", got)
+	}
+}
+
+func TestApplyWhamUsage_ClearsStaleSparkWhenUpstreamOmitsWindow(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "spark-clear", map[string]interface{}{
+		"access_token":                 "at",
+		"plan_type":                    "pro",
+		"codex_spark_used_percent":     80,
+		"codex_spark_reset_at":         time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+		"codex_spark_usage_updated_at": time.Now().Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "pro"}
+	account.SetUsageSnapshotSpark(80, time.Now().Add(2*time.Hour))
+
+	usage := &WhamUsage{PlanType: "pro"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 10, LimitWindowSeconds: 18000, ResetAt: time.Now().Add(3 * time.Hour).Unix()}
+	usage.RateLimit.SecondaryWindow = &WhamUsageWindow{UsedPercent: 5, LimitWindowSeconds: 604800, ResetAt: time.Now().Add(5 * 24 * time.Hour).Unix()}
+
+	ApplyWhamUsage(store, account, usage)
+	if _, ok := account.GetUsagePercentSpark(); ok {
+		t.Fatal("authoritative WHAM without spark should clear the stale spark snapshot")
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("codex_spark_used_percent"); got != "" {
+		t.Fatalf("persisted spark percent = %q, want cleared", got)
+	}
+}
+
+func TestPickSparkWhamWindow_ParsesCamelCaseAdditionalLimits(t *testing.T) {
+	raw := []byte(`{
+		"additionalRateLimits": [{
+			"limitName": "spark-five-hour",
+			"rateLimit": {
+				"primaryWindow": {
+					"usedPercent": "37.5",
+					"limitWindowSeconds": 18000,
+					"resetAt": 1779708117
+				}
+			}
+		}]
+	}`)
+	var usage WhamUsage
+	if err := json.Unmarshal(raw, &usage); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	window := pickSparkWhamWindow(usage.additionalRateLimits())
+	if window == nil {
+		t.Fatal("expected spark window from camelCase additionalRateLimits")
+	}
+	if window.UsedPercent != 37.5 {
+		t.Fatalf("used percent = %v, want 37.5", window.UsedPercent)
+	}
+	if window.LimitWindowSeconds != 18000 {
+		t.Fatalf("window seconds = %d, want 18000", window.LimitWindowSeconds)
 	}
 }

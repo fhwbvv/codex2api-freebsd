@@ -12,6 +12,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+func TestPromptRiskProfileListTimeoutAllowsProductionAggregation(t *testing.T) {
+	if promptRiskProfileListTimeout < 10*time.Second {
+		t.Fatalf("prompt risk profile list timeout = %s, want at least 10s for production aggregation", promptRiskProfileListTimeout)
+	}
+}
+
 func TestPromptRiskProfileListAndDetailAPI(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "admin-risk-profile.db"))

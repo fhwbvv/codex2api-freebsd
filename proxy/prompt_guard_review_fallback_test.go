@@ -23,6 +23,8 @@ func TestPromptGuardLocalTerminalBlockSurvivesReviewClear(t *testing.T) {
 	promptfilter.DefaultReviewClient = promptfilter.ReviewClient{HTTPClient: reviewServer.Client()}
 	t.Cleanup(func() { promptfilter.DefaultReviewClient = previousClient })
 
+	advanced := promptfilter.DefaultAdvancedConfig()
+	advanced.ReviewAdapter.RequestMode = promptfilter.ReviewRequestModeModerations
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:                    2,
 		TestConcurrency:                   1,
@@ -39,10 +41,10 @@ func TestPromptGuardLocalTerminalBlockSurvivesReviewClear(t *testing.T) {
 		PromptFilterReviewEnabled:         true,
 		PromptFilterReviewAPIKey:          "review-key",
 		PromptFilterReviewBaseURL:         reviewServer.URL,
-		PromptFilterReviewModel:           "review-model",
+		PromptFilterReviewModel:           "omni-moderation-latest",
 		PromptFilterReviewTimeoutSeconds:  2,
 		PromptFilterReviewFailClosed:      false,
-		PromptFilterAdvancedConfig:        promptfilter.MarshalAdvancedConfig(promptfilter.DefaultAdvancedConfig()),
+		PromptFilterAdvancedConfig:        promptfilter.MarshalAdvancedConfig(advanced),
 	})
 	handler := NewHandler(store, nil, nil, nil)
 	recorder := httptest.NewRecorder()

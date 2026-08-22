@@ -196,48 +196,49 @@ func (db *DB) UpdateAccountGroup(ctx context.Context, id int64, name, descriptio
 
 func (db *DB) DeleteAccountGroup(ctx context.Context, id int64, force ...bool) error {
 	allowMembers := len(force) > 0 && force[0]
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	ph := "$1"
-	if db.isSQLite() {
-		ph = "?"
-	}
-	var count int64
-	memberCountQuery := `
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		ph := "$1"
+		if db.isSQLite() {
+			ph = "?"
+		}
+		var count int64
+		memberCountQuery := `
 		SELECT COUNT(*)
 		FROM account_group_members m
 		JOIN accounts a ON a.id = m.account_id
 		WHERE m.group_id = ` + ph + ` AND a.status <> 'deleted' AND COALESCE(a.error_message, '') <> 'deleted'`
-	if err := tx.QueryRowContext(ctx, memberCountQuery, id).Scan(&count); err != nil {
-		return err
-	}
-	if count > 0 && !allowMembers {
-		return ErrAccountGroupNotEmpty
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id = "+ph, id); err != nil {
-		return err
-	}
-	if err := pruneDeletedGroupFromAPIKeyScopes(ctx, tx, db.isSQLite(), id); err != nil {
-		return err
-	}
-	if err := pruneDeletedScopeFromAPIKeyLimits(ctx, tx, db.isSQLite(), APIKeyScopeTypeGroup, id); err != nil {
-		return err
-	}
-	res, err := tx.ExecContext(ctx, "DELETE FROM account_groups WHERE id = "+ph, id)
+		if err := tx.QueryRowContext(ctx, memberCountQuery, id).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 && !allowMembers {
+			return ErrAccountGroupNotEmpty
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE group_id = "+ph, id); err != nil {
+			return err
+		}
+		if err := pruneDeletedGroupFromAPIKeyScopes(ctx, tx, db.isSQLite(), id); err != nil {
+			return err
+		}
+		if err := pruneDeletedScopeFromAPIKeyLimits(ctx, tx, db.isSQLite(), APIKeyScopeTypeGroup, id); err != nil {
+			return err
+		}
+		res, err := tx.ExecContext(ctx, "DELETE FROM account_groups WHERE id = "+ph, id)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	return tx.Commit()
+	return nil
 }
 
 func pruneDeletedGroupFromAPIKeyScopes(ctx context.Context, tx *sql.Tx, sqlite bool, groupID int64) error {
@@ -357,34 +358,35 @@ func containsInt64(slice []int64, target int64) bool {
 }
 
 func (db *DB) SetAccountGroups(ctx context.Context, accountID int64, groupIDs []int64) error {
-	tx, err := db.conn.BeginTx(ctx, nil)
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		ph := "$1"
+		insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
+		if db.isSQLite() {
+			ph = "?"
+			insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
+		}
+		if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE account_id = "+ph, accountID); err != nil {
+			return err
+		}
+		seen := make(map[int64]struct{}, len(groupIDs))
+		for _, gid := range groupIDs {
+			if gid <= 0 {
+				continue
+			}
+			if _, ok := seen[gid]; ok {
+				continue
+			}
+			seen[gid] = struct{}{}
+			if _, err := tx.ExecContext(ctx, insertQ, accountID, gid); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	ph := "$1"
-	insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
-	if db.isSQLite() {
-		ph = "?"
-		insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM account_group_members WHERE account_id = "+ph, accountID); err != nil {
-		return err
-	}
-	seen := make(map[int64]struct{}, len(groupIDs))
-	for _, gid := range groupIDs {
-		if gid <= 0 {
-			continue
-		}
-		if _, ok := seen[gid]; ok {
-			continue
-		}
-		seen[gid] = struct{}{}
-		if _, err := tx.ExecContext(ctx, insertQ, accountID, gid); err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
+	return nil
 }
 
 // BatchSetAccountGroups 在单个事务里把一批账号的分组归属整体替换成 groupIDs。
@@ -397,15 +399,13 @@ func (db *DB) BatchSetAccountGroups(ctx context.Context, accountIDs []int64, gro
 	if len(accountIDs) == 0 || len(groupIDs) == 0 {
 		return nil
 	}
-	tx, err := db.conn.BeginTx(ctx, nil)
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		return db.batchReplaceAccountGroups(ctx, tx, accountIDs, groupIDs)
+	})
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if err := db.batchReplaceAccountGroups(ctx, tx, accountIDs, groupIDs); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return nil
 }
 
 func (db *DB) GetAccountGroupIDs(ctx context.Context, accountID int64) ([]int64, error) {

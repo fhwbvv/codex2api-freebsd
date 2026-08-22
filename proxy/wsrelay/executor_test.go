@@ -550,3 +550,63 @@ func TestShouldRetryWebsocketSendError(t *testing.T) {
 		t.Fatal("nil is not a retryable send error")
 	}
 }
+
+// TestPrepareWebsocketHeadersConvergesForwardedClientRequestID 是 HTTP 侧
+// TestApplyCodexRequestHeadersConvergesForwardedClientRequestID 的 WS 对照：
+// 握手头有自己的一份透传列表和组装顺序，同一组不变量必须独立锁定，
+// 否则 issue #536 的泄漏会只在 WS 路径上复活。
+func TestPrepareWebsocketHeadersConvergesForwardedClientRequestID(t *testing.T) {
+	const (
+		clientUUID    = "01a00e75-8856-7542-89bf-35812620690f"
+		installUUID   = "341596ee-ab98-43f8-82e2-08ecdfb56db4"
+		workspacePath = "/Users/kyx/code_project/codex2api"
+		remoteURL     = "https://github.com/james-6-23/codex2api.git"
+		commitHash    = "3cd12a685fe3ea23b84a9097fd4563927857ea21"
+	)
+	rawMetadata := `{"installation_id":"` + installUUID + `","session_id":"` + clientUUID +
+		`","thread_id":"` + clientUUID + `","window_id":"` + clientUUID +
+		`:0","request_kind":"turn","workspaces":{"` + workspacePath +
+		`":{"associated_remote_urls":{"origin":"` + remoteURL + `"},"latest_git_commit_hash":"` + commitHash + `","has_changes":false}}}`
+
+	// 复刻真实 codex-tui 的握手头集合（见 wss://chatgpt.com/backend-api/codex/responses）。
+	ginHeaders := http.Header{}
+	ginHeaders.Set("X-Codex-Turn-Metadata", rawMetadata)
+	ginHeaders.Set("Session-Id", clientUUID)
+	ginHeaders.Set("Thread-Id", clientUUID)
+	ginHeaders.Set("X-Client-Request-Id", clientUUID)
+	ginHeaders.Set("X-Codex-Window-Id", clientUUID+":0")
+	ginHeaders.Set("Originator", "codex-tui")
+
+	account := &auth.Account{DBID: 42, AccountID: "42", CodexFingerprintMode: auth.CodexFingerprintModeSession}
+	exec := NewExecutor()
+	headers := exec.prepareWebsocketHeaders("token-123", account, "42", "upstream-session-id", "api-key-1", nil, ginHeaders, nil)
+
+	if got := headers.Get("X-Client-Request-Id"); got == clientUUID {
+		t.Fatal("X-Client-Request-Id still carries the downstream thread id after convergence")
+	} else if got == "" {
+		t.Fatal("X-Client-Request-Id was dropped, want a converged value")
+	}
+	// 握手的 Session_id / Conversation_id 归调用方决定，收敛不得介入。
+	if got := headers.Get("Session_id"); got != "upstream-session-id" {
+		t.Fatalf("Session_id = %q, want the caller value untouched", got)
+	}
+	if got := headers.Get("Conversation_id"); got != "upstream-session-id" {
+		t.Fatalf("Conversation_id = %q, want the caller value untouched", got)
+	}
+	// 下游没发 installation 头，出站也不该凭空多出一个。
+	if got := headers.Get("X-Codex-Installation-Id"); got != "" {
+		t.Fatalf("X-Codex-Installation-Id = %q, want unset", got)
+	}
+
+	var dump strings.Builder
+	for name, values := range headers {
+		for _, value := range values {
+			dump.WriteString(name + ": " + value + "\n")
+		}
+	}
+	for _, leaked := range []string{clientUUID, installUUID, workspacePath, remoteURL, "james-6-23", commitHash} {
+		if strings.Contains(dump.String(), leaked) {
+			t.Fatalf("original identifier %q survived the websocket handshake headers:\n%s", leaked, dump.String())
+		}
+	}
+}

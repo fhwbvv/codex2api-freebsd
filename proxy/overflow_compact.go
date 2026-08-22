@@ -32,8 +32,16 @@ const (
 	// overflowCompactSummaryInputBytesDefault 送去摘要的旧轮次文本上限（字节），
 	// 保证摘要调用自身远离窗口限制。
 	overflowCompactSummaryInputBytesDefault = 512 * 1024
-	// overflowCompactSummaryTimeout 摘要调用的超时。
+	// overflowCompactSummaryTimeout 摘要调用的总超时（覆盖全部缩量重试）。
 	overflowCompactSummaryTimeout = 120 * time.Second
+	// overflowCompactSummaryMinInputBytes 缩量重试的转写下限：再小的输入已经
+	// 承载不了有效信息，继续折半只是白费一次上游往返。
+	overflowCompactSummaryMinInputBytes = 32 * 1024
+	// overflowCompactSummaryMaxAttempts 摘要调用（含缩量重试）的最大次数。
+	overflowCompactSummaryMaxAttempts = 3
+	// overflowCompactFallbackDigestBytes 模型摘要彻底失败时,直接摘录旧轮次原文
+	// 的预算。远小于 tail 预算,不会把刚压下去的体积重新顶穿。
+	overflowCompactFallbackDigestBytes = 16 * 1024
 	// overflowCompactMinItems input 少于该条数时不值得压缩（多半是单条超大输入，
 	// 压缩救不了，直接透传原错误）。
 	overflowCompactMinItems = 4
@@ -43,6 +51,7 @@ const (
 
 const overflowCompactSummaryPrefix = "[Conversation summary from earlier turns]\n"
 const overflowCompactOmittedMarker = "[Earlier conversation turns were omitted because the input exceeded the model context window.]"
+const overflowCompactDigestPrefix = "[Verbatim excerpt of those turns, heavily truncated and possibly incomplete:]\n"
 
 func overflowCompactTailBytes() int {
 	if v := strings.TrimSpace(os.Getenv("CODEX_OVERFLOW_COMPACT_TAIL_KB")); v != "" {
@@ -198,11 +207,10 @@ func (h *Handler) compactOverflowResponsesBodyWithAttribution(ctx context.Contex
 	tail := inputItems[cut:]
 
 	summaryText := h.summarizeOverflowItems(ctx, firstNonEmptyAnyString(body["model"]), head, attribution)
-	var replacement string
-	if summaryText != "" {
-		replacement = overflowCompactSummaryPrefix + summaryText
-	} else {
-		replacement = overflowCompactOmittedMarker
+	replacement := overflowCompactSummaryPrefix + summaryText
+	mode := "模型摘要"
+	if summaryText == "" {
+		replacement, mode = overflowCompactFallbackText(head)
 	}
 
 	newInput := make([]any, 0, headStart+1+len(tail))
@@ -225,19 +233,89 @@ func (h *Handler) compactOverflowResponsesBodyWithAttribution(ctx context.Contex
 		return nil, false
 	}
 	log.Printf("超窗自动压缩: 旧轮次 %d 条 -> 摘要(%s), 保留最近 %d 条, body %dKB -> %dKB",
-		len(head), map[bool]string{true: "模型摘要", false: "省略标记"}[summaryText != ""],
-		len(tail), len(codexBody)/1024, len(result)/1024)
+		len(head), mode, len(tail), len(codexBody)/1024, len(result)/1024)
 	return result, true
 }
 
+// overflowCompactFallbackText 模型摘要不可用时的退化文本。此前只插一句"旧轮次
+// 已省略"，整段历史静默蒸发、模型在无上下文下作答且下游无从察觉；改为在省略
+// 标记后附一段直接摘录的旧轮次原文（远小于 tail 预算，不会重新顶穿窗口），
+// 至少保住用户目标、关键路径与未完成事项。摘录也拿不到时才退回纯标记。
+func overflowCompactFallbackText(items []any) (string, string) {
+	digest := strings.TrimSpace(flattenOverflowItemsTranscript(items, overflowCompactFallbackDigestBytes))
+	if digest == "" {
+		return overflowCompactOmittedMarker, "省略标记"
+	}
+	return overflowCompactOmittedMarker + "\n" + overflowCompactDigestPrefix + digest, "机械摘录"
+}
+
 // summarizeOverflowItems 用内部 Responses 调用把旧轮次转写摘要成一段文本。
-// 失败返回空串（调用方退化为省略标记）。
+//
+// 摘要调用自身也可能超窗：转写上限是固定字节数，而模型窗口因账号/映射而异，
+// 小窗口模型上 512KB 转写必然再次 400。此时按实际转写长度折半重试，直到成功、
+// 触及下限或用尽次数——比"一次失败就丢弃全部旧轮次"保住多得多的上下文。
+// 其余失败（鉴权、无可用账号、限流、无文本输出）与输入体积无关，不重试。
+// 全部尝试共享一个 overflowCompactSummaryTimeout 截止时间，最坏耗时不变。
+// 返回空串表示彻底失败，调用方退化为机械摘录。
 func (h *Handler) summarizeOverflowItems(ctx context.Context, model string, items []any, attribution *internalResponseAttribution) string {
-	transcript := flattenOverflowItemsTranscript(items, overflowCompactSummaryInputBytes())
-	if strings.TrimSpace(transcript) == "" || strings.TrimSpace(model) == "" {
+	model = strings.TrimSpace(model)
+	if model == "" {
 		return ""
 	}
+	callCtx, cancel := context.WithTimeout(ctx, overflowCompactSummaryTimeout)
+	defer cancel()
 
+	budget := overflowCompactSummaryInputBytes()
+	for attempt := 1; attempt <= overflowCompactSummaryMaxAttempts; attempt++ {
+		transcript := flattenOverflowItemsTranscript(items, budget)
+		if strings.TrimSpace(transcript) == "" {
+			return ""
+		}
+		text, status, respBody := h.requestOverflowSummary(callCtx, model, transcript, attribution)
+		if text != "" {
+			return text
+		}
+		if callCtx.Err() != nil {
+			log.Printf("超窗自动压缩: 摘要调用超时 (attempt %d), 退化为机械摘录", attempt)
+			return ""
+		}
+		if !overflowSummaryFailedForContextWindow(status, respBody) {
+			if status == 200 {
+				log.Printf("超窗自动压缩: 摘要调用无文本输出, 退化为机械摘录")
+			} else {
+				log.Printf("超窗自动压缩: 摘要调用失败 (status %d), 退化为机械摘录", status)
+			}
+			return ""
+		}
+		// 按实际转写长度折半，保证严格缩小（budget 可能远大于转写本身）。
+		next := len(transcript) / 2
+		if attempt == overflowCompactSummaryMaxAttempts || next < overflowCompactSummaryMinInputBytes {
+			log.Printf("超窗自动压缩: 摘要调用自身超窗且已无法继续缩量 (attempt %d, %dKB), 退化为机械摘录", attempt, len(transcript)/1024)
+			return ""
+		}
+		log.Printf("超窗自动压缩: 摘要调用自身超窗 (attempt %d, %dKB), 缩量至 %dKB 重试", attempt, len(transcript)/1024, next/1024)
+		budget = next
+	}
+	return ""
+}
+
+// overflowSummaryFailedForContextWindow 判断摘要调用的失败是否源于其自身输入
+// 超窗——只有这一类失败缩量重试才有意义。非流式错误体是 JSON，可直接判定；
+// 流式响应体是 SSE 文本，gjson 解析不了整体，用错误码子串兜底。
+func overflowSummaryFailedForContextWindow(status int, body []byte) bool {
+	if status == 200 || len(body) == 0 {
+		return false
+	}
+	if isContextLengthExceededBody(body) {
+		return true
+	}
+	lowered := strings.ToLower(string(body))
+	return strings.Contains(lowered, "context_length") || strings.Contains(lowered, "exceeds the context window")
+}
+
+// requestOverflowSummary 执行一次摘要调用，返回提取出的摘要文本与原始状态/响应体
+// （供调用方判定失败原因）。
+func (h *Handler) requestOverflowSummary(ctx context.Context, model, transcript string, attribution *internalResponseAttribution) (string, int, []byte) {
 	reqBody, err := json.Marshal(map[string]any{
 		"model":     model,
 		"stream":    true,
@@ -256,21 +334,13 @@ func (h *Handler) summarizeOverflowItems(ctx context.Context, model string, item
 		},
 	})
 	if err != nil {
-		return ""
+		return "", 0, nil
 	}
-
-	callCtx, cancel := context.WithTimeout(ctx, overflowCompactSummaryTimeout)
-	defer cancel()
-	status, respBody := h.executeInternalResponseWithAttribution(callCtx, reqBody, attribution)
+	status, respBody := h.executeInternalResponseWithAttribution(ctx, reqBody, attribution)
 	if status != 200 {
-		log.Printf("超窗自动压缩: 摘要调用失败 (status %d), 退化为省略标记", status)
-		return ""
+		return "", status, respBody
 	}
-	text := extractResponsesSSEOutputText(respBody)
-	if strings.TrimSpace(text) == "" {
-		log.Printf("超窗自动压缩: 摘要调用无文本输出, 退化为省略标记")
-	}
-	return strings.TrimSpace(text)
+	return strings.TrimSpace(extractResponsesSSEOutputText(respBody)), status, respBody
 }
 
 // flattenOverflowItemsTranscript 把 input items 拍平成"role: text"转写文本，

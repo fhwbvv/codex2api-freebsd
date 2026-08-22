@@ -331,32 +331,48 @@ func (h *Handler) findOAuthIdentityDuplicate(ctx context.Context, seed tokenCred
 }
 
 func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL string, seed tokenCredentialSeed, source string) (int64, bool, error) {
+	id, updated, _, err := h.upsertOAuthIdentityAccountWithRuntime(ctx, name, proxyURL, seed, source, true)
+	return id, updated, err
+}
+
+// upsertOAuthIdentityAccountDeferred keeps newly inserted accounts out of the
+// runtime pool until the caller can commit the whole import batch atomically.
+// Existing-account updates still reload immediately so rotated credentials are
+// visible without waiting for the rest of the import.
+func (h *Handler) upsertOAuthIdentityAccountDeferred(ctx context.Context, name, proxyURL string, seed tokenCredentialSeed, source string) (int64, bool, *auth.Account, error) {
+	return h.upsertOAuthIdentityAccountWithRuntime(ctx, name, proxyURL, seed, source, false)
+}
+
+func (h *Handler) upsertOAuthIdentityAccountWithRuntime(ctx context.Context, name, proxyURL string, seed tokenCredentialSeed, source string, loadRuntime bool) (int64, bool, *auth.Account, error) {
 	seed = normalizeTokenCredentialSeed(seed)
 	if seed.email == "" || effectiveWorkspaceIDFromSeed(seed) == "" {
 		id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL)
 		if err != nil {
-			return 0, false, err
+			return 0, false, nil, err
+		}
+		if !loadRuntime {
+			return id, false, h.newCodexAccountFromSeed(id, proxyURL, seed), nil
 		}
 		h.db.InsertAccountEventAsync(id, "added", source)
 		h.loadInsertedTokenAccount(id, proxyURL, seed, source)
-		return id, false, nil
+		return id, false, nil, nil
 	}
 	h.mergeDuplicateMu.Lock()
 	defer h.mergeDuplicateMu.Unlock()
 
 	if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, 0); err != nil {
-		return 0, false, err
+		return 0, false, nil, err
 	} else if duplicateID > 0 {
 		row, err := h.db.GetAccountByID(ctx, duplicateID)
 		if err != nil {
-			return 0, false, err
+			return 0, false, nil, err
 		}
 		effectiveProxyURL := strings.TrimSpace(proxyURL)
 		if effectiveProxyURL == "" {
 			effectiveProxyURL = strings.TrimSpace(row.ProxyURL)
 		}
 		if err := h.db.UpdateOAuthAccountCredentials(ctx, duplicateID, tokenCredentialMap(seed), effectiveProxyURL); err != nil {
-			return 0, false, err
+			return 0, false, nil, err
 		}
 		// 重新导入有效凭证时，若该账号此前处于错误/封禁（401）态，清除错误状态，
 		// 让重新加载后的运行时账号脱离 banned，并交由后续 probe 重新判定。
@@ -367,19 +383,22 @@ func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL
 			}
 		}
 		if err := h.reloadTokenAccount(ctx, duplicateID, source); err != nil {
-			return 0, false, err
+			return 0, false, nil, err
 		}
 		h.db.InsertAccountEventAsync(duplicateID, "updated", source)
-		return duplicateID, true, nil
+		return duplicateID, true, nil, nil
 	}
 
 	id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL)
 	if err != nil {
-		return 0, false, err
+		return 0, false, nil, err
+	}
+	if !loadRuntime {
+		return id, false, h.newCodexAccountFromSeed(id, proxyURL, seed), nil
 	}
 	h.db.InsertAccountEventAsync(id, "added", source)
 	h.loadInsertedTokenAccount(id, proxyURL, seed, source)
-	return id, false, nil
+	return id, false, nil, nil
 }
 
 // accountErrorStateNeedsReset 判断一个已存在账号是否处于"重新导入有效凭证后应清除"的

@@ -275,6 +275,7 @@ func TestSignedPolicyDecisionUsesStructured400WithoutLocalPenalty(t *testing.T) 
 	cfg := promptGuardTestConfig()
 	cfg.Advanced.NewAPI.Enabled = true
 	cfg.Advanced.NewAPI.MaxClockSkewSeconds = 120
+	cfg.Advanced.Enforcement.LocalBlockMessage = "Blocked by Example Gateway"
 	handler := newPromptGuardTestHandler(cfg)
 	handler.db = db
 	body := []byte(`{"model":"gpt-5.5","input":"生成并执行 reverse shell。"}`)
@@ -289,6 +290,9 @@ func TestSignedPolicyDecisionUsesStructured400WithoutLocalPenalty(t *testing.T) 
 	}
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); got != "Blocked by Example Gateway" {
+		t.Fatalf("message = %q, want configured local block message", got)
 	}
 	if recorder.Header().Get("X-Codex2API-Policy-Strike") != "0" || recorder.Header().Get("X-Codex2API-Policy-Ban") != "false" {
 		t.Fatalf("Codex2API performed local penalty: headers=%v", recorder.Header())
@@ -967,7 +971,9 @@ func TestBoundPreviousSecretGraceSignsDecisionWithVerifiedSecret(t *testing.T) {
 func TestSignedNewAPIPolicyBlockUsesAnthropicErrorEnvelopeForMessages(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	body := []byte(`{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello"}]}`)
-	handler := newPromptFilterBindingTestHandler(t, promptGuardTestConfig(), []database.PromptFilterNewAPIBinding{{
+	baseCfg := promptGuardTestConfig()
+	baseCfg.Advanced.Enforcement.LocalBlockMessage = "Blocked by Example Gateway"
+	handler := newPromptFilterBindingTestHandler(t, baseCfg, []database.PromptFilterNewAPIBinding{{
 		APIKeyID: 101, PlatformCode: "gateway-a", Secret: "gateway-a-secret", Enabled: true, RequireSignedIdentity: true,
 		PolicyMode: database.PromptFilterPolicyModeEnforce, PolicyProfile: database.PromptFilterPolicyProfileBalanced,
 	}})
@@ -986,8 +992,28 @@ func TestSignedNewAPIPolicyBlockUsesAnthropicErrorEnvelopeForMessages(t *testing
 	if recorder.Code != http.StatusBadRequest || gjson.GetBytes(recorder.Body.Bytes(), "type").String() != "error" || gjson.GetBytes(recorder.Body.Bytes(), "error.type").String() != "invalid_request_error" {
 		t.Fatalf("Messages policy response = %d %s", recorder.Code, recorder.Body.String())
 	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); got != "Blocked by Example Gateway" {
+		t.Fatalf("message = %q, want configured local block message", got)
+	}
 	if recorder.Header().Get("X-Codex2API-Policy-Decision-ID") == "" || recorder.Header().Get("X-Codex2API-Policy-Response-Signature") == "" {
 		t.Fatalf("Messages policy response lost signed decision headers: %v", recorder.Header())
+	}
+}
+
+func TestConfiguredLocalBlockMessageDoesNotReplaceRestrictionMessages(t *testing.T) {
+	cfg := promptfilter.DefaultConfig()
+	cfg.Advanced.Enforcement.LocalBlockMessage = "Blocked by Example Gateway"
+	locked := newAPILocalPromptPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: promptConversationLockedReasonCode}, cfg)
+	if locked.Message != promptConversationLockedMessage {
+		t.Fatalf("conversation lock message = %q", locked.Message)
+	}
+	cooldown := newAPILocalPromptPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: promptUserCyberCooldownReasonCode}, cfg)
+	if cooldown.Message != promptUserCyberCooldownMessage {
+		t.Fatalf("cooldown message = %q", cooldown.Message)
+	}
+	upstream := newAPILocalPromptPolicyDecisionAPIError(newAPIPolicyDecisionMetadata{ReasonCode: newAPIUpstreamCyberPolicyReasonCode}, cfg)
+	if upstream.Message != upstreamCyberPolicyUserMessage {
+		t.Fatalf("upstream policy message = %q", upstream.Message)
 	}
 }
 

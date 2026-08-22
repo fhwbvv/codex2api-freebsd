@@ -122,7 +122,7 @@ func normalizeGrokFunctionTool(tool map[string]any, name string) map[string]any 
 	for _, key := range []string{
 		"inputSchema", "input_schema", "deferLoading", "defer_loading",
 		"allowedCallers", "allowed_callers", "outputSchema", "output_schema",
-		"metadata", "x_provider",
+		"metadata", "x_provider", "cache_control", "cacheControl",
 	} {
 		delete(converted, key)
 	}
@@ -706,7 +706,8 @@ type grokStreamReverser struct {
 func (r *grokStreamReverser) rewriteLine(line []byte) []byte {
 	if !bytes.Contains(line, []byte(`"function_call"`)) &&
 		!bytes.Contains(line, []byte(`"response.function_call_arguments.`)) &&
-		!bytes.Contains(line, []byte(`"response.completed"`)) {
+		!bytes.Contains(line, []byte(`"response.completed"`)) &&
+		!bytes.Contains(line, []byte(`"response.incomplete"`)) {
 		return line
 	}
 	trimmed := bytes.TrimRight(line, "\r\n")
@@ -785,7 +786,8 @@ func (r *grokStreamReverser) rewriteLine(line []byte) []byte {
 			event["input"] = unwrapGrokCustomToolArguments(grokNsStringField(event, "arguments"))
 			delete(event, "arguments")
 		}
-	case "response.completed":
+	// 截断终态同样带完整 response.output，别名一样要还原。
+	case "response.completed", "response.incomplete":
 		if response, ok := event["response"].(map[string]any); ok {
 			reverseGrokNamespaceValue(response, r.aliases)
 		}

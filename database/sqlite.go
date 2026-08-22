@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -70,6 +71,27 @@ func (db *DB) withSQLiteWriteLock(ctx context.Context, fn func() error) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// withWriteTx serializes top-level SQLite mutations while preserving the
+// normal transaction behavior for PostgreSQL. Callers pass all nested writes
+// through the same transaction to avoid writer-gate re-entry deadlocks.
+func (db *DB) withWriteTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	if db == nil || db.conn == nil {
+		return errors.New("database is not initialized")
+	}
+	run := func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	return db.withSQLiteWriteLock(ctx, run)
 }
 
 func (db *DB) configureSQLite(ctx context.Context) error {
@@ -420,6 +442,19 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			review_latency_ms INTEGER NULL,
 			full_text TEXT DEFAULT ''
 		);`,
+		`CREATE TABLE IF NOT EXISTS prompt_review_profiles (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			base_url TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			request_mode TEXT NOT NULL DEFAULT 'moderations',
+			adapter_json TEXT NOT NULL DEFAULT '{}',
+			api_keys TEXT NOT NULL DEFAULT '',
+			timeout_seconds INTEGER NOT NULL DEFAULT 10,
+			active INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);`,
 		`DROP TABLE IF EXISTS prompt_filter_secrets;`,
 	}
 	for _, stmt := range statements {
@@ -586,8 +621,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "prompt_filter_disabled_patterns", "TEXT DEFAULT '[]'"},
 		{"system_settings", "prompt_filter_review_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "prompt_filter_review_api_key", "TEXT DEFAULT ''"},
-		{"system_settings", "prompt_filter_review_base_url", "TEXT DEFAULT 'https://api.openai.com'"},
-		{"system_settings", "prompt_filter_review_model", "TEXT DEFAULT 'omni-moderation-latest'"},
+		{"system_settings", "prompt_filter_review_base_url", "TEXT DEFAULT 'https://api.deepseek.com'"},
+		{"system_settings", "prompt_filter_review_model", "TEXT DEFAULT 'deepseek-v4-flash'"},
 		{"system_settings", "prompt_filter_review_timeout_seconds", "INTEGER DEFAULT 10"},
 		{"system_settings", "prompt_filter_review_fail_closed", "INTEGER DEFAULT 1"},
 		{"prompt_filter_logs", "review_model", "TEXT DEFAULT ''"},
@@ -661,6 +696,20 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		SET test_status = 'success'
 		WHERE COALESCE(test_status, 'untested') = 'untested'
 		  AND (COALESCE(test_ip, '') <> '' OR COALESCE(test_location, '') <> '' OR COALESCE(test_latency_ms, 0) > 0)
+	`); err != nil {
+		return err
+	}
+
+	// 审查服务从未配置过(无 key、未启用)且仍是旧出厂默认时,迁移到新的
+	// DeepSeek 默认供应商;真在用 OpenAI 审核的部署不受影响。
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE system_settings
+		SET prompt_filter_review_base_url = 'https://api.deepseek.com',
+			prompt_filter_review_model = 'deepseek-v4-flash'
+		WHERE COALESCE(prompt_filter_review_api_key, '') = ''
+		  AND COALESCE(prompt_filter_review_enabled, 0) = 0
+		  AND COALESCE(prompt_filter_review_base_url, '') = 'https://api.openai.com'
+		  AND COALESCE(prompt_filter_review_model, '') = 'omni-moderation-latest'
 	`); err != nil {
 		return err
 	}

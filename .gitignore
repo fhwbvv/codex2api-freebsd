@@ -33,6 +33,7 @@ USAGE_WINDOW_LOGIC.md
 scripts
 # 上面的 scripts 会匹配任意层级的同名目录;前端构建/CI 用的脚本需要入库。
 !frontend/scripts/
+!.github/scripts/
 
 # Logs
 logs/
@@ -49,3 +50,4 @@ grok-build-main/
 .superpowers/
 CLAUDE.md
 .cursor
+diagrams/

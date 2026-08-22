@@ -122,16 +122,20 @@ type PromptRiskEvent struct {
 }
 
 type PromptRiskProfileQuery struct {
-	Page        int
-	PageSize    int
-	SubjectType string
-	SubjectKey  string
-	Platform    string
-	RiskLevel   string
-	APIKeyID    int64
-	AccountID   int64
-	MinScore    int
-	Query       string
+	Page                  int
+	PageSize              int
+	SubjectType           string
+	SubjectKey            string
+	Platform              string
+	RiskLevel             string
+	APIKeyID              int64
+	AccountID             int64
+	MinScore              int
+	Query                 string
+	PrioritizeActiveLocks bool
+	ActiveLocksOnly       bool
+	ConversationLockTTL   time.Duration
+	UserCyberCooldownTTL  time.Duration
 }
 
 type PromptRiskEventQuery struct {
@@ -310,6 +314,8 @@ func (db *DB) ensurePromptRiskEventsTable(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_prompt_risk_events_incident ON prompt_risk_events(incident_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_risk_events_api_key ON prompt_risk_events(api_key_id, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_risk_events_account ON prompt_risk_events(account_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_risk_events_request_match ON prompt_risk_events(request_correlation_id, subject_type, subject_key, event_kind) WHERE request_correlation_id<>''`,
+		`CREATE INDEX IF NOT EXISTS idx_prompt_risk_events_fingerprint_match ON prompt_risk_events(prompt_fingerprint, subject_type, subject_key, created_at, event_kind) WHERE request_correlation_id='' AND prompt_fingerprint<>''`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_risk_sources_processed ON prompt_risk_event_sources(processed_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_risk_identities_external ON prompt_risk_identities(platform, external_user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_prompt_risk_identities_updated ON prompt_risk_identities(updated_at)`,
@@ -656,29 +662,49 @@ func reconcilePromptRiskReviewForSubject(ctx context.Context, exec promptRiskEve
 	if requestID == "" && fingerprint == "" {
 		return nil
 	}
-	windowStart := signal.CreatedAt.Add(-10 * time.Minute)
-	windowEnd := signal.CreatedAt.Add(10 * time.Minute)
-	match := `(request_correlation_id<>'' AND $1<>'' AND request_correlation_id=$1) OR
-		(request_correlation_id='' AND $1='' AND prompt_fingerprint<>'' AND $2<>'' AND prompt_fingerprint=$2 AND created_at >= $3 AND created_at <= $4)`
 	if signal.EventKind == promptRiskEventReviewCleared {
+		if requestID != "" {
+			_, err := exec.ExecContext(ctx, `UPDATE prompt_risk_events SET
+				event_kind=$1, request_risk_score=0, evidence_confidence=95
+				WHERE subject_type=$2 AND subject_key=$3 AND event_kind IN ($4,$5)
+				AND request_correlation_id<>'' AND request_correlation_id=$6`, promptRiskEventLocalBlockCleared, subject.Type, subject.Key,
+				promptRiskEventLocalBlock, promptRiskEventLocalBlockUnverified, requestID)
+			return err
+		}
+		windowStart := signal.CreatedAt.Add(-10 * time.Minute)
+		windowEnd := signal.CreatedAt.Add(10 * time.Minute)
 		_, err := exec.ExecContext(ctx, `UPDATE prompt_risk_events SET
-			event_kind=$5, request_risk_score=0, evidence_confidence=95
-			WHERE subject_type=$6 AND subject_key=$7 AND event_kind IN ($8,$9) AND (`+match+`)`,
-			requestID, fingerprint, windowStart, windowEnd, promptRiskEventLocalBlockCleared, subject.Type, subject.Key,
-			promptRiskEventLocalBlock, promptRiskEventLocalBlockUnverified)
+			event_kind=$1, request_risk_score=0, evidence_confidence=95
+			WHERE subject_type=$2 AND subject_key=$3 AND event_kind IN ($4,$5)
+			AND request_correlation_id='' AND prompt_fingerprint<>'' AND prompt_fingerprint=$6
+			AND created_at >= $7 AND created_at <= $8`, promptRiskEventLocalBlockCleared, subject.Type, subject.Key,
+			promptRiskEventLocalBlock, promptRiskEventLocalBlockUnverified, fingerprint, windowStart, windowEnd)
 		return err
 	}
+	if requestID != "" {
+		_, err := exec.ExecContext(ctx, `UPDATE prompt_risk_events SET
+			event_kind=$1, request_risk_score=0, evidence_confidence=95
+			WHERE source_type=$2 AND source_id=$3 AND subject_type=$4 AND subject_key=$5
+			AND event_kind=$6 AND EXISTS (
+				SELECT 1 FROM prompt_risk_events cleared
+				WHERE cleared.subject_type=$4 AND cleared.subject_key=$5 AND cleared.event_kind=$7
+				AND cleared.request_correlation_id<>'' AND cleared.request_correlation_id=$8
+			)`, promptRiskEventLocalBlockCleared, signal.SourceType, signal.SourceID, subject.Type, subject.Key,
+			promptRiskEventLocalBlockUnverified, promptRiskEventReviewCleared, requestID)
+		return err
+	}
+	windowStart := signal.CreatedAt.Add(-10 * time.Minute)
+	windowEnd := signal.CreatedAt.Add(10 * time.Minute)
 	_, err := exec.ExecContext(ctx, `UPDATE prompt_risk_events SET
-		event_kind=$5, request_risk_score=0, evidence_confidence=95
-		WHERE source_type=$6 AND source_id=$7 AND subject_type=$8 AND subject_key=$9
-		AND event_kind=$10 AND EXISTS (
+		event_kind=$1, request_risk_score=0, evidence_confidence=95
+		WHERE source_type=$2 AND source_id=$3 AND subject_type=$4 AND subject_key=$5
+		AND event_kind=$6 AND EXISTS (
 			SELECT 1 FROM prompt_risk_events cleared
-			WHERE cleared.subject_type=$8 AND cleared.subject_key=$9 AND cleared.event_kind=$11 AND (
-				(cleared.request_correlation_id<>'' AND $1<>'' AND cleared.request_correlation_id=$1) OR
-				(cleared.request_correlation_id='' AND $1='' AND cleared.prompt_fingerprint<>'' AND $2<>'' AND cleared.prompt_fingerprint=$2 AND cleared.created_at >= $3 AND cleared.created_at <= $4)
-			)
-		)`, requestID, fingerprint, windowStart, windowEnd, promptRiskEventLocalBlockCleared,
-		signal.SourceType, signal.SourceID, subject.Type, subject.Key, promptRiskEventLocalBlockUnverified, promptRiskEventReviewCleared)
+			WHERE cleared.subject_type=$4 AND cleared.subject_key=$5 AND cleared.event_kind=$7
+			AND cleared.request_correlation_id='' AND cleared.prompt_fingerprint<>'' AND cleared.prompt_fingerprint=$8
+			AND cleared.created_at >= $9 AND cleared.created_at <= $10
+		)`, promptRiskEventLocalBlockCleared, signal.SourceType, signal.SourceID, subject.Type, subject.Key,
+		promptRiskEventLocalBlockUnverified, promptRiskEventReviewCleared, fingerprint, windowStart, windowEnd)
 	return err
 }
 
@@ -906,6 +932,57 @@ func applyPromptRiskIdentityToEvent(event *PromptRiskEvent, identity promptRiskI
 	}
 }
 
+// promptRiskActiveRestrictionSubjects returns the profile subjects currently
+// restricted by a live conversation lock or user cooldown. It is intentionally
+// read-only: stale rows remain historical evidence and are excluded by the
+// configured TTL instead of being updated while the admin list is loading.
+func (db *DB) promptRiskActiveRestrictionSubjects(ctx context.Context, conversationTTL, userCooldownTTL time.Duration) (map[string]time.Time, error) {
+	result := make(map[string]time.Time)
+	if db == nil {
+		return result, nil
+	}
+	// The lock table is created once during database startup. Do not run DDL
+	// from this read path: repeated CREATE/ALTER checks on a busy SQLite instance
+	// can contend with OAuth and usage-log writers even when the schema is stable.
+	rows, err := db.conn.QueryContext(ctx, `SELECT session_hash, platform, newapi_user_id, reason_code, locked_at
+		FROM prompt_conversation_locks WHERE status='active'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	now := time.Now().UTC()
+	for rows.Next() {
+		var sessionHash, platform, userID, reasonCode string
+		var lockedRaw any
+		if err := rows.Scan(&sessionHash, &platform, &userID, &reasonCode, &lockedRaw); err != nil {
+			return nil, err
+		}
+		lockedAt, err := parsePromptRiskTimeValue(lockedRaw)
+		if err != nil {
+			return nil, err
+		}
+		if sessionHash = strings.ToLower(strings.TrimSpace(sessionHash)); sessionHash != "" &&
+			(conversationTTL <= 0 || lockedAt.After(now.Add(-conversationTTL))) {
+			key := PromptRiskSubjectSession + "\x00" + sessionHash
+			if current, ok := result[key]; !ok || lockedAt.After(current) {
+				result[key] = lockedAt
+			}
+		}
+		// Only a real upstream CYB expands to user scope. Local deterministic
+		// blocks remain attached to the exact session to avoid implicating every
+		// conversation of a shared user.
+		if reasonCode == "upstream_cyber_policy" && (userCooldownTTL <= 0 || lockedAt.After(now.Add(-userCooldownTTL))) {
+			if subjectKey := PromptRiskNewAPIUserSubjectKey(platform, userID); subjectKey != "" {
+				key := PromptRiskSubjectNewAPIUser + "\x00" + subjectKey
+				if current, ok := result[key]; !ok || lockedAt.After(current) {
+					result[key] = lockedAt
+				}
+			}
+		}
+	}
+	return result, rows.Err()
+}
+
 func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfileQuery) ([]*PromptRiskProfile, int, error) {
 	if db == nil {
 		return nil, 0, nil
@@ -1087,12 +1164,37 @@ func (db *DB) ListPromptRiskProfiles(ctx context.Context, query PromptRiskProfil
 			aggregates = append(aggregates, promptRiskAggregate{Profile: profile})
 		}
 	}
+	activeRestrictions := map[string]time.Time{}
+	if query.PrioritizeActiveLocks || query.ActiveLocksOnly {
+		activeRestrictions, err = db.promptRiskActiveRestrictionSubjects(ctx, query.ConversationLockTTL, query.UserCyberCooldownTTL)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	if query.ActiveLocksOnly {
+		filtered := aggregates[:0]
+		for i := range aggregates {
+			profileKey := aggregates[i].Profile.SubjectType + "\x00" + aggregates[i].Profile.SubjectKey
+			if _, active := activeRestrictions[profileKey]; active {
+				filtered = append(filtered, aggregates[i])
+			}
+		}
+		aggregates = filtered
+	}
 	sort.SliceStable(aggregates, func(i, j int) bool {
+		leftKey := aggregates[i].Profile.SubjectType + "\x00" + aggregates[i].Profile.SubjectKey
+		rightKey := aggregates[j].Profile.SubjectType + "\x00" + aggregates[j].Profile.SubjectKey
+		leftLockedAt, leftLocked := activeRestrictions[leftKey]
+		rightLockedAt, rightLocked := activeRestrictions[rightKey]
+		if leftLocked != rightLocked {
+			return leftLocked
+		}
+		if leftLocked && !leftLockedAt.Equal(rightLockedAt) {
+			return leftLockedAt.After(rightLockedAt)
+		}
 		if aggregates[i].Profile.RiskScore == aggregates[j].Profile.RiskScore {
 			if aggregates[i].Profile.LatestAt.Equal(aggregates[j].Profile.LatestAt) {
-				left := aggregates[i].Profile.SubjectType + "\x00" + aggregates[i].Profile.SubjectKey
-				right := aggregates[j].Profile.SubjectType + "\x00" + aggregates[j].Profile.SubjectKey
-				return left < right
+				return leftKey < rightKey
 			}
 			return aggregates[i].Profile.LatestAt.After(aggregates[j].Profile.LatestAt)
 		}

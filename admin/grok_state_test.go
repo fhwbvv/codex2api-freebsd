@@ -450,3 +450,70 @@ func TestInspectGrokProbeResponseUsesCompletionWhenNoDelta(t *testing.T) {
 		t.Fatalf("completed-only first token = %+v", observation)
 	}
 }
+
+// 探针体带 max_output_tokens:1，思考型模型的正常收尾是 response.incomplete。
+// 只认 completed 会让每个通的 Responses 口被判成 unavailable（http_status=200
+// 却 status=unavailable），进而永久关闭 Native 直通。
+func TestInspectGrokProbeResponseAcceptsIncompleteTerminal(t *testing.T) {
+	started := time.Now().Add(-50 * time.Millisecond)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n" +
+				"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n")),
+	}
+	observation := inspectGrokProbeResponse(context.Background(), proxy.GrokProtocolResponses, resp, nil, started)
+	if observation.status != "ok" {
+		t.Fatalf("truncated probe must count as ok: %+v", observation)
+	}
+	if observation.httpStatus != http.StatusOK {
+		t.Fatalf("http status = %d, want 200", observation.httpStatus)
+	}
+}
+
+func TestInspectGrokProbeResponseAcceptsIncompleteNonStreaming(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":1,"output_tokens":1}}`)),
+	}
+	observation := inspectGrokProbeResponse(context.Background(), proxy.GrokProtocolResponses, resp, nil, time.Now())
+	if observation.status != "ok" {
+		t.Fatalf("truncated non-streaming probe must count as ok: %+v", observation)
+	}
+}
+
+// response.failed 仍然是失败，不能被截断放行规则带偏。
+func TestInspectGrokProbeResponseStillRejectsFailedTerminal(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"x\"}}}\n\n")),
+	}
+	observation := inspectGrokProbeResponse(context.Background(), proxy.GrokProtocolResponses, resp, nil, time.Now())
+	if observation.status == "ok" {
+		t.Fatalf("failed terminal must not be ok: %+v", observation)
+	}
+}
+
+func TestGrokProbeResponsesTerminalOK(t *testing.T) {
+	for _, tc := range []struct {
+		status, eventType string
+		want              bool
+	}{
+		{"completed", "", true},
+		{"incomplete", "", true},
+		{"failed", "", false},
+		{"", "response.completed", true},
+		{"", "response.incomplete", true},
+		{"", "response.failed", false},
+		{"", "response.output_text.delta", false},
+	} {
+		if got := grokProbeResponsesTerminalOK(tc.status, tc.eventType); got != tc.want {
+			t.Errorf("grokProbeResponsesTerminalOK(%q,%q) = %v, want %v", tc.status, tc.eventType, got, tc.want)
+		}
+	}
+}

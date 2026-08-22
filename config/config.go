@@ -48,7 +48,7 @@ func (d *DatabaseConfig) DSN() string {
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		d.Host, d.Port, d.User, d.Password, d.DBName, sslMode)
 	if d.Schema != "" {
-		// 通过 libpq options 在连接启动时设置 search_path，覆盖连接池中的所有连接。
+		// 通过 PostgreSQL startup options 在连接启动时设置 search_path，覆盖连接池中的所有连接。
 		// schema 已在 Load() 阶段做白名单校验，此处可安全拼接。
 		dsn += fmt.Sprintf(" options='-c search_path=%s,public'", d.Schema)
 	}

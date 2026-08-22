@@ -385,7 +385,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		FirstTokenTimeoutSeconds:          0,
 		BillingTierPolicy:                 proxy.BillingTierPolicyActual,
 		AffinityMode:                      "bounded",
-		GrokConfig:                        `{"affinity_mode":"strict","probe_enabled":false,"probe_interval_minutes":30,"max_rate_limit_retries":0,"oauth_client_id":""}`,
+		GrokConfig:                        `{"affinity_mode":"strict","probe_enabled":false,"probe_interval_minutes":30,"max_rate_limit_retries":0,"oauth_client_id":"","follow_up_effort_enabled":false,"follow_up_tool_effort":"medium","follow_up_small_effort":"low"}`,
 		PublicKeyUsagePageEnabled:         true,
 		PublicImageStudioPageEnabled:      true,
 		CodexWSHideUpstreamErrors:         true,

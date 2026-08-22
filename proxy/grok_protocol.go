@@ -75,9 +75,10 @@ func routeHeaders(raw map[string]string) http.Header {
 	return result
 }
 
-// ResolveGrokUpstreamRoute uses a fresh native capability first, then the
-// catalog apiBackend. Missing catalogs use Responses for the conservative
-// built-in model set so existing OAuth/API-key accounts stay usable until sync.
+// ResolveGrokUpstreamRoute uses the catalog apiBackend. A fresh same-protocol
+// probe only marks Native passthrough; it cannot override a different catalog
+// backend. Missing catalogs use Responses for the conservative built-in model
+// set so existing OAuth/API-key accounts stay usable until sync.
 func ResolveGrokUpstreamRoute(account *auth.Account, model string, inbound GrokProtocol, now time.Time) GrokUpstreamRoute {
 	baseURL, _ := account.GrokCredentials()
 	resolved := GrokUpstreamRoute{
@@ -752,7 +753,7 @@ func (r *chatToResponsesReader) ensureToolOutput(index int) *chatResponseTool {
 }
 
 func (r *chatToResponsesReader) enqueueToolProgress(tool *chatResponseTool) {
-	if tool == nil || tool.id == "" {
+	if tool == nil || tool.id == "" || tool.name == "" {
 		return
 	}
 	if !tool.itemAdded {
@@ -766,6 +767,30 @@ func (r *chatToResponsesReader) enqueueToolProgress(tool *chatResponseTool) {
 	delta := arguments[tool.emittedArgsSize:]
 	tool.emittedArgsSize = len(arguments)
 	r.queue.Write(responseEvent("response.function_call_arguments.delta", map[string]any{"output_index": tool.outputIndex, "item_id": tool.id, "call_id": tool.id, "delta": delta}))
+}
+
+func chatResponseToolItem(tool *chatResponseTool, status string) map[string]any {
+	return map[string]any{
+		"id": tool.id, "type": "function_call", "call_id": tool.id,
+		"name": tool.name, "arguments": tool.arguments.String(), "status": status,
+	}
+}
+
+func (r *chatToResponsesReader) enqueueToolCompletion(tool *chatResponseTool) map[string]any {
+	if tool.id == "" {
+		tool.id = "call_" + uuid.NewString()
+	}
+	if tool.name == "" {
+		return chatResponseToolItem(tool, "incomplete")
+	}
+	r.enqueueToolProgress(tool)
+	item := chatResponseToolItem(tool, "completed")
+	r.queue.Write(responseEvent("response.function_call_arguments.done", map[string]any{
+		"output_index": tool.outputIndex, "item_id": tool.id, "call_id": tool.id,
+		"arguments": tool.arguments.String(),
+	}))
+	r.queue.Write(responseEvent("response.output_item.done", map[string]any{"output_index": tool.outputIndex, "item": item}))
+	return item
 }
 
 func (r *chatToResponsesReader) enqueueCreated() {
@@ -909,10 +934,14 @@ func (r *chatToResponsesReader) emitChatTerminal(status string) {
 			if tool == nil {
 				continue
 			}
+			if status == "completed" {
+				output = append(output, r.enqueueToolCompletion(tool))
+				continue
+			}
 			if tool.id == "" {
 				tool.id = "call_" + uuid.NewString()
 			}
-			output = append(output, map[string]any{"id": tool.id, "type": "function_call", "call_id": tool.id, "name": tool.name, "arguments": tool.arguments.String(), "status": "completed"})
+			output = append(output, chatResponseToolItem(tool, "incomplete"))
 		}
 	}
 	response := map[string]any{"id": r.responseID, "object": "response", "status": status, "model": r.model, "output": output, "usage": usage}
@@ -1014,6 +1043,7 @@ type messagesResponseBlock struct {
 	signature   strings.Builder
 	arguments   strings.Builder
 	outputIndex int
+	itemAdded   bool
 }
 
 func newMessagesToResponsesReader(source io.ReadCloser, model string) io.ReadCloser {
@@ -1031,6 +1061,41 @@ func (r *messagesToResponsesReader) ensureBlock(index int, blockType string) *me
 	r.blocks[index] = block
 	r.output = append(r.output, index)
 	return block
+}
+
+func messagesResponseToolItem(block *messagesResponseBlock, status string) map[string]any {
+	return map[string]any{
+		"id": block.id, "type": "function_call", "call_id": block.id,
+		"name": block.name, "arguments": block.arguments.String(), "status": status,
+	}
+}
+
+func (r *messagesToResponsesReader) enqueueToolAdded(block *messagesResponseBlock) {
+	if block == nil || block.itemAdded || block.id == "" {
+		return
+	}
+	r.queue.Write(responseEvent("response.output_item.added", map[string]any{
+		"output_index": block.outputIndex,
+		"item": map[string]any{
+			"id": block.id, "type": "function_call", "call_id": block.id,
+			"name": block.name, "arguments": "", "status": "in_progress",
+		},
+	}))
+	block.itemAdded = true
+}
+
+func (r *messagesToResponsesReader) enqueueToolCompletion(block *messagesResponseBlock) map[string]any {
+	if block.id == "" {
+		block.id = "call_" + uuid.NewString()
+	}
+	r.enqueueToolAdded(block)
+	item := messagesResponseToolItem(block, "completed")
+	r.queue.Write(responseEvent("response.function_call_arguments.done", map[string]any{
+		"output_index": block.outputIndex, "item_id": block.id, "call_id": block.id,
+		"arguments": block.arguments.String(),
+	}))
+	r.queue.Write(responseEvent("response.output_item.done", map[string]any{"output_index": block.outputIndex, "item": item}))
+	return item
 }
 
 func (r *messagesToResponsesReader) translate(data []byte) {
@@ -1059,8 +1124,7 @@ func (r *messagesToResponsesReader) translate(data []byte) {
 			block.name = event.Get("content_block.name").String()
 		}
 		if blockType == "tool_use" {
-			id := block.id
-			r.queue.Write(responseEvent("response.output_item.added", map[string]any{"output_index": block.outputIndex, "item": map[string]any{"id": id, "type": "function_call", "call_id": id, "name": block.name, "arguments": "", "status": "in_progress"}}))
+			r.enqueueToolAdded(block)
 		}
 	case "content_block_delta":
 		index := int(event.Get("index").Int())
@@ -1139,7 +1203,14 @@ func (r *messagesToResponsesReader) translate(data []byte) {
 					output = append(output, map[string]any{"id": "msg_" + uuid.NewString(), "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": block.text.String(), "annotations": []any{}}}})
 				}
 			case "tool_use":
-				output = append(output, map[string]any{"id": block.id, "type": "function_call", "call_id": block.id, "name": block.name, "arguments": block.arguments.String(), "status": "completed"})
+				if status == "completed" {
+					output = append(output, r.enqueueToolCompletion(block))
+					continue
+				}
+				if block.id == "" {
+					block.id = "call_" + uuid.NewString()
+				}
+				output = append(output, messagesResponseToolItem(block, "incomplete"))
 			}
 		}
 		response := map[string]any{"id": r.responseID, "object": "response", "status": status, "model": r.model, "output": output, "usage": usage}
@@ -1242,13 +1313,13 @@ func ExecuteGrokNativeProtocolProbeAtOriginWithHeaders(ctx context.Context, acco
 	if err != nil {
 		return nil, ErrInternalError("创建 Grok 探针请求失败", err)
 	}
-	applyGrokRequestHeaders(req, account, bearer, nil)
+	applyGrokRequestHeaders(req, account, bearer, nil, nil)
 	for name, values := range routeHeaders(extraHeaders) {
 		for _, value := range values {
 			req.Header.Set(name, value)
 		}
 	}
-	applyGrokRequestHeaders(req, account, bearer, nil)
+	applyGrokRequestHeaders(req, account, bearer, nil, nil)
 	req.Header.Set("Accept-Encoding", "gzip, br, deflate")
 	req.Header.Set("x-grok-turn-idx", "1")
 	if model != "" {
@@ -1301,11 +1372,7 @@ func canonicalGrokResponsesBody(inbound GrokProtocol, inboundBody, responsesBody
 	return body, err
 }
 
-func prepareGrokProtocolBody(protocol, inbound GrokProtocol, inboundBody, responsesBody []byte) ([]byte, error) {
-	canonical, err := canonicalGrokResponsesBody(inbound, inboundBody, responsesBody)
-	if err != nil {
-		return nil, err
-	}
+func convertCanonicalGrokResponsesBody(protocol GrokProtocol, canonical []byte) ([]byte, error) {
 	switch protocol {
 	case GrokProtocolChatCompletions:
 		return convertResponsesToChatRequest(canonical)
@@ -1329,7 +1396,7 @@ func rewriteGrokProtocolModel(body []byte, model string) ([]byte, error) {
 	return sjson.SetBytes(body, "model", model)
 }
 
-func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol, inboundBody, responsesBody []byte) ([]byte, error) {
+func prepareRoutedGrokProtocolRequest(route GrokUpstreamRoute, inbound GrokProtocol, inboundBody, responsesBody []byte) (grokPreflightResult, error) {
 	inbound = auth.NormalizeGrokProtocol(string(inbound))
 	// A same-protocol route receives the original downstream object even when
 	// it was selected from catalog apiBackend rather than a fresh capability
@@ -1339,10 +1406,24 @@ func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol
 	// ExecuteGrokProtocolRequest.
 	if route.Protocol == inbound && inbound != "" && len(inboundBody) > 0 {
 		body, err := rewriteGrokProtocolModel(inboundBody, route.Model)
-		if err != nil || route.Native {
+		if err != nil {
+			return grokPreflightResult{}, err
+		}
+		if route.Native {
 			// 仅 native 路由按线格式直通返回(forwardGrokNativeResponse),
 			// 可以完整保留 stream=false。
-			return body, err
+			//
+			// 但直通的是"传输形态",不是"请求内容":Codex 专有工具形态
+			// (custom / namespace / tool_search / additional_tools)与被丢弃的
+			// 顶层字段仍必须经 preflight 降级,否则原样发给 Grok 会 400。
+			// 统一跑 preflight 还让同一会话在 native 与非 native 之间切换时
+			// 请求体形态保持一致,不打断上游的静态前缀缓存。
+			// 实测 preflight 成本 0.06~1.9ms(6KB~544KB 请求体),相对 Grok
+			// 秒级首字可忽略。
+			if route.Protocol == GrokProtocolResponses {
+				return prepareGrokUpstreamBody(body), nil
+			}
+			return grokPreflightResult{Body: body, TurnIndex: 1, Model: gjson.GetBytes(body, "model").String()}, nil
 		}
 		// 非 native 的同协议路由不会直通:响应必须经 adaptGrokProtocolResponse
 		// 投影成规范 Responses SSE 再交给下游翻译器,而该投影只处理 SSE。
@@ -1351,7 +1432,7 @@ func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol
 		if !grokProtocolBodyStream(body) {
 			forced, forceErr := sjson.SetBytes(body, "stream", true)
 			if forceErr != nil {
-				return nil, forceErr
+				return grokPreflightResult{}, forceErr
 			}
 			if route.Protocol == GrokProtocolChatCompletions {
 				// Chat 的 usage 只随 include_usage 的独立 chunk 下发。
@@ -1361,9 +1442,34 @@ func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol
 			}
 			body = forced
 		}
-		return body, nil
+		if route.Protocol == GrokProtocolResponses {
+			return prepareGrokUpstreamBody(body), nil
+		}
+		return grokPreflightResult{Body: clampGrokReasoningEffort(body), TurnIndex: 1, Model: gjson.GetBytes(body, "model").String()}, nil
 	}
-	return prepareGrokProtocolBody(route.Protocol, inbound, inboundBody, responsesBody)
+
+	canonical, err := canonicalGrokResponsesBody(inbound, inboundBody, responsesBody)
+	if err != nil {
+		return grokPreflightResult{}, err
+	}
+	// Codex-only Responses tools and history must be lowered while the request
+	// still has canonical Responses semantics. Converting first rejects those
+	// variants and loses the request-local aliases needed to restore tool calls.
+	preflight := prepareGrokUpstreamBody(canonical)
+	converted, err := convertCanonicalGrokResponsesBody(route.Protocol, preflight.Body)
+	if err != nil {
+		return grokPreflightResult{}, err
+	}
+	if route.Protocol != GrokProtocolResponses {
+		converted = clampGrokReasoningEffort(converted)
+	}
+	preflight.Body = converted
+	return preflight, nil
+}
+
+func prepareRoutedGrokProtocolBody(route GrokUpstreamRoute, inbound GrokProtocol, inboundBody, responsesBody []byte) ([]byte, error) {
+	preflight, err := prepareRoutedGrokProtocolRequest(route, inbound, inboundBody, responsesBody)
+	return preflight.Body, err
 }
 
 func validGrokClientVersion(value string) bool {
@@ -1418,7 +1524,7 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 		model = strings.TrimSpace(gjson.GetBytes(inboundBody, "model").String())
 	}
 	route := ResolveGrokUpstreamRoute(account, model, inbound, time.Now())
-	body, err := prepareRoutedGrokProtocolBody(route, inbound, inboundBody, responsesBody)
+	preflight, err := prepareRoutedGrokProtocolRequest(route, inbound, inboundBody, responsesBody)
 	if err != nil {
 		return nil, ErrBadRequest("Grok protocol conversion failed: " + err.Error())
 	}
@@ -1433,20 +1539,17 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}
-	preflight := prepareGrokUpstreamBody(body)
-	if route.Protocol != GrokProtocolResponses || (route.Native && route.Protocol == auth.NormalizeGrokProtocol(string(inbound))) {
-		// Responses-specific history preflight cannot be applied after conversion.
-		preflight = grokPreflightResult{Body: body, TurnIndex: 1, Model: model}
-		if !route.Native {
-			preflight.Body = clampGrokReasoningEffort(body)
-		}
-	}
+	logGrokPrefixFingerprint(preflight.Body, preflight.TurnIndex, preflight.Model)
 	send := func(payload []byte, clientVersion string) (*http.Response, error) {
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, route.Endpoint, bytes.NewReader(payload))
 		if reqErr != nil {
 			return nil, ErrInternalError("创建请求失败", reqErr)
 		}
-		applyGrokRequestHeaders(req, account, bearer, headers)
+		conversationBody := inboundBody
+		if len(conversationBody) == 0 {
+			conversationBody = responsesBody
+		}
+		applyGrokRequestHeaders(req, account, bearer, headers, conversationBody)
 		if clientVersion != "" {
 			req.Header.Set("x-grok-client-version", clientVersion)
 		}
@@ -1456,7 +1559,7 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 			}
 		}
 		// Credential/security headers always win over model metadata.
-		applyGrokRequestHeaders(req, account, bearer, headers)
+		applyGrokRequestHeaders(req, account, bearer, headers, conversationBody)
 		if clientVersion != "" {
 			req.Header.Set("x-grok-client-version", clientVersion)
 		}
@@ -1509,15 +1612,17 @@ func ExecuteGrokProtocolRequest(ctx context.Context, account *auth.Account, inbo
 	recordGrokUpstreamObservationsAtOrigin(account, resp.Header, route.BaseURL)
 	observeGrokNativeProtocolFailure(account, route, inbound, resp)
 	markGrokNativeRoute(resp, route, inbound)
-	if len(preflight.Aliases) > 0 && resp.Body != nil {
-		streaming := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream")
-		resp.Body = newGrokNamespaceReverser(resp.Body, streaming, preflight.Aliases)
-	}
 	// Same-protocol native routes retain the provider wire representation. The
 	// concrete handler streams/copies it directly; converted routes continue to
 	// project through canonical Responses SSE for the existing translators.
 	if !isGrokNativeRouteResponse(resp) {
 		adaptGrokProtocolResponse(resp, route.Protocol, model, grokProtocolBodyStream(preflight.Body))
+	}
+	if len(preflight.Aliases) > 0 && resp.Body != nil {
+		streaming := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "event-stream")
+		resp.Body = newGrokNamespaceReverser(resp.Body, streaming, preflight.Aliases)
+		resp.Header.Del("Content-Length")
+		resp.ContentLength = -1
 	}
 	return resp, nil
 }

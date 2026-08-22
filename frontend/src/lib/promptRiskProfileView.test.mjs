@@ -85,3 +85,15 @@ test('active CYB conversation locks and user cooldowns are visible and manually 
   assert.match(zh.promptFilter.risk.conversationLock.description, /不会再次累计处罚/)
   assert.match(zh.promptFilter.risk.conversationLock.userCooldownDescription, /所有会话/)
 })
+
+test('live restrictions are prioritized, filterable, and link to the original audit', () => {
+  assert.match(api, /locked_only/)
+  assert.match(source, /lockedOnly: filters\.lockedOnly/)
+  assert.match(source, /promptFilter\.risk\.lockedProfiles/)
+  assert.match(source, /auditReference = activeRestriction\?\.incident_id/)
+  assert.match(source, /\/prompt-filter\/logs\?audit=/)
+  assert.match(source, /searchParams\.get\('audit'\)/)
+  assert.match(source, /q: auditReference/)
+  assert.match(zh.promptFilter.risk.lockedProfilesHint, /最近锁定时间优先/)
+  assert.match(zh.promptFilter.risk.conversationLock.openAudit, /原始审核/)
+})

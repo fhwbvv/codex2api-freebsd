@@ -237,7 +237,7 @@ func (h *Handler) PollGrokDeviceAuth(c *gin.Context) {
 	}
 
 	globalGrokDeviceStore.delete(req.SessionID)
-	id, email, err := h.createGrokOAuthAccount(ctx, createGrokOAuthAccountInput{
+	res, err := h.createGrokOAuthAccount(ctx, createGrokOAuthAccountInput{
 		Name:          name,
 		ProxyURL:      proxyURL,
 		BaseURL:       sess.BaseURL,
@@ -247,19 +247,30 @@ func (h *Handler) PollGrokDeviceAuth(c *gin.Context) {
 		Email:         result.Email,
 		TokenEndpoint: result.TokenEndpoint,
 		Source:        "oauth_device",
+		// 交互式重授权命中既有账号(含回收站)时更新凭据而非报"已存在"。
+		ReauthorizeExisting: true,
 	})
 	if err != nil {
 		writeInternalError(c, err)
 		return
 	}
 
-	h.triggerGrokUsageProbe(id)
+	h.triggerGrokUsageProbe(res.ID)
 
+	message := "Grok Device 授权成功"
+	switch {
+	case res.Revived:
+		message = fmt.Sprintf("Grok Device 授权成功，已复活回收站中的账号 %d 并更新凭据", res.ID)
+	case res.Updated:
+		message = fmt.Sprintf("Grok Device 授权成功，已更新既有账号 %d 的凭据", res.ID)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "authorized",
-		"message": "Grok Device 授权成功",
-		"id":      id,
-		"email":   email,
+		"message": message,
+		"id":      res.ID,
+		"email":   res.Email,
+		"updated": res.Updated,
+		"revived": res.Revived,
 	})
 }
 
@@ -283,11 +294,24 @@ type createGrokOAuthAccountInput struct {
 	Email         string
 	TokenEndpoint string
 	Source        string
+	// ReauthorizeExisting 开启"重授权即更新"语义:凭据身份命中既有账号时,
+	// 更新该账号的凭据(回收站账号顺带复活),而不是报"已存在"。
+	// 仅交互式授权路径打开;批量导入保持"重复即跳过"。
+	ReauthorizeExisting bool
 }
 
-func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuthAccountInput) (int64, string, error) {
+type createGrokOAuthAccountResult struct {
+	ID    int64
+	Email string
+	// Updated 表示命中既有账号并已更新凭据(而非新建)。
+	Updated bool
+	// Revived 表示既有账号原先在回收站,本次已复活。
+	Revived bool
+}
+
+func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuthAccountInput) (createGrokOAuthAccountResult, error) {
 	if in.Token == nil {
-		return 0, "", fmt.Errorf("token 为空")
+		return createGrokOAuthAccountResult{}, fmt.Errorf("token 为空")
 	}
 	clientID := auth.EffectiveGrokOAuthClientID()
 	subject := strings.TrimSpace(in.Subject)
@@ -343,10 +367,13 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 
 	id, duplicateID, err := h.db.InsertGrokAccountIfAbsent(ctx, name, credentials, in.ProxyURL, true)
 	if err != nil {
-		return 0, "", err
+		return createGrokOAuthAccountResult{}, err
 	}
 	if duplicateID > 0 {
-		return 0, "", fmt.Errorf("Grok 凭据身份已存在（账号 ID %d）", duplicateID)
+		if !in.ReauthorizeExisting {
+			return createGrokOAuthAccountResult{}, fmt.Errorf("Grok 凭据身份已存在（账号 ID %d）", duplicateID)
+		}
+		return h.reauthorizeGrokOAuthAccount(ctx, duplicateID, in, credentials, email)
 	}
 	source := in.Source
 	if source == "" {
@@ -374,5 +401,44 @@ func (h *Handler) createGrokOAuthAccount(ctx context.Context, in createGrokOAuth
 	h.store.AddAccount(acc)
 
 	security.SecurityAuditLog("GROK_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d auth_kind=oauth source=%s", id, source))
-	return id, email, nil
+	return createGrokOAuthAccountResult{ID: id, Email: email}, nil
+}
+
+// reauthorizeGrokOAuthAccount 把同一 OAuth 身份的新凭据合并进占位账号:
+// 回收站账号复活,正常账号原地更新 token(对齐 Codex OAuth 重授权语义)。
+// base_url/models/name/proxy 只有本次授权显式提供时才覆盖既有配置。
+func (h *Handler) reauthorizeGrokOAuthAccount(ctx context.Context, accountID int64, in createGrokOAuthAccountInput, credentials map[string]interface{}, email string) (createGrokOAuthAccountResult, error) {
+	overlay := make(map[string]interface{}, len(credentials))
+	for key, value := range credentials {
+		overlay[key] = value
+	}
+	if strings.TrimSpace(in.BaseURL) == "" {
+		delete(overlay, "base_url")
+	}
+	if len(in.Models) == 0 {
+		delete(overlay, "models")
+	}
+
+	reauth, err := h.db.ReauthGrokAccount(ctx, accountID, overlay, strings.TrimSpace(in.Name), strings.TrimSpace(in.ProxyURL))
+	if err != nil {
+		return createGrokOAuthAccountResult{}, fmt.Errorf("重授权更新账号 %d 失败: %w", accountID, err)
+	}
+
+	// 无论账号原先是否在内存池(回收站账号不在),都按"移除后重载"拿到最新凭据。
+	h.store.RemoveAccount(accountID)
+	if loadErr := h.store.LoadAccountByID(ctx, accountID); loadErr != nil {
+		return createGrokOAuthAccountResult{}, fmt.Errorf("重授权后重载账号 %d 失败: %w", accountID, loadErr)
+	}
+
+	source := in.Source
+	if source == "" {
+		source = "oauth_grok"
+	}
+	event := "updated"
+	if reauth.Revived {
+		event = "restored"
+	}
+	h.db.InsertAccountEventAsync(accountID, event, source)
+	security.SecurityAuditLog("GROK_ACCOUNT_REAUTHORIZED", fmt.Sprintf("account_id=%d revived=%t source=%s", accountID, reauth.Revived, source))
+	return createGrokOAuthAccountResult{ID: accountID, Email: email, Updated: true, Revived: reauth.Revived}, nil
 }

@@ -28,6 +28,7 @@ import AccountHealthBar from "./AccountHealthBar";
 import ChannelLogo from "./ChannelLogo";
 import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
+import RequestCountPills from "./RequestCountPills";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -42,7 +43,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
-import { formatLongUsageWindowLabel } from "../lib/usageFormat";
+import { formatLongUsageWindowLabel, getAccountStatusBadgeStatus } from "../lib/usageFormat";
 
 function isFutureTime(value?: string): boolean {
   if (!value) return false;
@@ -57,15 +58,34 @@ function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
   if (status === "rate_limited_7d") return "7d";
   if (reason === "rate_limited_5h") return "5h";
   if (reason === "rate_limited_7d") return "7d";
-  if (status === "rate_limited" || status === "quota_paused" || status === "usage_exhausted") {
-    if (account.reset_5h_at && isFutureTime(account.reset_5h_at)) return "5h";
-    if (account.reset_7d_at && isFutureTime(account.reset_7d_at)) return "7d";
-    if (typeof account.usage_percent_5h === "number" && account.usage_percent_5h >= 100)
-      return "5h";
-    if (typeof account.usage_percent_7d === "number" && account.usage_percent_7d >= 100)
-      return "7d";
+  const explicitlyRateLimited =
+    status === "rate_limited" ||
+    status === "responses_rate_limited" ||
+    status === "quota_paused" ||
+    status === "usage_exhausted" ||
+    reason === "responses_rate_limited";
+  if (!explicitlyRateLimited) return null;
+
+  if (
+    typeof account.usage_percent_7d === "number" &&
+    account.usage_percent_7d >= 100 &&
+    (!account.reset_7d_at || isFutureTime(account.reset_7d_at))
+  ) {
+    return "7d";
   }
-  return null;
+  if (
+    typeof account.usage_percent_5h === "number" &&
+    account.usage_percent_5h >= 100 &&
+    (!account.reset_5h_at || isFutureTime(account.reset_5h_at))
+  ) {
+    return "5h";
+  }
+
+  const has5hWindow =
+    typeof account.usage_percent_5h === "number" || !!account.reset_5h_at;
+  const has7dWindow =
+    typeof account.usage_percent_7d === "number" || !!account.reset_7d_at;
+  return has7dWindow && !has5hWindow ? "7d" : "5h";
 }
 
 // 复制邮箱按钮。navigator.clipboard 在非安全上下文（局域网 http 访问）下不存在，
@@ -430,7 +450,7 @@ export default function AccountDetailSheet({
               <div className="space-y-3 rounded-xl border border-border bg-card p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <StatusBadge
-                    status={account.status}
+                    status={getAccountStatusBadgeStatus(account)}
                     detail={rateWindow ?? undefined}
                     errorMessage={account.error_message}
                   />
@@ -652,22 +672,7 @@ export default function AccountDetailSheet({
             <Section title={t("accounts.detailMetrics")}>
               <div className="grid grid-cols-2 gap-2">
                 <MetricCard label={t("accounts.requests")}>
-                  <div className="flex items-baseline gap-1.5 tabular-nums">
-                    <span className="font-semibold text-emerald-600 dark:text-emerald-400">
-                      {account.success_requests ?? 0}
-                    </span>
-                    <span className="text-muted-foreground">/</span>
-                    <span className="font-semibold text-red-500">
-                      {account.error_requests ?? 0}
-                    </span>
-                  </div>
-                  {((account.retry_error_requests ?? 0) > 0 ||
-                    (account.rate_limit_attempts ?? 0) > 0) && (
-                    <div className="mt-1 text-[11px] text-muted-foreground">
-                      retry {account.retry_error_requests ?? 0} · 429{" "}
-                      {account.rate_limit_attempts ?? 0}
-                    </div>
-                  )}
+                  <RequestCountPills account={account} />
                 </MetricCard>
                 <MetricCard label={t("accounts.billed")}>
                   {h5 === null && d7 === null ? (

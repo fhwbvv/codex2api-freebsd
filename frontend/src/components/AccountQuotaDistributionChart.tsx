@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   Bar,
@@ -18,12 +18,11 @@ import { api } from '../api'
 import { getErrorMessage } from '../utils/error'
 import type { AccountQuotaAnalysis } from '../types'
 
-type QuotaWindow = '5h' | '7d'
-
 interface AccountQuotaDistributionChartProps {
-  analysis: Record<QuotaWindow, AccountQuotaAnalysis>
+  analysis: Record<'5h' | '7d', AccountQuotaAnalysis>
   className?: string
   compact?: boolean
+  onRefreshAnalysis?: () => Promise<void> | void
   onProbeStarted?: () => void
   onProbeError?: (message: string) => void
 }
@@ -35,8 +34,6 @@ interface DistributionBucket {
   bucketPercent: number
   fill: string
 }
-
-const quotaWindows: QuotaWindow[] = ['5h', '7d']
 
 const quotaBuckets = [
   { key: '0-10', min: 0, max: 10, fill: 'hsl(var(--success))' },
@@ -64,16 +61,74 @@ const tooltipLabelStyle = { color: 'var(--color-foreground)', fontWeight: 600 }
 const tooltipItemStyle = { color: 'var(--color-foreground)' }
 const legendWrapperStyle = { paddingTop: 4, fontSize: 12, color: axisColor }
 
+const probePollIntervalMs = 2500
+const probePollMaxMs = 3 * 60 * 1000
+
 export default function AccountQuotaDistributionChart({
   analysis,
   className = '',
   compact = false,
+  onRefreshAnalysis,
   onProbeStarted,
   onProbeError,
 }: AccountQuotaDistributionChartProps) {
   const { t } = useTranslation()
-  const [windowKey, setWindowKey] = useState<QuotaWindow>('7d')
   const [probing, setProbing] = useState(false)
+  const sampledRef = useRef(0)
+  const pollTimerRef = useRef<number | null>(null)
+
+  const stopProbePolling = () => {
+    if (pollTimerRef.current !== null) {
+      window.clearInterval(pollTimerRef.current)
+      pollTimerRef.current = null
+    }
+    setProbing(false)
+  }
+
+  const startProbePolling = () => {
+    if (pollTimerRef.current !== null) {
+      window.clearInterval(pollTimerRef.current)
+    }
+    const startedAt = Date.now()
+    let lastSampled = sampledRef.current
+    let staleTicks = 0
+    const tick = async () => {
+      try {
+        await onRefreshAnalysis?.()
+      } catch {
+        // 轮询失败不打断进度条，等下一拍。
+      }
+      let running = false
+      try {
+        const status = await api.getRuntimeStatus()
+        running = Boolean(status.probes?.usage_probe_running)
+      } catch {
+        running = Date.now() - startedAt < 15_000
+      }
+      const sampled = sampledRef.current
+      if (sampled !== lastSampled) {
+        lastSampled = sampled
+        staleTicks = 0
+      } else if (!running) {
+        staleTicks += 1
+      }
+      if (Date.now() - startedAt >= probePollMaxMs || (!running && staleTicks >= 2)) {
+        stopProbePolling()
+      }
+    }
+    window.setTimeout(() => {
+      void tick()
+    }, 800)
+    pollTimerRef.current = window.setInterval(() => {
+      void tick()
+    }, probePollIntervalMs)
+  }
+
+  useEffect(() => () => {
+    if (pollTimerRef.current !== null) {
+      window.clearInterval(pollTimerRef.current)
+    }
+  }, [])
 
   const handleProbe = async () => {
     if (probing) return
@@ -81,15 +136,15 @@ export default function AccountQuotaDistributionChart({
     try {
       await api.forceUsageProbe()
       onProbeStarted?.()
+      startProbePolling()
     } catch (err) {
+      stopProbePolling()
       onProbeError?.(getErrorMessage(err))
-    } finally {
-      setProbing(false)
     }
   }
 
   const distribution = useMemo(() => {
-    const source = analysis[windowKey]
+    const source = analysis['7d']
     const buckets: DistributionBucket[] = source.buckets.map((bucket, index) => ({
       key: quotaBuckets[index]?.key ?? `${bucket.min}-${bucket.max}`,
       label: `${bucket.min}-${bucket.max}%`,
@@ -109,12 +164,16 @@ export default function AccountQuotaDistributionChart({
       exhausted: source.exhausted,
       averageUsed: source.average_used,
     }
-  }, [analysis, windowKey])
+  }, [analysis])
 
+  sampledRef.current = distribution.sampled
+  const samplePercent = distribution.total > 0
+    ? Math.min(100, (distribution.sampled / distribution.total) * 100)
+    : 0
   const hasChartData = distribution.sampled > 0
 
   return (
-    <Card className={`${compact ? 'min-h-[430px]' : 'mb-4'} py-0 ${className}`}>
+    <Card className={`${compact ? 'min-h-0' : 'mb-4'} py-0 ${className}`}>
       <CardContent className={compact ? 'flex h-full flex-col p-4' : 'p-4 sm:p-5'}>
         <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
@@ -140,27 +199,11 @@ export default function AccountQuotaDistributionChart({
               <RefreshCw className={`size-3.5 ${probing ? 'animate-spin' : ''}`} />
               <span>{probing ? t('accounts.quotaDistributionRefreshing') : t('accounts.quotaDistributionRefresh')}</span>
             </button>
-            <div className="inline-flex rounded-lg border border-border bg-muted/50 p-0.5">
-              {quotaWindows.map((key) => (
-                <button
-                  key={key}
-                  type="button"
-                  onClick={() => setWindowKey(key)}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
-                    windowKey === key
-                      ? 'border border-border bg-background text-foreground shadow-sm'
-                      : 'text-muted-foreground hover:text-foreground'
-                  }`}
-                >
-                  {key}
-                </button>
-              ))}
-            </div>
           </div>
         </div>
 
         <div className={compact ? 'flex min-h-0 flex-1 flex-col gap-3' : 'grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]'}>
-          <div className={`${compact ? 'h-[200px] sm:h-[240px]' : 'h-[260px]'} w-full min-w-0`}>
+          <div className={`${compact ? 'min-h-[180px] flex-1' : 'h-[260px]'} w-full min-w-0`}>
             {hasChartData ? (
               <ResponsiveContainer width="100%" height="100%">
                 <ComposedChart data={distribution.buckets} margin={chartMargin}>
@@ -243,7 +286,7 @@ export default function AccountQuotaDistributionChart({
             )}
           </div>
 
-          <div className={compact ? 'grid grid-cols-2 gap-2 sm:grid-cols-3 2xl:grid-cols-6' : 'grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-2'}>
+          <div className={compact ? 'grid shrink-0 grid-cols-2 gap-2 sm:grid-cols-3 2xl:grid-cols-6' : 'grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-2'}>
             <QuotaMetric label={t('accounts.quotaDistributionEligible')} value={distribution.total} compact={compact} />
             <QuotaMetric label={t('accounts.quotaDistributionSampled')} value={distribution.sampled} compact={compact} />
             <QuotaMetric label={t('accounts.quotaDistributionUnsampled')} value={distribution.unsampled} tone={distribution.unsampled > 0 ? 'warning' : 'neutral'} compact={compact} />
@@ -257,6 +300,33 @@ export default function AccountQuotaDistributionChart({
             />
           </div>
         </div>
+
+        {distribution.total > 0 && samplePercent < 100 && (
+          <div className={`${compact ? 'mt-3' : 'mt-4'} shrink-0 rounded-lg border border-border bg-muted/20 px-3 py-2`}>
+            <div className="mb-1.5 flex items-center justify-between gap-3 text-[11px] font-medium">
+              <span className={probing ? 'text-sky-600 dark:text-sky-300' : 'text-muted-foreground'}>
+                {probing ? t('accounts.quotaDistributionProgressLive') : t('accounts.quotaDistributionProgress')}
+              </span>
+              <span className="tabular-nums text-foreground">
+                {t('accounts.quotaDistributionProgressValue', {
+                  sampled: distribution.sampled,
+                  total: distribution.total,
+                })}
+                <span className="ml-2 text-muted-foreground">{samplePercent.toFixed(1)}%</span>
+              </span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-muted">
+              <div
+                className={`h-full rounded-full transition-[width] duration-500 ${
+                  probing
+                    ? 'bg-gradient-to-r from-sky-400 via-violet-400 to-sky-400 bg-[length:200%_100%] animate-pulse'
+                    : 'bg-gradient-to-r from-sky-500 to-violet-400'
+                }`}
+                style={{ width: `${Math.max(samplePercent, samplePercent > 0 ? 2 : 0)}%` }}
+              />
+            </div>
+          </div>
+        )}
       </CardContent>
     </Card>
   )

@@ -35,6 +35,9 @@ var (
 	// context window 500k × 80%；环境变量非空时作为逃生阀直接覆盖推导结果。
 	grokCompactionAtOverride = strings.TrimSpace(os.Getenv("GROK_COMPACTION_AT"))
 	grokCompactionAtDefault  = "400000"
+	// 官方 Grok CLI 1.0.4 实抓：doom-loop 窗口 1024、会话内剩余压缩次数 1。
+	grokDoomLoopCheck        = grokEnv("GROK_DOOM_LOOP_CHECK", "1024")
+	grokCompactionsRemaining = grokEnv("GROK_COMPACTIONS_REMAINING", "1")
 )
 
 func grokEnv(key, fallback string) string {
@@ -89,9 +92,66 @@ func grokRandomHexID() string {
 	return strings.ReplaceAll(uuid.New().String(), "-", "")
 }
 
+// resolveGrokConversationID 给官方 Grok CLI 的 session/conv 头一个跨轮稳定值。
+// 只认会话级标识，不用 Idempotency-Key / x-client-request-id（那些每轮都变）。
+// Claude Code 通常不带 Session_id，因此再用 system + 首条 user 做内容种子。
+func resolveGrokConversationID(headers http.Header, body []byte) string {
+	if headers != nil {
+		for _, key := range []string{"Session-Id", "Session_id", "Conversation-Id", "Conversation_id"} {
+			if value := strings.TrimSpace(headers.Get(key)); value != "" {
+				return value
+			}
+		}
+	}
+	if value := strings.TrimSpace(gjson.GetBytes(body, "metadata.session_id").String()); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(gjson.GetBytes(body, "prompt_cache_key").String()); value != "" {
+		return value
+	}
+	if seed := deriveGrokConversationSeed(body); seed != "" {
+		return seed
+	}
+	if key := grokDownstreamAPIKey(headers); key != "" {
+		return uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:grok-conv:"+key)).String()
+	}
+	return uuid.New().String()
+}
+
+func grokDownstreamAPIKey(headers http.Header) string {
+	if headers == nil {
+		return ""
+	}
+	if value := strings.TrimSpace(strings.TrimPrefix(headers.Get("Authorization"), "Bearer ")); value != "" {
+		return value
+	}
+	for _, key := range []string{"X-Api-Key", "Anthropic-Auth-Token"} {
+		if value := strings.TrimSpace(headers.Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func deriveGrokConversationSeed(body []byte) string {
+	seed := deriveContentSessionSeed(body)
+	system := gjson.GetBytes(body, "system")
+	if !system.Exists() || system.Raw == "" || system.Raw == "null" {
+		return seed
+	}
+	stable := stableAnthropicSystemSeed([]byte(system.Raw))
+	if stable == "" {
+		return seed
+	}
+	sum := sha256.Sum256([]byte("codex2api:grok-conv:" + seed + "\x00" + stable))
+	return "grokconv-" + hex.EncodeToString(sum[:16])
+}
+
 // applyGrokRequestHeaders 按 Grok CLI 的推理头契约装配上游请求头。
 // API Key 凭据不发 x-xai-token-auth / x-authenticateresponse（与 Grok CLI 一致）。
-func applyGrokRequestHeaders(req *http.Request, account *auth.Account, bearer string, downstreamHeaders http.Header) {
+// inboundBody 用于在下游没带会话头时派生稳定的 x-grok-session-id / x-grok-conv-id，
+// 避免每轮随机 UUID 把 Grok prompt cache 打穿。探针/billing/媒体传 nil 即可。
+func applyGrokRequestHeaders(req *http.Request, account *auth.Account, bearer string, downstreamHeaders http.Header, inboundBody []byte) {
 	if req == nil {
 		return
 	}
@@ -99,11 +159,13 @@ func applyGrokRequestHeaders(req *http.Request, account *auth.Account, bearer st
 
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("User-Agent", grokUserAgent())
 	req.Header.Set("x-grok-client-version", grokClientVersion)
 	req.Header.Set("x-grok-client-identifier", grokClientIdentifier)
 	req.Header.Set("x-grok-client-mode", grokClientMode)
+	req.Header.Set("x-grok-doom-loop-check", grokDoomLoopCheck)
+	req.Header.Set("x-compactions-remaining", grokCompactionsRemaining)
 	if compactionAt := grokCompactionAtForAccount(account); compactionAt != "" {
 		req.Header.Set("x-compaction-at", compactionAt)
 	}
@@ -113,13 +175,7 @@ func applyGrokRequestHeaders(req *http.Request, account *auth.Account, bearer st
 	}
 
 	req.Header.Set("x-grok-agent-id", grokAgentID(account))
-	sessionID := ""
-	if downstreamHeaders != nil {
-		sessionID = strings.TrimSpace(downstreamHeaders.Get("Session_id"))
-	}
-	if sessionID == "" {
-		sessionID = uuid.New().String()
-	}
+	sessionID := resolveGrokConversationID(downstreamHeaders, inboundBody)
 	req.Header.Set("x-grok-session-id", sessionID)
 	req.Header.Set("x-grok-conv-id", sessionID)
 	req.Header.Set("x-grok-req-id", grokRandomHexID())
@@ -162,9 +218,11 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 	// 投递前一次性归一化：namespace 分组工具展平成子 function 并记录别名（响应流里再
 	// 反解回 {name, namespace}）、web_search 降级为最小形态、历史项按 Grok 原生契约重建、
 	// Codex 专属字段剥离、思考强度钳制，顺带算出轮次序号与模型名。
+	conversationBody := requestBody
 	preflight := prepareGrokUpstreamBody(requestBody)
 	requestBody = preflight.Body
 	nsAliases := preflight.Aliases
+	logGrokPrefixFingerprint(requestBody, preflight.TurnIndex, preflight.Model)
 
 	endpoint := grokResponsesEndpoint(baseURL)
 	turnIdx := preflight.TurnIndex
@@ -175,7 +233,7 @@ func ExecuteGrokRequest(ctx context.Context, account *auth.Account, requestBody 
 		if err != nil {
 			return nil, ErrInternalError("创建请求失败", err)
 		}
-		applyGrokRequestHeaders(req, account, bearer, headers)
+		applyGrokRequestHeaders(req, account, bearer, headers, conversationBody)
 		// 与官方 CLI 对齐的指纹头：会话内轮次序号 + 完整 Accept-Encoding。
 		req.Header.Set("x-grok-turn-idx", strconv.Itoa(turnIdx))
 		req.Header.Set("Accept-Encoding", "gzip, br, deflate")

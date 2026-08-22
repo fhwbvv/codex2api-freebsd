@@ -312,6 +312,23 @@ test('terminal enforcement exposes clean-review model exemptions', () => {
   assert.match(zh.promptFilter.help.conversationLockEnabled, /上游明确返回 cyber_policy/)
 })
 
+test('local block message editor round-trips through enforcement config', () => {
+  const source = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8')
+  const locales = ['en', 'zh', 'zh-TW'].map((name) => JSON.parse(readFileSync(new URL(`../locales/${name}.json`, import.meta.url), 'utf8')))
+
+  assert.match(source, /local_block_message: string/)
+  assert.match(source, /local_block_message: ''/)
+  assert.match(source, /typeof enforcement\.local_block_message === 'string'/)
+  assert.doesNotMatch(source, /maxLength=\{2000\}/)
+  assert.match(source, /Array\.from\(event\.target\.value\)\.slice\(0, 2000\)\.join\(''\)/)
+  assert.match(source, /promptFilter\.localBlockMessagePlaceholder/)
+  for (const locale of locales) {
+    assert.equal(typeof locale.promptFilter.localBlockMessage, 'string')
+    assert.equal(typeof locale.promptFilter.localBlockMessagePlaceholder, 'string')
+    assert.equal(typeof locale.promptFilter.help.localBlockMessage, 'string')
+  }
+})
+
 test('Moderations review exposes sub2api-compatible category thresholds', () => {
   const source = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8')
   const requiredFragments = [

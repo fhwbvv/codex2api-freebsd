@@ -101,15 +101,19 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		{ID: 5, Status: "active", Enabled: true},  // normal
 		{ID: 6, Status: "error", Enabled: true},   // DB error without runtime override
 		{ID: 7, Status: "cooldown", Enabled: true, CooldownReason: "rate_limited"},
+		{ID: 8, Status: "active", Enabled: true}, // runtime authoritative Responses limit
+		{ID: 9, Status: "cooldown", Enabled: true, CooldownReason: auth.ResponsesRateLimitedCooldownReason},
 	}
 
-	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1"}
+	activeFromStaleDB := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1", UsagePercent7dValid: true}
 	unauthorized := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
 	unauthorized.SetCooldownWithReason(time.Hour, "unauthorized")
-	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3"}
+	disabled := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3", UsagePercent7dValid: true}
 	rateLimited := &auth.Account{DBID: 4, Status: auth.StatusReady, AccessToken: "at-4"}
 	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
-	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
+	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5", UsagePercent7dValid: true}
+	responsesLimited := &auth.Account{DBID: 8, Status: auth.StatusReady, AccessToken: "at-8"}
+	responsesLimited.SetCooldownWithReason(time.Hour, auth.ResponsesRateLimitedCooldownReason)
 
 	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{
 		activeFromStaleDB,
@@ -117,10 +121,11 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 		disabled,
 		rateLimited,
 		normal,
+		responsesLimited,
 	})
 
-	if got.total != 7 || got.normal != 3 || got.rateLimited != 2 || got.abnormal != 2 || got.disabled != 1 {
-		t.Fatalf("counts = %+v, want total=7 normal=3 rateLimited=2 abnormal=2 disabled=1", got)
+	if got.total != 9 || got.normal != 3 || got.rateLimited != 4 || got.abnormal != 2 || got.disabled != 1 {
+		t.Fatalf("counts = %+v, want total=9 normal=3 rateLimited=4 abnormal=2 disabled=1", got)
 	}
 }
 
@@ -159,6 +164,27 @@ func TestSummarizeDashboardAccountsCountsCreditBackedAsNormal(t *testing.T) {
 	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{usingCredits, rateLimited})
 	if got.total != 2 || got.normal != 1 || got.rateLimited != 1 {
 		t.Fatalf("counts = %+v, want total=2 normal=1 rateLimited=1", got)
+	}
+}
+
+func TestSummarizeDashboardAccountsExcludesUnsampledFromAvailable(t *testing.T) {
+	rows := []*database.AccountRow{
+		{ID: 1, Status: "active", Enabled: true},
+		{ID: 2, Status: "active", Enabled: true},
+		{ID: 3, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamGrok}},
+		{ID: 4, Status: "active", Enabled: true, Credentials: map[string]interface{}{"upstream_type": auth.UpstreamOpenAIResponses}},
+	}
+	sampled := &auth.Account{DBID: 1, Status: auth.StatusReady, AccessToken: "at-1", UsagePercent7d: 12, UsagePercent7dValid: true}
+	unsampled := &auth.Account{DBID: 2, Status: auth.StatusReady, AccessToken: "at-2"}
+	grok := &auth.Account{DBID: 3, Status: auth.StatusReady, AccessToken: "at-3", UpstreamType: auth.UpstreamGrok}
+	responses := &auth.Account{DBID: 4, Status: auth.StatusReady, APIKey: "sk-test", BaseURL: "https://relay.example", UpstreamType: auth.UpstreamOpenAIResponses}
+
+	got, channels := summarizeDashboardAccounts(rows, []*auth.Account{sampled, unsampled, grok, responses})
+	if got.total != 4 || got.normal != 3 || got.rateLimited != 0 || got.abnormal != 0 {
+		t.Fatalf("counts = %+v, want total=4 normal=3 rateLimited=0 abnormal=0", got)
+	}
+	if channels[database.UpstreamChannelCodex].normal != 2 || channels[database.UpstreamChannelGrok].normal != 1 {
+		t.Fatalf("channel counts = %+v", channels)
 	}
 }
 
@@ -496,6 +522,98 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 			t.Fatalf("stream body missing %s:\n%s", want, body)
 		}
 	}
+}
+
+func TestCleanErrorStreamsProgress(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", Status: auth.StatusError, Email: "a@example.com"})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", Status: auth.StatusError, Email: "b@example.com"})
+	store.AddAccount(&auth.Account{DBID: 3, AccessToken: "at-3", Status: auth.StatusReady, Email: "ok@example.com"})
+
+	handler := &Handler{store: store}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/clean-error?stream=true", nil)
+
+	handler.CleanError(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("content-type = %q, want event-stream", got)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`"type":"start"`,
+		`"type":"progress"`,
+		`"type":"complete"`,
+		`"action":"clean"`,
+		`"success":2`,
+		`"deleted":2`,
+		`"account_email":"a@example.com"`,
+		`"account_email":"b@example.com"`,
+		`"message":"已清理 2 个账号"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("stream body missing %s:\n%s", want, body)
+		}
+	}
+	if strings.Count(body, `"message":"账号已清理"`) > 0 {
+		t.Fatalf("progress events should not claim the clean is finished:\n%s", body)
+	}
+	remaining := accountIDsFromStore(store)
+	if remaining[1] || remaining[2] {
+		t.Fatal("expected error accounts to be removed")
+	}
+	if !remaining[3] {
+		t.Fatal("expected healthy account to remain")
+	}
+}
+
+func TestCleanErrorJSONKeepsHealthyAccounts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", Status: auth.StatusError})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", Status: auth.StatusReady})
+
+	handler := &Handler{store: store}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/clean-error", nil)
+
+	handler.CleanError(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["cleaned"]; got != float64(1) {
+		t.Fatalf("cleaned = %v, want 1", got)
+	}
+	remaining := accountIDsFromStore(store)
+	if remaining[1] {
+		t.Fatal("expected error account to be removed")
+	}
+	if !remaining[2] {
+		t.Fatal("expected healthy account to remain")
+	}
+}
+
+func accountIDsFromStore(store *auth.Store) map[int64]bool {
+	found := make(map[int64]bool)
+	for _, acc := range store.Accounts() {
+		if acc != nil {
+			found[acc.DBID] = true
+		}
+	}
+	return found
 }
 
 func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
@@ -1443,6 +1561,46 @@ func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
 	}
 	if response.TransportRetryPolicy != "sticky" {
 		t.Fatalf("transport_retry_policy = %q, want sticky", response.TransportRetryPolicy)
+	}
+}
+
+func TestUpdateSettingsConnectionPoolCeilingIs5000(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"pg_max_conns":6000,"redis_pool_size":6000}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.PgMaxConns != 5000 {
+		t.Fatalf("pg_max_conns = %d, want 5000", response.PgMaxConns)
+	}
+	if response.RedisPoolSize != 5000 {
+		t.Fatalf("redis_pool_size = %d, want 5000", response.RedisPoolSize)
 	}
 }
 

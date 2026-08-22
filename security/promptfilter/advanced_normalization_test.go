@@ -6,7 +6,9 @@ import (
 	"compress/zlib"
 	"encoding/base64"
 	"encoding/hex"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func encodedStrictConfig() Config {
@@ -190,6 +192,38 @@ func TestConversationLockTTLDefaultsAndClamps(t *testing.T) {
 	}
 	if cfg.Enforcement.UserCyberCooldownMinutes != MaxUserCyberCooldownMinutes {
 		t.Fatalf("clamped user cyber cooldown = %d, want %d", cfg.Enforcement.UserCyberCooldownMinutes, MaxUserCyberCooldownMinutes)
+	}
+}
+
+func TestNormalizeAdvancedConfigLocalBlockMessage(t *testing.T) {
+	cfg := DefaultAdvancedConfig()
+	cfg.Enforcement.LocalBlockMessage = "  Request blocked by Example Gateway.  "
+
+	got := NormalizeAdvancedConfig(cfg)
+
+	if got.Enforcement.LocalBlockMessage != "Request blocked by Example Gateway." {
+		t.Fatalf("message = %q", got.Enforcement.LocalBlockMessage)
+	}
+}
+
+func TestNormalizeAdvancedConfigLocalBlockMessageRuneLimit(t *testing.T) {
+	cfg := DefaultAdvancedConfig()
+	cfg.Enforcement.LocalBlockMessage = strings.Repeat("界", MaxLocalBlockMessageRunes+1)
+
+	got := NormalizeAdvancedConfig(cfg)
+
+	if count := utf8.RuneCountInString(got.Enforcement.LocalBlockMessage); count != MaxLocalBlockMessageRunes {
+		t.Fatalf("runes = %d, want %d", count, MaxLocalBlockMessageRunes)
+	}
+}
+
+func TestNormalizeAdvancedConfigLocalBlockMessageTrimsAfterRuneLimit(t *testing.T) {
+	cfg := DefaultAdvancedConfig()
+	cfg.Enforcement.LocalBlockMessage = strings.Repeat("界", MaxLocalBlockMessageRunes-1) + "   尾"
+
+	got := NormalizeAdvancedConfig(cfg)
+	if strings.HasSuffix(got.Enforcement.LocalBlockMessage, " ") {
+		t.Fatalf("message retains trailing whitespace after truncation: %q", got.Enforcement.LocalBlockMessage[len(got.Enforcement.LocalBlockMessage)-4:])
 	}
 }
 

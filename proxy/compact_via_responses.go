@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -21,40 +22,119 @@ import (
 // body-signal 压缩形态。compact 预处理为旧专用端点剥除了 store/stream/include，
 // 而 /responses 上游要求 stream=true 且 store=false（实测缺 store 直接
 // 400 "Store must be set to false"），这里补回，并在 input 末尾追加
-// compaction_trigger（已存在时不重复注入）。
+// compaction_trigger。客户端已经携带触发器时也会归一到 input 最后一项。
 func appendCompactionTriggerToResponsesBody(body []byte) []byte {
 	out, _ := sjson.SetBytes(body, "stream", true)
 	out, _ = sjson.SetBytes(out, "store", false)
 	if !gjson.GetBytes(out, "include").Exists() {
 		out, _ = sjson.SetBytes(out, "include", []string{codexReasoningEncryptedContentInclude})
 	}
-	if requestBodyHasCompactionTrigger(out) {
-		return out
-	}
-	trigger := []byte(`{"type":"compaction_trigger"}`)
-	input := gjson.GetBytes(out, "input")
+	return normalizeCompactionTriggerFinal(out, true)
+}
+
+// normalizeCompactionTriggerFinal keeps at most one direct input-level
+// compaction_trigger and moves it behind every history/message/tool item.
+// Upstream rejects a trigger followed by any other input item with
+// "The 'compaction_trigger' item must be the final input item."
+//
+// addIfMissing is true only when rewriting the legacy /responses/compact
+// endpoint to body-signal compaction. Plain /responses preparation uses false:
+// it repairs the order only when the client already supplied a trigger.
+func normalizeCompactionTriggerFinal(body []byte, addIfMissing bool) []byte {
+	trigger := json.RawMessage(`{"type":"compaction_trigger"}`)
+	input := gjson.GetBytes(body, "input")
 	switch {
 	case input.IsArray():
-		out, _ = sjson.SetRawBytes(out, "input.-1", trigger)
-	case input.Type == gjson.String:
-		// input 为字符串时先转成标准 message item，再追加触发器。
-		msg, err := json.Marshal(map[string]any{
-			"type": "message",
-			"role": "user",
-			"content": []any{
-				map[string]any{"type": "input_text", "text": input.String()},
-			},
-		})
-		if err != nil {
-			return out
+		items := input.Array()
+		triggerCount := 0
+		for _, item := range items {
+			if isDirectCompactionTrigger(item) {
+				triggerCount++
+			}
 		}
-		items := append(append([]byte("["), msg...), ',')
-		items = append(append(items, trigger...), ']')
-		out, _ = sjson.SetRawBytes(out, "input", items)
+		if triggerCount == 0 && !addIfMissing {
+			return body
+		}
+		if triggerCount == 1 && len(items) > 0 && isCanonicalCompactionTrigger(items[len(items)-1]) {
+			return body
+		}
+
+		normalized := make([]json.RawMessage, 0, len(items)+1)
+		for _, item := range items {
+			if isDirectCompactionTrigger(item) {
+				continue
+			}
+			raw := strings.TrimSpace(item.Raw)
+			if raw == "" {
+				encoded, err := json.Marshal(item.Value())
+				if err != nil {
+					return body
+				}
+				raw = string(encoded)
+			}
+			normalized = append(normalized, json.RawMessage(raw))
+		}
+		normalized = append(normalized, trigger)
+		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return body
+		}
+		out, err := sjson.SetRawBytes(body, "input", encoded)
+		if err != nil {
+			return body
+		}
+		return out
+	case input.IsObject() && isDirectCompactionTrigger(input):
+		encoded, err := json.Marshal([]json.RawMessage{trigger})
+		if err != nil {
+			return body
+		}
+		out, err := sjson.SetRawBytes(body, "input", encoded)
+		if err != nil {
+			return body
+		}
+		return out
+	case addIfMissing:
+		normalized := make([]json.RawMessage, 0, 2)
+		switch {
+		case input.Type == gjson.String:
+			// input 为字符串时先转成标准 message item，再追加触发器。
+			msg, err := json.Marshal(map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": input.String()},
+				},
+			})
+			if err != nil {
+				return body
+			}
+			normalized = append(normalized, json.RawMessage(msg))
+		case input.IsObject() && !isDirectCompactionTrigger(input):
+			normalized = append(normalized, json.RawMessage(input.Raw))
+		}
+		normalized = append(normalized, trigger)
+		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return body
+		}
+		out, err := sjson.SetRawBytes(body, "input", encoded)
+		if err != nil {
+			return body
+		}
+		return out
 	default:
-		out, _ = sjson.SetRawBytes(out, "input", append(append([]byte("["), trigger...), ']'))
+		return body
 	}
-	return out
+}
+
+func isDirectCompactionTrigger(item gjson.Result) bool {
+	return item.IsObject() &&
+		strings.EqualFold(strings.TrimSpace(item.Get("type").String()), "compaction_trigger")
+}
+
+func isCanonicalCompactionTrigger(item gjson.Result) bool {
+	return item.IsObject() && item.Get("type").String() == "compaction_trigger"
 }
 
 // collectCompactResponsesSSE 把 body-signal 压缩的上游 /responses SSE 流聚合成

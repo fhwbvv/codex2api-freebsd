@@ -3,9 +3,11 @@ package database
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,6 +18,47 @@ func normalizeDriver(driver string) string {
 		return "postgres"
 	}
 	return driver
+}
+
+// sqlOpenDriverName maps the application driver name onto the registered
+// database/sql driver. The public config value stays "postgres"; the connector
+// is pgx's stdlib adapter (lib/pq is unmaintained for the 2026 protocol advisories).
+func sqlOpenDriverName(driver string) string {
+	if driver == "postgres" {
+		return "pgx"
+	}
+	return driver
+}
+
+// quotePostgresIdent quotes a PostgreSQL identifier the same way lib/pq did:
+// wrap in double quotes and double any embedded quotes. A NUL truncates the
+// name so a crafted schema/index cannot leak into the surrounding SQL.
+func quotePostgresIdent(name string) string {
+	if end := strings.IndexRune(name, 0); end >= 0 {
+		name = name[:end]
+	}
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// postgresInt8Array binds a []int64 as a PostgreSQL int8[] text literal for
+// `= ANY($n)`. The application driver used to call pq.Array for this.
+type postgresInt8Array []int64
+
+func (a postgresInt8Array) Value() (driver.Value, error) {
+	if a == nil {
+		return nil, nil
+	}
+	var builder strings.Builder
+	builder.Grow(2 + len(a)*4)
+	builder.WriteByte('{')
+	for index, value := range a {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(strconv.FormatInt(value, 10))
+	}
+	builder.WriteByte('}')
+	return builder.String(), nil
 }
 
 func parseDBTimeValue(value interface{}) (time.Time, error) {

@@ -64,8 +64,12 @@ func (h *Handler) CreateExternalImageJob(c *gin.Context) {
 	if imageProxy == nil {
 		imageProxy = proxy.NewHandler(h.store, h.db, nil, nil)
 	}
-	if imageProxy.InspectPromptFilterOpenAI(c, rawBody, "/v1/images/jobs", req.Model, func(c *gin.Context) {
-		writeExternalImageError(c, http.StatusBadRequest, "Prompt was blocked by prompt filter")
+	if imageProxy.InspectPromptFilterOpenAIWithBlockMessage(c, rawBody, "/v1/images/jobs", req.Model, func(c *gin.Context, customMessage string) {
+		message := "Prompt was blocked by prompt filter"
+		if customMessage != "" {
+			message = customMessage
+		}
+		writeExternalImageError(c, http.StatusBadRequest, message)
 	}) {
 		return
 	}

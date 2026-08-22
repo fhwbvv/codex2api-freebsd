@@ -13,6 +13,7 @@ const statusConfig: Record<string, { variant: 'default' | 'secondary' | 'destruc
   ready: { variant: 'default', dotColor: 'bg-emerald-500' },
   cooldown: { variant: 'secondary', dotColor: 'bg-amber-500' },
   rate_limited: { variant: 'secondary', dotColor: 'bg-yellow-500' },
+  responses_rate_limited: { variant: 'secondary', dotColor: 'bg-yellow-500' },
   rate_limited_5h: { variant: 'secondary', dotColor: 'bg-yellow-500' },
   rate_limited_7d: { variant: 'secondary', dotColor: 'bg-yellow-500' },
   usage_exhausted: { variant: 'secondary', dotColor: 'bg-yellow-500' },
@@ -23,6 +24,7 @@ const statusConfig: Record<string, { variant: 'default' | 'secondary' | 'destruc
   error: { variant: 'destructive', dotColor: 'bg-red-400' },
   refreshing: { variant: 'secondary', dotColor: 'bg-blue-500 animate-pulse' },
   paused: { variant: 'outline', dotColor: 'bg-blue-500' },
+  unsampled: { variant: 'outline', dotColor: 'bg-slate-400' },
 }
 
 export default function StatusBadge({ status, detail, errorMessage }: StatusBadgeProps) {

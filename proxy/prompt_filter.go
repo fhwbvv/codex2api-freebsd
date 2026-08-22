@@ -16,7 +16,15 @@ import (
 const (
 	upstreamCyberPolicyUserMessage       = "此内容因可能存在网络安全风险而被标记，本次已记录。请重新表述请求；再次触发可能会停用账号。如果确认是误判，请联系管理员。"
 	upstreamCyberPolicyLockedUserMessage = "此内容因可能存在网络安全风险而被标记，本次已记录并锁定当前对话。请新建对话后继续；再次触发可能会停用账号。如果确认是误判，请联系管理员解锁。"
+	defaultLocalPromptBlockMessage       = "Request contains content blocked by prompt filter"
 )
+
+func localPromptBlockMessage(cfg promptfilter.Config) string {
+	if message := strings.TrimSpace(cfg.Advanced.Enforcement.LocalBlockMessage); message != "" {
+		return message
+	}
+	return defaultLocalPromptBlockMessage
+}
 
 // promptFilterFullTextMaxRunes limits the persisted redacted blocked-request text preview.
 const promptFilterFullTextMaxRunes = 32000
@@ -34,11 +42,23 @@ func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endp
 // jobs. writeBlock may preserve an endpoint-specific error envelope; verified
 // NewAPI policy decisions still take precedence when they own the response.
 func (h *Handler) InspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context)) bool {
+	var messageWriter func(*gin.Context, string)
+	if writeBlock != nil {
+		messageWriter = func(c *gin.Context, _ string) { writeBlock(c) }
+	}
+	return h.InspectPromptFilterOpenAIWithBlockMessage(c, rawBody, endpoint, model, messageWriter)
+}
+
+// InspectPromptFilterOpenAIWithBlockMessage is the message-aware variant for
+// endpoints that keep their own error envelope. The callback receives the
+// configured local block message, or an empty string when the endpoint should
+// retain its existing default.
+func (h *Handler) InspectPromptFilterOpenAIWithBlockMessage(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context, string)) bool {
 	h.capturePromptRequestIngress(c, rawBody)
 	return h.inspectPromptFilterOpenAIWithBlockWriter(c, rawBody, endpoint, model, writeBlock)
 }
 
-func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context)) bool {
+func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBody []byte, endpoint string, model string, writeBlock func(*gin.Context, string)) bool {
 	if c != nil && c.GetBool("prompt_intelligence_internal") {
 		return false
 	}
@@ -69,17 +89,17 @@ func (h *Handler) inspectPromptFilterOpenAIWithBlockWriter(c *gin.Context, rawBo
 	}
 	// 在发往上游供应商之前锁定会话:本次已被拦下,后续绕过本地规则的等价变形
 	// 也不再有机会打到上游。
-	h.lockPromptConversationOnLocalBlock(c, cfg, signedBody, endpoint, model, evaluation.Decision.ReasonCode)
+	h.lockPromptConversationOnLocalBlock(c, cfg, signedBody, endpoint, model, evaluation.Decision, verdict)
 	if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, rawBody, endpoint, model, signedBody) {
 		return true
 	}
 	if writeBlock != nil {
-		writeBlock(c)
+		writeBlock(c, strings.TrimSpace(cfg.Advanced.Enforcement.LocalBlockMessage))
 		return true
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
-		"Request contains content blocked by prompt filter",
+		localPromptBlockMessage(cfg),
 		api.ErrorTypeInvalidRequest,
 	), http.StatusBadRequest)
 	return true
@@ -108,13 +128,13 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
 	}
-	h.lockPromptConversationOnLocalBlock(c, cfg, ingressRequestBody(c, nil), endpoint, model, evaluation.Decision.ReasonCode)
+	h.lockPromptConversationOnLocalBlock(c, cfg, ingressRequestBody(c, nil), endpoint, model, evaluation.Decision, verdict)
 	if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, []byte(text), endpoint, model, ingressRequestBody(c, nil)) {
 		return true
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(
 		api.ErrorCode("prompt_blocked"),
-		"Request contains content blocked by prompt filter",
+		localPromptBlockMessage(cfg),
 		api.ErrorTypeInvalidRequest,
 	), http.StatusBadRequest)
 	return true
@@ -143,11 +163,11 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 		c.Header("X-Prompt-Filter-Warning", promptFilterWarningMessage(evaluation))
 	}
 	if verdict.Action == promptfilter.ActionBlock {
-		h.lockPromptConversationOnLocalBlock(c, cfg, signedBody, endpoint, model, evaluation.Decision.ReasonCode)
+		h.lockPromptConversationOnLocalBlock(c, cfg, signedBody, endpoint, model, evaluation.Decision, verdict)
 		if h.sendNewAPIPolicyDecision(c, cfg, evaluation.Decision, verdict, rawBody, endpoint, model, signedBody) {
 			return true
 		}
-		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request contains content blocked by prompt filter")
+		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", localPromptBlockMessage(cfg))
 		return true
 	}
 	return false

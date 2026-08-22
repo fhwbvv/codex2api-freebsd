@@ -1523,7 +1523,7 @@ export default function ImageStudioPortal() {
           }
         }}
       >
-        <DialogContent className="flex max-h-[min(88dvh,720px)] w-[min(720px,calc(100vw-1.5rem))] max-w-none flex-col gap-0 overflow-hidden p-0">
+        <DialogContent className="flex max-h-[min(88dvh,720px)] w-[min(720px,calc(100vw-1.5rem))] max-w-none flex-col gap-0 overflow-hidden p-0 sm:p-0">
           <DialogHeader className="shrink-0 border-b border-border px-4 py-3 sm:px-5">
             <DialogTitle>{t('imageStudioPortal.pickFromGallery')}</DialogTitle>
             <DialogDescription>

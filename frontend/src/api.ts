@@ -664,8 +664,10 @@ export const api = {
       refreshed: boolean
       usage_percent_5h?: number
       usage_percent_7d?: number
+      usage_percent_spark?: number
       reset_5h_at?: string
       reset_7d_at?: string
+      reset_spark_at?: string
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
@@ -1092,7 +1094,7 @@ export const api = {
 		request<PromptPolicyAuditHealth>('/prompt-policy/incidents/health'),
 	clearPromptPolicyIncidents: () =>
 		request<MessageResponse>('/prompt-policy/incidents', { method: 'DELETE' }),
-	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string } = {}) => {
+	getPromptRiskProfiles: (params: { page?: number; pageSize?: number; subjectType?: string; platform?: string; riskLevel?: string; apiKeyId?: string; accountId?: string; minScore?: string; q?: string; lockedOnly?: boolean } = {}) => {
 		const search = new URLSearchParams()
 		search.set('page', String(params.page || 1))
 		search.set('page_size', String(params.pageSize || 20))
@@ -1103,6 +1105,7 @@ export const api = {
 		if (params.accountId) search.set('account_id', params.accountId)
 		if (params.minScore) search.set('min_score', params.minScore)
 		if (params.q) search.set('q', params.q)
+		if (params.lockedOnly) search.set('locked_only', 'true')
 		return request<import('./types').PromptRiskProfilesResponse>(`/prompt-policy/risk-profiles?${search.toString()}`)
 	},
 	getPromptRiskProfile: (subjectType: string, subjectKey: string, eventPage = 1, eventPageSize = 20, trustEventPage = 1, trustEventPageSize = 20) =>
@@ -1117,10 +1120,29 @@ export const api = {
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
   testPromptReview: (data: PromptReviewTestRequest) =>
     request<PromptReviewTestResponse>('/prompt-filter/review/test', { method: 'POST', body: JSON.stringify(data) }),
+  listPromptReviewModels: (data: { base_url?: string; api_key?: string; timeout_seconds?: number }) =>
+    request<{ endpoint: string; models: string[] }>('/prompt-filter/review/models', { method: 'POST', body: JSON.stringify(data) }),
   getPromptReviewAPIKeys: () =>
     request<PromptReviewAPIKeysResponse>('/prompt-filter/review/keys'),
   deletePromptReviewAPIKey: (keyID: string) =>
     request<PromptReviewAPIKeysResponse>(`/prompt-filter/review/keys/${encodeURIComponent(keyID)}`, { method: 'DELETE' }),
+  listPromptReviewProfiles: () =>
+    request<import('./types').PromptReviewProfilesResponse>('/prompt-filter/review/profiles'),
+  savePromptReviewProfile: (data: {
+    id?: string
+    name: string
+    base_url: string
+    model: string
+    request_mode: string
+    api_key?: string
+    adapter_json: string
+    timeout_seconds: number
+  }) =>
+    request<import('./types').PromptReviewProfile>('/prompt-filter/review/profiles', { method: 'POST', body: JSON.stringify(data) }),
+  activatePromptReviewProfile: (id: string) =>
+    request<import('./types').PromptReviewProfile>(`/prompt-filter/review/profiles/${encodeURIComponent(id)}/activate`, { method: 'POST' }),
+  deletePromptReviewProfile: (id: string) =>
+    request<{ ok: boolean }>(`/prompt-filter/review/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   testPromptFilterRulePattern: (data: { pattern: string; text: string }) =>
     request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>

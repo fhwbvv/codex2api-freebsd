@@ -135,6 +135,7 @@ type NewAPIConfig struct {
 type EnforcementConfig struct {
 	TerminalCategories       []string `json:"terminal_categories"`
 	TerminalBypassModels     []string `json:"terminal_bypass_models"`
+	LocalBlockMessage        string   `json:"local_block_message,omitempty"`
 	ConversationLockEnabled  bool     `json:"conversation_lock_enabled"`
 	ConversationLockTTLHours int      `json:"conversation_lock_ttl_hours"`
 	UserCyberCooldownMinutes int      `json:"user_cyber_cooldown_minutes"`
@@ -165,6 +166,7 @@ const (
 	DefaultUserCyberCooldownMinutes = 30
 	MinUserCyberCooldownMinutes     = 1
 	MaxUserCyberCooldownMinutes     = 24 * 60
+	MaxLocalBlockMessageRunes       = 2000
 )
 
 type NormalizationConfig struct {
@@ -772,6 +774,11 @@ func NormalizeAdvancedConfig(cfg AdvancedConfig) AdvancedConfig {
 		}
 	}
 	cfg.Enforcement.TerminalBypassModels = normalizedBypassModels
+	localBlockMessage := []rune(strings.TrimSpace(cfg.Enforcement.LocalBlockMessage))
+	if len(localBlockMessage) > MaxLocalBlockMessageRunes {
+		localBlockMessage = localBlockMessage[:MaxLocalBlockMessageRunes]
+	}
+	cfg.Enforcement.LocalBlockMessage = strings.TrimSpace(string(localBlockMessage))
 	if cfg.Enforcement.ConversationLockTTLHours <= 0 {
 		cfg.Enforcement.ConversationLockTTLHours = d.Enforcement.ConversationLockTTLHours
 	}

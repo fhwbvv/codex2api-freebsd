@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -98,6 +99,42 @@ func TestApply429CooldownUsageLimitWithoutResetStaysAccountScoped(t *testing.T) 
 	}
 }
 
+func TestApply429CooldownUsageLimitTriggersImmediateUsageProbe(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	acc := &auth.Account{
+		DBID:        2,
+		AccessToken: "token",
+		PlanType:    "plus",
+		Status:      auth.StatusReady,
+	}
+	store.AddAccount(acc)
+	probed := make(chan *auth.Account, 1)
+	store.SetUsageProbeFunc(func(_ context.Context, account *auth.Account) error {
+		probed <- account
+		return nil
+	})
+
+	Apply429Cooldown(
+		store,
+		acc,
+		[]byte(`{"error":{"type":"usage_limit_reached"}}`),
+		nil,
+		"gpt-5.4",
+	)
+
+	select {
+	case got := <-probed:
+		if got != acc {
+			t.Fatalf("usage probe account = %p, want %p", got, acc)
+		}
+		if !got.InLimitedState() {
+			t.Fatal("usage probe started before the Responses cooldown was visible")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("usage probe was not triggered immediately after Responses limit")
+	}
+}
+
 func TestSyncCodexUsageStatePremium5hOnlyHeadersMarksRateLimited(t *testing.T) {
 	store := newProxyPremiumTestStore()
 	acc := &auth.Account{
@@ -167,7 +204,7 @@ func TestSyncCodexUsageStateCreditAccountSkipsPremium5hWindowLimit(t *testing.T)
 	}
 }
 
-func TestSyncCodexUsageStateIgnoredLimitRecordsSnapshotWithoutBlocking(t *testing.T) {
+func TestSyncCodexUsageStateIgnoredLimitRecordsSnapshotForContinuationOnly(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:         4,
 		TestConcurrency:        1,
@@ -197,9 +234,15 @@ func TestSyncCodexUsageStateIgnoredLimitRecordsSnapshotWithoutBlocking(t *testin
 	if result.Premium5hRateLimited || acc.IsPremium5hRateLimited() {
 		t.Fatal("100% usage metadata must not create a premium cooldown when ignored")
 	}
-	if !acc.IsAvailable() {
-		t.Fatal("account should remain schedulable after a successful Responses status")
+	if acc.IsAvailable() {
+		t.Fatal("100% usage account must stay out of fresh-session scheduling")
 	}
+	store.BindSessionAffinity("working-turn", acc, "")
+	continued, _ := store.NextForContinuationWithFilter("working-turn", 0, nil, nil)
+	if continued != acc {
+		t.Fatal("100% usage metadata prevented the existing turn from continuing")
+	}
+	store.Release(continued)
 }
 
 func TestApply429CooldownUsageLimitStillBlocksWhenUsageStatusIgnored(t *testing.T) {
@@ -224,6 +267,14 @@ func TestApply429CooldownUsageLimitStillBlocksWhenUsageStatusIgnored(t *testing.
 	}
 	if !acc.HasActiveCooldown() {
 		t.Fatal("429 usage_limit_reached must create an explicit cooldown")
+	}
+	if got := acc.GetCooldownReason(); got != auth.ResponsesRateLimitedCooldownReason {
+		t.Fatalf("cooldown reason = %q, want authoritative Responses rejection", got)
+	}
+	store.BindSessionAffinity("working-turn", acc, "")
+	if got, _ := store.NextForContinuationWithFilter("working-turn", 0, nil, nil); got != nil {
+		store.Release(got)
+		t.Fatal("authoritative Responses 429 must stop an existing turn")
 	}
 }
 

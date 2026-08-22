@@ -624,14 +624,14 @@ func (h *Handler) sendNewAPIPolicyDecision(c *gin.Context, cfg promptfilter.Conf
 	metadata := buildNewAPIPolicyDecisionMetadataWithSecret(policyContext.Identity, decision, verdict, cfg, body, endpoint, model, "", policyContext.VerificationSecret)
 	writeNewAPIPolicyDecisionHeaders(c, metadata)
 	if requestUsesAnthropicErrorEnvelope(c) {
-		message := "请求违反安全策略，本次请求已被拒绝"
+		message := localPromptBlockMessage(cfg)
 		if metadata.ReasonCode == promptConversationLockedReasonCode {
 			message = promptConversationLockedMessage
 		}
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", message)
 		return true
 	}
-	api.SendErrorWithStatus(c, newAPIPolicyDecisionAPIError(metadata), http.StatusBadRequest)
+	api.SendErrorWithStatus(c, newAPILocalPromptPolicyDecisionAPIError(metadata, cfg), http.StatusBadRequest)
 	return true
 }
 
@@ -721,6 +721,17 @@ func newAPIPolicyDecisionAPIError(metadata newAPIPolicyDecisionMetadata) *api.AP
 	apiErr := api.NewAPIError(api.ErrorCode("request_policy_violation"), message, api.ErrorTypeInvalidRequest)
 	apiErr.Details = newAPIPolicyDecisionDetails(metadata)
 	return apiErr
+}
+
+func newAPILocalPromptPolicyDecisionAPIError(metadata newAPIPolicyDecisionMetadata, cfg promptfilter.Config) *api.APIError {
+	apiErr := newAPIPolicyDecisionAPIError(metadata)
+	switch metadata.ReasonCode {
+	case newAPIUpstreamCyberPolicyReasonCode, promptConversationLockedReasonCode, promptUserCyberCooldownReasonCode:
+		return apiErr
+	default:
+		apiErr.Message = localPromptBlockMessage(cfg)
+		return apiErr
+	}
 }
 
 func newAPIPolicyDecisionDetails(metadata newAPIPolicyDecisionMetadata) gin.H {

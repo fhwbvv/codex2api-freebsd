@@ -24,6 +24,24 @@ func (db *DB) ClearUsageSnapshot5h(ctx context.Context, id int64) error {
 	})
 }
 
+// UpdateUsageSnapshotSpark 持久化独立 spark 5h 用量快照。
+func (db *DB) UpdateUsageSnapshotSpark(ctx context.Context, id int64, pct float64, resetAt time.Time, updatedAt time.Time) error {
+	return db.UpdateCredentials(ctx, id, map[string]interface{}{
+		"codex_spark_used_percent":     pct,
+		"codex_spark_reset_at":         resetAt.Format(time.RFC3339),
+		"codex_spark_usage_updated_at": updatedAt.Format(time.RFC3339),
+	})
+}
+
+// ClearUsageSnapshotSpark 清除 credentials 中的 spark 窗口字段。
+func (db *DB) ClearUsageSnapshotSpark(ctx context.Context, id int64) error {
+	return db.UpdateCredentials(ctx, id, map[string]interface{}{
+		"codex_spark_used_percent":     nil,
+		"codex_spark_reset_at":         nil,
+		"codex_spark_usage_updated_at": nil,
+	})
+}
+
 // ClearCooldownIfReason clears only the cooldown that still has the expected
 // source. A concurrent 401 or generic 429 therefore cannot be erased by a
 // delayed premium-5h absence observation.

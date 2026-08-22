@@ -802,7 +802,7 @@ func promptPolicyIncidentWhere(query PromptPolicyIncidentQuery) (string, []any) 
 	if q := strings.TrimSpace(query.Query); q != "" {
 		args = append(args, "%"+strings.ToLower(q)+"%")
 		i := len(args)
-		clauses = append(clauses, fmt.Sprintf(`(LOWER(COALESCE(prompt_preview,'')) LIKE $%d OR LOWER(COALESCE(prompt_text,'')) LIKE $%d OR LOWER(COALESCE(local_matched_patterns,'')) LIKE $%d OR LOWER(COALESCE(upstream_error,'')) LIKE $%d OR LOWER(COALESCE(api_key_name,'')) LIKE $%d OR LOWER(COALESCE(account_name,'')) LIKE $%d OR LOWER(COALESCE(account_group_names,'')) LIKE $%d)`, i, i, i, i, i, i, i))
+		clauses = append(clauses, fmt.Sprintf(`(LOWER(COALESCE(incident_id,'')) LIKE $%d OR LOWER(COALESCE(request_correlation_id,'')) LIKE $%d OR LOWER(COALESCE(prompt_preview,'')) LIKE $%d OR LOWER(COALESCE(prompt_text,'')) LIKE $%d OR LOWER(COALESCE(local_matched_patterns,'')) LIKE $%d OR LOWER(COALESCE(upstream_error,'')) LIKE $%d OR LOWER(COALESCE(api_key_name,'')) LIKE $%d OR LOWER(COALESCE(account_name,'')) LIKE $%d OR LOWER(COALESCE(account_group_names,'')) LIKE $%d)`, i, i, i, i, i, i, i, i, i))
 	}
 	if len(clauses) == 0 {
 		return "", args

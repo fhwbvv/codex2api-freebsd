@@ -598,6 +598,68 @@ func TestNormalizeCodexResponsesLiteBodyStripsImageOnlyToolSet(t *testing.T) {
 	}
 }
 
+func TestExecuteRequestWebsocketSendsCompactionTriggerLast(t *testing.T) {
+	previousWS := WebsocketExecuteFunc
+	t.Cleanup(func() { WebsocketExecuteFunc = previousWS })
+
+	var seenBody []byte
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		seenBody = append([]byte(nil), requestBody...)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"id":"resp_test"}`)),
+		}, nil
+	}
+
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, body, "session-1", "", "sk-local", nil, http.Header{}, true)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	input := gjson.GetBytes(seenBody, "input").Array()
+	if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("final websocket body must end with compaction_trigger: %s", seenBody)
+	}
+}
+
+func TestExecuteOpenAIResponsesRequestSendsCompactionTriggerLast(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody, _ = io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(server.Close)
+
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "relay-token",
+	}
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"}
+	]}`)
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, body, "", nil)
+	if err != nil {
+		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	input := gjson.GetBytes(seenBody, "input").Array()
+	if len(input) != 2 || input[1].Get("type").String() != "compaction_trigger" {
+		t.Fatalf("final relay body must end with compaction_trigger: %s", seenBody)
+	}
+}
+
 func TestApplyOpenAIResponsesRequestHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
 	if err != nil {
@@ -1594,5 +1656,45 @@ func TestResolveUpstreamSessionID(t *testing.T) {
 		if want := IsolateCodexSessionID(7, "sess-xyz"); got != want {
 			t.Fatalf("explicit session mode=%s: got %q, want %q", mode, got, want)
 		}
+	}
+}
+
+// HTTP 出站收口必须兜底剥离 WS 事件信封的顶层 type，即使上层 prepare 被绕过
+// （native WS ingress 的 1009 降级 / 生图强制 HTTP / Agent Identity 强制 HTTP
+// 都会带信封 body 走到这里）；嵌套 type 不受影响 (issue #548)。
+func TestExecuteRequestHTTPStripsTopLevelEnvelopeType(t *testing.T) {
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+
+	bodyCh := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodyCh <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_test"}`))
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	raw := []byte(`{"type":"response.create","model":"gpt-5.4","stream":true,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 1, AccessToken: "token"}, raw, "", "", "sk-local", nil, http.Header{}, false)
+	if err != nil {
+		t.Fatalf("ExecuteRequest() error = %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case got := <-bodyCh:
+		if gjson.GetBytes(got, "type").Exists() {
+			t.Fatalf("top-level type should be stripped before HTTP upstream: %s", got)
+		}
+		if it := gjson.GetBytes(got, "input.0.type").String(); it != "message" {
+			t.Fatalf("nested input type = %q, want message; body=%s", it, got)
+		}
+		if ct := gjson.GetBytes(got, "input.0.content.0.type").String(); ct != "input_text" {
+			t.Fatalf("nested content type = %q, want input_text; body=%s", ct, got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for upstream request")
 	}
 }

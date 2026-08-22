@@ -2178,7 +2178,7 @@ function TemplateEditorDialog({
 
   return (
     <Dialog open={open} onOpenChange={nextOpen => { if (!nextOpen) onClose() }}>
-      <DialogContent className="!flex max-h-[calc(100dvh-1rem)] !w-[min(980px,calc(100vw-1rem))] !max-w-none flex-col gap-0 overflow-hidden p-0">
+      <DialogContent className="!flex max-h-[calc(100dvh-1rem)] !w-[min(980px,calc(100vw-1rem))] !max-w-none flex-col gap-0 overflow-hidden p-0 sm:p-0">
         <DialogHeader className="border-b border-border px-5 pb-4 pr-12 pt-5">
           <DialogTitle>{editing ? t('images.editTemplate') : t('images.createTemplate')}</DialogTitle>
           <DialogDescription>{t('images.templateDialogDesc')}</DialogDescription>
@@ -2622,7 +2622,7 @@ function AssetPreviewDialog({
 
   return (
     <Dialog open={open} onOpenChange={nextOpen => { if (!nextOpen) onClose() }}>
-      <DialogContent className="!flex !h-[calc(100dvh-0.75rem)] !w-[min(1480px,calc(100vw-0.75rem))] !max-w-none flex-col gap-0 overflow-hidden p-0" showCloseButton={false}>
+      <DialogContent className="!flex !h-[calc(100dvh-0.75rem)] !w-[min(1480px,calc(100vw-0.75rem))] !max-w-none flex-col gap-0 overflow-hidden p-0 sm:p-0" showCloseButton={false}>
         <DialogHeader className="sr-only">
           <DialogTitle>{t('images.previewTitle')}</DialogTitle>
           <DialogDescription>{asset.filename}</DialogDescription>

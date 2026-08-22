@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -296,6 +297,32 @@ func ErrorToGinResponse(c *gin.Context, err error) {
 		return
 	}
 
+	// 兜底识别:WS 握手阶段的工作区停用错误若因任何原因未在 wsrelay 层转换成
+	// 结构化响应(文本形如 "websocket handshake failed: ... deactivated_workspace"),
+	// 也绝不能以 500 + 原始握手内部细节漏给下游——按 503 池级错误返回(带
+	// Retry-After 提示退避),文案附上游原始错误体。坏账号会由采样探针/主路径
+	// 标错隔离,稍后重试可落到健康账号。
+	if message := err.Error(); strings.Contains(message, "websocket handshake failed") &&
+		strings.Contains(message, "deactivated_workspace") {
+		if c.Writer.Header().Get("Retry-After") == "" {
+			c.Header("Retry-After", "30")
+		}
+		// 握手错误文本尾部携带上游 JSON 错误体,只取该部分,握手内部细节
+		// (Cf-Ray/X-Request-Id 等)不外漏。
+		detail := ""
+		if idx := strings.Index(message, "{"); idx >= 0 {
+			detail = strings.TrimSpace(message[idx:])
+		}
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{
+				"message": deactivatedPoolErrorMessage(detail),
+				"type":    "server_error",
+				"code":    "account_pool_deactivated",
+			},
+		})
+		return
+	}
+
 	// Fallback for non-structured errors
 	c.JSON(http.StatusInternalServerError, gin.H{
 		"error": gin.H{
@@ -304,4 +331,18 @@ func ErrorToGinResponse(c *gin.Context, err error) {
 			"code":    ErrorCodeInternalError,
 		},
 	})
+}
+
+// deactivatedPoolErrorMessage 组装工作区停用的池级错误文案(英文,面向下游
+// 客户端展示),末尾附上游原始错误体(截断,避免超长 body 污染日志/客户端展示)。
+func deactivatedPoolErrorMessage(upstreamDetail string) string {
+	const message = "No available account in the pool (upstream workspace deactivated), please retry later"
+	upstreamDetail = strings.TrimSpace(upstreamDetail)
+	if upstreamDetail == "" {
+		return message
+	}
+	if len(upstreamDetail) > 500 {
+		upstreamDetail = upstreamDetail[:500] + "…"
+	}
+	return message + ". Upstream response: " + upstreamDetail
 }

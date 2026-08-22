@@ -3,10 +3,118 @@ package proxy
 import (
 	"bytes"
 	"compress/gzip"
+	"net/http"
 	"testing"
 
 	"github.com/andybalholm/brotli"
+	"github.com/codex2api/auth"
 )
+
+func TestApplyGrokRequestHeadersAlignsOfficialCLI(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamGrok, AccessToken: "at"}
+	applyGrokRequestHeaders(req, account, "tok", nil, nil)
+	checks := map[string]string{
+		"Accept":                   "text/event-stream",
+		"x-grok-doom-loop-check":   "1024",
+		"x-compactions-remaining":  "1",
+		"x-grok-client-identifier": grokClientIdentifier,
+	}
+	for key, want := range checks {
+		if got := req.Header.Get(key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+}
+
+func TestResolveGrokConversationIDStableAcrossTurns(t *testing.T) {
+	turn1 := []byte(`{
+		"model":"grok-4.6",
+		"system":[{"type":"text","text":"CLAUDE.md project rules"}],
+		"messages":[{"role":"user","content":"分析一下这个是什么项目呢"}]
+	}`)
+	turn2 := []byte(`{
+		"model":"grok-4.6",
+		"system":[{"type":"text","text":"CLAUDE.md project rules"}],
+		"messages":[
+			{"role":"user","content":"分析一下这个是什么项目呢"},
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+		]
+	}`)
+	got1 := resolveGrokConversationID(nil, turn1)
+	got2 := resolveGrokConversationID(nil, turn2)
+	if got1 == "" || got1 != got2 {
+		t.Fatalf("conversation id must stay stable across tool turns: %q vs %q", got1, got2)
+	}
+	other := resolveGrokConversationID(nil, []byte(`{
+		"model":"grok-4.6",
+		"system":[{"type":"text","text":"CLAUDE.md project rules"}],
+		"messages":[{"role":"user","content":"换一个完全不同的问题"}]
+	}`))
+	if other == "" || other == got1 {
+		t.Fatalf("different first user must not share conv id: %q", other)
+	}
+
+	dynamic1 := []byte(`{
+		"model":"grok-4.6",
+		"system":[
+			{"type":"text","text":"CLAUDE.md project rules","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"git dirty at 00:01"}
+		],
+		"messages":[{"role":"user","content":"分析一下这个是什么项目呢"}]
+	}`)
+	dynamic2 := []byte(`{
+		"model":"grok-4.6",
+		"system":[
+			{"type":"text","text":"CLAUDE.md project rules","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"git dirty at 00:03"}
+		],
+		"messages":[{"role":"user","content":"分析一下这个是什么项目呢"}]
+	}`)
+	if got := resolveGrokConversationID(nil, dynamic1); got == "" || got != resolveGrokConversationID(nil, dynamic2) {
+		t.Fatalf("dynamic uncached system must not drift conv id: %q vs %q", resolveGrokConversationID(nil, dynamic1), resolveGrokConversationID(nil, dynamic2))
+	}
+
+	headers := make(http.Header)
+	headers.Set("Session-Id", "claude-session-stable")
+	headers.Set("Idempotency-Key", "per-request-"+got1)
+	if got := resolveGrokConversationID(headers, turn2); got != "claude-session-stable" {
+		t.Fatalf("Session-Id should win, got %q", got)
+	}
+	if got := resolveGrokConversationID(http.Header{"Idempotency-Key": []string{"only-once"}}, turn1); got == "only-once" {
+		t.Fatal("Idempotency-Key must not become the Grok conversation id")
+	}
+
+	keyHeaders := make(http.Header)
+	keyHeaders.Set("X-Api-Key", "sk-test-shared")
+	empty1 := resolveGrokConversationID(keyHeaders, nil)
+	empty2 := resolveGrokConversationID(keyHeaders, nil)
+	if empty1 == "" || empty1 != empty2 {
+		t.Fatalf("API key fallback must be deterministic: %q vs %q", empty1, empty2)
+	}
+}
+
+func TestApplyGrokRequestHeadersReusesConversationID(t *testing.T) {
+	account := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamGrok, AccessToken: "at"}
+	body := []byte(`{"model":"grok-4.6","system":"rules","messages":[{"role":"user","content":"hello"}]}`)
+	req1, _ := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+	req2, _ := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+	applyGrokRequestHeaders(req1, account, "tok", nil, body)
+	applyGrokRequestHeaders(req2, account, "tok", nil, body)
+	if req1.Header.Get("x-grok-session-id") == "" || req1.Header.Get("x-grok-session-id") != req2.Header.Get("x-grok-session-id") {
+		t.Fatalf("session-id %q vs %q", req1.Header.Get("x-grok-session-id"), req2.Header.Get("x-grok-session-id"))
+	}
+	if req1.Header.Get("x-grok-session-id") != req1.Header.Get("x-grok-conv-id") {
+		t.Fatalf("session-id and conv-id should match, got %q / %q", req1.Header.Get("x-grok-session-id"), req1.Header.Get("x-grok-conv-id"))
+	}
+	if req1.Header.Get("x-grok-req-id") == req2.Header.Get("x-grok-req-id") {
+		t.Fatal("req-id must stay unique per request")
+	}
+}
 
 func TestGrokTurnIndex(t *testing.T) {
 	cases := []struct {

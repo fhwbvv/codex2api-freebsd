@@ -139,7 +139,7 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 			if email == "" {
 				email = result.Email
 			}
-			id, createdEmail, createErr := h.createGrokOAuthAccount(ctx, createGrokOAuthAccountInput{
+			created, createErr := h.createGrokOAuthAccount(ctx, createGrokOAuthAccountInput{
 				Name:          name,
 				ProxyURL:      req.ProxyURL,
 				BaseURL:       baseURL,
@@ -155,10 +155,11 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 				items[idx] = item
 				return
 			}
+			id := created.ID
 			item.OK = true
 			item.ID = id
-			if createdEmail != "" {
-				item.Email = createdEmail
+			if created.Email != "" {
+				item.Email = created.Email
 			}
 			items[idx] = item
 
@@ -320,7 +321,7 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 			}
 			mu.Unlock()
 
-			id, createdEmail, createErr := h.createGrokOAuthAccount(ctx, createGrokOAuthAccountInput{
+			created, createErr := h.createGrokOAuthAccount(ctx, createGrokOAuthAccountInput{
 				ProxyURL:      req.ProxyURL,
 				BaseURL:       baseURL,
 				Models:        models,
@@ -335,10 +336,11 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 				items[idx] = item
 				return
 			}
+			id := created.ID
 			item.OK = true
 			item.ID = id
-			if createdEmail != "" {
-				item.Email = createdEmail
+			if created.Email != "" {
+				item.Email = created.Email
 			}
 			items[idx] = item
 

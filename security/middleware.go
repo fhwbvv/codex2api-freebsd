@@ -55,12 +55,23 @@ func RateLimitMiddleware(requests int, window time.Duration) gin.HandlerFunc {
 	}
 }
 
-// RequestSizeLimiter limits request body size
+// RequestSizeLimiter limits request body size. 管理端账号导入端点(multipart
+// 文件上传)单独放宽到 MaxImportBodySize,其余端点用传入的 maxSize。
 func RequestSizeLimiter(maxSize int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 导入端点(multipart 文件上传)走流式限制:用 MaxBytesReader 包裹 body 交给
+		// handler,不整体 ReadAll、不缓存 raw_body。避免 200MB 文件在中间件里常驻
+		// 一整份内存(handler 用 ParseMultipartForm 流式解析,>32MB 落临时文件)。
+		// 超限时 handler 的 body 读取会返回错误,由 handler 侧回 400。
+		if MaxImportBodySize > 0 && IsLargeImportUploadPath(c.Request.URL.Path) {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxImportBodySize)
+			c.Next()
+			return
+		}
+		limit := maxSize
 		// Read the request body once, enforce the configured size limit, and cache it
 		// for downstream handlers that need raw JSON without re-reading c.Request.Body.
-		body, err := io.ReadAll(io.LimitReader(c.Request.Body, maxSize+1))
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, limit+1))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error": gin.H{
@@ -74,7 +85,7 @@ func RequestSizeLimiter(maxSize int64) gin.HandlerFunc {
 		defer c.Request.Body.Close()
 
 		// Check if body exceeds max size
-		if int64(len(body)) > maxSize {
+		if int64(len(body)) > limit {
 			c.JSON(http.StatusRequestEntityTooLarge, gin.H{
 				"error": gin.H{
 					"message": "请求体过大",

@@ -35,6 +35,8 @@ export interface AccountUsageWindow {
   tokens: number
   account_billed?: number
   user_billed?: number
+  model_counts?: Record<string, number>
+  model_success_counts?: Record<string, number>
 }
 
 export interface GrokProductUsage {
@@ -156,8 +158,11 @@ export interface AccountRow {
   error_requests?: number
   retry_error_requests?: number
   rate_limit_attempts?: number
+  error_status_counts?: Record<string, number>
+  success_model_counts?: Record<string, number>
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
+  usage_percent_spark?: number | null
   rate_limit_reset_credits?: number | null
   applicable_reset_credits?: number | null
   credits_balance?: string | null
@@ -181,6 +186,7 @@ export interface AccountRow {
   usage_today_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
+  reset_spark_at?: ISODateString
   // 长窗口(7d 槽)真实类型: "monthly"(free/team 月窗)/"weekly"/未知。
   // free/team plan 的长窗口实为约 30 天,标签应显示 30d 而非 7d (issue #324)。
   usage_window_7d_kind?: 'monthly' | 'weekly' | ''
@@ -265,6 +271,7 @@ export interface AccountsPageResponse extends AccountsResponse {
   }
   snapshot_at: ISODateString
   stats_state: 'ready' | 'stale' | 'warming'
+  disabled_sorts?: string[]
 }
 
 export interface AccountPageStatsItem {
@@ -301,7 +308,7 @@ export interface AccountsPageParams {
   healthTier?: 'healthy' | 'warm' | 'risky' | 'banned' | 'attention'
   proxyUrl?: string
   proxyFilter?: 'all' | 'unbound' | 'this' | 'other'
-  sort?: 'requests' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
+  sort?: 'requests' | 'today' | 'usage' | 'created_at' | 'updated_at' | 'scheduler_priority' | 'group' | 'risk' | 'dispatch_score' | 'latency_penalty' | 'unauthorized'
   order?: 'asc' | 'desc'
 }
 
@@ -1369,6 +1376,9 @@ export interface SystemSettings {
   grok_probe_enabled?: boolean
   grok_probe_interval_minutes?: number
   grok_max_rate_limit_retries?: number
+  grok_follow_up_effort_enabled?: boolean
+  grok_follow_up_tool_effort?: string
+  grok_follow_up_small_effort?: string
   grok_oauth_client_id?: string
   /** 环境变量 GROK_OAUTH_CLIENT_ID 是否正压着上面的设置（只读，后端下发）。 */
   grok_oauth_client_id_env_override?: boolean
@@ -1932,6 +1942,23 @@ export interface PromptReviewAPIKeyDescriptor {
 export interface PromptReviewAPIKeysResponse {
   items: PromptReviewAPIKeyDescriptor[]
   count: number
+}
+
+export interface PromptReviewProfile {
+  id: string
+  name: string
+  base_url: string
+  model: string
+  request_mode: string
+  timeout_seconds: number
+  key_count: number
+  active: boolean
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface PromptReviewProfilesResponse {
+  profiles: PromptReviewProfile[]
 }
 
 export interface PromptReviewTestResponse {
@@ -2733,6 +2760,8 @@ export interface APIKeyLimits {
   /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
   image_generation_policy?: "allow" | "strip" | "block"
   upstream_channel?: "codex" | "grok"
+  /** 允许该 Key 使用 ChatGPT Live（/v1/live）。默认关闭。 */
+  allow_live?: boolean
   /** 分组 / 账号维度的用量预算（issue #439）。 */
   scope_limits?: APIKeyScopeLimit[]
 }

@@ -461,10 +461,10 @@ export function isWindowRateLimitLike(account: AccountRow, windowKey: RecoveryWi
 function isShortRateLimitLike(account: AccountRow): boolean {
   const status = (account.status || '').toLowerCase()
   const reason = (account.cooldown_reason || '').toLowerCase()
-  if (status === 'rate_limited' || status === 'rate_limited_5h' || status === 'cooldown') {
+  if (status === 'rate_limited' || status === 'responses_rate_limited' || status === 'rate_limited_5h' || status === 'cooldown') {
     return true
   }
-  if (reason === 'rate_limited' || reason === 'rate_limited_5h') {
+  if (reason === 'rate_limited' || reason === 'responses_rate_limited' || reason === 'rate_limited_5h') {
     return true
   }
   return false

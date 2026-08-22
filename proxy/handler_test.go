@@ -183,6 +183,9 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	for _, path := range []string{
 		"/backend-api/codex/responses",
 		"/backend-api/codex/responses/*subpath",
+		"/v1/live",
+		"/live",
+		"/backend-api/codex/realtime/calls",
 	} {
 		if !postRoutes[path] {
 			t.Fatalf("expected POST route %s to be registered; routes=%v", path, postRoutes)
@@ -191,9 +194,12 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	for _, path := range []string{
 		"/v1/responses",
 		"/v1/realtime",
+		"/v1/live/:call_id",
 		"/responses",
 		"/realtime",
+		"/live/:call_id",
 		"/backend-api/codex/responses",
+		"/backend-api/codex/:call_id",
 	} {
 		if !getRoutes[path] {
 			t.Fatalf("expected GET route %s to be registered; routes=%v", path, getRoutes)
@@ -261,8 +267,10 @@ func TestRealtimeWebSocketTranslatesTextConversationToResponses(t *testing.T) {
 	}
 	select {
 	case gotBody := <-bodyCh:
-		if got := gjson.GetBytes(gotBody, "type").String(); got != "response.create" {
-			t.Fatalf("upstream type = %q body=%s", got, gotBody)
+		// 顶层 type 信封在 prepare 阶段剥离（HTTP 上游不接受，issue #548）；
+		// WS 出站帧的 type 由 wsrelay 的 prepareWebsocketBody 统一重设，不在此边界。
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("upstream body should not carry envelope type: %s", gotBody)
 		}
 		if got := gjson.GetBytes(gotBody, "model").String(); got != "gpt-5.4" {
 			t.Fatalf("upstream model = %q body=%s", got, gotBody)
@@ -407,6 +415,26 @@ func TestNormalizeResponsesWebSocketClientPayload(t *testing.T) {
 			t.Fatalf("error = %#v, want previous_response_id rejection", apiErr)
 		}
 	})
+
+	t.Run("preserves v2 prewarm fields", func(t *testing.T) {
+		got, model, apiErr := normalizeResponsesWebSocketClientPayload([]byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[],"generate":false,"client_metadata":{"x-codex-turn-state":"turn_123"}}`))
+		if apiErr != nil {
+			t.Fatalf("unexpected error: %v", apiErr)
+		}
+		if model != "gpt-5.6-sol" || gjson.GetBytes(got, "generate").Bool() {
+			t.Fatalf("v2 prewarm changed: model=%q body=%s", model, got)
+		}
+		if turnState := gjson.GetBytes(got, "client_metadata.x-codex-turn-state").String(); turnState != "turn_123" {
+			t.Fatalf("turn state = %q, want turn_123; body=%s", turnState, got)
+		}
+		prepared, _ := PrepareResponsesWebSocketBody(got)
+		if generate := gjson.GetBytes(prepared, "generate"); !generate.Exists() || generate.Bool() {
+			t.Fatalf("prepared v2 prewarm lost generate=false: %s", prepared)
+		}
+		if turnState := gjson.GetBytes(prepared, "client_metadata.x-codex-turn-state").String(); turnState != "turn_123" {
+			t.Fatalf("prepared turn state = %q, want turn_123; body=%s", turnState, prepared)
+		}
+	})
 }
 
 func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
@@ -455,8 +483,10 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	}
 	select {
 	case gotBody := <-bodyCh:
-		if gjson.GetBytes(gotBody, "type").String() != "response.create" {
-			t.Fatalf("upstream type missing: %s", gotBody)
+		// 顶层 type 信封在 prepare 阶段剥离（HTTP 上游不接受，issue #548）；
+		// WS 出站帧的 type 由 wsrelay 的 prepareWebsocketBody 统一重设，不在此边界。
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("upstream body should not carry envelope type: %s", gotBody)
 		}
 		if model := gjson.GetBytes(gotBody, "model").String(); model != "gpt-5.4" {
 			t.Fatalf("upstream model = %q, want mapped gpt-5.4; body=%s", model, gotBody)
@@ -497,6 +527,223 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	case <-bodyCh:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for second upstream request")
+	}
+}
+
+// TestResponsesWebSocket1009FallbackStripsEnvelopeType 覆盖 issue #548：native WS
+// ingress 收到上游 close 1009 后降级 HTTP，fallback 请求体必须剥掉 WS 事件信封的
+// 顶层 type（HTTP 上游会 400 Unsupported parameter: type），嵌套 type 保持完整；
+// 同时 1009 体积喂给体积路由，后续同尺寸请求直接首发 HTTP 不再进 WS。
+func TestResponsesWebSocket1009FallbackStripsEnvelopeType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		resinCfg.Store(previousResin)
+		globalWSSizeRouter = websocketSizeRouter{}
+	})
+	globalWSSizeRouter = websocketSizeRouter{}
+
+	var wsCalls int32
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		atomic.AddInt32(&wsCalls, 1)
+		return nil, errors.New("websocket send error: websocket: close 1009 (message too big)")
+	}
+
+	httpBodyCh := make(chan []byte, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		httpBodyCh <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			`data: {"type":"response.output_text.delta","delta":"fallback"}` + "\n\n" +
+				`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n",
+		))
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	// 大输入让 1009 时的体积达到体积路由的学习样本下限（64KB）。
+	bigText := strings.Repeat("issue548 ", 8192)
+	payload := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"%s"}]}]}`, bigText)
+
+	readTurnEvents := func(turn string) {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, first, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("%s: read first event: %v", turn, err)
+		}
+		if eventType := gjson.GetBytes(first, "type").String(); eventType != "response.output_text.delta" {
+			t.Fatalf("%s: first event type = %q body=%s", turn, eventType, first)
+		}
+		_, second, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("%s: read terminal event: %v", turn, err)
+		}
+		if eventType := gjson.GetBytes(second, "type").String(); eventType != "response.completed" {
+			t.Fatalf("%s: terminal event type = %q body=%s", turn, eventType, second)
+		}
+	}
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	select {
+	case gotBody := <-httpBodyCh:
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("HTTP fallback body should not carry envelope type: %.300s", gotBody)
+		}
+		if it := gjson.GetBytes(gotBody, "input.0.type").String(); it != "message" {
+			t.Fatalf("nested input type = %q, want message", it)
+		}
+		if ct := gjson.GetBytes(gotBody, "input.0.content.0.type").String(); ct != "input_text" {
+			t.Fatalf("nested content type = %q, want input_text", ct)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HTTP fallback request")
+	}
+	if got := atomic.LoadInt32(&wsCalls); got != 1 {
+		t.Fatalf("wsCalls = %d, want 1 (WS 尝试一次后降级 HTTP)", got)
+	}
+	readTurnEvents("turn-1")
+
+	// 第二帧同体积：体积路由已从 1009 学习阈值，应直接首发 HTTP，WS 调用数不变。
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("write second request: %v", err)
+	}
+	select {
+	case gotBody := <-httpBodyCh:
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("size-routed HTTP body should not carry envelope type: %.300s", gotBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for size-routed HTTP request")
+	}
+	if got := atomic.LoadInt32(&wsCalls); got != 1 {
+		t.Fatalf("wsCalls = %d, want 1 (体积路由应跳过第二次 WS 尝试)", got)
+	}
+	readTurnEvents("turn-2")
+}
+
+// TestResponsesWebSocket1009FallbackExpandsPreviousResponseFromCache 覆盖 issue #548
+// 的续链缺口：HTTP fallback 前若本地响应缓存命中 previous_response_id，历史应展开进
+// input[] 并剥离续链 id，避免 executor 出站删除该字段时静默丢失上游会话历史。
+func TestResponsesWebSocket1009FallbackExpandsPreviousResponseFromCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		resinCfg.Store(previousResin)
+		globalWSSizeRouter = websocketSizeRouter{}
+	})
+	globalWSSizeRouter = websocketSizeRouter{}
+
+	// 匿名请求的缓存归属是 "anon"；历史含 function_call 才会入缓存。
+	cacheCompletedResponse("anon",
+		[]byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"earlier"}]}]`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_issue548","output":[{"type":"function_call","call_id":"call_548","name":"lookup","arguments":"{}"}]}}`))
+
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		return nil, errors.New("websocket send error: websocket: close 1009 (message too big)")
+	}
+
+	httpBodyCh := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		httpBodyCh <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at", PlanType: "plus", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	payload := `{"type":"response.create","model":"gpt-5.4","previous_response_id":"resp_issue548","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]}`
+	if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	select {
+	case gotBody := <-httpBodyCh:
+		if prev := gjson.GetBytes(gotBody, "previous_response_id"); prev.Exists() {
+			t.Fatalf("previous_response_id should be expanded away before HTTP fallback: %s", gotBody)
+		}
+		if gjson.GetBytes(gotBody, "type").Exists() {
+			t.Fatalf("HTTP fallback body should not carry envelope type: %s", gotBody)
+		}
+		input := gjson.GetBytes(gotBody, "input")
+		if !input.IsArray() {
+			t.Fatalf("input should be an array: %s", gotBody)
+		}
+		foundHistory := false
+		foundCurrent := false
+		input.ForEach(func(_, item gjson.Result) bool {
+			if item.Get("call_id").String() == "call_548" {
+				foundHistory = true
+			}
+			if strings.Contains(item.Get("content.0.text").String(), "continue") {
+				foundCurrent = true
+			}
+			return true
+		})
+		if !foundHistory {
+			t.Fatalf("cached history (call_548) missing from expanded input: %s", gotBody)
+		}
+		if !foundCurrent {
+			t.Fatalf("current turn message missing from expanded input: %s", gotBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for HTTP fallback request")
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, event, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read terminal event: %v", err)
+	}
+	if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
+		t.Fatalf("terminal event type = %q body=%s", eventType, event)
 	}
 }
 
@@ -569,7 +816,7 @@ func TestResponsesWebSocketContinuationKeepsBoundAccountPastBoundedLimit(t *test
 	for turn := 1; turn <= 52; turn++ {
 		payload := fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","input":"turn-%d"}`, turn)
 		if previousResponseID != "" {
-			payload = fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"%s","input":"turn-%d"}`, previousResponseID, turn)
+			payload = fmt.Sprintf(`{"type":"response.create","model":"gpt-5.4","prompt_cache_key":"conversation-1","previous_response_id":"%s","input":"turn-%d","client_metadata":{"x-codex-turn-state":"turn-state-1"}}`, previousResponseID, turn)
 		}
 		if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
 			t.Fatalf("turn %d write request: %v", turn, err)
@@ -623,11 +870,34 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 				}
 			},
 		},
+		{
+			// 真实 ChatGPT WS 几乎总会先推 rate_limits / metadata。本机 2004 还开了
+			// loose + preflight passthrough，这两帧会先落到客户端。降级不能被它们挡住。
+			name: "in-stream response.failed after preflight",
+			rejected: func() *http.Response {
+				sse := "data: {\"type\":\"codex.rate_limits\",\"plan_type\":\"plus\"}\n\n" +
+					"data: {\"type\":\"codex.response.metadata\",\"headers\":{\"x-codex-turn-state\":\"turn\"}}\n\n" +
+					"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"code\":\"previous_response_not_found\",\"message\":\"Previous response with id 'resp_stale' not found.\"}}}\n\n"
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(sse)),
+				}
+			},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			gin.SetMode(gin.TestMode)
+			if tc.name == "in-stream response.failed after preflight" {
+				prev := CurrentRuntimeSettings()
+				next := prev
+				next.FirstTokenMode = FirstTokenModeLoose
+				next.CodexPreflightSSEPassthrough = true
+				ApplyRuntimeSettings(next)
+				t.Cleanup(func() { ApplyRuntimeSettings(prev) })
+			}
 
 			previousExec := WebsocketExecuteFunc
 			t.Cleanup(func() {
@@ -677,10 +947,7 @@ func TestResponsesWebSocketContinuationDegradesWhenUpstreamRejectsPreviousRespon
 			}
 
 			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-			_, event, err := conn.ReadMessage()
-			if err != nil {
-				t.Fatalf("read event: %v", err)
-			}
+			event := readResponsesWSTerminalEvent(t, conn)
 			if eventType := gjson.GetBytes(event, "type").String(); eventType != "response.completed" {
 				t.Fatalf("event type = %q, want response.completed; body=%s", eventType, event)
 			}
@@ -1300,6 +1567,59 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	}
 	if got := atomic.LoadInt64(&secondary.TotalRequests); got != 0 {
 		t.Fatalf("secondary TotalRequests = %d, want no fallback redispatch", got)
+	}
+}
+
+func TestResponsesHTTPIngressKeepsDownstreamAliveDuringUpstreamSilence(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousSettings := CurrentRuntimeSettings()
+	previousInterval := downstreamSSEKeepaliveInterval
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		ApplyRuntimeSettings(previousSettings)
+		downstreamSSEKeepaliveInterval = previousInterval
+	})
+
+	nextSettings := previousSettings
+	nextSettings.CodexForceWebsocket = true
+	nextSettings.CodexContinueThinking = false
+	ApplyRuntimeSettings(nextSettings)
+	downstreamSSEKeepaliveInterval = 5 * time.Millisecond
+
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write([]byte(`data: {"type":"response.output_text.delta","delta":"started"}` + "\n\n"))
+			time.Sleep(30 * time.Millisecond)
+			_, _ = pw.Write([]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+			_ = pw.Close()
+		}()
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: pr}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: "gpt-5.6-sol"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	got := recorder.Body.String()
+	for _, want := range []string{`"delta":"started"`, downstreamSSEKeepaliveComment, `"type":"response.completed"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stream missing %q; body=%q", want, got)
+		}
 	}
 }
 
@@ -3138,6 +3458,10 @@ func TestIsCodexModelUnsupportedError(t *testing.T) {
 	if !isCodexModelUnsupportedError(unsupported) {
 		t.Fatal("应识别模型不支持错误")
 	}
+	unknownProvider := []byte(`{"error":{"type":"upstream_error","message":"unknown provider for model gpt-5.6-sol"}}`)
+	if !isCodexModelUnsupportedError(unknownProvider) {
+		t.Fatal("应识别中转上游缺少模型提供商错误")
+	}
 	if isCodexModelUnsupportedError([]byte(`{"error":{"message":"Invalid value for 'temperature'","type":"invalid_request_error"}}`)) {
 		t.Fatal("普通 invalid_request 不应命中")
 	}
@@ -3150,6 +3474,10 @@ func TestIsCodexModelUnsupportedError(t *testing.T) {
 		t.Fatal("模型不支持的 400 应可换号重试")
 	}
 	general, rate = 0, 0
+	if !shouldRetryHTTPStatus(http.StatusBadRequest, unknownProvider, &general, &rate, 2, 1) {
+		t.Fatal("中转上游缺少模型提供商的 400 应可换号重试")
+	}
+	general, rate = 0, 0
 	if shouldRetryHTTPStatus(http.StatusBadRequest, []byte(`{"error":{"message":"bad request"}}`), &general, &rate, 2, 1) {
 		t.Fatal("普通 400 不应重试")
 	}
@@ -3159,6 +3487,10 @@ func TestResponseFailedModelUnsupportedRetryable(t *testing.T) {
 	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
 	if !responseFailedRetryable(payload) {
 		t.Fatal("模型不支持的 response.failed 应视为可换号重试")
+	}
+	unknownProvider := []byte(`{"type":"response.failed","response":{"status_code":400,"error":{"type":"upstream_error","message":"unknown provider for model gpt-5.6-sol"}}}`)
+	if !responseFailedRetryable(unknownProvider) {
+		t.Fatal("中转上游缺少模型提供商的 response.failed 应视为可换号重试")
 	}
 	plain := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"Invalid value for 'temperature'"}}}`)
 	if responseFailedRetryable(plain) {
@@ -3291,7 +3623,12 @@ func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
 
 func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
-	account := &auth.Account{DBID: 42, AccessToken: "at"}
+	account := &auth.Account{DBID: 42, AccessToken: "at", AccountID: "team-A", Status: auth.StatusReady}
+	sibling := &auth.Account{DBID: 43, AccessToken: "at-2", AccountID: "team-A", Status: auth.StatusReady}
+	other := &auth.Account{DBID: 44, AccessToken: "at-3", AccountID: "team-B", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.AddAccount(sibling)
+	store.AddAccount(other)
 	handler := &Handler{store: store}
 	body := []byte(`{"detail":{"code":"deactivated_workspace"}}`)
 
@@ -3312,6 +3649,33 @@ func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	account.Mu().RUnlock()
 	if !strings.Contains(errorMsg, "deactivated_workspace") {
 		t.Fatalf("ErrorMsg = %q, want deactivated_workspace", errorMsg)
+	}
+	if sibling.RuntimeStatus() != "error" {
+		t.Fatalf("same-workspace sibling status = %q, want error", sibling.RuntimeStatus())
+	}
+	sibling.Mu().RLock()
+	siblingMsg := sibling.ErrorMsg
+	sibling.Mu().RUnlock()
+	if !strings.Contains(siblingMsg, "工作区联动") {
+		t.Fatalf("sibling ErrorMsg = %q, want workspace-linked annotation", siblingMsg)
+	}
+	if other.RuntimeStatus() == "error" {
+		t.Fatal("other workspace must not be marked")
+	}
+}
+
+func TestGeneric402DoesNotLinkWorkspaceSiblings(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 42, AccessToken: "at", AccountID: "team-A", Status: auth.StatusReady}
+	sibling := &auth.Account{DBID: 43, AccessToken: "at-2", AccountID: "team-A", Status: auth.StatusReady}
+	store.AddAccount(account)
+	store.AddAccount(sibling)
+	handler := &Handler{store: store}
+
+	handler.applyCooldownForModel(account, http.StatusPaymentRequired, []byte(`{"error":{"message":"insufficient balance"}}`), &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if sibling.RuntimeStatus() == "error" {
+		t.Fatal("generic 402 must not fan out to workspace siblings")
 	}
 }
 
@@ -3677,6 +4041,39 @@ func TestApply429CooldownPremiumMarks5hRateLimitFromWindow(t *testing.T) {
 	}
 }
 
+func TestApply429CooldownSparkUsageLimitDoesNotMarkAccount(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 202, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
+	account.SetUsageSnapshot5h(40, time.Now().Add(2*time.Hour))
+
+	decision := Apply429Cooldown(
+		store,
+		account,
+		[]byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":1800}}`),
+		&http.Response{Header: make(http.Header)},
+		"gpt-5.3-codex-spark",
+	)
+	if decision.Scope != rateLimitScopeAccount {
+		t.Fatalf("decision.Scope = %q, want account", decision.Scope)
+	}
+	pct, resetAt, ok := account.GetUsageSnapshotSpark()
+	if !ok || pct != 100 {
+		t.Fatalf("spark snapshot = (%v, %v), want 100", pct, ok)
+	}
+	if got := time.Until(resetAt); got < 25*time.Minute || got > 35*time.Minute {
+		t.Fatalf("spark reset delta = %v, want about 30m", got)
+	}
+	if account.IsPremium5hRateLimited() {
+		t.Fatal("spark usage_limit_reached must not enter rate_limited_5h")
+	}
+	if reason := account.GetCooldownReason(); reason != "" {
+		t.Fatalf("cooldown_reason = %q, want empty", reason)
+	}
+	if pct5h, ok := account.GetUsagePercent5h(); !ok || pct5h != 40 {
+		t.Fatalf("main 5h snapshot = (%v, %v), want unchanged 40", pct5h, ok)
+	}
+}
+
 func TestApply429CooldownUsageLimitUpdatesFreePlanMetadata(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
@@ -3815,6 +4212,11 @@ func TestResponseFailedRetryableClassification(t *testing.T) {
 		{
 			name:    "non-retryable invalid_request",
 			payload: `{"type":"response.failed","response":{"error":{"type":"invalid_request_error","message":"bad input"}}}`,
+			want:    false,
+		},
+		{
+			name:    "previous response not found",
+			payload: `{"type":"response.failed","response":{"error":{"code":"previous_response_not_found","message":"missing response"}}}`,
 			want:    false,
 		},
 		{
@@ -5158,7 +5560,123 @@ func TestResponsesRelaySuccessPreservesNewerUsageLimitCooldown(t *testing.T) {
 	}
 }
 
-// 池中还有可用官方账号时,body-signal 请求被钉在官方账号上(不落中转)。
+// issue #540：纯 OpenAI Responses 中转池收到 Codex 新版 Remote Compact
+// （/responses + stream + compaction_trigger）时，必须按普通 /responses 选中该中转，
+// 不能在选号阶段直接 503。
+func TestResponses_NativeRemoteCompactionV2UsesRelayOnlyPool(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_issue_540","status":"completed","output":[{"type":"compaction_summary","summary":"compacted"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
+	}
+	if !requestBodyHasCompactionTrigger(seenBody) {
+		t.Fatalf("upstream body lost compaction_trigger: %s", seenBody)
+	}
+	if model := gjson.GetBytes(seenBody, "model").String(); model != "gpt-5.6-sol" {
+		t.Fatalf("upstream model = %q, want gpt-5.6-sol; body=%s", model, seenBody)
+	}
+}
+
+// issue #540：池里还有可用官方账号时，不能把流式 Remote Compact 钉死在官方账号上。
+// 官方号若因模型白名单选不上，必须回落到能打 /responses 的中转，而不是立刻 503。
+func TestResponses_NativeRemoteCompactionV2FallsBackToRelayWhenOfficialCannotServe(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_issue_540_fallback","status":"completed","output":[{"type":"compaction_summary","summary":"compacted"}],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:        2,
+		AccessToken: "at-codex",
+		Models:      []string{"gpt-5.4"},
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[{"type":"compaction_trigger"}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after falling back to relay; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
+	}
+}
+
+// excludeRelayAccountsFilter / storeHasAvailableCodexAccount 仍供其它路径复用；
+// 流式 Remote Compact 不再用它们把请求钉死在官方账号上（issue #540）。
 func TestBodySignalCompactFilters(t *testing.T) {
 	relay := &auth.Account{
 		DBID:         1,

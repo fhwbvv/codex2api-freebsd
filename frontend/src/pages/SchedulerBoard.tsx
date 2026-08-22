@@ -11,7 +11,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import StatusBadge from '../components/StatusBadge'
 import type { AccountListSummary, AccountRow, OpsOverviewResponse } from '../types'
 import { formatCompactEmail } from '../lib/utils'
-import { formatLongUsageWindowLabel } from '../lib/usageFormat'
+import { formatLongUsageWindowLabel, getAccountStatusBadgeStatus } from '../lib/usageFormat'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -253,7 +253,7 @@ export default function SchedulerBoard() {
                               {t('scheduler.score')} {Math.round(getDispatchScore(account))} · {t('scheduler.concurrency')} {account.dynamic_concurrency_limit ?? '-'} · {t('scheduler.plan')} {account.plan_type || '-'}
                             </div>
                           </div>
-                          <StatusBadge status={account.status} />
+                          <StatusBadge status={getAccountStatusBadgeStatus(account)} />
                         </div>
                         <div className="mt-3 flex flex-wrap items-center gap-2">
                           <Badge variant="outline" className={getHealthTierClassName(account.health_tier)}>

@@ -1089,6 +1089,23 @@ func classifyProbeStatus(status int, code string) string {
 	}
 }
 
+// grokProbeResponsesTerminalOK 判断 Responses 探针是否收到了"这口通了"的终态。
+// completed 与 incomplete 同为正常终态：探针体只给 1 个 output token，思考型
+// 模型必然以 incomplete 收场，把它排除在外等于永远判不出 ok。
+// status 取自非流式 body 的 response.status，eventType 取自流式事件的 type；
+// 调用方只关心其中一个时另一个传空串。
+func grokProbeResponsesTerminalOK(status, eventType string) bool {
+	switch status {
+	case "completed", "incomplete":
+		return true
+	}
+	switch eventType {
+	case "response.completed", "response.incomplete":
+		return true
+	}
+	return false
+}
+
 func retryAfterSeconds(header http.Header, now time.Time) int64 {
 	value := strings.TrimSpace(header.Get("Retry-After"))
 	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
@@ -1155,7 +1172,10 @@ func inspectGrokProbeResponse(ctx context.Context, protocol proxy.GrokProtocol, 
 				observation.status = "ok"
 			}
 		default:
-			if gjson.GetBytes(body, "status").String() == "completed" || gjson.GetBytes(body, "type").String() == "response.completed" {
+			// 探针体带 max_output_tokens:1，正常收尾必然是 incomplete 而非
+			// completed；只认 completed 会把每个通的 Responses 口判成
+			// unavailable（http_status=200 却 status=unavailable）。
+			if grokProbeResponsesTerminalOK(gjson.GetBytes(body, "status").String(), gjson.GetBytes(body, "type").String()) {
 				observation.status = "ok"
 			}
 		}
@@ -1176,7 +1196,8 @@ func inspectGrokProbeResponse(ctx context.Context, protocol proxy.GrokProtocol, 
 		eventType := gjson.GetBytes(data, "type").String()
 		switch protocol {
 		case proxy.GrokProtocolResponses:
-			if eventType == "response.completed" && gjson.GetBytes(data, "response.status").String() != "failed" {
+			// 同上：截断终态 response.incomplete 也是"这口通了"的证据。
+			if grokProbeResponsesTerminalOK("", eventType) && gjson.GetBytes(data, "response.status").String() != "failed" {
 				responsesCompleted = true
 			}
 			if eventType == "response.failed" || eventType == "error" {

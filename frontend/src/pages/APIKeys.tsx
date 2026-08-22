@@ -39,6 +39,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select, type SelectOption } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -124,6 +125,7 @@ interface LimitsFormState {
   tokenLimitDaily: string;
   tokenLimitDailyUnit: TokenLimitUnit;
   imageGenerationPolicy: ImageGenerationPolicy;
+  allowLive: boolean;
   upstreamChannel: UpstreamChannel;
   scopeLimits: ScopeLimitFormState[];
 }
@@ -211,6 +213,7 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
   imageGenerationPolicy: "allow",
+  allowLive: false,
   upstreamChannel: "auto",
   scopeLimits: [],
 };
@@ -1992,11 +1995,24 @@ export default function APIKeys() {
                 value={createForm.limits.upstreamChannel}
                 onChange={(upstreamChannel) =>
                   updateCreateForm({
-                    limits: { ...createForm.limits, upstreamChannel },
+                    limits: applyUpstreamChannel(
+                      createForm.limits,
+                      upstreamChannel,
+                    ),
                   })
                 }
               />
             </FormField>
+            {createForm.limits.upstreamChannel === "codex" ? (
+              <AllowLiveField
+                checked={createForm.limits.allowLive}
+                onCheckedChange={(allowLive) =>
+                  updateCreateForm({
+                    limits: { ...createForm.limits, allowLive },
+                  })
+                }
+              />
+            ) : null}
 
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
@@ -2171,11 +2187,24 @@ export default function APIKeys() {
                       value={editForm.limits.upstreamChannel}
                       onChange={(upstreamChannel) =>
                         updateEditForm({
-                          limits: { ...editForm.limits, upstreamChannel },
+                          limits: applyUpstreamChannel(
+                            editForm.limits,
+                            upstreamChannel,
+                          ),
                         })
                       }
                     />
                   </FormField>
+                  {editForm.limits.upstreamChannel === "codex" ? (
+                    <AllowLiveField
+                      checked={editForm.limits.allowLive}
+                      onCheckedChange={(allowLive) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, allowLive },
+                        })
+                      }
+                    />
+                  ) : null}
 
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField
@@ -2439,6 +2468,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimitDaily: tokenDaily.value,
     tokenLimitDailyUnit: tokenDaily.unit,
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
+    allowLive: Boolean(limits.allow_live),
     upstreamChannel:
       limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
         ? limits.upstream_channel
@@ -2554,6 +2584,41 @@ function UpstreamChannelPicker({
   );
 }
 
+function applyUpstreamChannel(
+  limits: LimitsFormState,
+  upstreamChannel: UpstreamChannel,
+): LimitsFormState {
+  return {
+    ...limits,
+    upstreamChannel,
+    allowLive: upstreamChannel === "codex" ? limits.allowLive : false,
+    planAllow: prunePlanAllow(limits.planAllow, upstreamChannel),
+  };
+}
+
+function AllowLiveField({
+  checked,
+  onCheckedChange,
+}: {
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="space-y-1.5 rounded-md border border-border/60 px-3 py-2">
+      <div className="flex items-center justify-between gap-3">
+        <label className="text-xs font-medium text-foreground">
+          {t("apiKeys.limits.allowLive")}
+        </label>
+        <Switch checked={checked} onCheckedChange={onCheckedChange} />
+      </div>
+      <p className="text-[10px] text-muted-foreground">
+        {t("apiKeys.limits.allowLiveHint")}
+      </p>
+    </div>
+  );
+}
+
 // resolveImageGenerationPolicy 统一新旧两种后端配置：显式 image_generation_policy 优先，
 // 未设时旧的 disable_image_generation=true 视为 block，其余为 allow。
 function resolveImageGenerationPolicy(
@@ -2612,7 +2677,10 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
   return {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
-    plan_allow: form.planAllow.map((p) => p.trim()).filter(Boolean),
+    plan_allow: prunePlanAllow(
+      form.planAllow.map((p) => p.trim()).filter(Boolean),
+      form.upstreamChannel,
+    ),
     no_affinity_group_ids: form.noAffinityGroupIds,
     rpm: intNum(form.rpm),
     rpd: intNum(form.rpd),
@@ -2632,6 +2700,7 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     // 兼容旧字段：block 时同步置位，其余留空由后端按 policy 归一。
     disable_image_generation:
       form.imageGenerationPolicy === "block" || undefined,
+    allow_live: form.upstreamChannel === "codex" && form.allowLive,
     upstream_channel:
       form.upstreamChannel === "auto" ? undefined : form.upstreamChannel,
     scope_limits: form.scopeLimits
@@ -3170,6 +3239,7 @@ function LimitsEditor({
             <PlanMultiSelect
               value={value.planAllow}
               onChange={(planAllow) => patch({ planAllow })}
+              options={planOptionsForChannel(value.upstreamChannel)}
               allLabel={t("apiKeys.limits.planAllowAll")}
             />
             <p className="text-[10px] text-muted-foreground">
@@ -3461,8 +3531,9 @@ function APIKeysSkeleton() {
   );
 }
 
-// PLAN_FILTER_OPTIONS 与后端 cleanPlanAllow 的白名单保持一致(pro 与 prolite 相互独立)。
-const PLAN_FILTER_OPTIONS = [
+// 套餐选项与后端 cleanPlanAllow 白名单保持一致(pro 与 prolite 相互独立)。
+// Codex / Grok 分列，自动渠道再合并；切渠道时只保留当前渠道能调度的套餐。
+const CODEX_PLAN_FILTER_OPTIONS = [
   "free",
   "plus",
   "pro",
@@ -3470,6 +3541,10 @@ const PLAN_FILTER_OPTIONS = [
   "team",
   "k12",
   "go",
+] as const;
+
+const GROK_PLAN_FILTER_OPTIONS = [
+  "free",
   "api",
   "supergrok",
   "x_basic",
@@ -3480,14 +3555,40 @@ const PLAN_FILTER_OPTIONS = [
   "supergrok_plus",
 ] as const;
 
+const PLAN_FILTER_OPTIONS = [
+  ...CODEX_PLAN_FILTER_OPTIONS,
+  ...GROK_PLAN_FILTER_OPTIONS.filter(
+    (plan) => !(CODEX_PLAN_FILTER_OPTIONS as readonly string[]).includes(plan),
+  ),
+];
+
+function planOptionsForChannel(channel: UpstreamChannel): readonly string[] {
+  if (channel === "codex") return CODEX_PLAN_FILTER_OPTIONS;
+  if (channel === "grok") return GROK_PLAN_FILTER_OPTIONS;
+  return PLAN_FILTER_OPTIONS;
+}
+
+function prunePlanAllow(
+  plans: string[],
+  channel: UpstreamChannel,
+): string[] {
+  if (channel === "auto") return plans;
+  const allowed = new Set(
+    planOptionsForChannel(channel).map((plan) => plan.toLowerCase()),
+  );
+  return plans.filter((plan) => allowed.has(plan.toLowerCase()));
+}
+
 // PlanMultiSelect 让 API Key 选择只调度哪些账号套餐。空表示不限套餐。
 function PlanMultiSelect({
   value,
   onChange,
+  options,
   allLabel,
 }: {
   value: string[];
   onChange: (value: string[]) => void;
+  options: readonly string[];
   allLabel: string;
 }) {
   return (
@@ -3504,7 +3605,7 @@ function PlanMultiSelect({
         >
           {allLabel}
         </button>
-        {PLAN_FILTER_OPTIONS.map((plan) => {
+        {options.map((plan) => {
           const active = value.includes(plan);
           return (
             <button

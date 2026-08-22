@@ -182,6 +182,12 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 				addScopedModel(records, alias, modelBackingGrok, time.Time{}, true)
 				addTarget(alias)
 			}
+			// 媒体(生图/生视频)模型不在账号文本目录里,按独立的媒体模型集补充展示,
+			// 与媒体端点的调度准入(grokMediaAccountSupportsModel)同源。
+			for _, id := range grokMediaModelsForAccount(account) {
+				addScopedModel(records, id, modelBackingGrok, time.Time{}, false)
+				addTarget(id)
+			}
 
 		case account.IsOpenAIResponsesAPI():
 			models := account.OpenAIResponsesModels()
@@ -239,6 +245,14 @@ func (h *Handler) scopedModelRecords(ctx context.Context, row *database.APIKeyRo
 	for key, record := range records {
 		if checkAPIKeyModel(record.id, row.Limits) != "" {
 			delete(records, key)
+		}
+	}
+	if row.Limits.AllowLive {
+		for _, id := range liveModelAliases {
+			if liveModelExplicitlyDenied(id, row.Limits.ModelDeny) {
+				continue
+			}
+			addScopedModel(records, id, modelBackingCodex, time.Time{}, true)
 		}
 	}
 	return records

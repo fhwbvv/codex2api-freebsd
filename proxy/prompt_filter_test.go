@@ -332,3 +332,78 @@ func TestPromptFilterWarningMessageNeverEmpty(t *testing.T) {
 		})
 	}
 }
+
+func newConfiguredLocalBlockMessageHandler(message string) *Handler {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:               2,
+		TestConcurrency:              1,
+		PromptFilterEnabled:          true,
+		PromptFilterMode:             promptfilter.ModeBlock,
+		PromptFilterThreshold:        50,
+		PromptFilterStrictThreshold:  90,
+		PromptFilterLogMatches:       true,
+		PromptFilterMaxTextLength:    promptfilter.DefaultMaxTextLength,
+		PromptFilterCustomPatterns:   `[{"name":"custom_message_block","pattern":"blocked-content","weight":100,"strict":true,"category":"test"}]`,
+		PromptFilterDisabledPatterns: "[]",
+	})
+	cfg := store.GetPromptFilterConfig()
+	cfg.Advanced.Enforcement.LocalBlockMessage = message
+	store.SetPromptFilterConfig(cfg)
+	return NewHandler(store, nil, nil, nil)
+}
+
+func TestPromptFilterOpenAIUsesConfiguredLocalBlockMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := newConfiguredLocalBlockMessageHandler("Blocked by Example Gateway")
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	blocked := handler.inspectPromptFilterOpenAI(c, []byte(`{"model":"gpt-5.5","input":"blocked-content"}`), "/v1/responses", "gpt-5.5")
+
+	if !blocked || recorder.Code != http.StatusBadRequest {
+		t.Fatalf("blocked=%v status=%d", blocked, recorder.Code)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, `"message":"Blocked by Example Gateway"`) {
+		t.Fatalf("response did not use configured message: %s", body)
+	}
+}
+
+func TestPromptFilterTextOpenAIUsesConfiguredLocalBlockMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := newConfiguredLocalBlockMessageHandler("Blocked by Example Gateway")
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/edits", nil)
+
+	blocked := handler.inspectPromptFilterTextOpenAI(c, "blocked-content", "/v1/images/edits", "gpt-image-2")
+
+	if !blocked || !strings.Contains(recorder.Body.String(), `"message":"Blocked by Example Gateway"`) {
+		t.Fatalf("blocked=%v response=%s", blocked, recorder.Body.String())
+	}
+}
+
+func TestPromptFilterAnthropicUsesConfiguredLocalBlockMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := newConfiguredLocalBlockMessageHandler("Blocked by Example Gateway")
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	blocked := handler.inspectPromptFilterAnthropic(c, []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"blocked-content"}]}`), "/v1/messages", "gpt-5.5")
+
+	if !blocked || recorder.Code != http.StatusBadRequest {
+		t.Fatalf("blocked=%v status=%d", blocked, recorder.Code)
+	}
+	if body := recorder.Body.String(); !strings.Contains(body, `"message":"Blocked by Example Gateway"`) {
+		t.Fatalf("response did not use configured message: %s", body)
+	}
+}
+
+func TestPromptFilterEmptyLocalBlockMessageKeepsDefault(t *testing.T) {
+	cfg := promptfilter.DefaultConfig()
+	cfg.Advanced.Enforcement.LocalBlockMessage = "  "
+	if got := localPromptBlockMessage(cfg); got != "Request contains content blocked by prompt filter" {
+		t.Fatalf("message = %q", got)
+	}
+}

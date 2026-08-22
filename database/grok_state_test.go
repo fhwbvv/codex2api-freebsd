@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -841,5 +842,138 @@ func TestMergeAccountCredentialsForGenerationIsFencedAndSanitized(t *testing.T) 
 	}
 	if got := final.GetCredentialStringSlice("models"); len(got) != 1 || got[0] != "grok-safe" {
 		t.Fatalf("stale generation changed legacy models: %#v", got)
+	}
+}
+
+// 重授权同一凭据身份:回收站账号复活并写入新 token,既有配置(models/base_url)
+// 未显式覆盖时保留;正常 error 态账号原地更新并清错;身份键属于第三方账号时拒绝。
+func TestReauthGrokAccountRevivesRecycleBinHolder(t *testing.T) {
+	db := newGrokStateTestDB(t)
+	ctx := context.Background()
+	base := map[string]any{
+		"upstream_type": "grok", "refresh_token": "rt-old", "access_token": "at-old",
+		"account_id": "subject-r", "grok_oidc_issuer": "https://auth.x.ai",
+		"credential_family_id": "family-r", "models": []string{"grok-4.6"},
+		"base_url": "https://custom.example/v1",
+	}
+	id, duplicateID, err := db.InsertGrokAccountIfAbsent(ctx, "victim", base, "", true)
+	if err != nil || id <= 0 || duplicateID != 0 {
+		t.Fatalf("insert = id %d duplicate %d err %v", id, duplicateID, err)
+	}
+	// 软删除进回收站(与管理端删除语义一致)
+	if _, err := db.conn.ExecContext(ctx, `UPDATE accounts SET status='deleted', deleted_at=CURRENT_TIMESTAMP, enabled=0, error_message='deleted' WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	// 重新授权同一身份仍被栅栏拦下
+	again := map[string]any{
+		"upstream_type": "grok", "refresh_token": "rt-new", "access_token": "at-new",
+		"account_id": "subject-r", "grok_oidc_issuer": "https://auth.x.ai",
+	}
+	if got, duplicate, err := db.InsertGrokAccountIfAbsent(ctx, "reauth", again, "", true); err != nil || got != 0 || duplicate != id {
+		t.Fatalf("duplicate detection = id %d duplicate %d err %v", got, duplicate, err)
+	}
+
+	result, err := db.ReauthGrokAccount(ctx, id, again, "", "")
+	if err != nil {
+		t.Fatalf("ReauthGrokAccount: %v", err)
+	}
+	if !result.Revived {
+		t.Fatal("recycle-bin holder must be revived")
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID after revive: %v", err)
+	}
+	if !strings.EqualFold(row.Status, "active") || !row.Enabled {
+		t.Fatalf("revived row status=%q enabled=%v", row.Status, row.Enabled)
+	}
+	if got := row.GetCredential("access_token"); got != "at-new" {
+		t.Fatalf("access_token = %q, want at-new", got)
+	}
+	if got := row.GetCredential("refresh_token"); got != "rt-new" {
+		t.Fatalf("refresh_token = %q, want rt-new", got)
+	}
+	// 未显式覆盖的既有配置保留
+	if got := row.GetCredential("base_url"); got != "https://custom.example/v1" {
+		t.Fatalf("base_url = %q, want preserved custom value", got)
+	}
+	if got := row.GetCredentialStringSlice("models"); len(got) != 1 || got[0] != "grok-4.6" {
+		t.Fatalf("models = %#v, want preserved", got)
+	}
+	// family 稳定,身份键仍指向同一账号,重复导入依旧被拦
+	if got := row.GetCredential("credential_family_id"); got != "family-r" {
+		t.Fatalf("credential_family_id = %q, want stable family-r", got)
+	}
+	if _, duplicate, err := db.InsertGrokAccountIfAbsent(ctx, "post-reauth", again, "", true); err != nil || duplicate != id {
+		t.Fatalf("post-reauth duplicate = %d err %v, want %d", duplicate, err, id)
+	}
+}
+
+func TestReauthGrokAccountUpdatesLiveHolderAndClearsErrorState(t *testing.T) {
+	db := newGrokStateTestDB(t)
+	ctx := context.Background()
+	base := map[string]any{
+		"upstream_type": "grok", "refresh_token": "rt-live", "access_token": "at-live",
+		"account_id": "subject-l", "credential_family_id": "family-l",
+	}
+	id, _, err := db.InsertGrokAccountIfAbsent(ctx, "live", base, "", true)
+	if err != nil || id <= 0 {
+		t.Fatalf("insert: id %d err %v", id, err)
+	}
+	if _, err := db.conn.ExecContext(ctx, `UPDATE accounts SET status='error', error_message='refresh token expired', enabled=0 WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.ReauthGrokAccount(ctx, id, map[string]any{
+		"upstream_type": "grok", "refresh_token": "rt-live-2", "access_token": "at-live-2",
+		"account_id": "subject-l",
+	}, "renamed", "")
+	if err != nil {
+		t.Fatalf("ReauthGrokAccount: %v", err)
+	}
+	if result.Revived {
+		t.Fatal("live holder must not be reported as revived")
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(row.Status, "active") || row.ErrorMessage != "" {
+		t.Fatalf("error state not cleared: status=%q msg=%q", row.Status, row.ErrorMessage)
+	}
+	// 正常账号的 enabled 由运维掌控,重授权不强行翻开
+	if row.Enabled {
+		t.Fatal("live holder enabled flag must be preserved")
+	}
+	if row.Name != "renamed" {
+		t.Fatalf("name = %q, want renamed", row.Name)
+	}
+	if got := row.GetCredential("access_token"); got != "at-live-2" {
+		t.Fatalf("access_token = %q", got)
+	}
+}
+
+func TestReauthGrokAccountRejectsForeignIdentityClaim(t *testing.T) {
+	db := newGrokStateTestDB(t)
+	ctx := context.Background()
+	holderID, _, err := db.InsertGrokAccountIfAbsent(ctx, "holder", map[string]any{
+		"upstream_type": "grok", "refresh_token": "rt-h", "account_id": "subject-h",
+		"credential_family_id": "family-h",
+	}, "", true)
+	if err != nil || holderID <= 0 {
+		t.Fatalf("insert holder: %v", err)
+	}
+	otherID, _, err := db.InsertGrokAccountIfAbsent(ctx, "other", map[string]any{
+		"upstream_type": "grok", "refresh_token": "rt-o", "account_id": "subject-o",
+		"credential_family_id": "family-o",
+	}, "", true)
+	if err != nil || otherID <= 0 {
+		t.Fatalf("insert other: %v", err)
+	}
+	// 试图把 holder 的身份合并到 other:必须拒绝
+	if _, err := db.ReauthGrokAccount(ctx, otherID, map[string]any{
+		"upstream_type": "grok", "refresh_token": "rt-x", "account_id": "subject-h",
+	}, "", ""); err == nil {
+		t.Fatal("merging a foreign identity into another account must fail")
 	}
 }

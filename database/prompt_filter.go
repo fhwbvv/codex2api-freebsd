@@ -873,8 +873,9 @@ func promptFilterLogWhere(query PromptFilterLogQuery) (string, []any) {
 			LOWER(COALESCE(api_key_masked, '')) LIKE $%d OR
 			LOWER(COALESCE(newapi_user_id, '')) LIKE $%d OR
 			LOWER(COALESCE(newapi_request_id, '')) LIKE $%d OR
-			LOWER(COALESCE(newapi_decision_id, '')) LIKE $%d
-		)`, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx))
+			LOWER(COALESCE(newapi_decision_id, '')) LIKE $%d OR
+			LOWER(COALESCE(request_correlation_id, '')) LIKE $%d
+		)`, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx, idx))
 	}
 	if len(clauses) == 0 {
 		return "", args

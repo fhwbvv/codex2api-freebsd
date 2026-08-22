@@ -1278,45 +1278,91 @@
 }
 
 /* 账号状态遮罩：霜面 + 细斜纹淡化内容，徽章保持清晰。
-   不用行级 opacity（会把徽章一起冲淡），也不用 filter（会破坏 tr 定位包含块）。
-   悬停时霜面退让，便于阅读和点击启用 / 恢复等操作。 */
+   卡片使用自身定位边界内的遮罩；表格直接绘制每个单元格的背景，
+   避免依赖 Safari 对 tr / td 绝对定位包含块的处理。 */
 .account-state-surface {
   isolation: isolate;
 }
 
-.account-state-overlay__scrim {
-  background-color: color-mix(in oklab, var(--color-background) 54%, transparent);
-  background-image:
-    linear-gradient(
-      180deg,
-      color-mix(in oklab, var(--color-background) 10%, transparent),
-      color-mix(in oklab, var(--color-foreground) 3.5%, transparent)
-    ),
-    repeating-linear-gradient(
-      -22deg,
-      transparent 0 9px,
-      color-mix(in oklab, var(--color-muted-foreground) 7%, transparent) 9px 10px
-    );
-  transition: opacity 180ms ease;
+.account-state-overlay--disabled,
+.account-state-table-row--disabled {
+  --account-state-background: color-mix(
+    in oklab,
+    var(--color-background) 54%,
+    transparent
+  );
+  --account-state-highlight: color-mix(
+    in oklab,
+    var(--color-background) 10%,
+    transparent
+  );
+  --account-state-shadow: color-mix(
+    in oklab,
+    var(--color-foreground) 3.5%,
+    transparent
+  );
+  --account-state-stripe: color-mix(
+    in oklab,
+    var(--color-muted-foreground) 7%,
+    transparent
+  );
 }
 
-.account-state-overlay--overload .account-state-overlay__scrim {
-  background-color: color-mix(
+.account-state-overlay--overload,
+.account-state-table-row--overload {
+  --account-state-background: color-mix(
     in oklab,
     hsl(28 86% 52%) 16%,
     color-mix(in oklab, var(--color-background) 50%, transparent)
   );
+  --account-state-highlight: color-mix(
+    in oklab,
+    hsl(32 90% 56%) 8%,
+    transparent
+  );
+  --account-state-shadow: color-mix(
+    in oklab,
+    var(--color-foreground) 3%,
+    transparent
+  );
+  --account-state-stripe: color-mix(
+    in oklab,
+    hsl(24 80% 42%) 10%,
+    transparent
+  );
+}
+
+.account-state-overlay__scrim,
+.account-state-table-row > [data-slot="table-cell"] {
+  background-color: var(--account-state-background);
   background-image:
     linear-gradient(
       180deg,
-      color-mix(in oklab, hsl(32 90% 56%) 8%, transparent),
-      color-mix(in oklab, var(--color-foreground) 3%, transparent)
+      var(--account-state-highlight),
+      var(--account-state-shadow)
     ),
     repeating-linear-gradient(
       -22deg,
       transparent 0 9px,
-      color-mix(in oklab, hsl(24 80% 42%) 10%, transparent) 9px 10px
+      var(--account-state-stripe) 9px 10px
     );
+}
+
+.account-state-overlay__scrim {
+  transition: opacity 180ms ease;
+}
+
+.account-state-table-row > [data-slot="table-cell"] > :not(.account-state-overlay--marker-only) {
+  opacity: 0.64;
+  transition: opacity 180ms ease;
+}
+
+.account-state-table-row:hover > [data-slot="table-cell"] > :not(.account-state-overlay--marker-only) {
+  opacity: 0.88;
+}
+
+.account-state-table-row > [data-slot="table-cell"] > .account-state-overlay--marker-only {
+  opacity: 1;
 }
 
 .account-state-overlay__mark {
@@ -1331,14 +1377,50 @@
   opacity: 0.58;
 }
 
-.dark .account-state-overlay__scrim {
-  background-color: color-mix(in oklab, var(--color-background) 48%, transparent);
+.dark .account-state-overlay--disabled,
+.dark .account-state-table-row--disabled {
+  --account-state-background: color-mix(
+    in oklab,
+    var(--color-background) 48%,
+    transparent
+  );
 }
 
-.dark .account-state-overlay--overload .account-state-overlay__scrim {
-  background-color: color-mix(
+.dark .account-state-overlay--overload,
+.dark .account-state-table-row--overload {
+  --account-state-background: color-mix(
     in oklab,
     hsl(28 70% 42%) 18%,
     color-mix(in oklab, var(--color-background) 46%, transparent)
   );
+}
+
+/* 细滚动条:弹窗与显式标记的滚动容器统一使用。标准属性优先
+   (Chrome/Firefox),WebKit 伪元素兜底 Safari。 */
+[data-slot='dialog-content'],
+.thin-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--color-muted-foreground) 45%, transparent) transparent;
+}
+
+[data-slot='dialog-content']::-webkit-scrollbar,
+.thin-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+[data-slot='dialog-content']::-webkit-scrollbar-track,
+.thin-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+[data-slot='dialog-content']::-webkit-scrollbar-thumb,
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background-color: color-mix(in oklab, var(--color-muted-foreground) 45%, transparent);
+}
+
+[data-slot='dialog-content']::-webkit-scrollbar-thumb:hover,
+.thin-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklab, var(--color-muted-foreground) 65%, transparent);
 }

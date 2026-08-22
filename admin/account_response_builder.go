@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,17 +81,17 @@ func (h *Handler) buildAccountResponse(
 	modelMapping := ""
 	var customHeaders map[string]string
 	var allowedAPIKeyIDs []int64
-	tokenWorkspaceID := ""
-	workspaceIDOverride := ""
-	effectiveWorkspaceID := ""
+	// 工作区 ID 不是密钥:Team/K12 徽章悬停要显示空间 ID。当前页
+	// ListActiveByIDs 已带完整凭据;custom_headers 只用来算生效空间,
+	// 摘要响应仍会剥掉原文。
+	headers := row.GetCredentialStringMap("custom_headers")
+	tokenWorkspaceID := openaiidentity.NormalizeWorkspaceID(row.GetCredential("workspace_id"))
+	workspaceIDOverride := openaiidentity.WorkspaceOverrideFromHeaders(headers)
+	effectiveWorkspaceID := openaiidentity.EffectiveWorkspaceID(tokenWorkspaceID, headers)
 	if includeDetails {
 		modelMapping = row.GetCredential("model_mapping")
-		customHeaders = row.GetCredentialStringMap("custom_headers")
+		customHeaders = headers
 		allowedAPIKeyIDs = row.GetCredentialInt64Slice("allowed_api_key_ids")
-		// workspace 路由字段依赖 custom_headers,与其余详情字段同档加载(PR #485)。
-		tokenWorkspaceID = openaiidentity.NormalizeWorkspaceID(row.GetCredential("workspace_id"))
-		workspaceIDOverride = openaiidentity.WorkspaceOverrideFromHeaders(customHeaders)
-		effectiveWorkspaceID = openaiidentity.EffectiveWorkspaceID(tokenWorkspaceID, customHeaders)
 	}
 	resp := accountResponse{
 		DetailLoaded:             includeDetails,
@@ -209,6 +210,9 @@ func (h *Handler) buildAccountResponse(
 		if usagePct5h, ok := runtimeAccount.GetUsagePercent5h(); ok {
 			resp.UsagePercent5h = &usagePct5h
 		}
+		if usagePctSpark, ok := runtimeAccount.GetUsagePercentSpark(); ok {
+			resp.UsagePercentSpark = &usagePctSpark
+		}
 		if credits, ok := runtimeAccount.GetRateLimitResetCredits(); ok {
 			resp.RateLimitResetCredits = &credits
 		}
@@ -237,6 +241,9 @@ func (h *Handler) buildAccountResponse(
 		}
 		if t := runtimeAccount.GetReset7dAt(); !t.IsZero() {
 			resp.Reset7dAt = t.Format(time.RFC3339)
+		}
+		if t := runtimeAccount.GetResetSparkAt(); !t.IsZero() {
+			resp.ResetSparkAt = t.Format(time.RFC3339)
 		}
 		if sec := runtimeAccount.GetWindow7dSeconds(); sec > 0 {
 			resp.Window7dSeconds = &sec
@@ -288,6 +295,18 @@ func (h *Handler) buildAccountResponse(
 		resp.ErrorRequests = requestCount.ErrorCount
 		resp.RetryErrorRequests = requestCount.RetryErrorCount
 		resp.RateLimitAttempts = requestCount.RateLimitAttemptCount
+		if len(requestCount.ErrorStatusCounts) > 0 {
+			resp.ErrorStatusCounts = make(map[string]int64, len(requestCount.ErrorStatusCounts))
+			for code, count := range requestCount.ErrorStatusCounts {
+				resp.ErrorStatusCounts[strconv.Itoa(code)] = count
+			}
+		}
+		if len(requestCount.SuccessModelCounts) > 0 {
+			resp.SuccessModelCounts = make(map[string]int64, len(requestCount.SuccessModelCounts))
+			for model, count := range requestCount.SuccessModelCounts {
+				resp.SuccessModelCounts[model] = count
+			}
+		}
 	}
 	if usage5h != nil {
 		resp.Usage5hDetail = &accountUsageWindow{

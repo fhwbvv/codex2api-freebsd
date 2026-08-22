@@ -156,7 +156,7 @@ func TestHandshakeUnauthorizedHTTPResponse(t *testing.T) {
 
 	t.Run("401 converts to real-status response with raw body", func(t *testing.T) {
 		body := `{"error":{"message":"token expired","code":"token_expired"}}`
-		resp, ok := handshakeUnauthorizedHTTPResponse(makeErr(http.StatusUnauthorized, body))
+		resp, ok := handshakeAccountErrorHTTPResponse(makeErr(http.StatusUnauthorized, body))
 		if !ok {
 			t.Fatal("expected conversion for 401")
 		}
@@ -178,19 +178,35 @@ func TestHandshakeUnauthorizedHTTPResponse(t *testing.T) {
 		}
 	})
 
-	t.Run("non-401 handshake statuses keep transport error semantics", func(t *testing.T) {
+	t.Run("402 deactivated workspace converts with parseable body", func(t *testing.T) {
+		resp, ok := handshakeAccountErrorHTTPResponse(makeErr(http.StatusPaymentRequired, `{"detail":{"code":"deactivated_workspace"}}`))
+		if !ok {
+			t.Fatal("expected conversion for 402")
+		}
+		if resp.StatusCode != http.StatusPaymentRequired {
+			t.Fatalf("StatusCode = %d, want 402", resp.StatusCode)
+		}
+		got, _ := io.ReadAll(resp.Body)
+		if !strings.Contains(string(got), `"deactivated_workspace"`) {
+			t.Fatalf("body missing workspace code: %q", got)
+		}
+	})
+
+	// 403 可能来自 Cloudflare 拦截（出口 IP 维度），按账号错误分类会误伤，保持
+	// transport 语义；429/503 同理（握手限流走粘滞重试）。
+	t.Run("non-account handshake statuses keep transport error semantics", func(t *testing.T) {
 		for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
-			if _, ok := handshakeUnauthorizedHTTPResponse(makeErr(status, `{"error":{"message":"x"}}`)); ok {
+			if _, ok := handshakeAccountErrorHTTPResponse(makeErr(status, `{"error":{"message":"x"}}`)); ok {
 				t.Fatalf("status %d should not convert", status)
 			}
 		}
 	})
 
 	t.Run("plain errors pass through", func(t *testing.T) {
-		if _, ok := handshakeUnauthorizedHTTPResponse(errors.New("dial tcp timeout")); ok {
+		if _, ok := handshakeAccountErrorHTTPResponse(errors.New("dial tcp timeout")); ok {
 			t.Fatal("plain error should not convert")
 		}
-		if _, ok := handshakeUnauthorizedHTTPResponse(formatDialHandshakeError(errors.New("dial tcp timeout"), nil)); ok {
+		if _, ok := handshakeAccountErrorHTTPResponse(formatDialHandshakeError(errors.New("dial tcp timeout"), nil)); ok {
 			t.Fatal("no-response handshake error should not convert")
 		}
 	})

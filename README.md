@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker">
 </p>
 
-**Turn a Codex account pool into an observable, schedulable, operations-ready OpenAI / Anthropic compatible gateway.** Codex2API is not a thin forwarding proxy. It is a long-running Codex access hub: it exposes `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, Images, and Models endpoints while managing Refresh Token / Access Token accounts, health scoring, dynamic concurrency, rate-limit recovery, usage tracking, and admin operations behind the scenes.
+**Turn a Codex account pool into an observable, schedulable, operations-ready OpenAI / Anthropic compatible gateway.** Codex2API is not a thin forwarding proxy. It is a long-running Codex access hub: it exposes `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, Images, Videos (Grok Imagine), and Models endpoints while managing Refresh Token / Access Token accounts, health scoring, dynamic concurrency, rate-limit recovery, usage tracking, and admin operations behind the scenes.
 
 Run it as a full **PostgreSQL + Redis** production stack or as a single-container **SQLite + in-memory cache** deployment. Point Codex CLI, Claude Code, the OpenAI SDK, or any compatible client at one Base URL, then manage accounts, proxies, API keys, prompt filtering, image workflows, and runtime settings from the built-in dashboard.
 
@@ -316,9 +316,13 @@ Each successful budget change receives a read-only generation and is polled by e
 | --- | --- |
 | `POST /v1/chat/completions` | Chat Completions style endpoint |
 | `POST /v1/responses` | Responses style endpoint |
-| `POST /v1/images/generations` | OpenAI Images generation endpoint |
+| `POST /v1/images/generations` | OpenAI Images generation endpoint (gpt-image-2 via Codex, grok-imagine via Grok) |
 | `POST /v1/images/edits` | OpenAI Images edit endpoint |
-| `GET /v1/models` | List available models (includes gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-image-2, etc.) |
+| `POST /v1/videos/generations` | Grok Imagine video generation (async, returns `request_id`) |
+| `POST /v1/videos/edits` / `POST /v1/videos/extensions` | Grok Imagine video edit / extension |
+| `GET /v1/videos/:id` | Poll video task status (`video.url` rewritten to the gateway content proxy) |
+| `GET /v1/videos/:id/content` | Download the generated video through the gateway (Range supported) |
+| `GET /v1/models` | List available models (includes gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-image-2, grok-imagine-*, etc.) |
 | `GET /health` | Health check |
 
 > **Pricing**: gpt-5.5 is billed at $5.00/M input and $30.00/M output (standard tier). Priority tier: $12.50/M input, $75.00/M output. Other models follow pricing rules in the billing engine.
@@ -568,11 +572,13 @@ Join the group to discuss deployment, usage, and development questions.
 
 ## Star History
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
-  <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
-  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=james-6-23/codex2api&type=Date" />
-</picture>
+<a href="https://star-history.dera.page/#james-6-23/codex2api&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=james-6-23/codex2api&type=Date" />
+  </picture>
+</a>
 
 ---
 

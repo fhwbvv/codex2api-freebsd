@@ -322,6 +322,9 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 		headers.Set("X-Codex-Beta-Features", betaFeatures)
 	} else if deviceCfg != nil && strings.TrimSpace(deviceCfg.BetaFeatures) != "" {
 		headers.Set("X-Codex-Beta-Features", strings.TrimSpace(deviceCfg.BetaFeatures))
+	} else {
+		// 会话级默认:真实 Codex 的每个握手都带该头,默认值即 remote_compaction_v2。
+		headers.Set("X-Codex-Beta-Features", "remote_compaction_v2")
 	}
 
 	// Originator
@@ -686,11 +689,12 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 	exec := GetExecutor()
 	wsResp, err := exec.ExecuteRequestViaWebsocket(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	if err != nil {
-		// 握手阶段的上游 401（token 失效/撤销）还原成真实状态码的 HTTP 响应返回，
-		// 而不是 transport 错误：否则 401 在使用日志里只会以 598/transport 出现，
-		// 且账号既不触发 unauthorized 冷却也不触发鉴权探针，失效账号会一直留在
-		// 调度池里被反复拨号（对比 HTTP 路径的 401 直接可见并立即冷却）。
-		if resp, ok := handshakeUnauthorizedHTTPResponse(err); ok {
+		// 握手阶段的上游 401/402（token 失效、工作区停用等账号维度错误）还原成
+		// 真实状态码的 HTTP 响应返回，而不是 transport 错误：否则在使用日志里只会
+		// 以 598/transport 出现，账号既不触发 unauthorized 冷却也不触发
+		// deactivated_workspace 标错，坏账号会一直留在调度池里被反复拨号
+		// （对比 HTTP 路径的 401/402 直接可见并立即冷却/标错）。
+		if resp, ok := handshakeAccountErrorHTTPResponse(err); ok {
 			return resp, nil
 		}
 		return nil, err

@@ -1,6 +1,9 @@
 package database
 
-import "testing"
+import (
+	"database/sql"
+	"testing"
+)
 
 func TestAccountRowGetCredentialInt64SliceNormalizesValues(t *testing.T) {
 	row := &AccountRow{
@@ -43,5 +46,57 @@ func TestNormalizeCodexCLIVersionSyncIntervalHours(t *testing.T) {
 		if got := NormalizeCodexCLIVersionSyncIntervalHours(in); got != want {
 			t.Errorf("NormalizeCodexCLIVersionSyncIntervalHours(%d) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+func TestSQLOpenDriverNameMapsPostgresToPgx(t *testing.T) {
+	if got := sqlOpenDriverName("postgres"); got != "pgx" {
+		t.Fatalf("sqlOpenDriverName(postgres) = %q, want pgx", got)
+	}
+	if got := sqlOpenDriverName("sqlite"); got != "sqlite" {
+		t.Fatalf("sqlOpenDriverName(sqlite) = %q, want sqlite", got)
+	}
+}
+
+func TestQuotePostgresIdentEscapesAndTruncates(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"public", `"public"`},
+		{`weird"name`, `"weird""name"`},
+		{"ok\x00DROP", `"ok"`},
+	}
+	for _, tc := range cases {
+		if got := quotePostgresIdent(tc.in); got != tc.want {
+			t.Fatalf("quotePostgresIdent(%q) = %s, want %s", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestPostgresInt8ArrayTextLiteral(t *testing.T) {
+	value, err := postgresInt8Array{3, 1, 2}.Value()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "{3,1,2}" {
+		t.Fatalf("Value() = %#v, want {3,1,2}", value)
+	}
+	empty, err := postgresInt8Array{}.Value()
+	if err != nil || empty != "{}" {
+		t.Fatalf("empty Value() = %#v err=%v, want {}", empty, err)
+	}
+	nilValue, err := postgresInt8Array(nil).Value()
+	if err != nil || nilValue != nil {
+		t.Fatalf("nil Value() = %#v err=%v, want nil", nilValue, err)
+	}
+}
+
+func TestPgxStdlibDriverIsRegistered(t *testing.T) {
+	db, err := sql.Open("pgx", "host=127.0.0.1 port=1 user=x password=x dbname=x sslmode=disable")
+	if err != nil {
+		t.Fatalf("sql.Open(pgx) failed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

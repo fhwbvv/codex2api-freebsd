@@ -44,14 +44,14 @@ type LimitSnapshot struct {
 
 // LimitMetrics 限流指标
 type LimitMetrics struct {
-	TotalRequests   int64     `json:"total_requests"`    // 总请求数
-	AllowedRequests int64     `json:"allowed_requests"`  // 允许请求数
-	BlockedRequests int64     `json:"blocked_requests"`  // 阻塞请求数
-	CurrentRPM      int64     `json:"current_rpm"`       // 当前RPM
-	LimitRPM        int64     `json:"limit_rpm"`         // 限制RPM
-	CooldownLevel   int       `json:"cooldown_level"`    // 当前冷却等级
-	NextResetAt     time.Time `json:"next_reset_at"`     // 下次重置时间
-	LastUpdatedAt   time.Time `json:"last_updated_at"`   // 最后更新时间
+	TotalRequests   int64     `json:"total_requests"`   // 总请求数
+	AllowedRequests int64     `json:"allowed_requests"` // 允许请求数
+	BlockedRequests int64     `json:"blocked_requests"` // 阻塞请求数
+	CurrentRPM      int64     `json:"current_rpm"`      // 当前RPM
+	LimitRPM        int64     `json:"limit_rpm"`        // 限制RPM
+	CooldownLevel   int       `json:"cooldown_level"`   // 当前冷却等级
+	NextResetAt     time.Time `json:"next_reset_at"`    // 下次重置时间
+	LastUpdatedAt   time.Time `json:"last_updated_at"`  // 最后更新时间
 }
 
 // ============ 令牌桶限流器 ============
@@ -61,7 +61,7 @@ type tokenBucket struct {
 	mu         sync.RWMutex
 	tokens     float64
 	maxTokens  float64
-	refillRate float64   // 每秒补充的令牌数
+	refillRate float64 // 每秒补充的令牌数
 	lastRefill time.Time
 }
 
@@ -270,14 +270,14 @@ func (cm *cooldownManager) getState() (level int, blockedAt time.Time, resetAt t
 
 // LevelLimiter 单级别限流器
 type LevelLimiter struct {
-	mu       sync.RWMutex
-	key      string          // 限流键
-	level    RateLimitLevel  // 限流级别
-	bucket   *tokenBucket    // 令牌桶
-	cooldown *cooldownManager // 冷却管理器
-	metrics  LimitMetrics    // 指标
-	enabled  bool            // 是否启用
-	lastAccess atomic.Int64  // 最后访问时间（用于 TTL 清理）
+	mu         sync.RWMutex
+	key        string           // 限流键
+	level      RateLimitLevel   // 限流级别
+	bucket     *tokenBucket     // 令牌桶
+	cooldown   *cooldownManager // 冷却管理器
+	metrics    LimitMetrics     // 指标
+	enabled    bool             // 是否启用
+	lastAccess atomic.Int64     // 最后访问时间（用于 TTL 清理）
 }
 
 // newLevelLimiter 创建单级别限流器
@@ -439,15 +439,15 @@ type EnhancedRateLimiter struct {
 	mu sync.RWMutex
 
 	// 各级别限流器
-	globalLimiter  *LevelLimiter            // 全局限流
+	globalLimiter   *LevelLimiter            // 全局限流
 	accountLimiters map[string]*LevelLimiter // 账号级限流器 (key: accountID)
 	modelLimiters   map[string]*LevelLimiter // 模型级限流器 (key: modelName)
 
 	// 配置
-	globalRPM   int // 全局RPM限制
-	accountRPM  int // 每账号RPM限制
-	modelRPM    int // 每模型RPM限制
-	enabled     bool
+	globalRPM  int // 全局RPM限制
+	accountRPM int // 每账号RPM限制
+	modelRPM   int // 每模型RPM限制
+	enabled    bool
 
 	// 持久化
 	db              *database.DB
@@ -645,7 +645,7 @@ func (erl *EnhancedRateLimiter) GetAllMetrics() map[string]interface{} {
 	defer erl.mu.RUnlock()
 
 	result := map[string]interface{}{
-		"global": erl.globalLimiter.getMetrics(),
+		"global":        erl.globalLimiter.getMetrics(),
 		"total_limited": atomic.LoadInt64(&erl.totalLimited),
 	}
 
@@ -783,9 +783,65 @@ func ComputeCooldown(prevLevel int) (time.Duration, int) {
 
 // ============ 兼容旧版接口 ============
 
+const (
+	requestRateBucketSeconds = int64(5)
+	requestRateBucketCount   = 12
+)
+
+// requestRateMeter 用 12 个 5 秒原子桶记录最近一分钟代理请求数。
+// 请求热路径只有一次 CAS，不依赖全局 RPM 限流是否开启，也不增加互斥锁。
+type requestRateMeter struct {
+	buckets [requestRateBucketCount]atomic.Uint64
+}
+
+func (m *requestRateMeter) mark(now time.Time) {
+	if m == nil {
+		return
+	}
+	slot := uint32(now.Unix() / requestRateBucketSeconds)
+	bucket := &m.buckets[slot%requestRateBucketCount]
+	for {
+		old := bucket.Load()
+		oldSlot := uint32(old >> 32)
+		oldCount := uint32(old)
+		nextCount := uint32(1)
+		if oldSlot == slot {
+			if oldCount == ^uint32(0) {
+				return
+			}
+			nextCount = oldCount + 1
+		}
+		next := uint64(slot)<<32 | uint64(nextCount)
+		if bucket.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+func (m *requestRateMeter) rpm(now time.Time) int64 {
+	if m == nil {
+		return 0
+	}
+	currentSlot := uint32(now.Unix() / requestRateBucketSeconds)
+	var total uint64
+	for i := range m.buckets {
+		packed := m.buckets[i].Load()
+		slot := uint32(packed >> 32)
+		if currentSlot-slot < requestRateBucketCount {
+			total += uint64(uint32(packed))
+		}
+	}
+	if total > uint64(^uint64(0)>>1) {
+		return int64(^uint64(0) >> 1)
+	}
+	return int64(total)
+}
+
 // RateLimiter 全局限流器（向后兼容）
 type RateLimiter struct {
 	enhanced *EnhancedRateLimiter
+	traffic  requestRateMeter
+	active   atomic.Int64
 }
 
 // NewRateLimiter 创建限流器（向后兼容）
@@ -810,6 +866,22 @@ func (rl *RateLimiter) GetRPM() int {
 	return 0
 }
 
+// GetCurrentRPM 返回最近 60 秒实际进入代理路由的请求数。
+func (rl *RateLimiter) GetCurrentRPM() int64 {
+	if rl == nil {
+		return 0
+	}
+	return rl.traffic.rpm(time.Now())
+}
+
+// GetActiveRequests 返回当前仍在处理的代理请求数（包括长连接和流式响应）。
+func (rl *RateLimiter) GetActiveRequests() int64 {
+	if rl == nil {
+		return 0
+	}
+	return rl.active.Load()
+}
+
 // Middleware 返回 Gin 中间件（向后兼容）
 func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -822,6 +894,9 @@ func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 			return
 		}
 
+		rl.traffic.mark(time.Now())
+		rl.active.Add(1)
+		defer rl.active.Add(-1)
 		if rl.enhanced != nil && !rl.enhanced.Allow() {
 			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error": gin.H{
@@ -846,8 +921,8 @@ func (rl *RateLimiter) GetEnhancedLimiter() *EnhancedRateLimiter {
 
 // RateLimitError 限流错误
 type RateLimitError struct {
-	Level   RateLimitLevel
-	Key     string
+	Level      RateLimitLevel
+	Key        string
 	RetryAfter time.Duration
 }
 

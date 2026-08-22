@@ -27,14 +27,22 @@ type HandshakeHTTPError struct {
 
 func (e *HandshakeHTTPError) Error() string { return e.msg }
 
-// handshakeUnauthorizedHTTPResponse 把握手阶段的 401 转换成携带真实状态码与
-// 上游原始错误体的 HTTP 响应，让调用方复用既有非 2xx 分支：usage log 记 401、
-// applyCooldownForModel 的 unauthorized 冷却与 missing_scope 特判、换号重试。
-// 其他状态码保持原有 transport 错误语义（如 503 握手限流仍走粘滞重试），
-// 不在此转换。
-func handshakeUnauthorizedHTTPResponse(err error) (*http.Response, bool) {
+// handshakeAccountErrorHTTPResponse 把握手阶段的账号维度错误转换成携带真实状态码
+// 与上游原始错误体的 HTTP 响应，让调用方复用既有非 2xx 分支：usage log 记真实
+// 状态码、applyCooldownForModel 的 unauthorized 冷却 / missing_scope 特判 /
+// deactivated_workspace 标错、换号重试。覆盖：
+//   - 401：token 失效/撤销；
+//   - 402：工作区被停用（deactivated_workspace）等账号计费维度拒绝——若停留在
+//     transport 错误层，被封 team 空间的账号会一直以"可用"留在池里被反复拨号。
+//
+// 403 不转换：握手 403 可能来自 Cloudflare 拦截（出口 IP 维度），按账号错误分类
+// 会误伤；连同 5xx/503 一起保持 transport 错误语义（握手限流仍走粘滞重试）。
+func handshakeAccountErrorHTTPResponse(err error) (*http.Response, bool) {
 	var hs *HandshakeHTTPError
-	if !errors.As(err, &hs) || hs.StatusCode != http.StatusUnauthorized {
+	if !errors.As(err, &hs) {
+		return nil, false
+	}
+	if hs.StatusCode != http.StatusUnauthorized && hs.StatusCode != http.StatusPaymentRequired {
 		return nil, false
 	}
 	header := http.Header{}

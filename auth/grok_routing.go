@@ -174,7 +174,11 @@ func grokCatalogRoutable(state *GrokRoutingState, now time.Time) bool {
 	return now.Before(state.ObservedAt.Add(grokCatalogStaleIfError))
 }
 
-// GetGrokModelRoute 先选择新鲜的同协议成功探针，否则回退到目录 apiBackend。
+// GetGrokModelRoute 以目录 apiBackend 为上游协议。新鲜同协议探针只决定
+// Native 直通，不能把协议改成和目录不一致的另一条口。
+// 官方 grok-4.6 目录是 responses；Messages 探针只用 user:hi 测通，
+// 若据此把 Claude Code 的 Anthropic 体打到 /v1/messages，上游会 400
+// invalid-argument "Invalid message role"。
 // 找不到具体模型时返回 false，调用者可按凭据类型使用保守默认目录。
 func (a *Account) GetGrokModelRoute(model string, inbound GrokProtocol, now time.Time) (GrokResolvedRoute, bool) {
 	if a == nil {
@@ -236,12 +240,11 @@ func (a *Account) GetGrokModelRoute(model string, inbound GrokProtocol, now time
 		}
 	}
 	native := false
-	if inbound = NormalizeGrokProtocol(string(inbound)); inbound != "" {
+	if inbound = NormalizeGrokProtocol(string(inbound)); inbound != "" && inbound == protocol {
 		for _, capability := range a.grokRouting.Capabilities {
 			if strings.EqualFold(strings.TrimSpace(capability.ModelID), model) &&
 				capability.Protocol == inbound && grokCapabilityFresh(capability, now) &&
 				strings.EqualFold(strings.TrimRight(strings.TrimSpace(capability.Origin), "/"), baseURL) {
-				protocol = inbound
 				native = true
 				break
 			}

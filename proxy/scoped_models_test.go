@@ -86,8 +86,16 @@ func TestScopedModelsIgnoresTransientCooldownButHonorsPaused(t *testing.T) {
 	store.AddAccount(paused)
 	handler := NewHandler(store, nil, nil, nil)
 	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 1})
-	if len(models) != 1 || models[0].ID != "grok-4.5" {
-		t.Fatalf("models = %+v, want stable cooled model only", models)
+	// cooled 账号(短冷却)保留展示,paused 账号整号隐藏;媒体模型集随账号可见性
+	// 一起出现/消失,这里只校验文本模型。
+	textModels := make([]string, 0, len(models))
+	for _, model := range models {
+		if !isGrokMediaModel(model.ID) {
+			textModels = append(textModels, model.ID)
+		}
+	}
+	if len(textModels) != 1 || textModels[0] != "grok-4.5" {
+		t.Fatalf("text models = %v, want stable cooled model only", textModels)
 	}
 }
 
@@ -214,8 +222,16 @@ func TestScopedModelsDeclaredListCannotOverrideCatalogVisibility(t *testing.T) {
 	store.AddAccount(account)
 	handler := NewHandler(store, nil, nil, nil)
 	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 1})
-	if len(models) != 1 || models[0].ID != "visible" {
-		t.Fatalf("models = %+v, explicit config must only narrow visible catalog", models)
+	// 媒体模型是独立能力轴(不在文本目录里),纯文本白名单不关闭它们;
+	// 这里只校验文本模型:目录外/隐藏条目不得被白名单复活。
+	textModels := make([]string, 0, len(models))
+	for _, model := range models {
+		if !isGrokMediaModel(model.ID) {
+			textModels = append(textModels, model.ID)
+		}
+	}
+	if len(textModels) != 1 || textModels[0] != "visible" {
+		t.Fatalf("text models = %v, explicit config must only narrow visible catalog", textModels)
 	}
 	if relayAccountSupportsModel(account, "declared-only") || relayAccountSupportsModel(account, "hidden") {
 		t.Fatal("request admission bypassed catalog visibility")

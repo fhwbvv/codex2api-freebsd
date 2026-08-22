@@ -2,9 +2,12 @@ package proxy
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -24,15 +27,19 @@ import (
 //
 // 明确不改写的部分：
 //   - 出站 Session_id 头：由 resolveUpstreamSessionID 独立决定（默认隔离模式下每请求
-//     随机），收敛不介入，否则会改变 prompt cache 隔离语义。
+//     随机），收敛不介入，否则会改变 prompt cache 隔离语义。注意它与 metadata 里的
+//     session_id 是两套独立身份，开启收敛后两者取值不同属预期。
 //   - turn_id / turn_started_at_unix_ms：客户端逐轮随机值，不标识设备或会话；
 //     重算反而会让头与体、turn_id 与其时间戳彼此不一致，本身就是特征。
 //   - 客户端未携带的字段：只改写已存在的键，绝不新增，避免改变 metadata 的形状。
+//     该规则同样适用于请求头——出站只覆盖下游确实发过的标识头，不凭空补发。
 
 const (
-	codexTurnMetadataHeader   = "X-Codex-Turn-Metadata"
-	codexInstallationIDHeader = "X-Codex-Installation-Id"
-	codexWindowIDHeader       = "X-Codex-Window-Id"
+	codexTurnMetadataHeader    = "X-Codex-Turn-Metadata"
+	codexInstallationIDHeader  = "X-Codex-Installation-Id"
+	codexWindowIDHeader        = "X-Codex-Window-Id"
+	codexClientRequestIDHeader = "X-Client-Request-Id"
+	codexThreadIDHeader        = "Thread-Id"
 )
 
 // codexFingerprintIDs 是一次请求的收敛目标值。全部字段都由「账号 + 下游请求头」
@@ -40,6 +47,7 @@ const (
 // 不需要跨函数传递即可保证一致。
 type codexFingerprintIDs struct {
 	mode           string
+	accountID      int64
 	installationID string
 	sessionID      string
 	threadID       string
@@ -49,8 +57,9 @@ type codexFingerprintIDs struct {
 // deriveStableCodexUUID 从种子确定性派生一个 UUIDv4 格式的字符串：同一种子恒定返回
 // 同一值，跨进程重启也不变，因此无需落库。
 //
-// 这里没有复用 uuid.NewSHA1（本仓库其它确定性 ID 的做法），因为那会产出 v5 UUID，
-// 版本位与真实客户端的 v4 标识不同，本身可被识别。
+// 仅用于 installation_id：抓包实证真实客户端的 installation 标识是 v4，session/thread/
+// window 则是 v7（见 deriveStableCodexUUIDv7）。这里没有复用 uuid.NewSHA1（本仓库其它
+// 确定性 ID 的做法），因为那会产出 v5 UUID，版本位与真实 v4 不同，本身可被识别。
 func deriveStableCodexUUID(seed string) string {
 	sum := sha256.Sum256([]byte(seed))
 	var u uuid.UUID
@@ -60,10 +69,61 @@ func deriveStableCodexUUID(seed string) string {
 	return u.String()
 }
 
+// deriveStableCodexUUIDv7 从种子确定性派生一个 UUIDv7 格式的字符串：前 48 bit 是毫秒
+// 时间戳（big-endian，按 RFC 9562），其余 74 bit 取种子哈希。同一 (种子, 时间戳) 恒定
+// 返回同值，跨进程重启也不变，无需落库。
+//
+// 用于 session / thread / window：抓包实证真实客户端的这三个标识是 UUIDv7，时间戳位
+// 解出的时刻与抓包时刻仅差数秒。之前一律写死 v4 有两处可识别特征——版本 nibble 与真实
+// 不符；更关键的是 v4 无时间序，上游若按 UUID 排序（主键索引 / 日志），一个 v4 会因其
+// 伪随机的"时间戳位"落到与真实会话完全无关的位置、跳到序列顶部或底部（见 #536 评论）。
+// installation_id 真实是 v4，仍走 deriveStableCodexUUID。
+func deriveStableCodexUUIDv7(seed string, unixMilli int64) string {
+	sum := sha256.Sum256([]byte(seed))
+	var u uuid.UUID
+	copy(u[:], sum[:16])
+	ms := uint64(unixMilli)
+	u[0] = byte(ms >> 40)
+	u[1] = byte(ms >> 32)
+	u[2] = byte(ms >> 24)
+	u[3] = byte(ms >> 16)
+	u[4] = byte(ms >> 8)
+	u[5] = byte(ms)
+	u[6] = (u[6] & 0x0f) | 0x70 // version 7
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return u.String()
+}
+
+const (
+	// codexIdentityFallbackEpochMilli 是账号加入时间不可用时的时间戳基准，取一个固定
+	// 的近期时刻（2025-01-01Z），确保派生的 v7 时间戳落在合理区间而不是 1970。
+	codexIdentityFallbackEpochMilli int64 = 1_735_689_600_000
+	// codexIdentitySpreadMilli 是会话时间戳相对基准的散布窗口（30 天）：让同账号的
+	// session / thread / window 及不同线程的 v7 时间戳互不相同，又不至于漂移到远离
+	// 账号存在期。真实客户端每个会话都会新建一批时间戳相近但互异的标识。
+	codexIdentitySpreadMilli int64 = 30 * 24 * 60 * 60 * 1000
+)
+
+// codexIdentityUnixMilli 为账号的收敛身份 UUID 派生一个确定性毫秒时间戳，用作 v7 的
+// 时间戳位。以账号加入时间为基准（随新账号自然前移，避免所有收敛值挤在同一固定时刻），
+// 叠加一个由种子派生的有界偏移，使 session / thread / window 及不同线程的时间戳互不
+// 相同而仍聚集在账号存在期附近。全程只依赖账号加入时间和种子，不引入 time.Now，因此
+// 保持"同种子恒定、无需落库"的性质。
+func codexIdentityUnixMilli(account *auth.Account, seed string) int64 {
+	base := atomic.LoadInt64(&account.AddedAt) / int64(time.Millisecond)
+	if base <= 0 {
+		base = codexIdentityFallbackEpochMilli
+	}
+	sum := sha256.Sum256([]byte("codex2api:codex-identity-ts:v1:" + seed))
+	offset := int64(binary.BigEndian.Uint64(sum[:8]) % uint64(codexIdentitySpreadMilli))
+	return base + offset
+}
+
 // resolveCodexFingerprintIDs 按账号配置推导收敛目标值，off 档或账号缺失时返回 nil。
 //
-// downstreamHeaders 是下游客户端的原始请求头，用于取客户端真实会话标识来派生
-// thread_id —— 这样每个真实 Codex 会话在上游对应一个独立线程，而不是全部压成一条。
+// downstreamHeaders 是下游客户端的原始请求头，用于取客户端真实会话/线程标识来派生
+// thread_id。session 档：同一客户端会话一条线程；会话与线程不同（子代理）时按真实
+// thread 再拆一条，避免 X-Client-Request-Id 塌缩后 previous_response_id 找不到。
 func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.Header) *codexFingerprintIDs {
 	if account == nil {
 		return nil
@@ -79,6 +139,7 @@ func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.He
 
 	ids := &codexFingerprintIDs{
 		mode:           mode,
+		accountID:      accountID,
 		installationID: resolveConvergedInstallationID(account, accountID),
 	}
 	if ids.installationID == "" {
@@ -88,11 +149,25 @@ func resolveCodexFingerprintIDs(account *auth.Account, downstreamHeaders http.He
 		return ids
 	}
 
-	ids.sessionID = deriveStableCodexUUID(fmt.Sprintf("codex2api:codex-session-id:v1:%d", accountID))
+	sessionSeed := fmt.Sprintf("codex2api:codex-session-id:v1:%d", accountID)
+	ids.sessionID = deriveStableCodexUUIDv7(sessionSeed, codexIdentityUnixMilli(account, sessionSeed))
 	ids.threadID = ids.sessionID
 	if mode == auth.CodexFingerprintModeSession {
-		if clientSessionID := extractClientCodexSessionID(downstreamHeaders); clientSessionID != "" {
-			ids.threadID = deriveStableCodexUUID(fmt.Sprintf("codex2api:codex-thread-id:v1:%d:%s", accountID, clientSessionID))
+		clientSessionID, clientThreadID := extractClientCodexIdentity(downstreamHeaders)
+		var threadSeed string
+		switch {
+		case clientThreadID != "" && clientSessionID != "" && clientThreadID != clientSessionID:
+			// 子代理 / 多窗口：真实 thread 与 session 不同。仍按会话派生会把
+			// 多条线程收成一条，X-Client-Request-Id（实测恒等于 thread-id）
+			// 跟着塌缩后，上游按线程查找 previous_response_id 就会 400（#541）。
+			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v2:%d:%s", accountID, clientThreadID)
+		case clientSessionID != "":
+			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v1:%d:%s", accountID, clientSessionID)
+		case clientThreadID != "":
+			threadSeed = fmt.Sprintf("codex2api:codex-thread-id:v1:%d:%s", accountID, clientThreadID)
+		}
+		if threadSeed != "" {
+			ids.threadID = deriveStableCodexUUIDv7(threadSeed, codexIdentityUnixMilli(account, threadSeed))
 		}
 	}
 	ids.windowID = ids.threadID + ":0"
@@ -161,14 +236,81 @@ func ApplyCodexFingerprintHeaders(outbound http.Header, account *auth.Account, d
 		}
 	}
 
-	// 仅对确有 Codex 引擎特征的下游请求补发标识头。
+	// X-Client-Request-Id 按白名单原样透传（codexAllowedForwardHeaders）。实测真实
+	// 客户端把它取成与自身 thread_id 相同的值，因此不处理就等于把下游用户的原始
+	// 线程标识直接送到上游，与已收敛的 metadata 各说各话。只在它确实复用了客户端
+	// 自报的会话/线程标识时改写；取值本就与身份无关时保持原样。
+	if converged := convergedClientRequestID(outbound.Get(codexClientRequestIDHeader), ids, downstreamHeaders); converged != "" {
+		outbound.Set(codexClientRequestIDHeader, converged)
+	}
+
+	// 仅对确有 Codex 引擎特征的下游请求处理标识头。
 	if !EvaluateEngineFingerprint(downstreamHeaders, nil, nil) {
 		return
 	}
-	outbound.Set(codexInstallationIDHeader, ids.installationID)
-	if ids.windowID != "" {
-		outbound.Set(codexWindowIDHeader, ids.windowID)
+	// 只覆盖下游确实发过的标识头。实测真实 Codex CLI 只发 x-codex-window-id，
+	// 从不发 x-codex-installation-id（installation_id 只存在于 turn metadata JSON 里）：
+	// 无条件补发等于给请求添一个真实客户端不会有的头，与收敛目标相反。
+	overrideExistingHeader(outbound, downstreamHeaders, codexInstallationIDHeader, ids.installationID)
+	overrideExistingHeader(outbound, downstreamHeaders, codexWindowIDHeader, ids.windowID)
+}
+
+// overrideExistingHeader 仅在下游确实发过该头时，用收敛值覆盖出站取值。
+// 判定读下游头而非出站头：这两个标识头都不在 codexAllowedForwardHeaders 里，
+// 下游即使发了，到这一步出站请求上也没有。
+func overrideExistingHeader(outbound, downstreamHeaders http.Header, name, value string) {
+	if value == "" || downstreamHeaders == nil {
+		return
 	}
+	if strings.TrimSpace(downstreamHeaders.Get(name)) == "" {
+		return
+	}
+	outbound.Set(name, value)
+}
+
+// convergedClientRequestID 在 X-Client-Request-Id 复用了客户端自报身份时返回对应的
+// 收敛值，否则返回空串表示不改写。device 档没有会话级收敛值，恒不改写。
+func convergedClientRequestID(current string, ids *codexFingerprintIDs, downstreamHeaders http.Header) string {
+	current = strings.TrimSpace(current)
+	if current == "" || ids == nil || ids.threadID == "" {
+		return ""
+	}
+	clientSessionID, clientThreadID := extractClientCodexIdentity(downstreamHeaders)
+	switch {
+	case clientThreadID != "" && current == clientThreadID:
+		return ids.threadID
+	case clientSessionID != "" && current == clientSessionID:
+		return ids.sessionID
+	default:
+		return ""
+	}
+}
+
+// extractClientCodexIdentity 取下游自报的原始会话/线程标识，用于判断别的头是否
+// 重复携带了同一个值。与 extractClientCodexSessionID 分开实现：后者是收敛值的派生
+// 输入，改动它会让既有账号已经稳定的 thread_id 发生漂移。
+func extractClientCodexIdentity(headers http.Header) (sessionID, threadID string) {
+	if headers == nil {
+		return "", ""
+	}
+	for _, name := range []string{"Session-Id", "Session_id"} {
+		if value := strings.TrimSpace(headers.Get(name)); value != "" {
+			sessionID = value
+			break
+		}
+	}
+	threadID = strings.TrimSpace(headers.Get(codexThreadIDHeader))
+	raw := strings.TrimSpace(headers.Get(codexTurnMetadataHeader))
+	if raw == "" || !gjson.Valid(raw) {
+		return sessionID, threadID
+	}
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(gjson.Get(raw, "session_id").String())
+	}
+	if threadID == "" {
+		threadID = strings.TrimSpace(gjson.Get(raw, "thread_id").String())
+	}
+	return sessionID, threadID
 }
 
 // ApplyCodexFingerprintToBody 收敛请求体 client_metadata 中的设备指纹。
@@ -234,7 +376,117 @@ func rewriteCodexTurnMetadataJSON(raw string, ids *codexFingerprintIDs) (string,
 		raw = updated
 		changed = true
 	}
+	if scrubbed, ok := scrubCodexWorkspaces(raw, ids.accountID); ok {
+		raw = scrubbed
+		changed = true
+	}
 	return raw, changed
+}
+
+// scrubCodexWorkspaces 抹掉 turn metadata 里的工作区身份。
+//
+// workspaces 以本地绝对路径为键（含系统用户名），条目里带 git remote URL 和 commit
+// hash。多人共享一个账号时，这些字段会把每个下游用户的身份原样送到上游——同一个
+// installation_id 下面挂着一堆互不相干的仓库地址和用户名目录，既是隐私泄漏，也让
+// 前面几项标识的收敛失去意义。
+//
+// 处理方式是收敛而非删除：路径键换成按原值派生的占位符（条目数与互异性都保留，
+// 不改变 metadata 形状），remote URL 整体移除，commit hash 换成派生占位值——
+// commit hash 是全局唯一的仓库标记，公开仓库可直接反查到归属，留着它等于换个
+// 字段泄漏 remote URL 同样的身份。
+//
+// 所有派生值都带 accountID：否则同一个下游用户的同一路径在不同账号下会得到相同
+// 占位符，上游据此就能把两个账号关联到同一个人。这也与本文件其它收敛值的种子
+// 惯例一致（见 resolveConvergedInstallationID）。
+func scrubCodexWorkspaces(raw string, accountID int64) (string, bool) {
+	workspaces := gjson.Get(raw, "workspaces")
+	if !workspaces.IsObject() {
+		return raw, false
+	}
+
+	rebuilt := "{}"
+	changed := false
+	failed := false
+	workspaces.ForEach(func(key, value gjson.Result) bool {
+		entry := value.Raw
+		if gjson.Get(entry, "associated_remote_urls").Exists() {
+			if updated, err := sjson.Delete(entry, "associated_remote_urls"); err == nil {
+				entry = updated
+				changed = true
+			}
+		}
+		originalPath := key.String()
+		placeholder := originalPath
+		// 已是占位符就保持原样：重试链路可能把改写过的载荷再送进来一次，
+		// 二次哈希会让同一工作区在不同尝试间漂移。
+		if !isPlaceholderWorkspacePath(originalPath) {
+			placeholder = placeholderWorkspacePath(accountID, originalPath)
+			changed = true
+		}
+		// commit hash 的占位值从「已派生的占位路径」导出，而不是从原哈希导出：
+		// 二次处理时路径已是占位符、导出结果不变，幂等性随之成立，同时不同工作区
+		// 仍得到互不相同的哈希。
+		if hash := gjson.Get(entry, "latest_git_commit_hash"); hash.Type == gjson.String && hash.String() != "" {
+			if replacement := placeholderCommitHash(accountID, placeholder); replacement != hash.String() {
+				if updated, err := sjson.Set(entry, "latest_git_commit_hash", replacement); err == nil {
+					entry = updated
+					changed = true
+				}
+			}
+		}
+		updated, err := sjson.SetRaw(rebuilt, placeholder, entry)
+		if err != nil {
+			failed = true
+			return false
+		}
+		rebuilt = updated
+		return true
+	})
+	if failed || !changed {
+		return raw, false
+	}
+
+	updated, err := sjson.SetRaw(raw, "workspaces", rebuilt)
+	if err != nil {
+		return raw, false
+	}
+	return updated, true
+}
+
+// placeholderWorkspacePath 把本地路径映射成稳定占位符：同一路径恒定得到同一占位符，
+// 不同路径互不相同，且不携带用户名或项目名。返回值不含 sjson 的路径元字符
+// （. * ?），可直接作为 sjson 路径使用。
+func placeholderWorkspacePath(accountID int64, original string) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "codex2api:workspace-path:v2:%d:%s", accountID, original))
+	return workspacePlaceholderPrefix + fmt.Sprintf("%x", sum[:workspacePlaceholderDigestBytes])
+}
+
+// placeholderCommitHash 派生一个与真实 commit hash 等长（40 位十六进制）的占位值，
+// 保持字段形状不变。种子取占位路径而非原哈希，见调用点说明。
+func placeholderCommitHash(accountID int64, placeholderPath string) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "codex2api:workspace-commit:v1:%d:%s", accountID, placeholderPath))
+	return fmt.Sprintf("%x", sum[:20])
+}
+
+const (
+	workspacePlaceholderPrefix = "/workspace/"
+	// 32 bit 对低熵的本地路径来说太窄——既可能撞键把两个工作区并成一个，
+	// 也便于用候选路径表反查。64 bit 无额外代价。
+	workspacePlaceholderDigestBytes = 8
+)
+
+// isPlaceholderWorkspacePath 判断路径是否已经是本函数产出的占位符，用于让抹除保持幂等。
+func isPlaceholderWorkspacePath(path string) bool {
+	suffix, ok := strings.CutPrefix(path, workspacePlaceholderPrefix)
+	if !ok || len(suffix) != workspacePlaceholderDigestBytes*2 {
+		return false
+	}
+	for _, r := range suffix {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // setExistingJSONString 只在目标路径已存在时替换其值，避免给客户端未携带该字段的

@@ -3,11 +3,77 @@ package proxy
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
+
+func TestRequestRateMeterRollingMinute(t *testing.T) {
+	var meter requestRateMeter
+	base := time.Unix(1_800_000_000, 0)
+	for i := 0; i < 3; i++ {
+		meter.mark(base)
+	}
+	for i := 0; i < 2; i++ {
+		meter.mark(base.Add(55 * time.Second))
+	}
+	if got := meter.rpm(base.Add(55 * time.Second)); got != 5 {
+		t.Fatalf("rpm in rolling minute = %d, want 5", got)
+	}
+	if got := meter.rpm(base.Add(61 * time.Second)); got != 2 {
+		t.Fatalf("rpm after oldest bucket expired = %d, want 2", got)
+	}
+}
+
+func TestRequestRateMeterConcurrentMarks(t *testing.T) {
+	var meter requestRateMeter
+	now := time.Unix(1_800_000_000, 0)
+	const workers = 32
+	const perWorker = 1000
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				meter.mark(now)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := meter.rpm(now); got != workers*perWorker {
+		t.Fatalf("concurrent rpm = %d, want %d", got, workers*perWorker)
+	}
+}
+
+func TestRateLimiterTracksTrafficWhenLimitDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	limiter := NewRateLimiter(0)
+	router := gin.New()
+	router.Use(limiter.Middleware())
+	activeSeen := int64(0)
+	router.GET("/v1/test", func(c *gin.Context) {
+		activeSeen = limiter.GetActiveRequests()
+		c.Status(http.StatusNoContent)
+	})
+	router.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/test", nil))
+	if got := limiter.GetCurrentRPM(); got != 1 {
+		t.Fatalf("tracked RPM = %d, want 1 with global limit disabled", got)
+	}
+	if activeSeen != 1 || limiter.GetActiveRequests() != 0 {
+		t.Fatalf("active requests seen/final = %d/%d, want 1/0", activeSeen, limiter.GetActiveRequests())
+	}
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/health", nil))
+	if got := limiter.GetCurrentRPM(); got != 1 {
+		t.Fatalf("health request changed tracked RPM to %d", got)
+	}
+}
 
 // ============ Token Bucket Tests ============
 
@@ -167,7 +233,7 @@ func TestCooldownManager_MaxLevel(t *testing.T) {
 	cm := newCooldownManager()
 
 	// 尝试超过最大等级
-	for i := 0; i < len(cooldownDurations) + 10; i++ {
+	for i := 0; i < len(cooldownDurations)+10; i++ {
 		cm.enterCooldown()
 	}
 

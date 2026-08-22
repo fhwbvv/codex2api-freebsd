@@ -59,9 +59,15 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 
 	// 今日口径与全局统计一致:服务器时区(TZ 配置,默认宿主时区)当天 0 点起。
 	// 失败时整列不下发,让前端保持占位,避免把"查询失败"显示成 0。
-	usageToday, todayErr := h.db.GetAccountUsageSinceByIDs(ctx, ids, database.StartOfDay(now))
+	todaySince := database.StartOfDay(now)
+	usageToday, todayErr := h.db.GetAccountUsageSinceByIDs(ctx, ids, todaySince)
 	if todayErr != nil {
 		log.Printf("获取当前页账号今日用量失败: %v", todayErr)
+	}
+	todayModels, todayModelErr := h.db.GetAccountModelCountsSinceByIDs(ctx, ids, todaySince)
+	if todayModelErr != nil {
+		log.Printf("获取当前页账号今日模型分布失败: %v", todayModelErr)
+		todayModels = map[int64]map[string]database.AccountModelCount{}
 	}
 
 	billing5hWindows, billing7dWindows := h.accountBillingWindows(ids)
@@ -106,6 +112,14 @@ func (h *Handler) GetAccountPageStats(c *gin.Context) {
 				todayWindow.Tokens = value.Tokens
 				todayWindow.AccountBilled = value.AccountBilled
 				todayWindow.UserBilled = value.UserBilled
+			}
+			if models := todayModels[id]; len(models) > 0 {
+				todayWindow.ModelCounts = make(map[string]int64, len(models))
+				todayWindow.ModelSuccessCounts = make(map[string]int64, len(models))
+				for model, count := range models {
+					todayWindow.ModelCounts[model] = count.Requests
+					todayWindow.ModelSuccessCounts[model] = count.Success
+				}
 			}
 			item.UsageTodayDetail = todayWindow
 		}

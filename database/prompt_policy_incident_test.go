@@ -102,6 +102,12 @@ func TestPromptPolicyIncidentPersistsNullableScoresAndExactEvidenceLink(t *testi
 	if err != nil || len(items) != 1 || items[0].ID != got.CandidateEvidenceID || items[0].PromptPolicyIncidentID != incident.IncidentID {
 		t.Fatalf("candidate evidence link items=%#v err=%v", items, err)
 	}
+	for _, auditReference := range []string{incident.IncidentID, incident.RequestCorrelationID} {
+		incidents, total, err := db.ListPromptPolicyIncidentsPage(ctx, PromptPolicyIncidentQuery{Page: 1, PageSize: 10, Query: auditReference})
+		if err != nil || total != 1 || len(incidents) != 1 || incidents[0].IncidentID != incident.IncidentID {
+			t.Fatalf("audit reference %q did not locate incident: total=%d incidents=%#v err=%v", auditReference, total, incidents, err)
+		}
+	}
 
 	notRun, notRunCandidate, notRunEvidence := promptPolicyTestInputs("incident-not-run")
 	notRun.LocalEvaluationState = PromptPolicyEvaluationNotRun

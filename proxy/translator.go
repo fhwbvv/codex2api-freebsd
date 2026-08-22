@@ -816,9 +816,9 @@ func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 // them to be forwarded as conversation context; the upstream rejects the type
 // with "Invalid input type 'compaction' at index N", so we translate in place.
 //
-// Compact v2 (newer Codex CLI) items are left untouched: compaction items
-// carrying "encrypted_content" originate from the upstream itself and must be
-// forwarded verbatim, or the compacted conversation context is lost.
+// Opaque Compact v2 items are left untouched so they remain source-affine.
+// Known reversible emulated envelopes are decoded into the same developer
+// summary representation as plaintext compaction items.
 func normalizeResponsesCompactionItems(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -828,8 +828,6 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 		return false
 	}
 
-	const summaryPrefix = "[Conversation summary from earlier turns]\n"
-
 	modified := false
 	out := make([]any, 0, len(inputItems))
 	for _, raw := range inputItems {
@@ -838,13 +836,24 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			out = append(out, raw)
 			continue
 		}
-		if firstNonEmptyAnyString(itemMap["type"]) != "compaction" {
+		itemType := firstNonEmptyAnyString(itemMap["type"])
+		if !isResponsesCompactionItemType(itemType) {
 			out = append(out, raw)
 			continue
 		}
 
-		// compact v2: 加密压缩项由上游生成并原生支持，必须原样透传
-		if firstNonEmptyAnyString(itemMap["encrypted_content"]) != "" {
+		if encryptedContent := firstNonEmptyAnyString(itemMap["encrypted_content"]); encryptedContent != "" {
+			rawEncryptedContent, _ := itemMap["encrypted_content"].(string)
+			if summaryText, portable := decodePortableCompactionSummary(rawEncryptedContent); portable {
+				out = append(out, responsesCompactionDeveloperMessage(summaryText))
+				modified = true
+				continue
+			}
+			// Unknown encrypted state must be forwarded verbatim.
+			out = append(out, raw)
+			continue
+		}
+		if itemType != "compaction" {
 			out = append(out, raw)
 			continue
 		}
@@ -858,16 +867,7 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			continue
 		}
 
-		out = append(out, map[string]any{
-			"type": "message",
-			"role": "developer",
-			"content": []any{
-				map[string]any{
-					"type": "input_text",
-					"text": summaryPrefix + summaryText,
-				},
-			},
-		})
+		out = append(out, responsesCompactionDeveloperMessage(summaryText))
 		modified = true
 	}
 
@@ -2201,6 +2201,10 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	// 7. 删除 Codex 不支持的字段
 	// 注意：prompt_cache_retention 上游(HTTP 与 WS 路径)均不接受，会返回
 	// 400 Unsupported parameter，因此在此一并剥离，executor / wsrelay 层也各自兜底删除。
+	// 顶层 type 是 Responses WS 事件信封字段(response.create)，native WS ingress 会
+	// 注入/保留它，HTTP /responses 上游不接受(400 Unsupported parameter: type)；
+	// WS 出站由 wsrelay 统一重设该字段，此处删除对 WS 路径无影响(issue #548)。
+	// map 上的 delete 只作用于顶层，input[]/tools 等嵌套对象里的合法 type 不受影响。
 	for _, field := range []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
@@ -2208,7 +2212,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		"logit_bias", "response_format", "serviceTier", "metadata",
 		"stream_options", "reasoning_effort", "truncation", "context_management",
 		"disable_response_storage", "verbosity",
-		"prompt_cache_retention", "safety_identifier",
+		"prompt_cache_retention", "safety_identifier", "type",
 	} {
 		delete(body, field)
 	}
@@ -2219,6 +2223,10 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	result, err := json.Marshal(body)
 	if err != nil {
 		return rawBody, expandedInputRaw
+	}
+	result = normalizeCompactionTriggerFinal(result, false)
+	if requestBodyHasCompactionTrigger(result) {
+		expandedInputRaw = gjson.GetBytes(result, "input").Raw
 	}
 	return result, expandedInputRaw
 }
@@ -2269,6 +2277,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	if err != nil {
 		return rawBody
 	}
+	result = normalizeCompactionTriggerFinal(result, false)
 	return result
 }
 
@@ -3462,6 +3471,12 @@ func TranslateStreamChunk(eventData []byte, model string, chunkID string, create
 		usage := extractUsage(eventData)
 		return newFinalChunk(chunkID, model, created, "stop", usage), true
 
+	// max_output_tokens 截断的正常终态：Chat 侧对应 finish_reason=length。
+	case "response.incomplete":
+		usage := extractUsage(eventData)
+		reason := gjson.GetBytes(eventData, "response.incomplete_details.reason").String()
+		return newFinalChunk(chunkID, model, created, responsesIncompleteFinishReason(eventType, reason), usage), true
+
 	case "response.failed":
 		errMsg := gjson.GetBytes(eventData, "response.error.message").String()
 		if errMsg == "" {
@@ -3584,11 +3599,15 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
 		return nil, false
 
-	case "response.completed":
+	case "response.completed", "response.incomplete":
 		usage := extractUsageFromResult(parsed.Get("response.usage"))
 		finishReason := "stop"
 		if st.HasToolCalls {
 			finishReason = "tool_calls"
+		}
+		// 截断态覆盖推导值：stop / tool_calls 会把半截输出说成正常收尾。
+		if override := responsesIncompleteFinishReason(eventType, parsed.Get("response.incomplete_details.reason").String()); override != "" {
+			finishReason = override
 		}
 		return newFinalChunk(st.ChunkID, st.Model, st.Created, finishReason, usage), true
 
@@ -3691,6 +3710,13 @@ func TranslateCompactResponse(responseData []byte, model string, id string) []by
 // 当有 toolCalls 且 content 为空时，content 输出为 JSON null
 // reasoning 为思考过程拼接文本,空字符串时 reasoning / reasoning_content 字段被省略。
 func BuildCompactResponse(id, model string, created int64, content, reasoning string, toolCalls []ToolCallResult, usage *UsageInfo) []byte {
+	return BuildCompactResponseWithFinishReason(id, model, created, content, reasoning, toolCalls, usage, "")
+}
+
+// BuildCompactResponseWithFinishReason 同上，额外允许调用方覆盖 finish_reason。
+// 上游按 max_output_tokens 截断时终态是 response.incomplete，推导值 stop /
+// tool_calls 会把截断响应说成正常收尾，需要覆盖成 length。空串表示不覆盖。
+func BuildCompactResponseWithFinishReason(id, model string, created int64, content, reasoning string, toolCalls []ToolCallResult, usage *UsageInfo, finishReasonOverride string) []byte {
 	finishReason := "stop"
 	msg := compactMessage{
 		Role:    "assistant",
@@ -3716,6 +3742,9 @@ func BuildCompactResponse(id, model string, created int64, content, reasoning st
 			msg.ToolCalls[i].Function.Name = tc.Name
 			msg.ToolCalls[i].Function.Arguments = tc.Arguments
 		}
+	}
+	if finishReasonOverride != "" {
+		finishReason = finishReasonOverride
 	}
 
 	resp := openAICompactResponse{

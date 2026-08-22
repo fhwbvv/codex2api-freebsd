@@ -5,26 +5,34 @@ import (
 	"time"
 )
 
-func TestGrokRoutingStatePrefersFreshNativeCapability(t *testing.T) {
+func TestGrokRoutingStateCatalogBackendBeatsCrossProtocolProbe(t *testing.T) {
 	account := &Account{UpstreamType: UpstreamGrok, AccessToken: "at", BaseURL: "https://account.example/v1", CredentialGeneration: 3}
 	now := time.Now()
 	account.SetGrokRoutingState(GrokRoutingState{
 		CredentialGeneration: 3,
 		Models:               []GrokModelRoute{{ModelID: "grok-4.5", BaseURL: "https://catalog.example/v1", APIBackend: GrokProtocolResponses}},
-		Capabilities:         []GrokProtocolCapability{{ModelID: "grok-4.5", Origin: "https://catalog.example/v1", Protocol: GrokProtocolMessages, Status: GrokCapabilityOK, ObservedAt: now, ExpiresAt: now.Add(time.Hour)}},
+		Capabilities: []GrokProtocolCapability{
+			{ModelID: "grok-4.5", Origin: "https://catalog.example/v1", Protocol: GrokProtocolMessages, Status: GrokCapabilityOK, ObservedAt: now, ExpiresAt: now.Add(time.Hour)},
+			{ModelID: "grok-4.5", Origin: "https://catalog.example/v1", Protocol: GrokProtocolResponses, Status: GrokCapabilityOK, ObservedAt: now, ExpiresAt: now.Add(time.Hour)},
+		},
 	})
 
 	route, ok := account.GetGrokModelRoute("GROK-4.5", GrokProtocolMessages, now)
 	if !ok {
 		t.Fatal("route not found")
 	}
-	if route.Protocol != GrokProtocolMessages || route.BaseURL != "https://catalog.example/v1" || !route.Native {
-		t.Fatalf("route = %#v", route)
+	if route.Protocol != GrokProtocolResponses || route.BaseURL != "https://catalog.example/v1" || route.Native {
+		t.Fatalf("Messages probe must not override catalog Responses: %#v", route)
 	}
 
 	route, ok = account.GetGrokModelRoute("grok-4.5", GrokProtocolChatCompletions, now)
 	if !ok || route.Protocol != GrokProtocolResponses || route.Native {
 		t.Fatalf("catalog fallback route = %#v, ok=%v", route, ok)
+	}
+
+	route, ok = account.GetGrokModelRoute("grok-4.5", GrokProtocolResponses, now)
+	if !ok || route.Protocol != GrokProtocolResponses || !route.Native {
+		t.Fatalf("same-protocol Responses probe should stay native: %#v, ok=%v", route, ok)
 	}
 }
 

@@ -11,6 +11,11 @@ import (
 const premium5hFallbackWindow = 5 * time.Hour
 const premium5hCooldownReason = "rate_limited_5h"
 
+// ResponsesRateLimitedCooldownReason marks authoritative upstream rejection.
+// It must remain distinct from WHAM-derived cooldowns so an active turn can
+// bypass only the latter when IgnoreUsageLimitStatus is enabled.
+const ResponsesRateLimitedCooldownReason = "responses_rate_limited"
+
 // NormalizePlanType canonicalizes a plan string for behavior-level comparisons.
 // OpenAI reports the $100 Pro tier as "prolite"; functionally it is a Pro plan
 // with a smaller usage cap, so we fold it into "pro" so that downstream plan
@@ -254,11 +259,24 @@ func (s *Store) MarkPremium5hRateLimitedAt(acc *Account, resetAt, observedAt tim
 	return acc.ApplyUsageObservation(observedAt, func() {
 		// observedAt orders competing upstream observations; stateAt reflects
 		// when the state is actually applied after any preceding DB/identity work.
-		s.markPremium5hRateLimited(acc, resetAt, time.Now())
+		s.markPremium5hRateLimited(acc, resetAt, time.Now(), premium5hCooldownReason)
 	})
 }
 
-func (s *Store) markPremium5hRateLimited(acc *Account, resetAt, observedAt time.Time) {
+// MarkResponsesPremium5hRateLimited records a 429 returned by /responses.
+// Unlike a WHAM snapshot, this is authoritative evidence that even an active
+// turn may no longer send another request.
+func (s *Store) MarkResponsesPremium5hRateLimited(acc *Account, resetAt time.Time) {
+	if acc == nil || s == nil {
+		return
+	}
+	now := time.Now()
+	_ = acc.ApplyUsageObservation(now, func() {
+		s.markPremium5hRateLimited(acc, resetAt, time.Now(), ResponsesRateLimitedCooldownReason)
+	})
+}
+
+func (s *Store) markPremium5hRateLimited(acc *Account, resetAt, observedAt time.Time, cooldownReason string) {
 	now := observedAt
 	if now.IsZero() {
 		now = time.Now()
@@ -275,7 +293,7 @@ func (s *Store) markPremium5hRateLimited(acc *Account, resetAt, observedAt time.
 	acc.LastRateLimitedAt = now
 	acc.Status = StatusCooldown
 	acc.CooldownUtil = resetAt
-	acc.CooldownReason = premium5hCooldownReason
+	acc.CooldownReason = cooldownReason
 	if acc.HealthTier != HealthTierBanned {
 		acc.HealthTier = HealthTierRisky
 	}
@@ -283,7 +301,7 @@ func (s *Store) markPremium5hRateLimited(acc *Account, resetAt, observedAt time.
 	acc.mu.Unlock()
 
 	s.fastSchedulerUpdate(acc)
-	s.setCachedAccountCooldown(acc.DBID, premium5hCooldownReason, resetAt)
+	s.setCachedAccountCooldown(acc.DBID, cooldownReason, resetAt)
 
 	if s.db == nil {
 		return
@@ -291,7 +309,7 @@ func (s *Store) markPremium5hRateLimited(acc *Account, resetAt, observedAt time.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.db.SetCooldown(ctx, acc.DBID, premium5hCooldownReason, resetAt); err != nil {
+	if err := s.db.SetCooldown(ctx, acc.DBID, cooldownReason, resetAt); err != nil {
 		log.Printf("[账号 %d] 持久化 premium 5h 限流冷却状态失败: %v", acc.DBID, err)
 	}
 	if err := s.db.UpdateUsageSnapshot5h(ctx, acc.DBID, 100, resetAt, now); err != nil {

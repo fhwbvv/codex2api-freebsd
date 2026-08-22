@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,8 +21,8 @@ import (
 )
 
 const (
-	DefaultReviewBaseURL                = "https://api.openai.com"
-	DefaultReviewModel                  = "omni-moderation-latest"
+	DefaultReviewBaseURL                = "https://api.deepseek.com"
+	DefaultReviewModel                  = "deepseek-v4-flash"
 	DefaultReviewTimeoutSeconds         = 10
 	DefaultReviewRequestMode            = ReviewRequestModeModerations
 	DefaultReviewScope                  = ReviewScopeAllRequests
@@ -268,7 +269,15 @@ func NormalizeReviewConfig(cfg ReviewConfig) ReviewConfig {
 	if cfg.TimeoutSeconds > 60 {
 		cfg.TimeoutSeconds = 60
 	}
+	explicitMode := strings.ToLower(strings.TrimSpace(cfg.Adapter.RequestMode))
 	cfg.Adapter = NormalizeReviewAdapterConfig(cfg.Adapter)
+	// 请求模式未显式配置时按模型推断:moderation 系列走 /moderations,其余
+	// (deepseek-v4-flash 等对话模型)走 /chat/completions。既有部署的
+	// omni-moderation-latest 继续落在 moderations,不受默认供应商切换影响。
+	if explicitMode != ReviewRequestModeChatCompletions && explicitMode != ReviewRequestModeModerations &&
+		!strings.Contains(strings.ToLower(cfg.Model), "moderation") {
+		cfg.Adapter.RequestMode = ReviewRequestModeChatCompletions
+	}
 	return cfg
 }
 
@@ -425,11 +434,63 @@ type reviewModelResponseError struct {
 }
 
 type reviewHTTPStatusError struct {
-	status int
+	status      int
+	contentType string
+	summary     string
 }
 
 func (e *reviewHTTPStatusError) Error() string {
-	return fmt.Sprintf("review request failed with status %d", e.status)
+	message := fmt.Sprintf("review request failed with status %d", e.status)
+	if e.contentType != "" {
+		message += " (" + e.contentType + ")"
+	}
+	if e.summary != "" {
+		message += ": " + e.summary
+	}
+	return message
+}
+
+func summarizeReviewHTTPBody(contentType string, body []byte) string {
+	if strings.Contains(strings.ToLower(contentType), "text/html") {
+		return "upstream returned an HTML error page; check the Base URL, proxy route, and provider endpoint"
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return "upstream returned an empty error body"
+	}
+	var decoded struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(body, &decoded) == nil {
+		parts := make([]string, 0, 2)
+		if decoded.Error.Message != "" {
+			parts = append(parts, decoded.Error.Message)
+		}
+		if decoded.Error.Code != "" {
+			parts = append(parts, "code="+decoded.Error.Code)
+		}
+		if decoded.Message != "" && len(parts) == 0 {
+			parts = append(parts, decoded.Message)
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "; ")
+		}
+	}
+	clean := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, trimmed)
+	if len([]rune(clean)) > 240 {
+		clean = string([]rune(clean)[:240]) + "…"
+	}
+	return clean
 }
 
 type reviewKeyCooldown struct {
@@ -797,15 +858,18 @@ func (c ReviewClient) reviewOnce(ctx context.Context, endpoint, apiKey string, p
 		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, true, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, reviewStatusRetriable(resp.StatusCode), &reviewHTTPStatusError{status: resp.StatusCode}
-	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReviewResponseBytes+1))
 	if err != nil {
 		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, false, err
 	}
 	if len(body) > maxReviewResponseBytes {
 		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, false, fmt.Errorf("review response exceeds %d bytes", maxReviewResponseBytes)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		return ReviewOutcome{Model: cfg.Model, Endpoint: endpoint}, reviewStatusRetriable(resp.StatusCode), &reviewHTTPStatusError{
+			status: resp.StatusCode, contentType: contentType, summary: summarizeReviewHTTPBody(contentType, body),
+		}
 	}
 	var outcome ReviewOutcome
 	if cfg.Adapter.RequestMode == ReviewRequestModeChatCompletions {
@@ -948,6 +1012,119 @@ func reviewEndpointForMode(baseURL, requestMode string) (string, error) {
 	parsed.RawQuery = ""
 	parsed.Fragment = ""
 	return parsed.String(), nil
+}
+
+// maxReviewModelsResponseBytes 单独放宽:聚合网关的模型列表可能远大于单条审查响应。
+const maxReviewModelsResponseBytes = 1024 * 1024
+
+// reviewModelsEndpoint 构造供应商的模型列表端点(OpenAI 兼容 GET /v1/models)。
+// 允许 base_url 直接填到请求端点,剥掉已知后缀再拼 /models。
+func reviewModelsEndpoint(baseURL string) (string, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		baseURL = DefaultReviewBaseURL
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("review base_url must start with http:// or https://")
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("review base_url must not contain embedded credentials")
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	pathLower := strings.ToLower(path)
+	for _, suffix := range []string{"/chat/completions", "/moderations", "/models"} {
+		if strings.HasSuffix(pathLower, suffix) {
+			path = path[:len(path)-len(suffix)]
+			pathLower = strings.ToLower(path)
+			break
+		}
+	}
+	if strings.HasSuffix(pathLower, "/v1") {
+		parsed.Path = path + "/models"
+	} else {
+		parsed.Path = path + "/v1/models"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+// ListReviewModels 拉取审查供应商的模型列表,依次尝试配置的每个 key,任一成功即返回。
+func (c ReviewClient) ListReviewModels(ctx context.Context, cfg ReviewConfig) ([]string, string, error) {
+	cfg = NormalizeReviewConfig(cfg)
+	endpoint, err := reviewModelsEndpoint(cfg.BaseURL)
+	if err != nil {
+		return nil, "", err
+	}
+	keys := cfg.APIKeyList()
+	if len(keys) == 0 {
+		return nil, endpoint, fmt.Errorf("review api key is not configured")
+	}
+	client := c.HTTPClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+	var lastErr error
+	for _, apiKey := range keys {
+		requestCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.TimeoutSeconds)*time.Second)
+		models, fetchErr := fetchReviewModelsOnce(requestCtx, client, endpoint, apiKey)
+		cancel()
+		if fetchErr == nil {
+			return models, endpoint, nil
+		}
+		lastErr = fetchErr
+	}
+	return nil, endpoint, lastErr
+}
+
+func fetchReviewModelsOnce(ctx context.Context, client *http.Client, endpoint, apiKey string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReviewModelsResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &reviewHTTPStatusError{status: resp.StatusCode}
+	}
+	if len(body) > maxReviewModelsResponseBytes {
+		return nil, fmt.Errorf("models response exceeds %d bytes", maxReviewModelsResponseBytes)
+	}
+	var decoded struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return nil, fmt.Errorf("invalid models response: %w", err)
+	}
+	seen := make(map[string]struct{}, len(decoded.Data))
+	models := make([]string, 0, len(decoded.Data))
+	for _, item := range decoded.Data {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		models = append(models, id)
+	}
+	sort.Strings(models)
+	return models, nil
 }
 
 func acquireReviewSlot(ctx context.Context, endpoint string, maxConcurrent int) (func(), error) {

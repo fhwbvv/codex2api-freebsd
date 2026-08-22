@@ -318,15 +318,24 @@ func TestK12GetsTeamSchedulerBias(t *testing.T) {
 
 func TestCleanByRuntimeStatusSkipsPremium5hRateLimitedAccount(t *testing.T) {
 	acc := newPremium5hTestAccount("plus", time.Now().Add(20*time.Minute))
+	acc.DBID = 1
+	authoritative := &Account{DBID: 2, AccessToken: "token", PlanType: "plus", Status: StatusReady}
+	authoritative.SetCooldownWithReason(time.Hour, ResponsesRateLimitedCooldownReason)
 	store := &Store{
-		accounts: []*Account{acc},
+		accounts: []*Account{acc, authoritative},
 	}
 
-	if cleaned := store.CleanByRuntimeStatus(context.Background(), "rate_limited"); cleaned != 0 {
-		t.Fatalf("CleanByRuntimeStatus() cleaned = %d, want 0", cleaned)
+	if cleaned := store.CleanByRuntimeStatus(context.Background(), "rate_limited"); cleaned != 1 {
+		t.Fatalf("CleanByRuntimeStatus() cleaned = %d, want 1 authoritative Responses limit", cleaned)
 	}
 	if store.AccountCount() != 1 {
-		t.Fatalf("AccountCount() = %d, want 1", store.AccountCount())
+		t.Fatalf("AccountCount() = %d, want premium 5h account to remain", store.AccountCount())
+	}
+	if store.FindByID(acc.ID()) == nil {
+		t.Fatal("premium 5h account should remain")
+	}
+	if store.FindByID(authoritative.ID()) != nil {
+		t.Fatal("authoritative Responses-limited account should be removed")
 	}
 }
 
@@ -360,12 +369,14 @@ func TestCleanRateLimitedManualClearsAllRateLimitFlavors(t *testing.T) {
 	lockedRL := newPremium5hTestAccount("plus", time.Now().Add(20*time.Minute))
 	lockedRL.DBID = 4
 	lockedRL.Locked = 1
+	authoritative := &Account{DBID: 5, AccessToken: "token-authoritative", PlanType: "plus", Status: StatusReady}
+	authoritative.SetCooldownWithReason(time.Hour, ResponsesRateLimitedCooldownReason)
 
-	store := &Store{accounts: []*Account{premium, exhausted, healthy, lockedRL}}
+	store := &Store{accounts: []*Account{premium, exhausted, healthy, lockedRL, authoritative}}
 
 	cleaned := store.CleanRateLimitedManual(context.Background())
-	if cleaned != 2 {
-		t.Fatalf("CleanRateLimitedManual() cleaned = %d, want 2 (premium + exhausted)", cleaned)
+	if cleaned != 3 {
+		t.Fatalf("CleanRateLimitedManual() cleaned = %d, want 3 (premium + exhausted + authoritative)", cleaned)
 	}
 	if store.AccountCount() != 2 {
 		t.Fatalf("AccountCount() = %d, want 2 (healthy + locked stay)", store.AccountCount())

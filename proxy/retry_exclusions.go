@@ -159,36 +159,92 @@ func (r *retryAccountExclusions) ForSelection() map[int64]bool {
 }
 
 func (h *Handler) nextRetryAccountForSession(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
-	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false)
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false, auth.DispatchPolicyStandard)
+}
+
+func (h *Handler) nextRetryAccountForSessionWithDispatch(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, false, policy)
 }
 
 func (h *Handler) nextRetryAccountForContinuation(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter) (*auth.Account, string) {
-	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true)
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true, auth.DispatchPolicyStandard)
 }
 
-func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool) (*auth.Account, string) {
+func (h *Handler) nextRetryAccountForContinuationWithDispatch(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
+	return h.nextRetryAccount(ctx, affinityKey, apiKeyID, exclusions, filter, true, policy)
+}
+
+// reconcileGraceWait bounds how long a missed request waits for the shared
+// background reconciliation. Waiting on the single-flight done channel never
+// queues work behind the database scan; it only spends this request's own
+// latency budget, so it can afford to cover a realistic full-pool scan.
+const reconcileGraceWait = 2 * time.Second
+
+// maxReconcileReentries caps how many completed reconciliations a single
+// request may ride back into the selection loop, so continuous cross-process
+// churn cannot pin a request in the loop beyond its context lifetime.
+const maxReconcileReentries = 3
+
+func (h *Handler) nextRetryAccount(ctx context.Context, affinityKey string, apiKeyID int64, exclusions *retryAccountExclusions, filter auth.AccountFilter, preserveBinding bool, policy auth.DispatchPolicy) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
+	reconcileReentries := 0
 	for {
 		exclude := exclusions.ForSelection()
 		var account *auth.Account
 		var stickyProxyURL string
 		if preserveBinding {
-			account, stickyProxyURL = h.store.NextForContinuationWithFilter(affinityKey, apiKeyID, exclude, filter)
+			account, stickyProxyURL = h.store.NextForContinuationWithDispatch(affinityKey, apiKeyID, exclude, filter, policy)
 		} else {
-			account, stickyProxyURL = h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, exclude, filter)
+			account, stickyProxyURL = h.nextAccountForSessionWithDispatch(affinityKey, apiKeyID, exclude, filter, policy)
 		}
 		if account != nil {
 			return account, stickyProxyURL
 		}
+		reconcileDone := h.store.TriggerDispatchStateReconcileAsync()
 		if preserveBinding {
-			account, stickyProxyURL = h.store.WaitForContinuationAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
+			account, stickyProxyURL = h.store.WaitForContinuationAvailableWithDispatch(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter, policy)
 		} else {
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithDispatch(ctx, affinityKey, 30*time.Second, apiKeyID, exclude, filter, policy)
 		}
 		if account != nil {
 			return account, stickyProxyURL
+		}
+		if reconcileDone == nil {
+			// The pre-wait trigger may have been throttled; after a long wait
+			// the in-memory state can be stale again, so give the post-wait
+			// moment one more chance to own or join a reconciliation.
+			reconcileDone = h.store.TriggerDispatchStateReconcileAsync()
+		}
+		// If the scheduler had no candidates and returned immediately, wait a
+		// bounded grace period for the shared background reconciliation, then
+		// re-enter the full selection loop (including the availability wait)
+		// so a repaired pool restores the old queueing semantics instead of
+		// granting a single immediate re-check. Requests never queue behind
+		// the database scan itself.
+		if reconcileDone != nil && reconcileReentries < maxReconcileReentries && ctx.Err() == nil {
+			timer := time.NewTimer(reconcileGraceWait)
+			reconciled := false
+			select {
+			case <-reconcileDone:
+				reconciled = true
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			if reconciled && ctx.Err() == nil {
+				reconcileReentries++
+				continue
+			}
+		}
+		if ctx.Err() != nil {
+			return nil, ""
 		}
 		if !exclusions.ResetSoft() {
 			return nil, ""

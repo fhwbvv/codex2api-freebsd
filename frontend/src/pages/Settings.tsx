@@ -1228,6 +1228,11 @@ export default function Settings() {
     { label: t('settings.affinityModeBounded'), value: 'bounded' },
     { label: t('settings.affinityModeOff'), value: 'off' },
   ]
+  const grokFollowUpEffortOptions = [
+    { label: t('settings.grokFollowUpEffortLow'), value: 'low' },
+    { label: t('settings.grokFollowUpEffortMedium'), value: 'medium' },
+    { label: t('settings.grokFollowUpEffortHigh'), value: 'high' },
+  ]
   const clientCompatOptions = [
     { label: t('settings.clientCompatPreserve'), value: 'preserve' },
     { label: t('settings.clientCompatAuto'), value: 'auto' },
@@ -1332,6 +1337,9 @@ export default function Settings() {
     grok_probe_enabled: false,
     grok_probe_interval_minutes: 30,
     grok_max_rate_limit_retries: 0,
+    grok_follow_up_effort_enabled: false,
+    grok_follow_up_tool_effort: 'medium',
+    grok_follow_up_small_effort: 'low',
     grok_oauth_client_id: '',
     max_retries: 2,
     max_rate_limit_retries: 1,
@@ -2663,6 +2671,30 @@ export default function Settings() {
                     onCheckedChange={(checked) => autoSaveBooleanField('grok_probe_enabled', checked)}
                   />
                 </SettingField>
+                <SettingField label={t('settings.grokFollowUpEffortEnabled')} description={t('settings.grokFollowUpEffortEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.grok_follow_up_effort_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('grok_follow_up_effort_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField label={t('settings.grokFollowUpToolEffort')} description={t('settings.grokFollowUpToolEffortDesc')}>
+                  <Select
+                    value={settingsForm.grok_follow_up_tool_effort || 'medium'}
+                    disabled={!settingsForm.grok_follow_up_effort_enabled}
+                    onValueChange={(value) => autoSaveStringField('grok_follow_up_tool_effort', value)}
+                    options={grokFollowUpEffortOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.grokFollowUpSmallEffort')} description={t('settings.grokFollowUpSmallEffortDesc')}>
+                  <Select
+                    value={settingsForm.grok_follow_up_small_effort || 'low'}
+                    disabled={!settingsForm.grok_follow_up_effort_enabled}
+                    onValueChange={(value) => autoSaveStringField('grok_follow_up_small_effort', value)}
+                    options={grokFollowUpEffortOptions}
+                  />
+                </SettingField>
               </div>
               <div className={SETTINGS_FIELD_GRID_3}>
                 {/* client_id 同时可由环境变量 GROK_OAUTH_CLIENT_ID 指定，且环境变量优先级更高；
@@ -3383,7 +3415,7 @@ export default function Settings() {
                     <SettingField label={t('settings.pgMaxConns')} description={t('settings.pgMaxConnsRange')}>
                       <DraftNumberInput
                         min={5}
-                        max={500}
+                        max={5000}
                         value={settingsForm.pg_max_conns}
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, pg_max_conns: value }))}
                       />
@@ -3393,7 +3425,7 @@ export default function Settings() {
                     <SettingField label={t('settings.redisPoolSize')} description={t('settings.redisPoolSizeRange')}>
                       <DraftNumberInput
                         min={5}
-                        max={500}
+                        max={5000}
                         value={settingsForm.redis_pool_size}
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, redis_pool_size: value }))}
                       />

@@ -684,6 +684,10 @@ func shouldReviewPromptGuardDecision(decision promptfilter.Decision, verdict pro
 	return shouldReviewPromptFilterVerdict(verdict, cfg)
 }
 
+// promptGuardDetectorExternalReview 标记这样一种 block:本地过滤器放行,唯一
+// 证据是外部审核模型打了 flag。
+const promptGuardDetectorExternalReview = "external_review"
+
 func finalizePromptGuardDecision(decision promptfilter.Decision, verdict promptfilter.Verdict) promptfilter.Decision {
 	decision.Score = verdict.Score
 	decision.RawScore = verdict.RawScore
@@ -703,7 +707,7 @@ func finalizePromptGuardDecision(decision promptfilter.Decision, verdict promptf
 	if verdict.Reviewed && verdict.ReviewFlagged && finalAction != promptfilter.ActionAllow && len(verdict.Matched) == 0 &&
 		(decision.PrimaryOrigin == "" || decision.PrimaryOrigin == promptfilter.OriginCurrentUser) {
 		decision.PrimaryOrigin = promptfilter.OriginCurrentUser
-		decision.PrimaryDetector = "external_review"
+		decision.PrimaryDetector = promptGuardDetectorExternalReview
 		decision.StrikeEligible = false
 	}
 	if decision.ApplicationPromptKind != "" && finalAction != promptfilter.ActionAllow && decision.PrimaryOrigin == "" {

@@ -315,13 +315,23 @@ func parseSessionExpiresAt(raw string) time.Time {
 	return time.Time{}
 }
 
+// IsPermanentRefreshFailure 判断 RT/session 刷新是否已经不可恢复。
+// 这类错误再试也换不出 AT，账号应标未授权，不能停在「刷新中」。
+func IsPermanentRefreshFailure(err error) bool {
+	return isNonRetryable(err)
+}
+
 // isNonRetryable 判断是否不可重试的认证错误
 func isNonRetryable(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	for _, needle := range []string{"invalid_grant", "invalid_client", "unauthorized_client", "access_denied", "refresh_token_reused"} {
+	for _, needle := range []string{
+		"invalid_grant", "invalid_client", "unauthorized_client", "access_denied",
+		"refresh_token_reused", "refresh_token_invalidated", "token_invalidated",
+		"session has ended",
+	} {
 		if strings.Contains(msg, needle) {
 			return true
 		}

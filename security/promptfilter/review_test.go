@@ -37,6 +37,35 @@ func TestDefaultReviewPromptIsProviderNeutralAndTreatsInputAsData(t *testing.T) 
 	}
 }
 
+func TestReviewHTTPStatusErrorSummarizesHTMLWithoutLeakingPage(t *testing.T) {
+	error := (&reviewHTTPStatusError{
+		status: 502, contentType: "text/html; charset=UTF-8",
+		summary: summarizeReviewHTTPBody("text/html", []byte("<html>proxy failure details</html>")),
+	}).Error()
+	if !strings.Contains(error, "status 502") || !strings.Contains(error, "HTML error page") {
+		t.Fatalf("error = %q, want status and HTML guidance", error)
+	}
+	if strings.Contains(error, "proxy failure details") {
+		t.Fatalf("error leaked upstream HTML body: %q", error)
+	}
+}
+
+func TestReviewTextReportsHTMLUpstreamErrorsBriefly(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("<html><title>fanrenapi.com | 502: Bad gateway</title></html>"))
+	}))
+	defer server.Close()
+	client := ReviewClient{HTTPClient: server.Client()}
+	_, err := client.ReviewTextDetailed(context.Background(), "hello", ReviewConfig{
+		Enabled: true, APIKey: "test-key", BaseURL: server.URL, Model: "omni-moderation-latest", TimeoutSeconds: 2,
+	})
+	if err == nil || !strings.Contains(err.Error(), "HTML error page") || strings.Contains(err.Error(), "fanrenapi.com") {
+		t.Fatalf("unexpected upstream error: %v", err)
+	}
+}
+
 func TestShouldReviewVerdictScopes(t *testing.T) {
 	base := ReviewConfig{Enabled: true, APIKey: "test-key", BaseURL: "https://review.example"}
 	tests := []struct {
@@ -254,6 +283,7 @@ func TestReviewCircuitBreakerFailsFastAndRecovers(t *testing.T) {
 		Model:          "review-model",
 		TimeoutSeconds: 2,
 		Adapter: ReviewAdapterConfig{
+			RequestMode:            ReviewRequestModeModerations,
 			CircuitBreakerFailures: 1,
 			CircuitBreakerSeconds:  30,
 		},
@@ -321,6 +351,7 @@ func TestReviewCircuitBreakerStopsQueuedRequestsBeforeUpstream(t *testing.T) {
 		Model:          "review-model",
 		TimeoutSeconds: 2,
 		Adapter: ReviewAdapterConfig{
+			RequestMode:            ReviewRequestModeModerations,
 			MaxConcurrent:          1,
 			CircuitBreakerFailures: 1,
 			CircuitBreakerSeconds:  30,
@@ -369,6 +400,7 @@ func TestReviewTextQuarantinesPaymentRequiredKeyAndUsesHealthyKeys(t *testing.T)
 	cfg := ReviewConfig{
 		Enabled: true, APIKey: "bad-key\ngood-key", BaseURL: server.URL,
 		Model: "review-model", TimeoutSeconds: 2,
+		Adapter: ReviewAdapterConfig{RequestMode: ReviewRequestModeModerations},
 	}
 	client := ReviewClient{HTTPClient: server.Client()}
 	for range 3 {
@@ -381,6 +413,84 @@ func TestReviewTextQuarantinesPaymentRequiredKeyAndUsesHealthyKeys(t *testing.T)
 	}
 	if goodCalls.Load() != 3 {
 		t.Fatalf("healthy key calls = %d, want 3", goodCalls.Load())
+	}
+}
+
+// 请求模式未显式配置时按模型推断:moderation 系列走 moderations,其余走
+// chat_completions;显式配置永远优先。
+func TestNormalizeReviewConfigInfersRequestModeFromModel(t *testing.T) {
+	cases := []struct {
+		name  string
+		model string
+		mode  string
+		want  string
+	}{
+		{name: "default model infers chat", model: "", mode: "", want: ReviewRequestModeChatCompletions},
+		{name: "deepseek infers chat", model: "deepseek-v4-flash", mode: "", want: ReviewRequestModeChatCompletions},
+		{name: "moderation model stays moderations", model: "omni-moderation-latest", mode: "", want: ReviewRequestModeModerations},
+		{name: "explicit moderations retained", model: "deepseek-v4-flash", mode: ReviewRequestModeModerations, want: ReviewRequestModeModerations},
+		{name: "explicit chat retained", model: "omni-moderation-latest", mode: ReviewRequestModeChatCompletions, want: ReviewRequestModeChatCompletions},
+	}
+	for _, tc := range cases {
+		cfg := NormalizeReviewConfig(ReviewConfig{Model: tc.model, Adapter: ReviewAdapterConfig{RequestMode: tc.mode}})
+		if cfg.Adapter.RequestMode != tc.want {
+			t.Fatalf("%s: request mode = %q, want %q", tc.name, cfg.Adapter.RequestMode, tc.want)
+		}
+	}
+}
+
+func TestReviewModelsEndpoint(t *testing.T) {
+	cases := []struct {
+		base string
+		want string
+	}{
+		{base: "https://api.deepseek.com", want: "https://api.deepseek.com/v1/models"},
+		{base: "https://api.openai.com/v1", want: "https://api.openai.com/v1/models"},
+		{base: "https://gw.example.com/v1/chat/completions", want: "https://gw.example.com/v1/models"},
+		{base: "https://gw.example.com/v1/moderations", want: "https://gw.example.com/v1/models"},
+		{base: "https://gw.example.com/v1/models", want: "https://gw.example.com/v1/models"},
+		{base: "", want: DefaultReviewBaseURL + "/v1/models"},
+	}
+	for _, tc := range cases {
+		got, err := reviewModelsEndpoint(tc.base)
+		if err != nil {
+			t.Fatalf("reviewModelsEndpoint(%q): %v", tc.base, err)
+		}
+		if got != tc.want {
+			t.Fatalf("reviewModelsEndpoint(%q) = %q, want %q", tc.base, got, tc.want)
+		}
+	}
+	if _, err := reviewModelsEndpoint("ftp://example.com"); err == nil {
+		t.Fatal("non-http scheme was accepted")
+	}
+}
+
+func TestListReviewModelsFallsBackAcrossKeys(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") == "Bearer bad-key" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{{"id": "deepseek-v4-flash"}, {"id": "deepseek-chat"}, {"id": "deepseek-chat"}},
+		})
+	}))
+	defer server.Close()
+	client := ReviewClient{HTTPClient: server.Client()}
+	models, endpoint, err := client.ListReviewModels(context.Background(), ReviewConfig{
+		APIKey: "bad-key\ngood-key", BaseURL: server.URL, TimeoutSeconds: 2,
+	})
+	if err != nil {
+		t.Fatalf("ListReviewModels: %v", err)
+	}
+	if endpoint != server.URL+"/v1/models" {
+		t.Fatalf("endpoint = %q", endpoint)
+	}
+	if len(models) != 2 || models[0] != "deepseek-chat" || models[1] != "deepseek-v4-flash" {
+		t.Fatalf("models = %#v", models)
 	}
 }
 

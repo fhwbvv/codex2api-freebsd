@@ -910,16 +910,27 @@ func stripResponsesImageGenerationCapabilities(body []byte) []byte {
 }
 
 func validateImagesModel(model string) error {
-	if !isImageOnlyModel(model) {
+	if isGrokVideoModel(model) {
+		return fmt.Errorf("model %q is a video model, use /v1/videos/generations instead", strings.TrimSpace(model))
+	}
+	if !isImageOnlyModel(model) && !isGrokImageModel(model) {
 		return fmt.Errorf("images endpoint requires an image model, got %q", strings.TrimSpace(model))
 	}
 	return nil
 }
 
+// mediaOnlyModelEndpoints 返回媒体专用模型对应的下游端点提示文案。
+func mediaOnlyModelEndpoints(model string) string {
+	if isGrokVideoModel(model) {
+		return "/v1/videos/generations, /v1/videos/edits and /v1/videos/extensions"
+	}
+	return "/v1/images/generations and /v1/images/edits"
+}
+
 func sendImageOnlyModelError(c *gin.Context, model string) {
 	c.JSON(http.StatusServiceUnavailable, gin.H{
 		"error": gin.H{
-			"message": fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", strings.TrimSpace(model)),
+			"message": fmt.Sprintf("model %s is only supported on %s", strings.TrimSpace(model), mediaOnlyModelEndpoints(model)),
 			"type":    "server_error",
 		},
 	})
@@ -1060,6 +1071,10 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
+	if isGrokImageModel(imageModel) {
+		h.forwardGrokImagesRequest(c, "/v1/images/generations", imageModel, requestModel, logEffectiveModel, promptForRequest, responseFormat, grokImagesParamsFromJSON(rawBody), nil, stream)
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -1188,6 +1203,10 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
+	}
+	if isGrokImageModel(imageModel) {
+		h.forwardGrokImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, promptForRequest, responseFormat, grokImagesParamsFromForm(c), images, stream)
+		return
 	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
@@ -1323,6 +1342,10 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	}
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
+	}
+	if isGrokImageModel(imageModel) {
+		h.forwardGrokImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, promptForRequest, responseFormat, grokImagesParamsFromJSON(rawBody), images, stream)
+		return
 	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)

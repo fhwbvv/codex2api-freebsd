@@ -78,6 +78,10 @@ func TestResponsesContinuationUnavailableWaitsForRelayRouting(t *testing.T) {
 		if recorder.Code != http.StatusOK || gjson.GetBytes(seenBody, "previous_response_id").String() != "resp_missing" {
 			t.Fatalf("compaction fallback status=%d upstream=%s response=%s", recorder.Code, seenBody, recorder.Body.String())
 		}
+		input := gjson.GetBytes(seenBody, "input").Array()
+		if len(input) == 0 || input[len(input)-1].Get("type").String() != "compaction_trigger" {
+			t.Fatalf("compaction trigger must be the final upstream input item: %s", seenBody)
+		}
 	})
 }
 

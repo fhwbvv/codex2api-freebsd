@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -55,6 +56,10 @@ const (
 
 	// whamDailyUsageKeepDays 是本地快照保留期。上游只有 7 天，本地留一年足够看趋势。
 	whamDailyUsageKeepDays = 365
+
+	// whamDailyUsageMinAccountAge 是自动刷新官方结算的最短账号年龄。
+	// 官方统计基本在账号产生请求后的次日才出数，导入当天拉上游只会空转。
+	whamDailyUsageMinAccountAge = 24 * time.Hour
 )
 
 var whamDailyUsageProbeOnce sync.Once
@@ -98,7 +103,7 @@ func (h *Handler) StartWhamDailyUsageProbe(ctx context.Context) {
 // 账号额度短期不会变化，降频到 6 小时；其余账号按小时刷新。
 func whamDailyUsageProbeIntervalFor(account *auth.Account) time.Duration {
 	switch account.RuntimeStatus() {
-	case "rate_limited", "rate_limited_7d", "usage_limited", "usage_limit", "usage_exhausted":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_7d", "usage_limited", "usage_limit", "usage_exhausted":
 		return whamDailyUsageProbeRateLimitedInterval
 	}
 	return whamDailyUsageProbeBaseInterval
@@ -217,7 +222,7 @@ func (h *Handler) enqueueWhamDailyUsageBackfill(ids []int64) {
 			continue
 		}
 		account := h.store.FindByID(id)
-		if !whamDailyUsageBackfillEligible(account) {
+		if !whamDailyUsageAutoRefreshEligible(account, now) {
 			continue
 		}
 		h.whamDailyBackfillInFlight[id] = struct{}{}
@@ -239,6 +244,21 @@ func whamDailyUsageBackfillEligible(account *auth.Account) bool {
 		return false
 	}
 	return account.GetAccessToken() != ""
+}
+
+func whamDailyUsageAutoRefreshEligible(account *auth.Account, now time.Time) bool {
+	if !whamDailyUsageBackfillEligible(account) {
+		return false
+	}
+	switch account.RuntimeStatus() {
+	case "unauthorized", "error":
+		return false
+	}
+	addedAt := time.Unix(0, atomic.LoadInt64(&account.AddedAt))
+	if addedAt.Unix() > 0 && now.Sub(addedAt) < whamDailyUsageMinAccountAge {
+		return false
+	}
+	return true
 }
 
 func (h *Handler) finishWhamDailyUsageBackfill(id int64) {
@@ -328,6 +348,9 @@ func (h *Handler) whamDailyUsageProbeTargets() []*auth.Account {
 			continue
 		}
 		if account.GetAccessToken() == "" {
+			continue
+		}
+		if !whamDailyUsageAutoRefreshEligible(account, time.Now()) {
 			continue
 		}
 		out = append(out, account)

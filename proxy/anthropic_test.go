@@ -3,9 +3,11 @@ package proxy
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/codex2api/auth"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -87,6 +89,9 @@ func TestTranslateAnthropicToResponsesForGrokPreservesControls(t *testing.T) {
 		"text.format.type":  "json_schema",
 		"text.format.name":  "structured_output",
 		"reasoning.effort":  "high",
+		"reasoning.summary": "detailed",
+		"include.0":         "reasoning.encrypted_content",
+		"include.1":         "no_inline_citations",
 	}
 	for path, want := range checks {
 		if value := gjson.GetBytes(got, path); value.String() != want {
@@ -110,6 +115,126 @@ func TestTranslateAnthropicToResponsesForGrokAcceptsNestedJSONSchemaFormat(t *te
 	}
 	if gjson.GetBytes(got, "text.format.name").String() != "answer" || gjson.GetBytes(got, "text.format.strict").Bool() {
 		t.Fatalf("nested JSON schema metadata not preserved; body=%s", got)
+	}
+}
+
+func TestTranslateAnthropicToResponsesForGrokSplitsSystemCacheBreakpoints(t *testing.T) {
+	raw := []byte(`{
+		"model":"grok-4.6",
+		"messages":[{"role":"user","content":"分析项目"}],
+		"system":[
+			{"type":"text","text":"today git dirty","cache_control":null},
+			{"type":"text","text":"You are Claude Code","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"CLAUDE.md rules","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"date 2026-08-18"}
+		]
+	}`)
+	got, _, err := TranslateAnthropicToResponsesForGrok(raw, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := gjson.GetBytes(got, "input")
+	if input.Get("#").Int() != 5 {
+		t.Fatalf("input len = %d, want 5; body=%s", input.Get("#").Int(), got)
+	}
+	want := []string{"You are Claude Code", "CLAUDE.md rules", "today git dirty", "date 2026-08-18"}
+	for i, text := range want {
+		item := input.Get(strconv.Itoa(i))
+		if item.Get("role").String() != "developer" || item.Get("content.0.text").String() != text {
+			t.Fatalf("input.%d = %s, want developer %q", i, item.Raw, text)
+		}
+		if strings.Contains(item.Raw, "cache_control") {
+			t.Fatalf("Grok input must not forward cache_control: %s", item.Raw)
+		}
+	}
+	if input.Get("4.role").String() != "user" || input.Get("4.content.0.text").String() != "分析项目" {
+		t.Fatalf("last item should be the user turn; body=%s", got)
+	}
+}
+
+func TestTranslateAnthropicToCodexStillJoinsSystemBlocks(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hi"}],
+		"system":[
+			{"type":"text","text":"static","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"dynamic"}
+		]
+	}`)
+	got, _, err := TranslateAnthropicToCodexWithModels(raw, "", []string{"gpt-5.4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "input.#").Int() != 2 {
+		t.Fatalf("Codex should keep one joined system message; body=%s", got)
+	}
+	if text := gjson.GetBytes(got, "input.0.content.0.text").String(); text != "static\n\ndynamic" {
+		t.Fatalf("joined system = %q; body=%s", text, got)
+	}
+}
+
+func TestTranslateAnthropicToResponsesForGrokDowngradesFollowUpReasoning(t *testing.T) {
+	prev := currentGrokFollowUpEffortConfig()
+	t.Cleanup(func() { SetGrokFollowUpEffortConfig(prev) })
+	SetGrokFollowUpEffortConfig(auth.GrokFollowUpEffortConfig{Enabled: true, ToolEffort: "medium", SmallEffort: "low"})
+
+	first := []byte(`{
+		"model":"grok-4.6",
+		"output_config":{"effort":"high"},
+		"tools":[{"name":"Read","input_schema":{"type":"object"}}],
+		"messages":[{"role":"user","content":"分析项目"}]
+	}`)
+	got, _, err := TranslateAnthropicToResponsesForGrok(first, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "high" || gjson.GetBytes(got, "reasoning.summary").String() != "detailed" {
+		t.Fatalf("first turn should stay high+detailed; body=%s", got)
+	}
+
+	follow := []byte(`{
+		"model":"grok-4.6",
+		"output_config":{"effort":"high"},
+		"tools":[{"name":"Read","input_schema":{"type":"object"}}],
+		"messages":[
+			{"role":"user","content":"分析项目"},
+			{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"README.md"}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}
+		]
+	}`)
+	got, _, err = TranslateAnthropicToResponsesForGrok(follow, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "medium" || gjson.GetBytes(got, "reasoning.summary").String() != "auto" {
+		t.Fatalf("tool_result follow-up should be medium+auto; body=%s", got)
+	}
+
+	small := []byte(`{"model":"grok-4.6","system":"short","messages":[{"role":"user","content":"取个标题"}]}`)
+	got, _, err = TranslateAnthropicToResponsesForGrok(small, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "low" || gjson.GetBytes(got, "reasoning.summary").String() != "auto" {
+		t.Fatalf("small no-tools request should be low+auto; body=%s", got)
+	}
+
+	lowClient := []byte(`{"model":"grok-4.6","output_config":{"effort":"low"},"tools":[{"name":"Read","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"分析项目"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`)
+	got, _, err = TranslateAnthropicToResponsesForGrok(lowClient, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "low" {
+		t.Fatalf("explicit lower effort must not be raised; body=%s", got)
+	}
+
+	SetGrokFollowUpEffortConfig(auth.GrokFollowUpEffortConfig{Enabled: false, ToolEffort: "medium", SmallEffort: "low"})
+	got, _, err = TranslateAnthropicToResponsesForGrok(follow, "", []string{"grok-4.6"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "high" || gjson.GetBytes(got, "reasoning.summary").String() != "detailed" {
+		t.Fatalf("disabled follow-up policy should keep high+detailed; body=%s", got)
 	}
 }
 
@@ -738,110 +863,61 @@ func jsonEqual(t *testing.T, a, b string) bool {
 	return string(ab) == string(bb)
 }
 
-// TestAnthropicStreamTranslator_ToolInputBufferedAndCleaned 模拟 gpt-5.5 把
-// "pages":"" 拆成多片 SSE 推送：translator 应缓冲到 tool_use 块关闭时再
-// 整段清洗，并以单次 input_json_delta 发出，下游收到的 JSON 不含空 pages。
-func TestAnthropicStreamTranslator_ToolInputBufferedAndCleaned(t *testing.T) {
+// TestAnthropicStreamTranslator_ToolInputStreamedIncrementally 对齐官方
+// Anthropic：arguments 碎片立即变成 input_json_delta。空可选字段清洗只发生在
+// 非流式聚合，不把整段 JSON 攒到关块再一次下发。
+func TestAnthropicStreamTranslator_ToolInputStreamedIncrementally(t *testing.T) {
 	tests := []struct {
-		name      string
-		toolName  string
-		deltas    []string
-		wantInput string
+		name   string
+		tool   string
+		deltas []string
 	}{
 		{
-			name:     "read drops empty pages",
-			toolName: "Read",
-			deltas: []string{
-				`{"file_path":"/etc/hosts"`,
-				`,"pages":""`,
-				`}`,
-			},
-			wantInput: `{"file_path":"/etc/hosts"}`,
+			name:   "read fragments stream as-is",
+			tool:   "Read",
+			deltas: []string{`{"file_path":"/etc/hosts"`, `,"pages":""`, `}`},
 		},
 		{
-			name:     "write preserves empty content",
-			toolName: "Write",
-			deltas: []string{
-				`{"file_path":"/tmp/empty.txt"`,
-				`,"content":""`,
-				`}`,
-			},
-			wantInput: `{"file_path":"/tmp/empty.txt","content":""}`,
-		},
-		{
-			name:     "enter worktree drops empty name when path is set",
-			toolName: "EnterWorktree",
-			deltas: []string{
-				`{"name":""`,
-				`,"path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"`,
-				`}`,
-			},
-			wantInput: `{"path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
-		},
-		{
-			name:     "enter worktree drops empty path when name is set",
-			toolName: "EnterWorktree",
-			deltas: []string{
-				`{"name":"feature-x"`,
-				`,"path":""`,
-				`}`,
-			},
-			wantInput: `{"name":"feature-x"}`,
+			name:   "write fragments stream as-is",
+			tool:   "Write",
+			deltas: []string{`{"file_path":"/tmp/empty.txt"`, `,"content":""`, `}`},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
-
-			// response.created
 			tr.translateEvent([]byte(`{"type":"response.created"}`))
-			// output_item.added — 启动 tool_use 块
 			tr.translateEvent([]byte(`{
 				"type":"response.output_item.added",
 				"output_index":0,
-				"item":{"type":"function_call","call_id":"call_abc","name":` + mustJSONString(tc.toolName) + `}
+				"item":{"type":"function_call","call_id":"call_abc","name":` + mustJSONString(tc.tool) + `}
 			}`))
 
-			var streamed []anthropicStreamEvent
+			var got []string
 			for _, d := range tc.deltas {
 				evt := []byte(`{"type":"response.function_call_arguments.delta","delta":` +
 					mustJSONString(d) + `}`)
-				streamed = append(streamed, tr.translateEvent(evt)...)
+				for _, streamed := range tr.translateEvent(evt) {
+					if streamed.Type == "content_block_delta" && streamed.Delta != nil && streamed.Delta.Type == "input_json_delta" {
+						got = append(got, streamed.Delta.PartialJSON)
+					}
+				}
 			}
-
-			// delta 阶段不应该泄漏任何 input_json_delta
-			for _, evt := range streamed {
-				if evt.Type == "content_block_delta" {
-					t.Fatalf("expected no content_block_delta during streaming, got %+v", evt)
+			if len(got) != len(tc.deltas) {
+				t.Fatalf("streamed %d input_json_delta, want %d: %q", len(got), len(tc.deltas), got)
+			}
+			for i, d := range tc.deltas {
+				if got[i] != d {
+					t.Fatalf("delta[%d] = %q, want %q", i, got[i], d)
 				}
 			}
 
-			// output_item.done 触发 closeCurrentBlock，整段清洗
 			closing := tr.translateEvent([]byte(`{"type":"response.output_item.done"}`))
-
-			var sawDelta bool
-			var sawStop bool
 			for _, evt := range closing {
 				if evt.Type == "content_block_delta" {
-					sawDelta = true
-					if evt.Delta == nil || evt.Delta.Type != "input_json_delta" {
-						t.Fatalf("expected input_json_delta, got %+v", evt.Delta)
-					}
-					if !jsonEqual(t, evt.Delta.PartialJSON, tc.wantInput) {
-						t.Fatalf("cleaned tool input = %q, want equivalent to %q",
-							evt.Delta.PartialJSON, tc.wantInput)
-					}
+					t.Fatalf("close must not emit another input_json_delta, got %+v", evt)
 				}
-				if evt.Type == "content_block_stop" {
-					sawStop = true
-				}
-			}
-			if !sawDelta {
-				t.Fatalf("expected one content_block_delta with cleaned input on close")
-			}
-			if !sawStop {
-				t.Fatalf("expected content_block_stop on close")
 			}
 		})
 	}
@@ -859,27 +935,17 @@ func TestAnthropicStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 		"type":"response.custom_tool_call_input.delta",
 		"delta":"{\"query\":\"hello\"}"
 	}`))
-	for _, evt := range streamed {
-		if evt.Type == "content_block_delta" {
-			t.Fatalf("expected no content_block_delta during streaming, got %+v", evt)
-		}
-	}
-
-	closing := tr.translateEvent([]byte(`{"type":"response.output_item.done"}`))
 	var sawDelta bool
-	for _, evt := range closing {
-		if evt.Type == "content_block_delta" {
+	for _, evt := range streamed {
+		if evt.Type == "content_block_delta" && evt.Delta != nil && evt.Delta.Type == "input_json_delta" {
 			sawDelta = true
-			if evt.Delta == nil || evt.Delta.Type != "input_json_delta" {
-				t.Fatalf("expected input_json_delta, got %+v", evt.Delta)
-			}
 			if !jsonEqual(t, evt.Delta.PartialJSON, `{"query":"hello"}`) {
 				t.Fatalf("custom tool input = %q", evt.Delta.PartialJSON)
 			}
 		}
 	}
 	if !sawDelta {
-		t.Fatalf("expected custom tool input_json_delta on close")
+		t.Fatalf("expected custom tool input_json_delta while streaming")
 	}
 }
 
@@ -923,8 +989,8 @@ func TestAnthropicResponseAccumulatorUsesStreamDeltasWhenCompletedOutputIsEmpty(
 	if resp.Content[0].Type != "text" {
 		t.Fatalf("content type = %q, want text", resp.Content[0].Type)
 	}
-	if resp.StopReason != "end_turn" {
-		t.Fatalf("stop_reason = %q, want end_turn", resp.StopReason)
+	if anthropicStopReasonValue(resp.StopReason) != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn", anthropicStopReasonValue(resp.StopReason))
 	}
 	// 上游 input_tokens=10 含 3 个缓存命中；Anthropic 语义下 input_tokens 不含
 	// 缓存，应对外报 input=7（10-3）、cache_read=3，避免缓存 token 被重复计费。
@@ -1104,5 +1170,98 @@ func TestAnthropicAccumulator_SignatureInNonStreamResponse(t *testing.T) {
 	}
 	if resp.Content[0].Type != "thinking" || resp.Content[0].Signature != "SIG" {
 		t.Fatalf("thinking block should carry signature, got %+v", resp.Content[0])
+	}
+}
+
+func TestAnthropicMessageStartMatchesOfficialShape(t *testing.T) {
+	tr := newAnthropicStreamTranslator("grok-4.6")
+	events := tr.translateEvent([]byte(`{"type":"response.created"}`))
+	if len(events) != 1 || events[0].Type != "message_start" || events[0].Message == nil {
+		t.Fatalf("events = %+v", events)
+	}
+	data, err := json.Marshal(events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw := gjson.GetBytes(data, "message.content").Raw; raw != "[]" {
+		t.Fatalf("message.content = %s, want []", raw)
+	}
+	if raw := gjson.GetBytes(data, "message.stop_reason").Raw; raw != "null" {
+		t.Fatalf("message.stop_reason = %s, want null", raw)
+	}
+	if raw := gjson.GetBytes(data, "message.stop_details").Raw; raw != "null" {
+		t.Fatalf("message.stop_details = %s, want null", raw)
+	}
+}
+
+func TestAnthropicStreamEmitsPingAfterFirstBlock(t *testing.T) {
+	tr := newAnthropicStreamTranslator("grok-4.6")
+	tr.translateEvent([]byte(`{"type":"response.created"}`))
+	events := tr.translateEvent([]byte(`{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1","name":"Read"}}`))
+	var sawStart, sawPing bool
+	for _, evt := range events {
+		switch evt.Type {
+		case "content_block_start":
+			sawStart = true
+		case "ping":
+			if !sawStart {
+				t.Fatal("ping must follow content_block_start")
+			}
+			sawPing = true
+		}
+	}
+	if !sawStart || !sawPing {
+		t.Fatalf("start=%v ping=%v events=%+v", sawStart, sawPing, events)
+	}
+
+	delta := tr.translateEvent([]byte(`{"type":"response.function_call_arguments.delta","delta":"{}"}`))
+	if len(delta) == 0 || delta[0].Type != "content_block_delta" {
+		t.Fatalf("expected streamed input_json_delta, got %+v", delta)
+	}
+}
+
+func TestAnthropicAccumulatorSanitizesStreamedToolInput(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+	acc := newAnthropicResponseAccumulator("claude-sonnet-4-5")
+	for _, ev := range []string{
+		`{"type":"response.created"}`,
+		`{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_abc","name":"Read"}}`,
+		`{"type":"response.function_call_arguments.delta","delta":"{\"file_path\":\"/etc/hosts\""}`,
+		`{"type":"response.function_call_arguments.delta","delta":",\"pages\":\"\""}`,
+		`{"type":"response.function_call_arguments.delta","delta":"}"}`,
+		`{"type":"response.output_item.done"}`,
+		`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}`,
+	} {
+		acc.apply(tr.translateEvent([]byte(ev)))
+	}
+	resp := acc.build(nil)
+	if len(resp.Content) != 1 {
+		t.Fatalf("len(content) = %d, want 1: %+v", len(resp.Content), resp.Content)
+	}
+	if !jsonEqual(t, string(resp.Content[0].Input), `{"file_path":"/etc/hosts"}`) {
+		t.Fatalf("sanitized tool input = %q", string(resp.Content[0].Input))
+	}
+}
+
+func TestResolveMessagesRoutingBodySkipsFullTranslation(t *testing.T) {
+	raw := []byte(`{
+		"model":"grok-4.6",
+		"messages":[{"role":"user","content":"hello from a large prompt"}],
+		"output_config":{"effort":"high"},
+		"speed":"fast"
+	}`)
+	handler := &Handler{}
+	got := handler.resolveMessagesRoutingBody(raw, "grok-4.6", []string{"grok-4.6"})
+	if gjson.GetBytes(got, "input").Exists() || gjson.GetBytes(got, "messages").Exists() {
+		t.Fatalf("routing stub must not translate the message list: %s", got)
+	}
+	if gjson.GetBytes(got, "model").String() != "grok-4.6" {
+		t.Fatalf("model = %s", got)
+	}
+	if gjson.GetBytes(got, "reasoning.effort").String() != "high" {
+		t.Fatalf("effort = %s", got)
+	}
+	if !gjson.GetBytes(got, "service_tier").Exists() {
+		t.Fatalf("speed=fast should set service_tier: %s", got)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -349,6 +350,16 @@ func main() {
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
 	security.MaxRequestBodySize = cfg.MaxRequestBodySize
+	// 账号导入端点(multipart 文件上传)单独放宽体积上限,默认 200MB,可用
+	// CODEX_MAX_IMPORT_BODY_SIZE_MB 覆盖。前端按大小分批发送,单批控制在此上限内。
+	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_IMPORT_BODY_SIZE_MB")); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			security.MaxImportBodySize = int64(mb) * 1024 * 1024
+		}
+	}
+	if security.MaxImportBodySize < int64(security.MaxRequestBodySize) {
+		security.MaxImportBodySize = int64(security.MaxRequestBodySize)
+	}
 	r.Use(security.RequestSizeLimiter(int64(security.MaxRequestBodySize)))
 	r.Use(security.RequestBodyDecompressor(int64(security.MaxRequestBodySize)))
 	r.Use(api.BodyCacheMiddleware())
@@ -487,12 +498,29 @@ func main() {
 		c.Redirect(http.StatusFound, "/admin/")
 	})
 
-	// 健康检查
+	// 健康检查：只做非阻塞的尽力统计，避免账号热路径锁竞争拖死 liveness。
+	// 但账号池读锁连续超过门槛一次都拿不到时视为疑似死锁,降 503 让
+	// healthcheck 重启实例——否则死锁实例会一直以 200 留在服务里。
+	healthProbe := &healthLockProbe{}
 	r.GET("/health", func(c *gin.Context) {
+		available, total, countsComplete := store.HealthCountsNonBlocking()
+		blocked := healthProbe.observe(total >= 0, time.Now())
+		if blocked >= healthStoreLockStallThreshold {
+			c.JSON(503, gin.H{
+				"status":          "unavailable",
+				"reason":          "account store lock stalled",
+				"blocked_seconds": int(blocked / time.Second),
+				"available":       available,
+				"total":           total,
+				"counts_complete": countsComplete,
+			})
+			return
+		}
 		c.JSON(200, gin.H{
-			"status":    "ok",
-			"available": store.AvailableCount(),
-			"total":     store.AccountCount(),
+			"status":          "ok",
+			"available":       available,
+			"total":           total,
+			"counts_complete": countsComplete,
 		})
 	})
 
@@ -574,7 +602,13 @@ func loggerMiddleware() gin.HandlerFunc {
 		start := time.Now()
 		c.Next()
 		latency := time.Since(start)
-		if shouldSkipAccessLog(c.Request.Method, c.Request.URL.Path, c.Writer.Status()) {
+		statusCode := c.Writer.Status()
+		if override, ok := c.Get(proxy.AccessLogStatusContextKey); ok {
+			if status, valid := override.(int); valid && status >= 100 && status <= 599 {
+				statusCode = status
+			}
+		}
+		if shouldSkipAccessLog(c.Request.Method, c.Request.URL.Path, statusCode) {
 			return
 		}
 
@@ -611,9 +645,9 @@ func loggerMiddleware() gin.HandlerFunc {
 		}
 
 		if emailStr != "" {
-			log.Printf("%s %s %d %v%s [%s] [%s]", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), latency, tagStr, emailStr, proxyStr)
+			log.Printf("%s %s %d %v%s [%s] [%s]", c.Request.Method, c.Request.URL.Path, statusCode, latency, tagStr, emailStr, proxyStr)
 		} else {
-			log.Printf("%s %s %d %v%s", c.Request.Method, c.Request.URL.Path, c.Writer.Status(), latency, tagStr)
+			log.Printf("%s %s %d %v%s", c.Request.Method, c.Request.URL.Path, statusCode, latency, tagStr)
 		}
 	}
 }

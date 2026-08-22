@@ -2175,6 +2175,87 @@ func TestPrepareResponsesBody_PassesThroughCompactV2Items(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBody_MovesCompactionTriggerToFinalInputItem(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[
+			{"type":"message","role":"user","content":"compact this"},
+			{"type":"compaction_trigger"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("input length = %d, want 3; body=%s", len(input), got)
+	}
+	if gotType := input[1].Get("type").String(); gotType == "compaction_trigger" {
+		t.Fatalf("compaction_trigger must not remain before the final item; body=%s", got)
+	}
+	if gotType := input[2].Get("type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("final input type = %q, want compaction_trigger; body=%s", gotType, got)
+	}
+}
+
+func TestPrepareOpenAIResponsesBody_MovesCompactionTriggerToFinalInputItem(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[
+			{"type":"compaction_trigger"},
+			{"type":"context_compaction","encrypted_content":"opaque"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 3 {
+		t.Fatalf("input length = %d, want 3; body=%s", len(input), got)
+	}
+	if gotType := input[0].Get("type").String(); gotType != "context_compaction" {
+		t.Fatalf("input[0].type = %q, want context_compaction; body=%s", gotType, got)
+	}
+	if gotType := input[2].Get("type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("final input type = %q, want compaction_trigger; body=%s", gotType, got)
+	}
+}
+
+func TestPrepareResponsesBody_CachedHistoryStillKeepsCompactionTriggerFinal(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"previous_response_id":"resp_previous",
+		"input":[
+			{"type":"compaction_trigger"},
+			{"type":"function_call_output","call_id":"call_1","output":"ok"}
+		]
+	}`)
+	cached := []json.RawMessage{
+		json.RawMessage(`{"type":"message","role":"user","content":"earlier question"}`),
+		json.RawMessage(`{"type":"function_call","call_id":"call_1","name":"run","arguments":"{}"}`),
+	}
+
+	got, expanded := prepareResponsesBodyWithOptions(raw, responsesBodyPrepareOptions{
+		forceStoreFalse:        true,
+		expandPreviousResponse: true,
+		cachedResponseItems:    cached,
+	})
+	input := gjson.GetBytes(got, "input").Array()
+	if len(input) != 4 {
+		t.Fatalf("input length = %d, want 4; body=%s", len(input), got)
+	}
+	if gotType := input[len(input)-1].Get("type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("final input type = %q, want compaction_trigger; body=%s", gotType, got)
+	}
+	if expandedType := gjson.Get(expanded, "#(type==\"compaction_trigger\").type").String(); expandedType != "compaction_trigger" {
+		t.Fatalf("expanded cache input lost compaction_trigger: %s", expanded)
+	}
+	if gotType := gjson.Get(expanded, "3.type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("expanded final input type = %q, want compaction_trigger; expanded=%s", gotType, expanded)
+	}
+}
+
 func TestPrepareCompactResponsesBody_ConvertsPlaintextCompactionToDeveloperMessage(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -3741,6 +3822,27 @@ func TestIsReservedCodexTool(t *testing.T) {
 	for i, c := range cases {
 		if got := isReservedCodexTool(c.tool); got != c.want {
 			t.Errorf("case %d: isReservedCodexTool = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// 顶层 type 是 Responses WS 事件信封字段，HTTP /responses 上游不接受
+// (400 Unsupported parameter: type)；prepare 阶段必须剥离顶层、保留嵌套 (issue #548)。
+func TestPrepareResponsesBodyStripsTopLevelWebSocketEnvelopeType(t *testing.T) {
+	raw := []byte(`{"type":"response.create","model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	for name, prepare := range map[string]func([]byte) ([]byte, string){
+		"http": PrepareResponsesBody,
+		"ws":   PrepareResponsesWebSocketBody,
+	} {
+		got, _ := prepare(raw)
+		if gjson.GetBytes(got, "type").Exists() {
+			t.Fatalf("%s: top-level type should be stripped: %s", name, got)
+		}
+		if it := gjson.GetBytes(got, "input.0.type").String(); it != "message" {
+			t.Fatalf("%s: nested input type = %q, want message; body=%s", name, it, got)
+		}
+		if ct := gjson.GetBytes(got, "input.0.content.0.type").String(); ct != "input_text" {
+			t.Fatalf("%s: nested content type = %q, want input_text; body=%s", name, ct, got)
 		}
 	}
 }

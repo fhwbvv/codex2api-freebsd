@@ -200,3 +200,73 @@ func TestShouldDeferPreContentSSEEvent(t *testing.T) {
 		})
 	}
 }
+
+// 模型摘要不可用时的退化：此前整段旧对话静默蒸发，现在必须附带一段可读的
+// 原文摘录，让续写模型仍能看到用户目标与关键事实。
+func TestCompactOverflowResponsesBody_FallbackKeepsVerbatimDigest(t *testing.T) {
+	t.Setenv("CODEX_OVERFLOW_COMPACT_TAIL_KB", "1")
+
+	big := strings.Repeat("x", 900)
+	body := `{
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"system prompt"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"the project codename is Bluebird. ` + big + `"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` + big + `"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"` + big + `"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"recent question"}]}
+		]
+	}`
+
+	h := &Handler{}
+	// 无 model 字段 => 摘要调用被跳过，直接走退化路径，不依赖真实上游。
+	got, ok := h.compactOverflowResponsesBody(context.Background(), []byte(body))
+	if !ok {
+		t.Fatal("expected compaction to succeed")
+	}
+	placeholder := gjson.GetBytes(got, "input").Array()[1].Get("content.0.text").String()
+	if !strings.Contains(placeholder, "omitted") {
+		t.Fatalf("fallback lost the omission marker: %q", placeholder)
+	}
+	if !strings.Contains(placeholder, "Bluebird") {
+		t.Fatalf("fallback dropped the earlier conversation entirely: %q", placeholder)
+	}
+	if len(placeholder) > overflowCompactFallbackDigestBytes*2 {
+		t.Fatalf("fallback digest is unbounded: %d bytes", len(placeholder))
+	}
+}
+
+func TestOverflowCompactFallbackTextDegradesToMarkerWhenEmpty(t *testing.T) {
+	text, mode := overflowCompactFallbackText(nil)
+	if text != overflowCompactOmittedMarker || mode != "省略标记" {
+		t.Fatalf("empty head fallback = %q / %q", text, mode)
+	}
+	digest, mode := overflowCompactFallbackText([]any{
+		map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "deploy target is prod-eu"}}},
+	})
+	if !strings.Contains(digest, "deploy target is prod-eu") || mode != "机械摘录" {
+		t.Fatalf("digest fallback = %q / %q", digest, mode)
+	}
+}
+
+// 只有"摘要调用自身超窗"才值得缩量重试；其余失败换个体积也是同样结果。
+func TestOverflowSummaryFailedForContextWindow(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "json context length error", status: 400, body: `{"error":{"code":"context_length_exceeded"}}`, want: true},
+		{name: "json window message", status: 400, body: `{"error":{"message":"input exceeds the context window"}}`, want: true},
+		{name: "sse text fallback", status: 400, body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\"}}}\n", want: true},
+		{name: "rate limited", status: 429, body: `{"error":{"code":"rate_limit_exceeded"}}`, want: false},
+		{name: "no available account", status: 503, body: `{"error":{"message":"no available account"}}`, want: false},
+		{name: "success without text", status: 200, body: `{}`, want: false},
+		{name: "empty body", status: 400, body: "", want: false},
+	}
+	for _, tc := range cases {
+		if got := overflowSummaryFailedForContextWindow(tc.status, []byte(tc.body)); got != tc.want {
+			t.Fatalf("%s: overflowSummaryFailedForContextWindow = %t, want %t", tc.name, got, tc.want)
+		}
+	}
+}

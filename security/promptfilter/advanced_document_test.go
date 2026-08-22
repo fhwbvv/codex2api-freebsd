@@ -80,6 +80,19 @@ func TestParseAdvancedConfigDocumentRemovesCaseVariantNewAPISecrets(t *testing.T
 	}
 }
 
+func TestAdvancedConfigDocumentRoundTripsLocalBlockMessage(t *testing.T) {
+	document, err := ParseAdvancedConfigDocument(`{"enforcement":{"local_block_message":"Custom block"}}`)
+	if err != nil {
+		t.Fatalf("ParseAdvancedConfigDocument: %v", err)
+	}
+	if got := document.Effective.Enforcement.LocalBlockMessage; got != "Custom block" {
+		t.Fatalf("message = %q, want Custom block", got)
+	}
+	if !strings.Contains(document.Raw, `"local_block_message":"Custom block"`) {
+		t.Fatalf("persisted document lost local block message: %s", document.Raw)
+	}
+}
+
 func TestMergeAdvancedConfigDocumentUpdatesFieldsWithoutDroppingUnknowns(t *testing.T) {
 	base := `{
 		"normalization":{"enabled":true,"future_decoder":"v2"},

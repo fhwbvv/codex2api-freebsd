@@ -602,6 +602,106 @@ func (db *DB) InsertGrokAccountIfAbsent(ctx context.Context, name string, creden
 	return accountID, duplicateAccountID, err
 }
 
+// GrokReauthResult describes how a duplicate-identity re-authorization landed.
+type GrokReauthResult struct {
+	// Revived 表示该账号原先在回收站,本次重授权已将其复活。
+	Revived bool
+}
+
+// ReauthGrokAccount 把一次新授权的凭据合并进已持有该凭据身份的账号:
+// 回收站账号复活(status/deleted_at/enabled/冷却全部重置),正常账号原地更新
+// token(status=error 时顺带清错)。name/proxyURL 仅在非空时覆盖既有值。
+// 新凭据派生出的全部身份键都必须归属 accountID(缺失的键补登记),任一键
+// 属于其他账号时中止——两份身份不能被静默合并。
+func (db *DB) ReauthGrokAccount(ctx context.Context, accountID int64, credentials map[string]any, name, proxyURL string) (GrokReauthResult, error) {
+	var result GrokReauthResult
+	if db == nil || db.conn == nil {
+		return result, errors.New("database is not initialized")
+	}
+	if accountID <= 0 {
+		return result, errors.New("invalid account id")
+	}
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		tx, beginErr := db.conn.BeginTx(ctx, nil)
+		if beginErr != nil {
+			return beginErr
+		}
+		defer tx.Rollback()
+
+		selectQuery := `SELECT credentials, status, COALESCE(error_message,''), deleted_at IS NOT NULL FROM accounts WHERE id=$1`
+		if !db.isSQLite() {
+			selectQuery += ` FOR UPDATE`
+		}
+		var currentRaw any
+		var status, errorMessage string
+		var deleted bool
+		if scanErr := tx.QueryRowContext(ctx, selectQuery, accountID).Scan(&currentRaw, &status, &errorMessage, &deleted); scanErr != nil {
+			return scanErr
+		}
+		existing := decodeCredentials(currentRaw)
+		if !strings.EqualFold(strings.TrimSpace(credentialStringFromMap(existing, "upstream_type")), "grok") {
+			return fmt.Errorf("账号 %d 不是 Grok 账号,不能承接 Grok 重授权", accountID)
+		}
+		inRecycleBin := deleted || strings.EqualFold(strings.TrimSpace(status), "deleted") || strings.EqualFold(strings.TrimSpace(errorMessage), "deleted")
+
+		merged := mergeCredentialMaps(existing, credentials)
+		// credentialFamilyCandidate 优先取既有 credential_family_id,family 跨 RT 轮转稳定。
+		familyID := credentialFamilyCandidate(merged)
+		if familyID == "" {
+			familyID = "cf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		}
+		merged["credential_family_id"] = familyID
+
+		for _, identityKey := range grokCredentialIdentityKeys(merged, familyID) {
+			if _, claimErr := tx.ExecContext(ctx, `INSERT INTO grok_credential_identity_claims(identity_key,account_id) VALUES($1,$2) ON CONFLICT(identity_key) DO NOTHING`, identityKey, accountID); claimErr != nil {
+				return claimErr
+			}
+			var holder int64
+			if queryErr := tx.QueryRowContext(ctx, `SELECT account_id FROM grok_credential_identity_claims WHERE identity_key=$1`, identityKey).Scan(&holder); queryErr != nil {
+				return queryErr
+			}
+			if holder != accountID {
+				return fmt.Errorf("凭据身份已被账号 %d 占用,无法合并到账号 %d,请先处理冲突账号", holder, accountID)
+			}
+		}
+
+		encoded, marshalErr := json.Marshal(merged)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		credentialsExpr := "$1"
+		if !db.isSQLite() {
+			credentialsExpr = "$1::jsonb"
+		}
+		if _, updateErr := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE accounts SET credentials=%s, credential_family_id=$2, updated_at=CURRENT_TIMESTAMP WHERE id=$3`, credentialsExpr), encoded, familyID, accountID); updateErr != nil {
+			return updateErr
+		}
+		if name = strings.TrimSpace(name); name != "" {
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE accounts SET name=$1 WHERE id=$2`, name, accountID); updateErr != nil {
+				return updateErr
+			}
+		}
+		if proxyURL = strings.TrimSpace(proxyURL); proxyURL != "" {
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE accounts SET proxy_url=$1 WHERE id=$2`, proxyURL, accountID); updateErr != nil {
+				return updateErr
+			}
+		}
+		if inRecycleBin {
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE accounts SET status='active', error_message='', deleted_at=NULL, enabled=$1, cooldown_until=NULL, cooldown_reason='' WHERE id=$2`, true, accountID); updateErr != nil {
+				return updateErr
+			}
+			result.Revived = true
+		} else if strings.EqualFold(strings.TrimSpace(status), "error") {
+			// 与 Codex 重导入语义一致:仅清鉴权类错误态,不动合法的限速冷却。
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE accounts SET status='active', error_message='' WHERE id=$1`, accountID); updateErr != nil {
+				return updateErr
+			}
+		}
+		return tx.Commit()
+	})
+	return result, err
+}
+
 // backfillGrokCredentialIdentityClaims assigns each historical identity to its
 // oldest account. INSERT ... ON CONFLICT makes the migration safe when an old
 // deployment already contains duplicates: those rows remain available for

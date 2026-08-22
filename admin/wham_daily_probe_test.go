@@ -21,12 +21,14 @@ func TestWhamDailyUsageDueTargetsUsesPerStatusIntervals(t *testing.T) {
 	now := time.Now()
 	active := &auth.Account{DBID: 1, AccessToken: "token"}
 	limited := rateLimitedProbeAccount(2, now)
-	all := []*auth.Account{active, limited}
+	authoritative := &auth.Account{DBID: 3, AccessToken: "token"}
+	authoritative.SetCooldownUntil(now.Add(12*time.Hour), auth.ResponsesRateLimitedCooldownReason)
+	all := []*auth.Account{active, limited, authoritative}
 
-	// 首轮：没有计时记录，两个账号都要刷。
+	// 首轮：没有计时记录，三个账号都要刷。
 	lastAttempt := map[int64]time.Time{}
-	if targets := whamDailyUsageDueTargets(all, lastAttempt, now); len(targets) != 2 {
-		t.Fatalf("first round targets = %d, want 2", len(targets))
+	if targets := whamDailyUsageDueTargets(all, lastAttempt, now); len(targets) != 3 {
+		t.Fatalf("first round targets = %d, want 3", len(targets))
 	}
 
 	// 半小时后：正常账号未到 1h，限流账号未到 6h，都不刷。
@@ -52,6 +54,9 @@ func TestWhamDailyUsageDueTargetsUsesPerStatusIntervals(t *testing.T) {
 	if !found[2] {
 		t.Fatalf("6h targets = %+v, want rate-limited account 2 due", targets)
 	}
+	if !found[3] {
+		t.Fatalf("6h targets = %+v, want Responses-limited account 3 due", targets)
+	}
 }
 
 func TestWhamDailyUsageDueTargetsRecoveredAccountResumesHourly(t *testing.T) {
@@ -67,6 +72,33 @@ func TestWhamDailyUsageDueTargetsRecoveredAccountResumesHourly(t *testing.T) {
 	hourLater := now.Add(time.Hour)
 	if targets := whamDailyUsageDueTargets([]*auth.Account{recovered}, lastAttempt, hourLater); len(targets) != 1 {
 		t.Fatalf("recovered 1h targets = %d, want 1", len(targets))
+	}
+}
+
+func TestWhamDailyUsageAutoRefreshEligibleSkipsErrorBannedAndNewAccounts(t *testing.T) {
+	now := time.Now()
+	ready := &auth.Account{DBID: 1, AccessToken: "at", AddedAt: now.Add(-25 * time.Hour).UnixNano()}
+	if !whamDailyUsageAutoRefreshEligible(ready, now) {
+		t.Fatal("account older than one day should auto-refresh")
+	}
+
+	fresh := &auth.Account{DBID: 2, AccessToken: "at", AddedAt: now.Add(-2 * time.Hour).UnixNano()}
+	if whamDailyUsageAutoRefreshEligible(fresh, now) {
+		t.Fatal("account imported within one day should wait for official settlement")
+	}
+
+	errored := &auth.Account{DBID: 3, AccessToken: "at", Status: auth.StatusError, AddedAt: now.Add(-48 * time.Hour).UnixNano()}
+	if whamDailyUsageAutoRefreshEligible(errored, now) {
+		t.Fatal("error account should not auto-refresh official usage")
+	}
+
+	banned := &auth.Account{
+		DBID: 4, AccessToken: "at", Status: auth.StatusCooldown,
+		CooldownUtil: now.Add(time.Hour), CooldownReason: "unauthorized",
+		AddedAt: now.Add(-48 * time.Hour).UnixNano(),
+	}
+	if whamDailyUsageAutoRefreshEligible(banned, now) {
+		t.Fatal("banned account should not auto-refresh official usage")
 	}
 }
 

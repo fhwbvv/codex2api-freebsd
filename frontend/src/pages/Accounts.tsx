@@ -1,4 +1,4 @@
-import type { ChangeEvent, DragEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
+import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate } from "react-router-dom";
@@ -57,12 +57,20 @@ import {
   type AccountOperationResult,
   type AccountOperationResultsState,
 } from "../lib/accountOperationResults";
+import { operationProgressMessage } from "../lib/operationProgressMessage";
 import {
   readOperationResultsVisibility,
   writeOperationResultsVisibility,
 } from "../lib/operationResultsPreference";
 import {
+  isLargePoolSortDisabled,
+  resolveDisabledAccountSorts,
+} from "../lib/accountListSort";
+import {
   formatLongUsageWindowLabel,
+  getAccountStatusBadgeStatus,
+  isOfficialCostHiddenAccount,
+  isOfficialCostTooNew,
   needsOfficialCostReload,
   needsUsageReload,
 } from "../lib/usageFormat";
@@ -76,6 +84,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   Table,
   TableBody,
@@ -155,6 +169,16 @@ import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
 import AccountHealthBar from "../components/AccountHealthBar";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import RequestCountPills, {
+  CountBreakdownTooltip,
+} from "../components/RequestCountPills";
+import { buildModelCountBreakdown } from "../lib/requestErrorStatus";
+import {
+  accountStateSurfaceClass,
+  accountStateTableRowClass,
+  renderAccountStateOverlay,
+  resolveAccountOverlayKind,
+} from "../components/AccountStateOverlay";
 import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
@@ -172,6 +196,35 @@ import AccountGroupFilterSelect, {
 import ChipInput from "../components/ChipInput";
 
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
+
+// 账号导入的体积约束。后端对导入端点放宽到 200MB;单个文件无法再切分,超过
+// 上限直接拒绝。多文件按累计大小切成多批,每批控制在 150MB 内(留余量给
+// multipart 边界与其它表单字段),避免单个请求体触发后端上限。
+const IMPORT_MAX_FILE_BYTES = 200 * 1024 * 1024;
+const IMPORT_BATCH_MAX_BYTES = 150 * 1024 * 1024;
+
+const formatMB = (bytes: number): string =>
+  `${Math.round(bytes / (1024 * 1024))}MB`;
+
+// splitFilesIntoBatches 按累计字节大小把文件分批。单个文件即便超过 batchMax
+// 也自成一批(交由后端上限兜底),保证每个文件都被投递。
+function splitFilesIntoBatches(files: File[], batchMax: number): File[][] {
+  const batches: File[][] = [];
+  let current: File[] = [];
+  let currentSize = 0;
+  for (const file of files) {
+    if (current.length > 0 && currentSize + file.size > batchMax) {
+      batches.push(current);
+      current = [];
+      currentSize = 0;
+    }
+    current.push(file);
+    currentSize += file.size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches.length > 0 ? batches : [[]];
+}
+
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
   "codex2api:accounts:email-domain-tags-visible";
@@ -710,7 +763,7 @@ function useMediaQuery(query: string) {
   return matches;
 }
 
-type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh";
+type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh" | "clean";
 
 interface BatchOperationEvent {
   type: "start" | "progress" | "complete";
@@ -862,25 +915,6 @@ interface AccountRowActions {
   usageRefreshed: () => void;
 }
 
-type AccountOverlayKind = "disabled" | "overload";
-
-function resolveAccountOverlayKind(
-  account: AccountRow,
-): AccountOverlayKind | null {
-  if (account.enabled === false) return "disabled";
-  if (account.status === "overload_paused") return "overload";
-  return null;
-}
-
-function accountStateSurfaceClass(
-  account: AccountRow,
-  extraWhenActive = "",
-): string {
-  return resolveAccountOverlayKind(account)
-    ? ` account-state-surface${extraWhenActive}`
-    : "";
-}
-
 function formatCountdownRemaining(untilMs: number, nowMs: number): string {
   const diff = Math.max(0, untilMs - nowMs);
   if (diff <= 0) return "";
@@ -916,193 +950,6 @@ function useCountdownRemaining(until?: string): string {
   return remaining;
 }
 
-function AccountStateOverlay({
-  kind,
-  label,
-  compact = false,
-  countdownUntil,
-  resumingLabel,
-  recoverLabel,
-  recoveringLabel,
-  onRecover,
-}: {
-  kind: AccountOverlayKind;
-  label: string;
-  compact?: boolean;
-  countdownUntil?: string;
-  resumingLabel?: string;
-  recoverLabel?: string;
-  recoveringLabel?: string;
-  onRecover?: () => void | Promise<void>;
-}) {
-  const remaining = useCountdownRemaining(countdownUntil);
-  const [busy, setBusy] = useState(false);
-  const isOverload = kind === "overload";
-  const countdownText = remaining || (isOverload ? resumingLabel : undefined);
-
-  const handleRecover = async (event: ReactMouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!onRecover || busy) return;
-    setBusy(true);
-    try {
-      await onRecover();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div
-      className={cn(
-        "account-state-overlay pointer-events-none absolute inset-0 z-10 overflow-hidden rounded-[inherit]",
-        isOverload
-          ? "account-state-overlay--overload"
-          : "account-state-overlay--disabled",
-      )}
-      aria-hidden={!isOverload}
-    >
-      <div className="account-state-overlay__scrim absolute inset-0" />
-      <div className="account-state-overlay__mark absolute inset-0 flex items-center justify-center px-3">
-        {isOverload && !compact ? (
-          <div className="flex min-w-[188px] flex-col items-center gap-2 rounded-2xl border border-orange-300/60 bg-card/95 px-4 py-3 text-orange-800 shadow-[0_1px_2px_hsl(24_80%_20%/0.06),0_10px_28px_hsl(24_80%_20%/0.08)] backdrop-blur-md dark:border-orange-400/25 dark:text-orange-100 dark:shadow-[0_1px_2px_rgb(0_0_0/0.24),0_10px_28px_rgb(0_0_0/0.2)]">
-            <div className="flex items-center gap-1.5">
-              <span className="flex size-5 items-center justify-center rounded-full bg-orange-500/15 text-orange-600 dark:text-orange-300">
-                <ShieldAlert className="size-3" />
-              </span>
-              <span className="text-xs font-medium tracking-[0.04em]">
-                {label}
-              </span>
-            </div>
-            {countdownText ? (
-              <span
-                className="font-mono text-lg font-semibold leading-none tabular-nums tracking-wide"
-                title={countdownUntil ? formatBeijingTime(countdownUntil) : undefined}
-              >
-                {countdownText}
-              </span>
-            ) : null}
-            {onRecover ? (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={(event) => void handleRecover(event)}
-                className="pointer-events-auto inline-flex items-center gap-1 rounded-full bg-orange-600 px-2.5 py-1 text-[11px] font-medium text-white shadow-sm transition-colors hover:bg-orange-500 disabled:cursor-wait disabled:opacity-70 dark:bg-orange-500 dark:hover:bg-orange-400"
-              >
-                {busy ? (
-                  <Loader2 className="size-3 animate-spin" />
-                ) : (
-                  <RotateCcw className="size-3" />
-                )}
-                {busy ? recoveringLabel : recoverLabel}
-              </button>
-            ) : null}
-          </div>
-        ) : (
-          <span
-            className={cn(
-              "inline-flex items-center rounded-full border bg-card/95 shadow-[0_1px_2px_hsl(222_40%_11%/0.06),0_8px_24px_hsl(222_40%_11%/0.06)] backdrop-blur-md dark:shadow-[0_1px_2px_rgb(0_0_0/0.24),0_8px_24px_rgb(0_0_0/0.18)]",
-              compact && isOverload
-                ? "gap-2 py-1.5 pl-2 pr-2.5"
-                : compact
-                  ? "gap-1 py-0.5 pl-1 pr-1.5"
-                  : "gap-1.5 py-1 pl-1.5 pr-2.5",
-              isOverload
-                ? "border-orange-300/70 text-orange-800 dark:border-orange-400/25 dark:text-orange-100"
-                : "border-border/60 text-muted-foreground",
-            )}
-          >
-            <span
-              className={cn(
-                "flex items-center justify-center rounded-full",
-                compact && isOverload ? "size-6" : compact ? "size-4" : "size-5",
-                isOverload
-                  ? "bg-orange-500/15 text-orange-600 dark:text-orange-300"
-                  : "bg-muted/80 text-muted-foreground",
-              )}
-            >
-              {isOverload ? (
-                <ShieldAlert className={compact ? "size-3.5" : "size-3"} />
-              ) : (
-                <PowerOff className={compact ? "size-2.5" : "size-3"} />
-              )}
-            </span>
-            <span
-              className={cn(
-                "font-medium tracking-[0.04em]",
-                compact && isOverload ? "text-sm" : compact ? "text-[11px]" : "text-xs",
-              )}
-            >
-              {label}
-            </span>
-            {countdownText ? (
-              <span
-                className={cn(
-                  "font-mono font-semibold tabular-nums tracking-wide",
-                  compact && isOverload ? "text-sm" : compact ? "text-[11px]" : "text-xs",
-                )}
-                title={countdownUntil ? formatBeijingTime(countdownUntil) : undefined}
-              >
-                {countdownText}
-              </span>
-            ) : null}
-            {isOverload && onRecover ? (
-              <button
-                type="button"
-                disabled={busy}
-                onClick={(event) => void handleRecover(event)}
-                className={cn(
-                  "pointer-events-auto inline-flex items-center rounded-full bg-orange-600 font-medium text-white shadow-sm transition-colors hover:bg-orange-500 disabled:cursor-wait disabled:opacity-70 dark:bg-orange-500 dark:hover:bg-orange-400",
-                  compact ? "gap-1.5 px-2.5 py-1 text-xs" : "gap-1 px-2 py-0.5 text-[11px]",
-                )}
-              >
-                {busy ? (
-                  <Loader2 className={compact ? "size-3.5 animate-spin" : "size-3 animate-spin"} />
-                ) : (
-                  <RotateCcw className={compact ? "size-3.5" : "size-3"} />
-                )}
-                {busy ? recoveringLabel : recoverLabel}
-              </button>
-            ) : null}
-          </span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function renderAccountStateOverlay(
-  account: AccountRow,
-  t: ReturnType<typeof useTranslation>["t"],
-  options: {
-    compact?: boolean;
-    onRecover?: () => void | Promise<void>;
-  } = {},
-) {
-  const kind = resolveAccountOverlayKind(account);
-  if (!kind) return null;
-  return (
-    <AccountStateOverlay
-      kind={kind}
-      compact={options.compact}
-      label={
-        kind === "disabled"
-          ? t("accounts.disabledOverlay")
-          : t("accounts.overloadOverlay")
-      }
-      countdownUntil={
-        kind === "overload"
-          ? getAccountStatusCountdownUntil(account)
-          : undefined
-      }
-      resumingLabel={t("accounts.overloadResuming")}
-      recoverLabel={t("accounts.overloadRecover")}
-      recoveringLabel={t("accounts.overloadRecovering")}
-      onRecover={kind === "overload" ? options.onRecover : undefined}
-    />
-  );
-}
-
 // memo 边界:宿主 Accounts 组件有上百个 state,任何弹窗/表单/进度条状态变化都会
 // 整树重渲染;行数据没变时这里直接跳过,交互卡顿的大头就在这。
 const AccountTableRow = memo(function AccountTableRow({
@@ -1134,6 +981,13 @@ const AccountTableRow = memo(function AccountTableRow({
   t: ReturnType<typeof useTranslation>["t"];
   actions: AccountRowActions;
 }) {
+  const tableOverlayKind = resolveAccountOverlayKind(account);
+  const tableOverlay = renderAccountStateOverlay(account, t, {
+    compact: true,
+    markerOnly: true,
+    onRecover: () => actions.resetStatus(account),
+  });
+
   return (
                           <TableRow
                             key={account.id}
@@ -1144,11 +998,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                 : selected
                                   ? "bg-primary/5"
                                   : ""
-                            }${
-                              // 禁用 / 过载暂停用独立遮罩层淡化内容，徽章保持清晰。relative 让遮罩以整行为定位基准。
-                              // 不用 grayscale / 行级 opacity：filter 会破坏定位包含块，opacity 会把徽章一起冲淡。
-                              accountStateSurfaceClass(account, " relative")
-                            }`}
+                            }${accountStateTableRowClass(account)}`}
                             onClick={(event) => {
                               const target = event.target as HTMLElement | null;
                               if (
@@ -1162,17 +1012,38 @@ const AccountTableRow = memo(function AccountTableRow({
                             }}
                           >
                             <TableCell>
-                              {renderAccountStateOverlay(account, t, {
-                                compact: true,
-                                onRecover: () => actions.resetStatus(account),
-                              })}
-                              <input
-                                type="checkbox"
-                                className="size-4 cursor-pointer accent-primary"
-                                checked={selected}
-                                onChange={() => actions.toggleSelect(account.id)}
-                                onClick={(event) => event.stopPropagation()}
-                              />
+                              <div className="flex items-center gap-1">
+                                <input
+                                  type="checkbox"
+                                  className="size-4 cursor-pointer accent-primary"
+                                  checked={selected}
+                                  onChange={() => actions.toggleSelect(account.id)}
+                                  onClick={(event) => event.stopPropagation()}
+                                />
+                                {!visibleColumns.status && tableOverlayKind ? (
+                                  <span className="sr-only">
+                                    {tableOverlayKind === "disabled"
+                                      ? t("accounts.disabledOverlay")
+                                      : t("accounts.overloadOverlay")}
+                                  </span>
+                                ) : null}
+                                {!visibleColumns.status &&
+                                tableOverlayKind === "overload" ? (
+                                  <button
+                                    type="button"
+                                    className="inline-flex size-7 items-center justify-center rounded-md text-orange-700 transition-colors hover:bg-orange-500/10 dark:text-orange-300"
+                                    title={t("accounts.overloadRecover")}
+                                    aria-label={t("accounts.overloadRecover")}
+                                    onClick={(event) => {
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      void actions.resetStatus(account);
+                                    }}
+                                  >
+                                    <RotateCcw className="size-3.5" />
+                                  </button>
+                                ) : null}
+                              </div>
                             </TableCell>
                             {visibleColumns.sequence && (
                               <TableCell
@@ -1362,7 +1233,10 @@ const AccountTableRow = memo(function AccountTableRow({
                             {visibleColumns.plan && (
                               <TableCell>
                                 <div className="flex flex-wrap items-center gap-1.5">
-                                  <PlanBadge planType={account.plan_type} />
+                                  <PlanBadge
+                                    planType={account.plan_type}
+                                    workspaceId={accountWorkspaceId(account)}
+                                  />
                                   <ExpiryBadge
                                     expiresAt={account.subscription_expires_at}
                                     planType={account.plan_type}
@@ -1371,70 +1245,68 @@ const AccountTableRow = memo(function AccountTableRow({
                               </TableCell>
                             )}
                             {visibleColumns.status && (
-                              <TableCell>
-                                <div
-                                  className="min-w-[168px] max-w-[240px] space-y-1.5"
-                                  title={[
-                                    t("accounts.healthSummary", {
-                                      health: formatHealthTier(
-                                        account.health_tier,
-                                        t,
-                                      ),
-                                      score: Math.round(
-                                        getDispatchScore(account),
-                                      ),
-                                      concurrency:
-                                        account.dynamic_concurrency_limit ?? "-",
-                                    }),
-                                    account.status === "error" &&
-                                    account.error_message
-                                      ? account.error_message
-                                      : "",
-                                    (account.model_cooldowns?.length ?? 0) > 0
-                                      ? `model ${account.model_cooldowns?.[0]?.model}${(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ""}`
-                                      : "",
-                                  ]
-                                    .filter(Boolean)
-                                    .join("\n")}
-                                >
-                                  <div className="flex min-h-6 flex-wrap items-center gap-1.5">
-                                    <StatusBadge
-                                      status={
-                                        account.status === "overload_paused"
-                                          ? "active"
-                                          : account.status
-                                      }
-                                      detail={
-                                        account.status === "overload_paused"
-                                          ? undefined
-                                          : getAccountRateLimitWindow(account) ??
-                                            undefined
-                                      }
-                                      errorMessage={account.error_message}
-                                    />
-                                    <UsingCreditsBadge account={account} />
-                                    {account.status !== "overload_paused" && (
-                                      <AccountStatusCountdown account={account} />
-                                    )}
-                                    {(account.active_requests ?? 0) > 0 && (
-                                      <span
-                                        className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
-                                        title={t("accounts.activeRequestsTooltip", {
-                                          count: account.active_requests ?? 0,
-                                        })}
-                                      >
+                              <TableCell data-account-state-cell="status">
+                                {tableOverlay ?? (
+                                  <div
+                                    className="min-w-[168px] max-w-[240px] space-y-1.5"
+                                    title={[
+                                      t("accounts.healthSummary", {
+                                        health: formatHealthTier(
+                                          account.health_tier,
+                                          t,
+                                        ),
+                                        score: Math.round(
+                                          getDispatchScore(account),
+                                        ),
+                                        concurrency:
+                                          account.dynamic_concurrency_limit ?? "-",
+                                      }),
+                                      account.status === "error" &&
+                                      account.error_message
+                                        ? account.error_message
+                                        : "",
+                                      (account.model_cooldowns?.length ?? 0) > 0
+                                        ? `model ${account.model_cooldowns?.[0]?.model}${(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ""}`
+                                        : "",
+                                    ]
+                                      .filter(Boolean)
+                                      .join("\n")}
+                                  >
+                                    <div className="flex min-h-6 flex-wrap items-center gap-1.5">
+                                      <StatusBadge
+                                        status={getAccountStatusBadgeStatus(account)}
+                                        detail={
+                                          account.status === "overload_paused"
+                                            ? undefined
+                                            : getAccountRateLimitWindow(account) ??
+                                              undefined
+                                        }
+                                        errorMessage={account.error_message}
+                                      />
+                                      <UsingCreditsBadge account={account} />
+                                      {account.status !== "overload_paused" && (
+                                        <AccountStatusCountdown account={account} />
+                                      )}
+                                      {(account.active_requests ?? 0) > 0 && (
                                         <span
-                                          className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
-                                          aria-hidden
-                                        />
-                                        {account.active_requests}
-                                      </span>
-                                    )}
+                                          className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+                                          title={t("accounts.activeRequestsTooltip", {
+                                            count: account.active_requests ?? 0,
+                                          })}
+                                        >
+                                          <span
+                                            className="size-1.5 animate-pulse rounded-full bg-blue-500 dark:bg-blue-400"
+                                            aria-hidden
+                                          />
+                                          {account.active_requests}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <AccountHealthBar
+                                      buckets={healthBuckets}
+                                    />
                                   </div>
-                                  <AccountHealthBar
-                                    buckets={healthBuckets}
-                                  />
-                                </div>
+                                )}
                               </TableCell>
                             )}
                             {visibleColumns.today && (
@@ -1444,26 +1316,7 @@ const AccountTableRow = memo(function AccountTableRow({
                             )}
                             {visibleColumns.requests && (
                               <TableCell>
-                                <div className="space-y-0.5 text-[13px]">
-                                  <div className="flex items-center gap-2">
-                                    <span className="font-medium tabular-nums text-emerald-600 dark:text-emerald-400">
-                                      {account.success_requests ?? 0}
-                                    </span>
-                                    <span className="text-muted-foreground">
-                                      /
-                                    </span>
-                                    <span className="font-medium tabular-nums text-red-500 dark:text-red-400">
-                                      {account.error_requests ?? 0}
-                                    </span>
-                                  </div>
-                                  {((account.retry_error_requests ?? 0) > 0 ||
-                                    (account.rate_limit_attempts ?? 0) > 0) && (
-                                    <div className="text-[11px] text-muted-foreground">
-                                      retry {account.retry_error_requests ?? 0}{" "}
-                                      · 429 {account.rate_limit_attempts ?? 0}
-                                    </div>
-                                  )}
-                                </div>
+                                <RequestCountPills account={account} compact />
                               </TableCell>
                             )}
                             {visibleColumns.usage && (
@@ -1730,7 +1583,13 @@ export default function Accounts() {
     "all",
   );
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | null
+    | "requests"
+    | "today"
+    | "usage"
+    | "importTime"
+    | "schedulerPriority"
+    | "group"
+    | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
@@ -2476,7 +2335,7 @@ export default function Accounts() {
         rateLimited: event.rate_limited ?? prev?.rateLimited ?? 0,
         deleted: event.deleted ?? prev?.deleted ?? 0,
         done: event.type === "complete",
-        message: event.error || event.message || prev?.message,
+        message: operationProgressMessage(event, prev?.message),
       }));
       if (event.type === "complete") {
         if (
@@ -2612,24 +2471,27 @@ export default function Accounts() {
       facets: accountsResponse.facets,
       snapshotAt: accountsResponse.snapshot_at,
       statsState: accountsResponse.stats_state,
+      disabledSorts: accountsResponse.disabled_sorts ?? [],
     };
   }, [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, sortDir, sortKey, statusFilter, tagFilter]);
 
-  const loadAccountAnalysis = useCallback(async () => {
+  const loadAccountAnalysis = useCallback(async (opts?: { silent?: boolean }) => {
     accountAnalysisAbortRef.current?.abort();
     const controller = new AbortController();
     accountAnalysisAbortRef.current = controller;
-    setAccountAnalysisLoading(true);
-    setAccountAnalysisError(null);
+    if (!opts?.silent) {
+      setAccountAnalysisLoading(true);
+      setAccountAnalysisError(null);
+    }
     try {
       const response = await api.getAccountAnalysis("codex", controller.signal);
       if (!controller.signal.aborted) setAccountAnalysis(response);
     } catch (analysisError) {
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && !opts?.silent) {
         setAccountAnalysisError(getErrorMessage(analysisError));
       }
     } finally {
-      if (!controller.signal.aborted) setAccountAnalysisLoading(false);
+      if (!controller.signal.aborted && !opts?.silent) setAccountAnalysisLoading(false);
     }
   }, []);
 
@@ -2658,6 +2520,7 @@ export default function Accounts() {
     facets: { tags: string[]; email_domains: AccountEmailDomainFacet[] };
     snapshotAt: string;
     statsState: "ready" | "stale" | "warming";
+    disabledSorts: string[];
   }>({
     initialData: {
       accounts: [],
@@ -2667,12 +2530,30 @@ export default function Accounts() {
       facets: { tags: [], email_domains: [] },
       snapshotAt: "",
       statsState: "warming",
+      disabledSorts: [],
     },
     load: loadAccounts,
     // Grok 视图与本组件共用挂载:此时 codex 列表链(列表→health-bars→page-stats
     // →静默重载循环)必须整体停摆,否则在 Grok 页后台空转并连带整树重渲染。
     enabled: providerView === "codex",
   });
+  const disabledSorts = useMemo(
+    () => resolveDisabledAccountSorts(data.disabledSorts, data.summary?.total),
+    [data.disabledSorts, data.summary?.total],
+  );
+  const usageSortBlocked = isLargePoolSortDisabled("requests", disabledSorts);
+  const guardUsageSort = useCallback(
+    (key: "requests" | "today") => {
+      if (!isLargePoolSortDisabled(key, disabledSorts)) {
+        return false;
+      }
+      showToast(t("accounts.largePoolSortDisabled"), "warning");
+      return true;
+    },
+    [disabledSorts, showToast, t],
+  );
+  // 禁用窗口(冷启动首轮聚合)只拦截新的排序点击,不清用户已选的排序:
+  // 后端会把被禁用的排序静默降级成默认序,聚合完成后自动按原选择恢复。
   // data.snapshotAt 变化说明列表快照重建过(含删除/封禁后的缓存失效),
   // 分析图跟着重取,避免统计卡已更新而额度分布仍显示旧账号集。
   useEffect(() => {
@@ -2692,6 +2573,42 @@ export default function Accounts() {
     }));
     return account;
   }, [setData]);
+  // 删除后先本地摘行,再静默对齐统计卡。reload() 会把顶部打成「加载中」,
+  // 大号池上连点删除等于反复整页转圈。
+  const refreshAfterAccountRemoval = useCallback((ids: number[]) => {
+    if (ids.length === 0) {
+      void reloadSilently();
+      return;
+    }
+    const drop = new Set(ids);
+    let remainingOnPage = 0;
+    setData((current) => {
+      const accounts = current.accounts.filter((account) => !drop.has(account.id));
+      remainingOnPage = accounts.length;
+      return {
+        ...current,
+        accounts,
+        total: Math.max(0, current.total - ids.length),
+        summary: current.summary
+          ? { ...current.summary, total: Math.max(0, current.summary.total - ids.length) }
+          : current.summary,
+      };
+    });
+    setSelected((current) => {
+      if (current.size === 0) return current;
+      const next = new Set(current);
+      let changed = false;
+      for (const id of ids) {
+        if (next.delete(id)) changed = true;
+      }
+      return changed ? next : current;
+    });
+    if (remainingOnPage === 0 && page > 1) {
+      setPage(page - 1);
+      return;
+    }
+    void reloadSilently();
+  }, [page, reloadSilently, setData]);
   const visibleAccountIDs = useMemo(
     () => data.accounts.map((account) => account.id),
     [data.accounts],
@@ -2944,7 +2861,8 @@ export default function Accounts() {
       statsStaleRetriesRef.current = 0;
       return undefined;
     }
-    if (statsStaleRetriesRef.current >= 5) return undefined;
+    const maxStatsRetries = data.disabledSorts.includes("requests") ? 60 : 5;
+    if (statsStaleRetriesRef.current >= maxStatsRetries) return undefined;
     const timer = window.setTimeout(() => {
       if (document.hidden) return;
       statsStaleRetriesRef.current += 1;
@@ -3738,24 +3656,55 @@ export default function Accounts() {
     }
   };
 
-  const readImportSSE = async (res: Response) => {
-    setImportProgress({
-      show: true,
+  // readImportSSE 读取单批导入的 SSE 进度流。baseline 是此前已完成批次的累计值,
+  // 本批实时进度叠加其上;markDoneOnComplete=false 时(还有后续批次)不置 done,
+  // 让进度条跨批保持运行态。本批结束后把本批终值累加进 baseline(原地修改)。
+  const readImportSSE = async (
+    res: Response,
+    baseline?: {
+      current: number;
+      total: number;
+      success: number;
+      updated: number;
+      duplicate: number;
+      failed: number;
+    },
+    markDoneOnComplete = true,
+  ) => {
+    const base = baseline ?? {
       current: 0,
       total: 0,
       success: 0,
       updated: 0,
       duplicate: 0,
       failed: 0,
+    };
+    setImportProgress({
+      show: true,
+      current: base.current,
+      total: base.total,
+      success: base.success,
+      updated: base.updated,
+      duplicate: base.duplicate,
+      failed: base.failed,
       done: false,
     });
     const reader = res.body?.getReader();
     if (!reader) {
-      setImportProgress((p) => ({ ...p, done: true }));
+      setImportProgress((p) => ({ ...p, done: markDoneOnComplete }));
       return;
     }
     const decoder = new TextDecoder();
     let buffer = "";
+    // 本批最后一次事件的终值,用于结束后累加进 baseline。
+    let last = {
+      current: 0,
+      total: 0,
+      success: 0,
+      updated: 0,
+      duplicate: 0,
+      failed: 0,
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -3774,21 +3723,39 @@ export default function Accounts() {
             duplicate: number;
             failed: number;
           };
+          last = {
+            current: event.current ?? 0,
+            total: event.total ?? 0,
+            success: event.success ?? 0,
+            updated: event.updated ?? 0,
+            duplicate: event.duplicate ?? 0,
+            failed: event.failed ?? 0,
+          };
           setImportProgress((p) => ({
             ...p,
-            current: event.current,
-            total: event.total,
-            success: event.success,
-            updated: event.updated ?? 0,
-            duplicate: event.duplicate,
-            failed: event.failed,
-            done: event.type === "complete",
+            current: base.current + last.current,
+            total: base.total + last.total,
+            success: base.success + last.success,
+            updated: base.updated + last.updated,
+            duplicate: base.duplicate + last.duplicate,
+            failed: base.failed + last.failed,
+            done: markDoneOnComplete && event.type === "complete",
           }));
-          if (event.type === "complete") void reload();
+          // 单批(旧调用方)或分批最后一批完成时刷新列表;中间批不刷新,
+          // 避免多批导入反复整表重载。
+          if (markDoneOnComplete && event.type === "complete") void reload();
         } catch {
           /* 忽略解析异常 */
         }
       }
+    }
+    if (baseline) {
+      baseline.current += last.current;
+      baseline.total += last.total;
+      baseline.success += last.success;
+      baseline.updated += last.updated;
+      baseline.duplicate += last.duplicate;
+      baseline.failed += last.failed;
     }
   };
 
@@ -3804,6 +3771,24 @@ export default function Accounts() {
       showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
       return;
     }
+
+    // 单个文件超过后端导入上限(200MB)无法再切分,直接拒绝并提示。
+    const oversized = files.find((f) => f.size > IMPORT_MAX_FILE_BYTES);
+    if (oversized) {
+      showToast(
+        t("accounts.importFileTooLarge", {
+          name: oversized.name,
+          max: formatMB(IMPORT_MAX_FILE_BYTES),
+        }),
+        "error",
+      );
+      return;
+    }
+
+    // 按累计大小把文件切成多批,每批控制在 IMPORT_BATCH_MAX_BYTES 内,避免单个
+    // 请求体过大触发后端限制;后端导入无状态且按凭据幂等去重,分批完全安全。
+    const batches = splitFilesIntoBatches(files, IMPORT_BATCH_MAX_BYTES);
+
     setImporting(true);
     setImportProgress({
       show: true,
@@ -3815,67 +3800,79 @@ export default function Accounts() {
       failed: 0,
       done: false,
     });
+
+    // 跨批累加的基线:每批的 SSE/JSON 进度都是相对本批的,叠加到已完成批次之上。
+    const totals = {
+      current: 0,
+      total: 0,
+      success: 0,
+      updated: 0,
+      duplicate: 0,
+      failed: 0,
+    };
+
     try {
-      const formData = new FormData();
-      if (format !== "txt") formData.append("format", format);
-      const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
-      if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
-      const routedHeaders = applyOptionalWorkspaceRouteHeader(
-        parsedCustomHeaders.value,
-        workspaceOverride,
-      );
-      if (routedHeaders) {
-        formData.append(
-          "custom_headers",
-          JSON.stringify(routedHeaders),
+      for (let i = 0; i < batches.length; i++) {
+        const batch = batches[i];
+        const formData = new FormData();
+        if (format !== "txt") formData.append("format", format);
+        const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
+        if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
+        const routedHeaders = applyOptionalWorkspaceRouteHeader(
+          parsedCustomHeaders.value,
+          workspaceOverride,
         );
-      }
-      if (allowDuplicate) formData.append("allow_duplicate", "true");
-      if (importGroupIds.length > 0) {
-        formData.append("group_ids", JSON.stringify(importGroupIds));
-      }
-      for (const f of files) formData.append("file", f);
-      const res = await fetch("/api/admin/accounts/import", {
-        method: "POST",
-        body: formData,
-        headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
-      });
-      if (res.headers.get("content-type")?.includes("text/event-stream")) {
-        await readImportSSE(res);
-      } else {
-        const data = await res.json();
-        if (!res.ok) {
-          setImportProgress((p) => ({ ...p, show: false }));
-          showToast(
-            data.error
-              ? t("accounts.importFailedWithReason", { error: data.error })
-              : t("accounts.importFailed"),
-            "error",
-          );
+        if (routedHeaders) {
+          formData.append("custom_headers", JSON.stringify(routedHeaders));
+        }
+        if (allowDuplicate) formData.append("allow_duplicate", "true");
+        if (importGroupIds.length > 0) {
+          formData.append("group_ids", JSON.stringify(importGroupIds));
+        }
+        for (const f of batch) formData.append("file", f);
+
+        const res = await fetch("/api/admin/accounts/import", {
+          method: "POST",
+          body: formData,
+          headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
+        });
+
+        // 只有最后一批完成后才标记 done,让进度条在多批之间保持运行态。
+        const isLastBatch = i === batches.length - 1;
+        if (res.headers.get("content-type")?.includes("text/event-stream")) {
+          await readImportSSE(res, totals, isLastBatch);
         } else {
-          setImportProgress({
-            show: true,
-            current: data.total ?? 0,
-            total: data.total ?? 0,
-            success: data.success ?? 0,
-            updated: data.updated ?? 0,
-            duplicate: data.duplicate ?? 0,
-            failed: data.failed ?? 0,
-            done: true,
-          });
-          showToast(t("accounts.importCompleted"));
-          void reload();
+          const data = await res.json();
+          if (!res.ok) {
+            setImportProgress((p) => ({ ...p, show: false }));
+            showToast(
+              data.error
+                ? t("accounts.importFailedWithReason", { error: data.error })
+                : t("accounts.importFailed"),
+              "error",
+            );
+            return;
+          }
+          totals.current += data.total ?? 0;
+          totals.total += data.total ?? 0;
+          totals.success += data.success ?? 0;
+          totals.updated += data.updated ?? 0;
+          totals.duplicate += data.duplicate ?? 0;
+          totals.failed += data.failed ?? 0;
+          setImportProgress({ show: true, ...totals, done: isLastBatch });
+          if (isLastBatch) void reload();
         }
       }
+      showToast(t("accounts.importCompleted"));
     } catch (error) {
       setImportProgress({
         show: true,
-        current: 1,
-        total: 1,
-        success: 0,
-        updated: 0,
-        duplicate: 0,
-        failed: 1,
+        current: Math.max(totals.current, 1),
+        total: Math.max(totals.total, 1),
+        success: totals.success,
+        updated: totals.updated,
+        duplicate: totals.duplicate,
+        failed: totals.failed + 1,
         done: true,
       });
       showToast(
@@ -4305,7 +4302,7 @@ export default function Accounts() {
     try {
       await api.deleteAccount(account.id);
       showToast(t("accounts.deleted"));
-      void reload();
+      refreshAfterAccountRemoval([account.id]);
     } catch (error) {
       showToast(
         t("accounts.deleteFailed", { error: getErrorMessage(error) }),
@@ -4428,7 +4425,7 @@ export default function Accounts() {
     try {
       await api.deleteAccount(account.id);
       showToast(t("accounts.pendingReview.rejected"));
-      void reload();
+      refreshAfterAccountRemoval([account.id]);
     } catch (error) {
       showToast(
         t("accounts.deleteFailed", { error: getErrorMessage(error) }),
@@ -4466,7 +4463,7 @@ export default function Accounts() {
       const fail = result?.failed ?? 0;
       showToast(t("accounts.batchDeleteDone", { success, fail }));
       setSelected(new Set());
-      void reload();
+      void reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.batchDeleteFailed", { error: getErrorMessage(error) }),
@@ -5063,9 +5060,17 @@ export default function Accounts() {
     if (!confirmed) return;
     setCleaningBanned(true);
     try {
-      await api.cleanBanned();
-      showToast(t("accounts.cleanBannedSuccess"));
-      void reload();
+      const result = await runStreamingAccountOperation(
+        "/accounts/clean-banned?stream=true",
+        undefined,
+        t("accounts.cleanBannedProgressTitle"),
+      );
+      showToast(
+        t("accounts.cleanBannedSuccessCount", {
+          count: result?.deleted ?? result?.success ?? 0,
+        }),
+      );
+      await reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.cleanBannedFailed", { error: getErrorMessage(error) }),
@@ -5086,9 +5091,17 @@ export default function Accounts() {
     if (!confirmed) return;
     setCleaningRateLimited(true);
     try {
-      await api.cleanRateLimited();
-      showToast(t("accounts.cleanRateLimitedSuccess"));
-      void reload();
+      const result = await runStreamingAccountOperation(
+        "/accounts/clean-rate-limited?stream=true",
+        undefined,
+        t("accounts.cleanRateLimitedProgressTitle"),
+      );
+      showToast(
+        t("accounts.cleanRateLimitedSuccessCount", {
+          count: result?.deleted ?? result?.success ?? 0,
+        }),
+      );
+      await reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.cleanRateLimitedFailed", { error: getErrorMessage(error) }),
@@ -5109,9 +5122,17 @@ export default function Accounts() {
     if (!confirmed) return;
     setCleaningError(true);
     try {
-      await api.cleanError();
-      showToast(t("accounts.cleanErrorSuccess"));
-      void reload();
+      const result = await runStreamingAccountOperation(
+        "/accounts/clean-error?stream=true",
+        undefined,
+        t("accounts.cleanErrorProgressTitle"),
+      );
+      showToast(
+        t("accounts.cleanErrorSuccessCount", {
+          count: result?.deleted ?? result?.success ?? 0,
+        }),
+      );
+      await reloadSilently();
     } catch (error) {
       showToast(
         t("accounts.cleanErrorFailed", { error: getErrorMessage(error) }),
@@ -6023,14 +6044,10 @@ export default function Accounts() {
               </Button>
             </div>
           ) : null}
-          {loading || data.statsState !== "ready" ? (
+          {loading || disabledSorts.length > 0 ? (
             <div className="mb-2 flex items-center justify-end gap-1.5 text-xs text-muted-foreground" role="status">
-              {loading ? <Loader2 className="size-3 animate-spin" /> : null}
-              {loading
-                ? t("common.loading")
-                : data.statsState === "warming"
-                  ? t("accounts.statsWarming")
-                  : t("accounts.statsStale")}
+              <Loader2 className="size-3 animate-spin" />
+              {loading ? t("common.loading") : t("accounts.statsWarming")}
             </div>
           ) : null}
           <div className="mb-4 grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-5">
@@ -6105,12 +6122,9 @@ export default function Accounts() {
                 analysis={accountAnalysis.quota}
                 compact
                 className="min-w-0"
+                onRefreshAnalysis={() => loadAccountAnalysis({ silent: true })}
                 onProbeStarted={() => {
                   showToast(t('accounts.quotaDistributionRefreshStarted'), 'success')
-                  // 探针在后台并发执行；稍等一下再静默拉取，让首批结果有机会回流
-                  window.setTimeout(() => {
-                    void loadAccountAnalysis()
-                  }, 4000)
                 }}
                 onProbeError={(message) => showToast(message, 'error')}
               />
@@ -6383,15 +6397,21 @@ export default function Accounts() {
                       className="w-full min-w-0 sm:w-32"
                       compact
                       value={
-                        sortKey === "requests" || sortKey === "usage" || sortKey === "importTime"
+                        sortKey === "requests" ||
+                        sortKey === "today" ||
+                        sortKey === "usage" ||
+                        sortKey === "importTime"
                           ? sortKey
                           : "default"
                       }
                       onValueChange={(value) => {
+                        if (value === "requests" || value === "today") {
+                          if (guardUsageSort(value)) return;
+                        }
                         if (value === "default") {
                           setSortKey(null);
                         } else {
-                          setSortKey(value as "requests" | "usage" | "importTime");
+                          setSortKey(value as "requests" | "today" | "usage" | "importTime");
                           setSortDir("desc");
                         }
                         setPage(1);
@@ -6399,11 +6419,15 @@ export default function Accounts() {
                       options={[
                         { value: "default", label: t("accounts.cardSortDefault") },
                         { value: "requests", label: t("accounts.requests") },
+                        { value: "today", label: t("accounts.todayStats") },
                         { value: "usage", label: t("accounts.usage") },
                         { value: "importTime", label: t("accounts.importTime") },
                       ]}
                     />
-                    {(sortKey === "requests" || sortKey === "usage" || sortKey === "importTime") && (
+                    {(sortKey === "requests" ||
+                      sortKey === "today" ||
+                      sortKey === "usage" ||
+                      sortKey === "importTime") && (
                       <Button
                         type="button"
                         variant="outline"
@@ -6904,16 +6928,51 @@ export default function Accounts() {
                         )}
                         {visibleColumns.today && (
                           <TableHead
-                            className="text-[13px] font-semibold"
-                            title={t("accounts.todayStatsHint")}
+                            className={`text-[13px] font-semibold select-none transition-colors ${
+                              usageSortBlocked
+                                ? "cursor-not-allowed text-muted-foreground"
+                                : "cursor-pointer hover:text-primary"
+                            }`}
+                            title={
+                              usageSortBlocked
+                                ? t("accounts.largePoolSortDisabled")
+                                : t("accounts.todayStatsHint")
+                            }
+                            onClick={() => {
+                              if (guardUsageSort("today")) return;
+                              if (sortKey === "today") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("today");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
                           >
-                            {t("accounts.todayStats")}
+                            {t("accounts.todayStats")}{" "}
+                            {sortKey === "today"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.requests && (
                           <TableHead
-                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                            className={`text-[13px] font-semibold select-none transition-colors ${
+                              usageSortBlocked
+                                ? "cursor-not-allowed text-muted-foreground"
+                                : "cursor-pointer hover:text-primary"
+                            }`}
+                            title={
+                              usageSortBlocked
+                                ? t("accounts.largePoolSortDisabled")
+                                : undefined
+                            }
                             onClick={() => {
+                              if (guardUsageSort("requests")) return;
                               if (sortKey === "requests") {
                                 setSortDir((d) =>
                                   d === "asc" ? "desc" : "asc",
@@ -11826,6 +11885,10 @@ function isActiveAutoPauseWindowReached(
 
 // Plans that carry a rolling 5h usage window (mirrors Go isPremium5hPlan).
 // k12/edu are paid education workspaces with 5h limits (issue #307/#309).
+function isSparkUsagePlan(planType?: string): boolean {
+  return normalizePlanType(planType) === "pro";
+}
+
 function isPremiumUsagePlan(planType?: string): boolean {
   return [
     "plus",
@@ -11849,22 +11912,6 @@ function isRateLimitedAccount(account: AccountRow): boolean {
   return getAccountRateLimitWindow(account) !== null;
 }
 
-function isUnsampledQuotaAccount(account: AccountRow): boolean {
-  const status = (account.status || "").toLowerCase();
-  if (status === "unauthorized" || account.openai_responses_api || account.grok_api) {
-    return false;
-  }
-  // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
-  // 否则这类账号会永远显示"未采样" (issue #282)。
-  const has7d =
-    typeof account.usage_percent_7d === "number" &&
-    Number.isFinite(account.usage_percent_7d);
-  const has5h =
-    typeof account.usage_percent_5h === "number" &&
-    Number.isFinite(account.usage_percent_5h);
-  return !has7d && !has5h;
-}
-
 function getAccountRateLimitWindow(
   account: AccountRow,
 ): RateLimitWindow | null {
@@ -11872,11 +11919,13 @@ function getAccountRateLimitWindow(
   const reason = (account.cooldown_reason || "").toLowerCase();
   const explicitlyRateLimited =
     status === "rate_limited" ||
+    status === "responses_rate_limited" ||
     status === "usage_exhausted" ||
     status === "quota_paused" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d" ||
     reason === "rate_limited" ||
+    reason === "responses_rate_limited" ||
     reason === "rate_limited_5h" ||
     reason === "rate_limited_7d";
   const usageWindowsAreInformational =
@@ -11925,7 +11974,23 @@ function getAccountRateLimitWindow(
     return "5h";
   }
 
-  return explicitlyRateLimited ? "5h" : null;
+  if (!explicitlyRateLimited) {
+    return null;
+  }
+
+  // A generic Responses 429 does not identify its quota window. Until the
+  // immediate WHAM refresh replaces that transient state, keep the badge
+  // aligned with the usage bar that actually exists instead of inventing 5h.
+  const has5hWindow =
+    typeof account.usage_percent_5h === "number" || !!account.reset_5h_at;
+  const has7dWindow =
+    typeof account.usage_percent_7d === "number" ||
+    hasUsageWindowDetail(account.usage_7d_detail) ||
+    !!account.reset_7d_at;
+  if (has7dWindow && !has5hWindow) {
+    return "7d";
+  }
+  return "5h";
 }
 
 function getRateLimitedWindowStats(accounts: AccountRow[]): {
@@ -12213,7 +12278,7 @@ function OperationProgressToast({
       ? Math.min(100, Math.max(0, Math.round((progress.current / progress.total) * 100)))
       : 0;
   const metrics =
-    progress.action === "batch_delete"
+    progress.action === "batch_delete" || progress.action === "clean"
       ? [
           {
             label: t("accounts.operationProgressDeleted"),
@@ -12377,7 +12442,29 @@ function ExpiryBadge({ expiresAt, planType }: { expiresAt?: string; planType?: s
   return null;
 }
 
-function PlanBadge({ planType }: { planType?: string }) {
+function isWorkspacePlan(planType?: string): boolean {
+  const normalized = normalizePlanType(planType);
+  return (
+    normalized === "team" ||
+    normalized === "teamplus" ||
+    normalized === "k12" ||
+    normalized === "edu" ||
+    normalized === "education"
+  );
+}
+
+function accountWorkspaceId(account: Pick<AccountRow, "effective_workspace_id" | "token_workspace_id">): string {
+  return (account.effective_workspace_id || account.token_workspace_id || "").trim();
+}
+
+function PlanBadge({
+  planType,
+  workspaceId,
+}: {
+  planType?: string;
+  workspaceId?: string;
+}) {
+  const { t } = useTranslation();
   const label = formatPlanLabel(planType);
   if (label === "-")
     return <span className="text-[12px] text-muted-foreground">-</span>;
@@ -12398,14 +12485,35 @@ function PlanBadge({ planType }: { planType?: string }) {
   const cls =
     style[key] ||
     "bg-slate-100 text-slate-600 ring-slate-400/20 dark:bg-slate-500/15 dark:text-slate-300 dark:ring-slate-400/20";
-
-  return (
+  const trimmedWorkspaceId = workspaceId?.trim() ?? "";
+  const badge = (
     <span
       className={`inline-flex min-w-0 max-w-full items-center truncate rounded-md px-2.5 py-1 text-[13px] font-semibold ring-1 ring-inset ${cls}`}
-      title={label}
     >
       {label}
     </span>
+  );
+  if (!isWorkspacePlan(planType) || !trimmedWorkspaceId) {
+    return badge;
+  }
+
+  return (
+    <TooltipProvider delayDuration={0} skipDelayDuration={0}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex min-w-0 max-w-full cursor-help">
+            {badge}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          sideOffset={6}
+          className="max-w-[360px] font-mono text-[11px]"
+        >
+          {t("accounts.planWorkspaceId", { id: trimmedWorkspaceId })}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 
@@ -13072,7 +13180,10 @@ function AccountMobileCard({
               <span className="rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-mono font-semibold text-muted-foreground">
                 #{sequence}
               </span>
-              <PlanBadge planType={account.plan_type} />
+              <PlanBadge
+                planType={account.plan_type}
+                workspaceId={accountWorkspaceId(account)}
+              />
               <SchedulerPriorityBadge account={account} />
               <UsingCreditsBadge account={account} />
               {account.status !== "overload_paused" && (
@@ -13113,14 +13224,13 @@ function AccountMobileCard({
                   })}
                 </div>
               </div>
-              <div className="shrink-0">
+              <div
+                className="shrink-0"
+                aria-hidden={Boolean(resolveAccountOverlayKind(account))}
+              >
                 <div className="flex flex-wrap items-center justify-end gap-1.5">
                   <StatusBadge
-                    status={
-                      account.status === "overload_paused"
-                        ? "active"
-                        : account.status
-                    }
+                    status={getAccountStatusBadgeStatus(account)}
                     detail={
                       account.status === "overload_paused"
                         ? undefined
@@ -13225,22 +13335,7 @@ function AccountMobileCard({
                 icon={<Zap className="size-3.5" />}
                 tone="emerald"
               >
-                <div className="flex items-baseline gap-2 text-[13px]">
-                  <span className="text-base font-semibold text-emerald-600 dark:text-emerald-400">
-                    {account.success_requests ?? 0}
-                  </span>
-                  <span className="text-muted-foreground">/</span>
-                  <span className="font-semibold text-red-500">
-                    {account.error_requests ?? 0}
-                  </span>
-                </div>
-                {((account.retry_error_requests ?? 0) > 0 ||
-                  (account.rate_limit_attempts ?? 0) > 0) && (
-                  <div className="mt-1 text-[11px] text-muted-foreground">
-                    retry {account.retry_error_requests ?? 0} · 429 {" "}
-                    {account.rate_limit_attempts ?? 0}
-                  </div>
-                )}
+                <RequestCountPills account={account} />
               </AccountPersonalMetric>
               <AccountPersonalMetric
                 label={t("accounts.billed")}
@@ -13384,7 +13479,10 @@ function AccountMobileCard({
                     </span>
                   )}
                   {(!visibleColumns || visibleColumns.plan) && (
-                    <PlanBadge planType={account.plan_type} />
+                    <PlanBadge
+                      planType={account.plan_type}
+                      workspaceId={accountWorkspaceId(account)}
+                    />
                   )}
                   {(!visibleColumns || visibleColumns.priority) && (
                     <SchedulerPriorityBadge account={account} />
@@ -13418,13 +13516,12 @@ function AccountMobileCard({
                 )}
               </div>
               {(!visibleColumns || visibleColumns.status) && (
-                <div className="flex min-w-[112px] shrink-0 flex-col items-end">
+                <div
+                  className="flex min-w-[112px] shrink-0 flex-col items-end"
+                  aria-hidden={Boolean(resolveAccountOverlayKind(account))}
+                >
                   <StatusBadge
-                    status={
-                      account.status === "overload_paused"
-                        ? "active"
-                        : account.status
-                    }
+                    status={getAccountStatusBadgeStatus(account)}
                     detail={
                       account.status === "overload_paused"
                         ? undefined
@@ -13520,22 +13617,7 @@ function AccountMobileCard({
       >
         {(!visibleColumns || visibleColumns.requests) && (
           <AccountMobileMetric label={t("accounts.requests")} className="min-h-[84px]">
-            <div className="flex items-center gap-2 text-[13px]">
-              <span className="font-medium text-emerald-600">
-                {account.success_requests ?? 0}
-              </span>
-              <span className="text-muted-foreground">/</span>
-              <span className="font-medium text-red-500">
-                {account.error_requests ?? 0}
-              </span>
-            </div>
-            {((account.retry_error_requests ?? 0) > 0 ||
-              (account.rate_limit_attempts ?? 0) > 0) && (
-              <div className="mt-0.5 text-[11px] text-muted-foreground">
-                retry {account.retry_error_requests ?? 0} · 429{" "}
-                {account.rate_limit_attempts ?? 0}
-              </div>
-            )}
+            <RequestCountPills account={account} compact />
           </AccountMobileMetric>
         )}
         {(!visibleColumns || visibleColumns.billed) && (
@@ -13884,6 +13966,7 @@ function TestConnectionModal({
   restoreOnSuccess?: boolean;
 }) {
   const { t } = useTranslation();
+  const { showToast } = useToast();
   const [output, setOutput] = useState<string[]>([]);
   const [status, setStatus] = useState<
     "connecting" | "streaming" | "success" | "error"
@@ -14083,13 +14166,11 @@ function TestConnectionModal({
                 case "test_complete":
                   receivedTerminalEvent = true;
                   setStatus(event.success ? "success" : "error");
-                  markSettled();
                   break;
                 case "error":
                   receivedTerminalEvent = true;
                   setStatus("error");
                   setErrorMsg(event.error || t("accounts.unknownError"));
-                  markSettled();
                   break;
               }
             } catch {
@@ -14115,7 +14196,11 @@ function TestConnectionModal({
           processEventLines([buffer]);
         }
 
-        if (!receivedTerminalEvent) {
+        if (receivedTerminalEvent) {
+          // 等服务端关闭 SSE 后再刷新列表：后端会在连接结束时提交状态并失效
+          // 账号快照，提前刷新会重新读到“未采样”的旧缓存。
+          markSettled();
+        } else {
           setStatus("error");
           setErrorMsg(t("accounts.connectionEndedUnexpectedly"));
           markSettled();
@@ -14173,6 +14258,14 @@ function TestConnectionModal({
     error: "text-red-500",
   }[status];
   const formattedErrorMsg = errorMsg ? formatTestErrorMessage(errorMsg) : "";
+  const handleCopyFailureDetails = async () => {
+    try {
+      await copyTextToClipboard(formattedErrorMsg);
+      showToast(t("common.copied"));
+    } catch {
+      showToast(t("common.copyFailed"), "error");
+    }
+  };
 
   return (
     <Modal
@@ -14236,12 +14329,25 @@ function TestConnectionModal({
         )}
 
         {errorMsg && (
-          <div className="max-h-[40vh] overflow-auto rounded-xl border border-red-200 bg-red-50 p-3.5 text-red-600 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
-            <div className="mb-2 text-sm font-semibold">
-              {t("accounts.failureDetails")}
+          <div className="rounded-xl border border-red-200 bg-red-50 p-3.5 text-red-600 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="text-sm font-semibold">
+                {t("accounts.failureDetails")}
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 shrink-0 px-2 text-red-600 hover:bg-red-100 hover:text-red-700 dark:text-red-400 dark:hover:bg-red-900/40 dark:hover:text-red-300"
+                onClick={() => void handleCopyFailureDetails()}
+                title={t("common.copy")}
+              >
+                <Copy className="size-3.5" />
+                {t("common.copy")}
+              </Button>
             </div>
             <pre
-              className="text-[13px] leading-relaxed whitespace-pre-wrap break-all"
+              className="max-h-[34vh] overflow-auto text-[13px] leading-relaxed whitespace-pre-wrap break-all"
               style={{ fontFamily: "var(--font-geist-mono)" }}
             >
               {formattedErrorMsg}
@@ -14299,6 +14405,14 @@ function usageBarColor(pct: number): string {
   return "bg-emerald-500";
 }
 
+// 标签 / 条 / 百分比 三列固定，避免 7d 与 spark 把进度条拉成不同长度。
+const USAGE_BAR_LABEL_CLASS =
+  "w-10 shrink-0 text-[11px] font-medium text-muted-foreground";
+const USAGE_BAR_TRACK_CLASS =
+  "h-1.5 w-[88px] shrink-0 rounded-full bg-muted overflow-hidden";
+const USAGE_BAR_META_CLASS =
+  "text-[11px] font-medium text-muted-foreground mt-0.5 pl-[46px]";
+
 // 单行用量进度条
 function UsageBar({
   label,
@@ -14319,29 +14433,20 @@ function UsageBar({
   return (
     <div>
       <div className="flex items-center gap-1.5">
-        <span className="text-[11px] font-medium text-muted-foreground w-7 shrink-0">
-          {label}
-        </span>
-        <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden min-w-[72px]">
+        <span className={USAGE_BAR_LABEL_CLASS}>{label}</span>
+        <div className={USAGE_BAR_TRACK_CLASS}>
           <div
             className={`h-full rounded-full transition-all ${usageBarColor(pct)}`}
             style={{ width: `${Math.min(100, pct)}%` }}
           />
         </div>
-        <span className="text-[12px] font-semibold w-[42px] text-right shrink-0">
+        <span className="w-[42px] shrink-0 text-right text-[12px] font-semibold tabular-nums">
           {pct.toFixed(1)}%
         </span>
       </div>
-      {detailText && (
-        <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]">
-          {detailText}
-        </div>
-      )}
+      {detailText && <div className={USAGE_BAR_META_CLASS}>{detailText}</div>}
       {resetTime && (
-        <div
-          className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[34px]"
-          title={resetTime.title}
-        >
+        <div className={USAGE_BAR_META_CLASS} title={resetTime.title}>
           ⏱ {resetTime.label}
         </div>
       )}
@@ -14369,7 +14474,7 @@ function UsageWindowStat({
   return (
     <div className="flex flex-col gap-0.5">
       <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-        <span className="w-7 shrink-0">{label}</span>
+        <span className={USAGE_BAR_LABEL_CLASS}>{label}</span>
         <span>
           {formatCompactUsageNumber(detail?.requests)}{" "}
           {t("accounts.usageReqUnit")} /{" "}
@@ -14378,7 +14483,7 @@ function UsageWindowStat({
         </span>
       </div>
       {(accountBilledText || userBilledText) && (
-        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-[34px]">
+        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-[46px]">
           {accountBilledText && (
             <span>
               {t("accounts.accountBilledLabel")}: ${accountBilledText}
@@ -14420,11 +14525,21 @@ function TodayStatsCell({ account }: { account: AccountRow }) {
   ]
     .filter(Boolean)
     .join("\n");
+  const modelBreakdown = buildModelCountBreakdown(detail.model_counts, requests);
 
-  return (
+  const content = (
     <div
-      className="flex flex-col items-start gap-1 whitespace-nowrap text-[12px] tabular-nums cursor-default"
-      title={tooltip}
+      className={cn(
+        "flex flex-col items-start gap-1 whitespace-nowrap text-[12px] tabular-nums",
+        requests > 0 ? "cursor-help" : "cursor-default",
+      )}
+      title={requests > 0 ? undefined : tooltip}
+      tabIndex={requests > 0 ? 0 : undefined}
+      aria-label={
+        requests > 0
+          ? t("accounts.todayModelTooltipAria", { count: requests })
+          : undefined
+      }
     >
       <div className="flex items-center gap-2">
         <span
@@ -14496,6 +14611,36 @@ function TodayStatsCell({ account }: { account: AccountRow }) {
       </div>
     </div>
   );
+
+  if (requests <= 0) {
+    return content;
+  }
+
+  return (
+    <CountBreakdownTooltip
+      title={t("accounts.todayModelTooltipTitle")}
+      empty={t("accounts.todayModelEmpty")}
+      total={requests}
+      rows={modelBreakdown.map((row) => {
+        const success = detail.model_success_counts?.[row.key];
+        return {
+          key: row.key,
+          label: row.key === "unknown" ? t("accounts.unknownModel") : row.key,
+          count: row.count,
+          percent: row.percent,
+          successRate:
+            typeof success === "number" && row.count > 0
+              ? (success / row.count) * 100
+              : undefined,
+        };
+      })}
+      showModelIcon
+      tone="today"
+      barClassName="bg-gradient-to-r from-sky-400 to-violet-300"
+    >
+      {content}
+    </CountBreakdownTooltip>
+  );
 }
 
 // 用量列组件
@@ -14550,6 +14695,10 @@ function UsageCell({
     account.usage_percent_7d !== null && account.usage_percent_7d !== undefined;
   const has5h =
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
+  const hasSparkPct =
+    account.usage_percent_spark !== null &&
+    account.usage_percent_spark !== undefined;
+  const showSpark = isSparkUsagePlan(account.plan_type);
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
   const has5hReset = !!account.reset_5h_at;
   const has7dReset = !!account.reset_7d_at;
@@ -14561,12 +14710,28 @@ function UsageCell({
   // 5h 是上游可选窗口：仅数据存在时展示，不再因 premium plan 强制占位（issue #382）
   const showFiveHour = fiveHourPresent;
 
+  const sparkBar = showSpark ? (
+    hasSparkPct ? (
+      <UsageBar
+        label="spark"
+        pct={account.usage_percent_spark!}
+        resetAt={account.reset_spark_at}
+      />
+    ) : (
+      <UsageBar
+        label="spark"
+        pct={0}
+        resetAt={account.reset_spark_at}
+      />
+    )
+  ) : null;
+
   if (showFiveHour) {
-    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset)
+    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset && !showSpark)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
-      <div className={`${wide ? "w-full" : "w-52"} flex items-start gap-1`}>
-        <div className="flex-1 space-y-1.5">
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1.5">
           {has5h ? (
             <UsageBar
               label="5h"
@@ -14577,6 +14742,28 @@ function UsageCell({
           ) : (
             <UsageWindowStat label="5h" detail={account.usage_5h_detail} />
           )}
+          {sparkBar}
+          {has7d ? (
+            <UsageBar
+              label={longWindowLabel}
+              pct={account.usage_percent_7d!}
+              resetAt={account.reset_7d_at}
+              detail={account.usage_7d_detail}
+            />
+          ) : (
+            <UsageWindowStat label={longWindowLabel} detail={account.usage_7d_detail} />
+          )}
+        </div>
+        {refreshButton}
+      </div>
+    );
+  }
+
+  if (showSpark) {
+    return (
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px] space-y-1.5">
+          {sparkBar}
           {has7d ? (
             <UsageBar
               label={longWindowLabel}
@@ -14595,8 +14782,8 @@ function UsageCell({
 
   if (sevenDayPresent) {
     return (
-      <div className={`${wide ? "w-full" : "w-48"} flex items-start gap-1`}>
-        <div className="flex-1">
+      <div className={`${wide ? "w-full" : "w-56"} flex items-start gap-1`}>
+        <div className="w-[188px]">
           {has7d ? (
             <UsageBar
               label={longWindowLabel}
@@ -14636,11 +14823,17 @@ function BilledCell({
   const { t } = useTranslation();
   const official =
     typeof account.official_usd_7d === "number" ? account.official_usd_7d : null;
-  const showOfficial = isCodexOfficialAccount(account);
+  const showOfficial =
+    isCodexOfficialAccount(account) && !isOfficialCostHiddenAccount(account);
   // synced 表示后端已成功同步过但上游没有数据(官方统计有滞后):
   // 这是确定的"暂无数据",不是"还在加载",不该转圈。
+  // 导入未满一天、封禁/错误号也不转圈：官方结算要到次日才出数。
   const officialSynced = account.official_usage_synced === true;
-  const officialPending = showOfficial && official === null && !officialSynced;
+  const officialPending =
+    showOfficial &&
+    official === null &&
+    !officialSynced &&
+    !isOfficialCostTooNew(account);
   const [officialSpinTimedOut, setOfficialSpinTimedOut] = useState(false);
   useEffect(() => {
     if (!officialPending) return undefined;
@@ -14735,6 +14928,7 @@ function getAccountStatusCountdownUntil(
   const status = account.status;
   const rateLimited =
     status === "rate_limited" ||
+    status === "responses_rate_limited" ||
     status === "rate_limited_5h" ||
     status === "rate_limited_7d";
   if (

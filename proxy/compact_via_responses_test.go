@@ -44,6 +44,84 @@ func TestAppendCompactionTriggerToResponsesBody_NoDuplicateTrigger(t *testing.T)
 	}
 }
 
+func TestAppendCompactionTriggerToResponsesBody_MovesExistingTriggerToEnd(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"message","role":"user","content":"compact this"},
+		{"type":"compaction_trigger"},
+		{"type":"function_call_output","call_id":"call_1","output":"ok"},
+		{"type":"compaction_trigger"}
+	]}`)
+	out := appendCompactionTriggerToResponsesBody(body)
+
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 3 {
+		t.Fatalf("重复触发器应合并为 1 个, got %d 条: %s", len(items), out)
+	}
+	if got := items[1].Get("type").String(); got != "function_call_output" {
+		t.Fatalf("非触发器 input 顺序应保持不变, got %q: %s", got, out)
+	}
+	if got := items[2].Get("type").String(); got != "compaction_trigger" {
+		t.Fatalf("compaction_trigger 必须位于 input 末尾, got %q: %s", got, out)
+	}
+}
+
+func TestNormalizeCompactionTriggerFinal_IgnoresNestedToolOutput(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"function_call_output","call_id":"call_1","output":{"type":"compaction_trigger"}},
+		{"type":"message","role":"user","content":"continue"}
+	]}`)
+	out := normalizeCompactionTriggerFinal(body, false)
+
+	if string(out) != string(body) {
+		t.Fatalf("nested tool output must not be treated as a protocol trigger: %s", out)
+	}
+}
+
+func TestNormalizeCompactionTriggerFinal_WrapsDirectObjectInput(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","input":{"type":"compaction_trigger"}}`)
+	out := normalizeCompactionTriggerFinal(body, false)
+
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 1 {
+		t.Fatalf("direct trigger object should become a one-item input array, got %d: %s", len(items), out)
+	}
+	if got := items[0].Get("type").String(); got != "compaction_trigger" {
+		t.Fatalf("input[0].type = %q, want compaction_trigger; body=%s", got, out)
+	}
+}
+
+func TestNormalizeCompactionTriggerFinal_CanonicalizesTriggerType(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","input":[
+		{"type":"message","role":"user","content":"compact this"},
+		{"type":" COMPACTION_TRIGGER "}
+	]}`)
+	out := normalizeCompactionTriggerFinal(body, false)
+
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("input length = %d, want 2; body=%s", len(items), out)
+	}
+	if got := items[1].Get("type").String(); got != "compaction_trigger" {
+		t.Fatalf("final trigger type = %q, want canonical compaction_trigger; body=%s", got, out)
+	}
+}
+
+func TestAppendCompactionTriggerToResponsesBody_PreservesObjectInput(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.6-sol","input":{"type":"message","role":"user","content":"compact this"}}`)
+	out := appendCompactionTriggerToResponsesBody(body)
+
+	items := gjson.GetBytes(out, "input").Array()
+	if len(items) != 2 {
+		t.Fatalf("object input should be preserved before the trigger, got %d: %s", len(items), out)
+	}
+	if got := items[0].Get("type").String(); got != "message" {
+		t.Fatalf("input[0].type = %q, want message; body=%s", got, out)
+	}
+	if got := items[1].Get("type").String(); got != "compaction_trigger" {
+		t.Fatalf("input[1].type = %q, want compaction_trigger; body=%s", got, out)
+	}
+}
+
 func TestAppendCompactionTriggerToResponsesBody_StringInput(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.6-sol","input":"please compact"}`)
 	out := appendCompactionTriggerToResponsesBody(body)

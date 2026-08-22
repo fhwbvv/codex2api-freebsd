@@ -63,17 +63,78 @@ export function needsUsageReload(account: {
   return !has5h && !has7d
 }
 
+type AccountStatusSource = {
+  status?: string | null
+  openai_responses_api?: boolean
+  grok_api?: boolean
+  usage_percent_5h?: number | null
+  usage_percent_7d?: number | null
+}
+
+export function isUnsampledQuotaAccount(account: AccountStatusSource): boolean {
+  const status = (account.status || '').toLowerCase()
+  if (
+    status === 'unauthorized' ||
+    status === 'error' ||
+    account.openai_responses_api ||
+    account.grok_api
+  ) {
+    return false
+  }
+  // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样。
+  const has7d =
+    typeof account.usage_percent_7d === 'number' &&
+    Number.isFinite(account.usage_percent_7d)
+  const has5h =
+    typeof account.usage_percent_5h === 'number' &&
+    Number.isFinite(account.usage_percent_5h)
+  return !has7d && !has5h
+}
+
+export function getAccountStatusBadgeStatus(account: AccountStatusSource): string {
+  const status = account.status || 'unknown'
+  if (status === 'overload_paused') return 'active'
+  const key = status.toLowerCase()
+  if ((key === 'active' || key === 'ready') && isUnsampledQuotaAccount(account)) {
+    return 'unsampled'
+  }
+  return status
+}
+
+// 官方结算通常在账号产生请求后的次日才出数。导入未满一天就拉上游只会空转。
+export const officialCostMinAccountAgeMs = 24 * 60 * 60 * 1000
+
+export function isOfficialCostHiddenAccount(account: {
+  status?: string | null
+}): boolean {
+  const status = (account.status || '').toLowerCase()
+  return status === 'unauthorized' || status === 'error'
+}
+
+export function isOfficialCostTooNew(
+  account: { created_at?: string | null },
+  now = Date.now(),
+): boolean {
+  if (!account.created_at) return false
+  const created = Date.parse(account.created_at)
+  if (!Number.isFinite(created)) return false
+  return now - created < officialCostMinAccountAgeMs
+}
+
 // Codex OAuth/AT 账号的官方 7d 成本来自本地快照。列表打开时快照经常还是空的，
 // 需要重拉 page-stats 直到回补完成（中转/Grok 没有该字段，不要空转）。
 // official_usage_synced 表示后端已成功同步过但上游没有数据（官方统计有
 // 滞后），这时继续重拉也不会有结果，交给后台小时级探针即可。
 export function needsOfficialCostReload(account: {
+  status?: string | null
+  created_at?: string | null
   openai_responses_api?: boolean
   grok_api?: boolean
   official_usd_7d?: number | null
   official_usage_synced?: boolean
 }): boolean {
   if (account.openai_responses_api || account.grok_api) return false
+  if (isOfficialCostHiddenAccount(account) || isOfficialCostTooNew(account)) return false
   if (account.official_usage_synced) return false
   return account.official_usd_7d === null || account.official_usd_7d === undefined
 }

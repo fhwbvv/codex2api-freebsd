@@ -128,6 +128,19 @@ test("estimatePressureForecast prefers real account window length for burn", () 
   }
 });
 
+test("estimatePressureForecast excludes Responses-limited accounts from supply", () => {
+  const now = Date.now();
+  const forecast = estimatePressureForecast([
+    baseAccount({
+      status: "responses_rate_limited",
+      usage_percent_5h: 20,
+      reset_5h_at: new Date(now + HOUR).toISOString(),
+    }),
+  ], "5h", now, 0, 0, 10_000);
+  assert.equal(forecast.dispatchableAccounts, 0);
+  assert.equal(forecast.rateLimitPressure, 1);
+});
+
 test("selectPoolRunway picks earlier pressure between 5h and 7d", () => {
   const now = Date.now();
   const accounts = [

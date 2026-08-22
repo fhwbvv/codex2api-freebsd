@@ -110,6 +110,16 @@ func TestRefreshTokenReusedIsNonRetryable(t *testing.T) {
 	}
 }
 
+func TestRefreshTokenInvalidatedIsPermanentFailure(t *testing.T) {
+	invalidatedErr := errors.New(`刷新失败（重试 3 次）: 刷新失败 (status 401): {"error":{"message":"Your session has ended. Please log in again.","code":"refresh_token_invalidated"}}`)
+	if !IsPermanentRefreshFailure(invalidatedErr) {
+		t.Fatal("refresh_token_invalidated should be treated as a permanent refresh failure")
+	}
+	if !isNonRetryable(invalidatedErr) {
+		t.Fatal("refresh_token_invalidated should skip further refresh retries")
+	}
+}
+
 func TestRefreshWithSessionToken(t *testing.T) {
 	accessToken := makeTestJWT(map[string]interface{}{
 		"exp": time.Now().Add(time.Hour).Unix(),

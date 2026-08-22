@@ -105,6 +105,24 @@ func BenchmarkPostgresFortyThousandAccountPage(b *testing.B) {
 		}
 	})
 
+	fullIDs := make([]int64, len(projection))
+	for index, row := range projection {
+		fullIDs[index] = row.ID
+	}
+	b.Run("request_counts_full_pool_40000", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(40_000, "ids/op")
+		for index := 0; index < b.N; index++ {
+			counts, queryErr := db.GetAccountRequestCountsByIDs(context.Background(), fullIDs)
+			if queryErr != nil {
+				b.Fatal(queryErr)
+			}
+			if len(counts) != 40_000 {
+				b.Fatalf("counts=%d, want 40000", len(counts))
+			}
+		}
+	})
+
 	b.Run("page_20_four_queries", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ReportMetric(4, "sql/op")

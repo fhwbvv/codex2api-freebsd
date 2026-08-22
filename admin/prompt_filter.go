@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"regexp"
@@ -18,6 +19,7 @@ import (
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 const promptFilterAuditContextMaxRunes = 2000
@@ -130,6 +132,236 @@ type promptReviewAPIKeyDescriptor struct {
 type promptReviewAPIKeysResponse struct {
 	Items []promptReviewAPIKeyDescriptor `json:"items"`
 	Count int                            `json:"count"`
+}
+
+type promptReviewProfileResponse struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	BaseURL       string    `json:"base_url"`
+	Model         string    `json:"model"`
+	RequestMode   string    `json:"request_mode"`
+	TimeoutSecond int       `json:"timeout_seconds"`
+	KeyCount      int       `json:"key_count"`
+	Active        bool      `json:"active"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type promptReviewProfilesResponse struct {
+	Profiles []promptReviewProfileResponse `json:"profiles"`
+}
+
+type promptReviewProfileRequest struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	BaseURL       string `json:"base_url"`
+	Model         string `json:"model"`
+	RequestMode   string `json:"request_mode"`
+	APIKey        string `json:"api_key"`
+	AdapterJSON   string `json:"adapter_json"`
+	TimeoutSecond int    `json:"timeout_seconds"`
+}
+
+func toPromptReviewProfileResponse(profile database.PromptReviewProfile) promptReviewProfileResponse {
+	return promptReviewProfileResponse{
+		ID: profile.ID, Name: profile.Name, BaseURL: profile.BaseURL, Model: profile.Model,
+		RequestMode: profile.RequestMode, TimeoutSecond: profile.TimeoutSecond,
+		KeyCount: len((promptfilter.ReviewConfig{APIKey: profile.APIKeys}).APIKeyList()),
+		Active:   profile.Active, CreatedAt: profile.CreatedAt, UpdatedAt: profile.UpdatedAt,
+	}
+}
+
+func promptReviewProfileAdapterJSON(raw string, fallback promptfilter.ReviewAdapterConfig) (string, promptfilter.ReviewAdapterConfig, error) {
+	adapter := fallback
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &adapter); err != nil {
+			return "", adapter, errors.New("adapter_json 无效")
+		}
+	}
+	adapter = promptfilter.NormalizeReviewAdapterConfig(adapter)
+	encoded, err := json.Marshal(adapter)
+	if err != nil {
+		return "", adapter, err
+	}
+	return string(encoded), adapter, nil
+}
+
+func (h *Handler) ListPromptReviewProfiles(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	profiles, err := h.db.ListPromptReviewProfiles(c.Request.Context())
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	items := make([]promptReviewProfileResponse, 0, len(profiles))
+	for _, profile := range profiles {
+		items = append(items, toPromptReviewProfileResponse(profile))
+	}
+	c.JSON(http.StatusOK, promptReviewProfilesResponse{Profiles: items})
+}
+
+func (h *Handler) SavePromptReviewProfile(c *gin.Context) {
+	if h == nil || h.db == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	var req promptReviewProfileRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len([]rune(req.Name)) > 120 {
+		writeError(c, http.StatusBadRequest, "档案名称不能为空且不能超过 120 个字符")
+		return
+	}
+	current := h.store.GetPromptFilterConfig().Review
+	profileID := strings.TrimSpace(req.ID)
+	var existing *database.PromptReviewProfile
+	if profileID != "" {
+		var err error
+		existing, err = h.db.GetPromptReviewProfile(c.Request.Context(), profileID)
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
+	}
+	if profileID == "" {
+		profileID = uuid.NewString()
+	}
+	apiKeys := strings.TrimSpace(req.APIKey)
+	if apiKeys == "" {
+		if existing != nil {
+			apiKeys = existing.APIKeys
+		} else {
+			// 留空表示保存当前已生效的 Key，避免用户为了保存新档案而
+			// 必须再次粘贴现有 DeepSeek Key。
+			apiKeys = current.APIKey
+		}
+	}
+	baseURL := strings.TrimSpace(req.BaseURL)
+	if baseURL == "" && existing != nil {
+		baseURL = existing.BaseURL
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" && existing != nil {
+		model = existing.Model
+	}
+	requestMode := strings.TrimSpace(req.RequestMode)
+	if requestMode == "" && existing != nil {
+		requestMode = existing.RequestMode
+	}
+	if req.TimeoutSecond <= 0 && existing != nil {
+		req.TimeoutSecond = existing.TimeoutSecond
+	}
+	if req.TimeoutSecond <= 0 {
+		req.TimeoutSecond = current.TimeoutSeconds
+	}
+	adapterRaw := req.AdapterJSON
+	if strings.TrimSpace(adapterRaw) == "" && existing != nil {
+		adapterRaw = existing.AdapterJSON
+	}
+	if strings.TrimSpace(adapterRaw) == "" {
+		adapterRaw, _, _ = promptReviewProfileAdapterJSON("", current.Adapter)
+	}
+	canonicalAdapter, adapter, err := promptReviewProfileAdapterJSON(adapterRaw, current.Adapter)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	reviewCfg := current
+	reviewCfg.APIKey, reviewCfg.BaseURL, reviewCfg.Model = apiKeys, baseURL, model
+	reviewCfg.TimeoutSeconds, reviewCfg.Adapter = req.TimeoutSecond, adapter
+	reviewCfg = promptfilter.NormalizeReviewConfig(reviewCfg)
+	if err := promptfilter.ValidateReviewConfig(reviewCfg); err != nil {
+		writeError(c, http.StatusBadRequest, "Prompt 审核配置无效: "+err.Error())
+		return
+	}
+	profile := database.PromptReviewProfile{ID: profileID, Name: req.Name, BaseURL: reviewCfg.BaseURL, Model: reviewCfg.Model,
+		RequestMode: reviewCfg.Adapter.RequestMode, AdapterJSON: canonicalAdapter, APIKeys: reviewCfg.APIKey,
+		TimeoutSecond: reviewCfg.TimeoutSeconds, Active: existing != nil && existing.Active}
+	if err := h.db.UpsertPromptReviewProfile(c.Request.Context(), profile); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, toPromptReviewProfileResponse(profile))
+}
+
+func (h *Handler) ActivatePromptReviewProfile(c *gin.Context) {
+	if h == nil || h.db == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	profile, err := h.db.GetPromptReviewProfile(c.Request.Context(), strings.TrimSpace(c.Param("profile_id")))
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if profile == nil {
+		writeError(c, http.StatusNotFound, "审核配置档案不存在")
+		return
+	}
+	var adapter promptfilter.ReviewAdapterConfig
+	if err := json.Unmarshal([]byte(profile.AdapterJSON), &adapter); err != nil {
+		writeError(c, http.StatusConflict, "审核配置档案中的适配器配置无效")
+		return
+	}
+	adapter = promptfilter.NormalizeReviewAdapterConfig(adapter)
+	h.settingsUpdateMu.Lock()
+	defer h.settingsUpdateMu.Unlock()
+	settings, err := h.db.GetSystemSettings(c.Request.Context())
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if settings == nil {
+		writeError(c, http.StatusNotFound, "系统设置不存在")
+		return
+	}
+	patchRaw, _ := json.Marshal(map[string]any{"review_adapter": adapter})
+	document, err := promptfilter.MergeAdvancedConfigDocument(settings.PromptFilterAdvancedConfig, string(patchRaw))
+	if err != nil {
+		writeError(c, http.StatusConflict, "审核配置档案无法应用: "+err.Error())
+		return
+	}
+	settings.PromptFilterReviewAPIKey = profile.APIKeys
+	settings.PromptFilterReviewBaseURL = profile.BaseURL
+	settings.PromptFilterReviewModel = profile.Model
+	settings.PromptFilterReviewTimeoutSeconds = profile.TimeoutSecond
+	settings.PromptFilterAdvancedConfig = document.Raw
+	settings.PreservePromptFilterReviewAPIKey = false
+	if err := h.db.UpdateSystemSettings(c.Request.Context(), settings); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	runtimeCfg := h.store.GetPromptFilterConfig()
+	runtimeCfg.Review.APIKey, runtimeCfg.Review.BaseURL, runtimeCfg.Review.Model = profile.APIKeys, profile.BaseURL, profile.Model
+	runtimeCfg.Review.TimeoutSeconds, runtimeCfg.Review.Adapter = profile.TimeoutSecond, adapter
+	if err := h.store.SetPromptFilterConfigWithAdvancedRaw(runtimeCfg, document.Raw); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if err := h.db.SetPromptReviewProfileActive(c.Request.Context(), profile.ID); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	profile.Active = true
+	c.JSON(http.StatusOK, toPromptReviewProfileResponse(*profile))
+}
+
+func (h *Handler) DeletePromptReviewProfile(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	if err := h.db.DeletePromptReviewProfile(c.Request.Context(), strings.TrimSpace(c.Param("profile_id"))); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 func promptReviewAPIKeyID(key string) string {
@@ -569,6 +801,46 @@ func (h *Handler) TestPromptFilter(c *gin.Context) {
 		Endpoint: result.Endpoint,
 		Model:    result.Model,
 	})
+}
+
+type promptReviewModelsRequest struct {
+	BaseURL        string `json:"base_url"`
+	APIKey         string `json:"api_key"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+// ListPromptReviewModels 从审查供应商拉取 OpenAI 兼容的模型列表,供前端选择审查模型。
+// base_url/api_key 允许携带表单草稿值覆盖已存配置,便于保存前先拉列表。
+func (h *Handler) ListPromptReviewModels(c *gin.Context) {
+	if h == nil || h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "Prompt 审核配置不可用")
+		return
+	}
+	var req promptReviewModelsRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	reviewCfg := h.store.GetPromptFilterConfig().Review
+	if key := strings.TrimSpace(req.APIKey); key != "" {
+		reviewCfg.APIKey = key
+	}
+	if baseURL := strings.TrimSpace(req.BaseURL); baseURL != "" {
+		reviewCfg.BaseURL = baseURL
+	}
+	if req.TimeoutSeconds > 0 {
+		reviewCfg.TimeoutSeconds = req.TimeoutSeconds
+	}
+	if len(promptfilter.NormalizeReviewConfig(reviewCfg).APIKeyList()) == 0 {
+		writeError(c, http.StatusBadRequest, "请先配置审查 API Key")
+		return
+	}
+	models, endpoint, err := promptfilter.DefaultReviewClient.ListReviewModels(c.Request.Context(), reviewCfg)
+	if err != nil {
+		writeError(c, http.StatusBadGateway, "拉取模型列表失败: "+err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"endpoint": endpoint, "models": models})
 }
 
 func (h *Handler) TestPromptReviewConnection(c *gin.Context) {

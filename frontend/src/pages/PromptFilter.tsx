@@ -1,6 +1,6 @@
 import type { Dispatch, ReactNode, SetStateAction, TextareaHTMLAttributes } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { NavLink, useParams } from 'react-router-dom'
+import { NavLink, useParams, useSearchParams } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { Activity, AlertTriangle, BookOpen, CheckCircle2, ChevronDown, ClipboardCheck, Copy, FileText, Gauge, GitBranch, HelpCircle, Layers, ListChecks, Network, Pencil, Plus, Power, PowerOff, RefreshCw, Save, Search, Shield, ShieldAlert, Sparkles, Trash2, Users, Wand2, X } from 'lucide-react'
 import { AdminAPIError, api } from '../api'
@@ -17,7 +17,7 @@ import { formatBeijingTime, formatRelativeTime } from '../utils/time'
 import { getErrorMessage } from '../utils/error'
 import { getPromptFilterScoreBand, normalizePromptFilterScore } from '../lib/promptFilterScore'
 import { parseAdvancedConfigDocument, patchAdvancedConfigDocument, readAdvancedConfigPath } from '../types'
-import type { AdvancedConfigObject, AdvancedConfigPatch, PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterTestResponse, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptIdentityUpdateMode, PromptIntelligenceAIAnalysisResponse, PromptIntelligenceAIProvider, PromptIntelligenceCandidate, PromptIntelligenceEvidenceResponse, PromptIntelligenceGatewayKey, PromptIntelligenceRun, PromptPolicyAuditHealth, PromptPolicyIncident, PromptPolicyIncidentDetailResponse, PromptReviewAPIKeyDescriptor, PromptReviewKeyTestResult, PromptReviewTestResponse, PromptRiskProfile, PromptRiskProfileDetailResponse, SystemSettings } from '../types'
+import type { AdvancedConfigObject, AdvancedConfigPatch, PromptFilterLog, PromptFilterMatch, PromptFilterRule, PromptFilterRulesResponse, PromptFilterTestResponse, PromptGuardConfig, PromptGuardLayer, PromptGuardMode, PromptGuardProfile, PromptGuardProvider, PromptIdentityUpdateMode, PromptIntelligenceAIAnalysisResponse, PromptIntelligenceAIProvider, PromptIntelligenceCandidate, PromptIntelligenceEvidenceResponse, PromptIntelligenceGatewayKey, PromptIntelligenceRun, PromptPolicyAuditHealth, PromptPolicyIncident, PromptPolicyIncidentDetailResponse, PromptReviewAPIKeyDescriptor, PromptReviewKeyTestResult, PromptReviewProfile, PromptReviewTestResponse, PromptRiskProfile, PromptRiskProfileDetailResponse, SystemSettings } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -90,6 +90,7 @@ type RiskProfileFilters = {
   accountId: string
   minScore: string
   q: string
+  lockedOnly: boolean
 }
 
 type RulePatternTestState = {
@@ -207,7 +208,7 @@ type PromptGuardEditorConfig = Omit<PromptGuardConfig, 'performance'>
 
 type AdvancedProtectionConfig = {
   guard: PromptGuardEditorConfig
-  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean; local_severe_strike_enabled: boolean; authorized_pentest_allowed: boolean }
+  enforcement: { terminal_categories: string[]; terminal_bypass_models: string[]; local_block_message: string; conversation_lock_enabled: boolean; conversation_lock_ttl_hours: number; user_cyber_cooldown_minutes: number; cyb_strike_enabled: boolean; local_severe_strike_enabled: boolean; authorized_pentest_allowed: boolean }
   normalization: {
     enabled: boolean
     decode_url: boolean
@@ -298,7 +299,7 @@ const defaultPromptGuard: PromptGuardEditorConfig = {
 
 const defaultAdvancedProtection: AdvancedProtectionConfig = {
   guard: defaultPromptGuard,
-  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false, local_severe_strike_enabled: true, authorized_pentest_allowed: false },
+  enforcement: { terminal_categories: [], terminal_bypass_models: ['codex-auto-review'], local_block_message: '', conversation_lock_enabled: true, conversation_lock_ttl_hours: 168, user_cyber_cooldown_minutes: 30, cyb_strike_enabled: false, local_severe_strike_enabled: true, authorized_pentest_allowed: false },
   normalization: {
     enabled: true,
     decode_url: true,
@@ -394,6 +395,9 @@ function parseAdvancedProtection(value: AdvancedConfigObject): AdvancedProtectio
       terminal_bypass_models: Array.isArray(enforcement.terminal_bypass_models)
         ? enforcement.terminal_bypass_models.filter((model: unknown): model is string => typeof model === 'string')
         : [...defaultAdvancedProtection.enforcement.terminal_bypass_models],
+      local_block_message: typeof enforcement.local_block_message === 'string'
+        ? enforcement.local_block_message
+        : defaultAdvancedProtection.enforcement.local_block_message,
       conversation_lock_enabled: typeof enforcement.conversation_lock_enabled === 'boolean'
         ? enforcement.conversation_lock_enabled
         : defaultAdvancedProtection.enforcement.conversation_lock_enabled,
@@ -448,8 +452,8 @@ const defaultForm: PromptFilterForm = {
   prompt_filter_review_api_key: '',
   prompt_filter_review_api_key_configured: false,
   prompt_filter_review_api_key_count: 0,
-  prompt_filter_review_base_url: 'https://api.openai.com',
-  prompt_filter_review_model: 'omni-moderation-latest',
+  prompt_filter_review_base_url: 'https://api.deepseek.com',
+  prompt_filter_review_model: 'deepseek-v4-flash',
   prompt_filter_review_timeout_seconds: 10,
   prompt_filter_review_fail_closed: true,
 }
@@ -533,8 +537,8 @@ const normalizePromptFilterForm = (settings?: SystemSettings | null): PromptFilt
   prompt_filter_review_api_key: '',
   prompt_filter_review_api_key_configured: Boolean(settings?.prompt_filter_review_api_key_configured),
   prompt_filter_review_api_key_count: settings?.prompt_filter_review_api_key_count || 0,
-  prompt_filter_review_base_url: settings?.prompt_filter_review_base_url || 'https://api.openai.com',
-  prompt_filter_review_model: settings?.prompt_filter_review_model || 'omni-moderation-latest',
+  prompt_filter_review_base_url: settings?.prompt_filter_review_base_url || 'https://api.deepseek.com',
+  prompt_filter_review_model: settings?.prompt_filter_review_model || 'deepseek-v4-flash',
   prompt_filter_review_timeout_seconds: settings?.prompt_filter_review_timeout_seconds || 10,
   prompt_filter_review_fail_closed: settings?.prompt_filter_review_fail_closed ?? true,
 })
@@ -777,6 +781,10 @@ export default function PromptFilter() {
             runTest={runTest}
             advancedConfigError={advancedConfigError}
             settingsSaveRevision={settingsSaveRevision}
+            onSettingsChanged={(settings) => {
+              setForm(normalizePromptFilterForm(settings))
+              setData((current) => ({ ...current, settings }))
+            }}
             onSave={() => void saveSettings()}
           />
         ) : null}
@@ -1187,6 +1195,14 @@ function AdvancedProtectionEditor({
             <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalCategoriesHint')}</p>
             <CompactField label={t('promptFilter.terminalBypassModels')} hint={t('promptFilter.help.terminalBypassModels')}><Input value={terminalBypassModelsText} placeholder="codex-auto-review" onChange={(e) => update('enforcement', { terminal_bypass_models: e.target.value.split(',').map((item) => item.trim()).filter(Boolean) })} /></CompactField>
             <p className="text-[11px] leading-relaxed text-muted-foreground">{t('promptFilter.terminalBypassModelsHint')}</p>
+            <CompactField label={t('promptFilter.localBlockMessage')} hint={t('promptFilter.help.localBlockMessage')}>
+              <Textarea
+                rows={3}
+                value={config.enforcement.local_block_message}
+                placeholder={t('promptFilter.localBlockMessagePlaceholder')}
+                onChange={(event) => update('enforcement', { local_block_message: Array.from(event.target.value).slice(0, 2000).join('') })}
+              />
+            </CompactField>
             <SwitchField label={t('promptFilter.conversationLockEnabled')} hint={t('promptFilter.help.conversationLockEnabled')} checked={config.enforcement.conversation_lock_enabled} onCheckedChange={(next) => update('enforcement', { conversation_lock_enabled: next })} />
             {config.enforcement.conversation_lock_enabled ? <div className="grid gap-3 sm:grid-cols-2">
               <CompactField label={t('promptFilter.conversationLockTTL')} hint={t('promptFilter.help.conversationLockTTL')}><DraftNumberInput min={1} max={720} value={config.enforcement.conversation_lock_ttl_hours} onValueChange={(next) => update('enforcement', { conversation_lock_ttl_hours: next })} /></CompactField>
@@ -2751,6 +2767,7 @@ function OverviewView({
   runTest,
   advancedConfigError,
   settingsSaveRevision,
+  onSettingsChanged,
   onSave,
 }: {
   form: PromptFilterForm
@@ -2772,6 +2789,7 @@ function OverviewView({
   runTest: () => void
   advancedConfigError: string | null
   settingsSaveRevision: number
+  onSettingsChanged: (settings: SystemSettings) => void
   onSave: () => void
 }) {
   const { t } = useTranslation()
@@ -2794,11 +2812,16 @@ function OverviewView({
   )
   const [reviewTestText, setReviewTestText] = useState('请帮我整理今天的会议纪要。')
   const [reviewTesting, setReviewTesting] = useState(false)
+  const [reviewModelsLoading, setReviewModelsLoading] = useState(false)
+  const [reviewModelOptions, setReviewModelOptions] = useState<string[]>([])
   const [reviewTestResult, setReviewTestResult] = useState<PromptReviewTestResponse | null>(null)
   const [configuredReviewKeys, setConfiguredReviewKeys] = useState<PromptReviewAPIKeyDescriptor[]>([])
   const [reviewKeysLoading, setReviewKeysLoading] = useState(false)
   const [reviewKeysRefreshTick, setReviewKeysRefreshTick] = useState(0)
   const [deletingReviewKeyID, setDeletingReviewKeyID] = useState<string | null>(null)
+  const [reviewProfiles, setReviewProfiles] = useState<PromptReviewProfile[]>([])
+  const [reviewProfilesLoading, setReviewProfilesLoading] = useState(false)
+  const [reviewProfileActionID, setReviewProfileActionID] = useState<string | null>(null)
   const { confirm, confirmDialog } = useConfirmDialog()
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [reviewSettingsOpen, setReviewSettingsOpen] = useState(false)
@@ -2882,6 +2905,24 @@ function OverviewView({
     }
     setForm((current) => ({ ...current, prompt_filter_advanced_config: patched.serialized }))
   }
+  const fetchReviewModels = async () => {
+    setReviewModelsLoading(true)
+    try {
+      const result = await api.listPromptReviewModels({
+        base_url: form.prompt_filter_review_base_url?.trim() || undefined,
+        api_key: form.prompt_filter_review_api_key?.trim() || undefined,
+        timeout_seconds: form.prompt_filter_review_timeout_seconds || undefined,
+      })
+      setReviewModelOptions(result.models)
+      if (!result.models.length) {
+        showToast(t('promptFilter.reviewModelsEmpty'), 'error')
+      }
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewModelsFetchFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewModelsLoading(false)
+    }
+  }
   const runReviewConnectionTest = async () => {
     const text = reviewTestText.trim()
     if (!text) {
@@ -2915,6 +2956,67 @@ function OverviewView({
       setReviewTesting(false)
     }
   }
+  const refreshReviewProfiles = async () => {
+    setReviewProfilesLoading(true)
+    try {
+      const result = await api.listPromptReviewProfiles()
+      setReviewProfiles(result.profiles ?? [])
+    } catch (err) {
+      showToast(getErrorMessage(err), 'error')
+    } finally {
+      setReviewProfilesLoading(false)
+    }
+  }
+  const saveReviewProfile = async () => {
+    const name = window.prompt(t('promptFilter.reviewProfileNamePrompt'))?.trim()
+    if (!name) return
+    setReviewProfileActionID('new')
+    try {
+      const result = await api.savePromptReviewProfile({
+        name,
+        base_url: form.prompt_filter_review_base_url,
+        model: form.prompt_filter_review_model,
+        request_mode: reviewAdapter.request_mode,
+        api_key: form.prompt_filter_review_api_key?.trim() || undefined,
+        adapter_json: JSON.stringify(reviewAdapter),
+        timeout_seconds: form.prompt_filter_review_timeout_seconds,
+      })
+      setReviewProfiles((current) => [result, ...current.filter((profile) => profile.id !== result.id)])
+      showToast(t('promptFilter.reviewProfileSaved'))
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewProfileSaveFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewProfileActionID(null)
+    }
+  }
+  const activateReviewProfile = async (profile: PromptReviewProfile) => {
+    setReviewProfileActionID(profile.id)
+    try {
+      await api.activatePromptReviewProfile(profile.id)
+      const settings = await api.getSettings()
+      setForm(normalizePromptFilterForm(settings))
+      onSettingsChanged(settings)
+      await refreshReviewProfiles()
+      showToast(t('promptFilter.reviewProfileActivated'))
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewProfileActivateFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewProfileActionID(null)
+    }
+  }
+  const deleteReviewProfile = async (profile: PromptReviewProfile) => {
+    if (!window.confirm(t('promptFilter.reviewProfileDeleteConfirm', { name: profile.name }))) return
+    setReviewProfileActionID(profile.id)
+    try {
+      await api.deletePromptReviewProfile(profile.id)
+      setReviewProfiles((current) => current.filter((item) => item.id !== profile.id))
+      showToast(t('promptFilter.reviewProfileDeleted'))
+    } catch (err) {
+      showToast(`${t('promptFilter.reviewProfileDeleteFailed')}: ${getErrorMessage(err)}`, 'error')
+    } finally {
+      setReviewProfileActionID(null)
+    }
+  }
   useEffect(() => {
     if (!reviewSettingsOpen) return
     let cancelled = false
@@ -2931,6 +3033,9 @@ function OverviewView({
       })
     return () => { cancelled = true }
   }, [reviewSettingsOpen, settingsSaveRevision, reviewKeysRefreshTick, showToast])
+  useEffect(() => {
+    if (reviewSettingsOpen) void refreshReviewProfiles()
+  }, [reviewSettingsOpen])
   const deleteReviewKey = async (keyID: string, masked: string) => {
     const approved = await confirm({
       title: t('promptFilter.reviewKeyDeleteTitle'),
@@ -3124,9 +3229,9 @@ function OverviewView({
       </div>
 
       <Dialog open={advancedOpen} onOpenChange={setAdvancedOpen}>
-        <DialogContent className="max-h-[92vh] w-[calc(100vw-2rem)] max-w-none overflow-y-auto sm:max-w-6xl">
-          <DialogHeader><DialogTitle>{t('promptFilter.advancedTitle')}</DialogTitle><DialogDescription>{t('promptFilter.advancedDescription')}</DialogDescription></DialogHeader>
-          <div className="space-y-4">
+        <DialogContent className="flex max-h-[92vh] w-[calc(100vw-2rem)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-6xl sm:p-0">
+          <DialogHeader className="border-b px-5 pb-4 pt-5 pr-12 sm:px-6 sm:pt-6 sm:pr-12"><DialogTitle>{t('promptFilter.advancedTitle')}</DialogTitle><DialogDescription>{t('promptFilter.advancedDescription')}</DialogDescription></DialogHeader>
+          <div className="thin-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4 sm:px-6">
             <div className="rounded-xl border bg-muted/20 p-4">
               <div className="mb-4">
                 <h3 className="text-sm font-semibold">{t('promptFilter.dailyPolicyTitle')}</h3>
@@ -3182,14 +3287,68 @@ function OverviewView({
                   </div>
                   <div className="grid gap-4 sm:grid-cols-3">
                     <Field label={t('promptFilter.reviewBaseUrl')}>
-                      <Input value={form.prompt_filter_review_base_url} placeholder="https://api.example.com/v1" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
+                      <Input value={form.prompt_filter_review_base_url} placeholder="https://api.deepseek.com" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_base_url: event.target.value }))} />
                     </Field>
                     <Field label={t('promptFilter.reviewModel')}>
-                      <Input value={form.prompt_filter_review_model} placeholder="review-model" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
+                      <div className="flex gap-2">
+                        <Input className="min-w-0 flex-1" value={form.prompt_filter_review_model} placeholder="deepseek-v4-flash" onChange={(event) => setForm((current) => ({ ...current, prompt_filter_review_model: event.target.value }))} />
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="shrink-0"
+                          disabled={reviewModelsLoading}
+                          title={t('promptFilter.reviewModelsFetchHint')}
+                          onClick={() => void fetchReviewModels()}
+                        >
+                          {reviewModelsLoading ? <RefreshCw className="size-4 animate-spin" /> : t('promptFilter.reviewModelsFetch')}
+                        </Button>
+                      </div>
+                      {reviewModelOptions.length > 0 ? (
+                        <Select
+                          className="mt-2"
+                          value={reviewModelOptions.includes(form.prompt_filter_review_model) ? form.prompt_filter_review_model : ''}
+                          placeholder={t('promptFilter.reviewModelsPick', { count: reviewModelOptions.length })}
+                          options={reviewModelOptions.map((model) => ({ value: model, label: model }))}
+                          onValueChange={(model) => setForm((current) => ({ ...current, prompt_filter_review_model: model }))}
+                        />
+                      ) : null}
                     </Field>
                     <Field label={t('promptFilter.reviewTimeout')}>
                       <DraftNumberInput min={1} max={60} value={form.prompt_filter_review_timeout_seconds} onValueChange={(value) => setForm((current) => ({ ...current, prompt_filter_review_timeout_seconds: value }))} />
                     </Field>
+                  </div>
+                  <div className="space-y-3 rounded-lg border border-primary/15 bg-primary/[0.04] p-4">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold">{t('promptFilter.reviewProfilesTitle')}</div>
+                        <p className="mt-1 text-xs leading-5 text-muted-foreground">{t('promptFilter.reviewProfilesHint')}</p>
+                      </div>
+                      <Button type="button" variant="outline" size="sm" onClick={() => void saveReviewProfile()} disabled={reviewProfileActionID !== null}>
+                        <Save className="size-4" /> {t('promptFilter.reviewProfileSave')}
+                      </Button>
+                    </div>
+                    {reviewProfilesLoading ? <div className="text-xs text-muted-foreground">{t('common.loading')}</div> : null}
+                    {reviewProfiles.length > 0 ? (
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        {reviewProfiles.map((profile) => (
+                          <div key={profile.id} className="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="truncate text-xs font-semibold">{profile.name}</span>
+                                {profile.active ? <Badge variant="default">{t('promptFilter.reviewProfileActive')}</Badge> : null}
+                              </div>
+                              <div className="mt-1 truncate text-[11px] text-muted-foreground">{profile.base_url} · {profile.model} · {profile.key_count} keys</div>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1">
+                              {!profile.active ? <Button type="button" size="sm" variant="outline" disabled={reviewProfileActionID !== null} onClick={() => void activateReviewProfile(profile)}>{t('promptFilter.reviewProfileActivate')}</Button> : null}
+                              <Button type="button" size="icon" variant="ghost" className="text-destructive hover:text-destructive" disabled={reviewProfileActionID !== null} onClick={() => void deleteReviewProfile(profile)} aria-label={t('promptFilter.reviewProfileDelete')}>
+                                <Trash2 className="size-4" />
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : <div className="text-xs text-muted-foreground">{t('promptFilter.reviewProfilesEmpty')}</div>}
                   </div>
                   <Field label={t('promptFilter.reviewApiKey')}>
                     <Textarea
@@ -3409,7 +3568,7 @@ function OverviewView({
               ) : null}
             </div>
           </div>
-          <DialogFooter className="flex-wrap sm:justify-between">
+          <DialogFooter className="flex-wrap border-t px-5 py-4 sm:justify-between sm:px-6">
             <div className="flex flex-wrap items-end gap-2">
               <div className="min-w-[210px] space-y-1.5">
                 <div className="text-xs font-semibold text-muted-foreground">{t('promptFilter.recommendedStrengthTitle')}</div>
@@ -3545,12 +3704,15 @@ type PromptLogClearSection = 'incidents' | 'review' | 'local'
 function LogsView({ onPromptLogsChanged }: { onPromptLogsChanged: () => Promise<void> }) {
   const { t } = useTranslation()
   const { showToast } = useToast()
-  const [incidentDraftFilters, setIncidentDraftFilters] = useState<LogFilters>(emptyFilters)
-  const [incidentFilters, setIncidentFilters] = useState<LogFilters>(emptyFilters)
-  const [reviewDraftFilters, setReviewDraftFilters] = useState<LogFilters>(emptyFilters)
-  const [reviewFilters, setReviewFilters] = useState<LogFilters>(emptyFilters)
-  const [localDraftFilters, setLocalDraftFilters] = useState<LogFilters>(emptyFilters)
-  const [localFilters, setLocalFilters] = useState<LogFilters>(emptyFilters)
+  const [searchParams] = useSearchParams()
+  const auditReference = searchParams.get('audit')?.trim() || ''
+  const initialLogFilters = () => ({ ...emptyFilters, q: auditReference })
+  const [incidentDraftFilters, setIncidentDraftFilters] = useState<LogFilters>(initialLogFilters)
+  const [incidentFilters, setIncidentFilters] = useState<LogFilters>(initialLogFilters)
+  const [reviewDraftFilters, setReviewDraftFilters] = useState<LogFilters>(initialLogFilters)
+  const [reviewFilters, setReviewFilters] = useState<LogFilters>(initialLogFilters)
+  const [localDraftFilters, setLocalDraftFilters] = useState<LogFilters>(initialLogFilters)
+  const [localFilters, setLocalFilters] = useState<LogFilters>(initialLogFilters)
   const [logPage, setLogPage] = useState(1)
   const [logPageSize, setLogPageSize] = usePersistedPageSize('prompt_filter_logs', 20, DEFAULT_PAGE_SIZE_OPTIONS)
   const [reviewPage, setReviewPage] = useState(1)
@@ -3918,6 +4080,7 @@ const emptyRiskProfileFilters: RiskProfileFilters = {
   accountId: '',
   minScore: '',
   q: '',
+  lockedOnly: false,
 }
 
 function RiskProfilesView() {
@@ -3947,6 +4110,7 @@ function RiskProfilesView() {
         accountId: filters.accountId,
         minScore: filters.minScore,
         q: filters.q,
+        lockedOnly: filters.lockedOnly,
       })
       setProfiles(result.profiles ?? [])
       setTotal(result.total ?? 0)
@@ -3994,13 +4158,16 @@ function RiskProfilesView() {
         </div>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border bg-muted/20 p-3">
-          <Button size="sm" variant={draftFilters.subjectType === 'newapi_user' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: 'newapi_user' })); setFilters((current) => ({ ...current, subjectType: 'newapi_user' })); setPage(1) }}>
+          <Button size="sm" variant={!draftFilters.lockedOnly && draftFilters.subjectType === 'newapi_user' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: 'newapi_user', lockedOnly: false })); setFilters((current) => ({ ...current, subjectType: 'newapi_user', lockedOnly: false })); setPage(1) }}>
             <Users className="size-4" />{t('promptFilter.risk.peopleProfiles')}
           </Button>
-          <Button size="sm" variant={draftFilters.subjectType === '' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: '' })); setFilters((current) => ({ ...current, subjectType: '' })); setPage(1) }}>
+          <Button size="sm" variant={!draftFilters.lockedOnly && draftFilters.subjectType === '' ? 'default' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: '', lockedOnly: false })); setFilters((current) => ({ ...current, subjectType: '', lockedOnly: false })); setPage(1) }}>
             <Network className="size-4" />{t('promptFilter.risk.allObjects')}
           </Button>
-          <span className="text-xs leading-5 text-muted-foreground">{draftFilters.subjectType === 'newapi_user' ? t('promptFilter.risk.peopleProfilesHint') : t('promptFilter.risk.nonPersonHint')}</span>
+          <Button size="sm" variant={draftFilters.lockedOnly ? 'destructive' : 'outline'} onClick={() => { setDraftFilters((current) => ({ ...current, subjectType: '', lockedOnly: true })); setFilters((current) => ({ ...current, subjectType: '', lockedOnly: true })); setPage(1) }}>
+            <ShieldAlert className="size-4" />{t('promptFilter.risk.lockedProfiles')}
+          </Button>
+          <span className="text-xs leading-5 text-muted-foreground">{draftFilters.lockedOnly ? t('promptFilter.risk.lockedProfilesHint') : draftFilters.subjectType === 'newapi_user' ? t('promptFilter.risk.peopleProfilesHint') : t('promptFilter.risk.nonPersonHint')}</span>
         </div>
 
         <div className="mb-4 grid grid-cols-[repeat(auto-fit,minmax(155px,1fr))] gap-3">
@@ -4166,6 +4333,8 @@ function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile
   }
   const activeRestriction = item.conversation_lock
   const isUserCooldown = activeRestriction?.restriction_scope === 'user_cooldown' || item.subject_type === 'newapi_user'
+  const isLocalRestriction = !isUserCooldown && activeRestriction?.reason_code !== 'upstream_cyber_policy'
+  const auditReference = activeRestriction?.incident_id || activeRestriction?.request_id || activeRestriction?.decision_id?.replace(/^local-block:/, '') || ''
   return <>
     <Button size="sm" variant="outline" onClick={() => { setEventPage(1); setTrustEventPage(1); setOpen(true) }}>{t('promptFilter.cyberDetail')}</Button>
     <Dialog open={open} onOpenChange={setOpen}>
@@ -4175,10 +4344,11 @@ function PromptRiskProfileDetailButton({ profile }: { profile: PromptRiskProfile
           <div className="rounded-lg border border-[hsl(var(--warning))]/30 bg-[hsl(var(--warning-bg))] p-3 text-sm text-[hsl(var(--warning))]">{detail?.guardrail || t('promptFilter.risk.guardrail')}</div>
           {item.conversation_lock?.status === 'active' ? <div className="rounded-lg border border-destructive/35 bg-destructive/5 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
-              <div><div className="flex items-center gap-2 font-semibold text-destructive"><ShieldAlert className="size-4" />{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownTitle' : 'promptFilter.risk.conversationLock.title')}<Badge variant="destructive">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownActive' : 'promptFilter.risk.conversationLock.active')}</Badge></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownDescription' : 'promptFilter.risk.conversationLock.description')}</p></div>
+              <div><div className="flex items-center gap-2 font-semibold text-destructive"><ShieldAlert className="size-4" />{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownTitle' : 'promptFilter.risk.conversationLock.title')}<Badge variant="destructive">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownActive' : 'promptFilter.risk.conversationLock.active')}</Badge></div><p className="mt-1 text-xs leading-5 text-muted-foreground">{t(isUserCooldown ? 'promptFilter.risk.conversationLock.userCooldownDescription' : isLocalRestriction ? 'promptFilter.risk.conversationLock.localDescription' : 'promptFilter.risk.conversationLock.description')}</p></div>
               <Button size="sm" variant="destructive" disabled={unlockingConversation} onClick={() => void unlockConversation()}>{t(isUserCooldown ? 'promptFilter.risk.conversationLock.unlockUserCooldown' : 'promptFilter.risk.conversationLock.unlock')}</Button>
             </div>
-            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.lockedAt')} value={formatBeijingTime(item.conversation_lock.locked_at)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.expiresAt')} value={item.conversation_lock.expires_at ? formatBeijingTime(item.conversation_lock.expires_at) : '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.remaining')} value={formatPromptRestrictionRemaining(item.conversation_lock.remaining_seconds)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.reason')} value={isUserCooldown ? 'user_cyber_cooldown' : 'conversation_cyber_locked'} /><PromptPolicyDetailField label={t('promptFilter.colEndpoint')} value={item.conversation_lock.endpoint || '-'} /><PromptPolicyDetailField label={t('promptFilter.reviewModel')} value={item.conversation_lock.model || '-'} /></div>
+            <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4"><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.lockedAt')} value={formatBeijingTime(item.conversation_lock.locked_at)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.expiresAt')} value={item.conversation_lock.expires_at ? formatBeijingTime(item.conversation_lock.expires_at) : '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.remaining')} value={formatPromptRestrictionRemaining(item.conversation_lock.remaining_seconds)} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.reason')} value={isUserCooldown ? 'user_cyber_cooldown' : item.conversation_lock.reason_code || 'conversation_cyber_locked'} /><PromptPolicyDetailField label={t('promptFilter.colEndpoint')} value={item.conversation_lock.endpoint || '-'} /><PromptPolicyDetailField label={t('promptFilter.reviewModel')} value={item.conversation_lock.model || '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.auditReference')} value={auditReference || '-'} /><PromptPolicyDetailField label={t('promptFilter.risk.conversationLock.decisionId')} value={item.conversation_lock.decision_id || '-'} /></div>
+            {auditReference ? <div className="mt-3 flex flex-wrap items-center gap-2"><Button size="sm" variant="outline" asChild><NavLink to={`/prompt-filter/logs?audit=${encodeURIComponent(auditReference)}`}><Search className="size-3.5" />{t('promptFilter.risk.conversationLock.openAudit')}</NavLink></Button><span className="font-mono text-xs text-muted-foreground">{auditReference}</span></div> : null}
           </div> : null}
           <div className="rounded-lg border bg-muted/20 p-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
@@ -5407,6 +5577,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
   const { t } = useTranslation()
   const matches = parseLogMatches(log.matched_patterns)
   const [expanded, setExpanded] = useState(false)
+  const [detailOpen, setDetailOpen] = useState(false)
   const fullText = (log.full_text || '').trim()
   const hasFull = fullText.length > 0
   const matchContext = (log.match_context || '').trim()
@@ -5428,6 +5599,7 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
   const auditScore = typeof log.audit_score === 'number' ? log.audit_score : undefined
   const apiKeyLabel = log.api_key_name || log.api_key_masked || '-'
   const decisionSource = promptFilterDecisionSource(log)
+  const hasPreviewDetail = Boolean(matchContext || userPrompt || hasFull)
   return (
     <>
     <TableRow>
@@ -5531,7 +5703,18 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
         {!compact && log.newapi_request_id ? <div className="truncate font-mono text-[11px] text-muted-foreground" title={log.newapi_request_id}>{t('promptFilter.newapiRequest')} {log.newapi_request_id}</div> : null}
       </TableCell>
       <TableCell className="min-w-0">
-        <div className="space-y-1.5">
+        <div
+          className={cn('space-y-1.5', hasPreviewDetail && 'cursor-pointer rounded-md transition-colors hover:bg-muted/40')}
+          role={hasPreviewDetail ? 'button' : undefined}
+          tabIndex={hasPreviewDetail ? 0 : undefined}
+          onClick={hasPreviewDetail ? () => setDetailOpen(true) : undefined}
+          onKeyDown={hasPreviewDetail ? (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+              event.preventDefault()
+              setDetailOpen(true)
+            }
+          } : undefined}
+        >
           {matchContext ? (
             <div className="min-w-0 rounded-md border border-[hsl(var(--warning))]/20 bg-[hsl(var(--warning-bg))] px-2 py-1.5">
               <div className="mb-0.5 flex min-w-0 items-center gap-1 text-[10px] font-semibold text-[hsl(var(--warning))]">
@@ -5576,6 +5759,50 @@ function PromptFilterLogRow({ log, compact }: { log: PromptFilterLog; compact?: 
           </button>
         ) : null}
         {!compact && log.review_model ? <div className="mt-1 truncate text-xs text-muted-foreground">{log.review_model}</div> : null}
+        {hasPreviewDetail ? (
+          <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
+            <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-3xl">
+              <DialogHeader>
+                <DialogTitle>{t('promptFilter.previewDetailTitle')}</DialogTitle>
+                <DialogDescription className="break-all font-mono text-xs">
+                  {formatBeijingTime(log.created_at)} · {log.endpoint || '-'} · {log.model || '-'}
+                </DialogDescription>
+              </DialogHeader>
+              <div className="space-y-4 text-sm">
+                {matchContext ? (
+                  <div>
+                    <div className="mb-2 flex flex-wrap items-baseline gap-1.5">
+                      <span className="font-semibold">{t('promptFilter.matchContextLabel')}</span>
+                      <span className="text-xs text-muted-foreground">{t('promptFilter.triggerOrigin')}: {primaryOriginLabel}</span>
+                    </div>
+                    <pre className="max-h-[30vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-[hsl(var(--warning))]/30 bg-[hsl(var(--warning-bg))] p-3 text-xs leading-relaxed text-foreground"><HighlightedPromptPreview text={matchContext} /></pre>
+                  </div>
+                ) : null}
+                {userPrompt ? (
+                  <div>
+                    <div className="mb-2 font-semibold">{userPromptLabel}</div>
+                    <pre className="max-h-[30vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground"><HighlightedPromptPreview text={userPrompt} /></pre>
+                  </div>
+                ) : null}
+                {hasFull ? (
+                  <div>
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <span className="font-semibold">{t('promptFilter.fullTextTitle')}</span>
+                      <button
+                        type="button"
+                        onClick={() => void navigator.clipboard?.writeText(fullText)}
+                        className="text-xs font-medium text-primary hover:underline"
+                      >
+                        {t('common.copy')}
+                      </button>
+                    </div>
+                    <pre className="max-h-[40vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground"><HighlightedPromptText text={fullText} terms={hitTerms} /></pre>
+                  </div>
+                ) : null}
+              </div>
+            </DialogContent>
+          </Dialog>
+        ) : null}
       </TableCell>
     </TableRow>
     {expanded && hasFull ? (

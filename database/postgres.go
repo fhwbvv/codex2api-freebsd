@@ -18,7 +18,8 @@ import (
 
 	"github.com/codex2api/internal/openaiidentity"
 	"github.com/google/uuid"
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
@@ -352,9 +353,8 @@ type usageLogEntry struct {
 // schema 仅对 PostgreSQL 生效；为空时保持数据库默认 search_path。
 func New(driver string, dsn string, schema ...string) (*DB, error) {
 	driver = normalizeDriver(driver)
-	driverName := driver
+	driverName := sqlOpenDriverName(driver)
 	if driver == "sqlite" {
-		driverName = "sqlite"
 		dsn = sqliteConnectDSN(dsn)
 	}
 
@@ -419,7 +419,7 @@ func New(driver string, dsn string, schema ...string) (*DB, error) {
 		// search_path 已通过 DSN 的 options=-c search_path=... 在所有连接启动时设置；
 		// 这里仅做一次幂等的 CREATE SCHEMA + SET 兜底，便于首次部署时自动建好 schema。
 		if pgSchema != "" {
-			quoted := pq.QuoteIdentifier(pgSchema)
+			quoted := quotePostgresIdent(pgSchema)
 			if _, err := conn.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+quoted); err != nil {
 				return nil, fmt.Errorf("创建数据库 schema 失败: %w", err)
 			}
@@ -540,12 +540,12 @@ func (db *DB) ensureUsageLogsGenerationIndex(parent context.Context) error {
 		return nil
 	}
 	if exists && !valid {
-		if _, err := db.conn.ExecContext(ctx, `DROP INDEX `+pq.QuoteIdentifier(indexName)); err != nil {
+		if _, err := db.conn.ExecContext(ctx, `DROP INDEX `+quotePostgresIdent(indexName)); err != nil {
 			return fmt.Errorf("清理无效索引 %s 失败: %w", indexName, err)
 		}
 	}
 	// CONCURRENTLY 不能在事务块内执行；单条 ExecContext 走 autocommit，满足要求。
-	if _, err := db.conn.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+pq.QuoteIdentifier(indexName)+` ON usage_logs(account_id, credential_generation, created_at)`); err != nil {
+	if _, err := db.conn.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+quotePostgresIdent(indexName)+` ON usage_logs(account_id, credential_generation, created_at)`); err != nil {
 		return fmt.Errorf("在线创建索引 %s 失败: %w", indexName, err)
 	}
 	log.Printf("usage_logs 代际索引 %s 已就绪", indexName)
@@ -1281,10 +1281,19 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_disabled_patterns TEXT DEFAULT '[]';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_api_key TEXT DEFAULT '';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_base_url TEXT DEFAULT 'https://api.openai.com';
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_model TEXT DEFAULT 'omni-moderation-latest';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_base_url TEXT DEFAULT 'https://api.deepseek.com';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_model TEXT DEFAULT 'deepseek-v4-flash';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_timeout_seconds INT DEFAULT 10;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_fail_closed BOOLEAN DEFAULT TRUE;
+	-- 审查服务从未配置过(无 key、未启用)且仍是旧出厂默认时,迁移到新的
+	-- DeepSeek 默认供应商;真在用 OpenAI 审核的部署不受影响。
+	UPDATE system_settings
+	SET prompt_filter_review_base_url = 'https://api.deepseek.com',
+		prompt_filter_review_model = 'deepseek-v4-flash'
+	WHERE COALESCE(prompt_filter_review_api_key, '') = ''
+	  AND COALESCE(prompt_filter_review_enabled, FALSE) = FALSE
+	  AND COALESCE(prompt_filter_review_base_url, '') = 'https://api.openai.com'
+	  AND COALESCE(prompt_filter_review_model, '') = 'omni-moderation-latest';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.144.1';
 	ALTER TABLE system_settings ALTER COLUMN codex_min_cli_version SET DEFAULT '0.144.1';
@@ -1395,6 +1404,19 @@ func (db *DB) migrate(ctx context.Context) error {
 				review_request_mode VARCHAR(32) DEFAULT '',
 				review_latency_ms BIGINT NULL,
 				full_text        TEXT DEFAULT ''
+			);
+			CREATE TABLE IF NOT EXISTS prompt_review_profiles (
+				id VARCHAR(64) PRIMARY KEY,
+				name VARCHAR(120) NOT NULL,
+				base_url VARCHAR(512) NOT NULL DEFAULT '',
+				model VARCHAR(128) NOT NULL DEFAULT '',
+				request_mode VARCHAR(32) NOT NULL DEFAULT 'moderations',
+				adapter_json TEXT NOT NULL DEFAULT '{}',
+				api_keys TEXT NOT NULL DEFAULT '',
+				timeout_seconds INTEGER NOT NULL DEFAULT 10,
+				active BOOLEAN NOT NULL DEFAULT FALSE,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 			);
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_model VARCHAR(100) DEFAULT '';
 			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN DEFAULT FALSE;
@@ -1620,6 +1642,9 @@ type APIKeyLimits struct {
 	// (context_length_exceeded)后，网关把 input 旧轮次摘要压缩并重试一次，
 	// 而不是直接把 400 透传给下游。默认关闭。
 	AutoCompactOnOverflow bool `json:"auto_compact_overflow,omitempty"`
+	// AllowLive 为 true 时，该 Key 可以使用 ChatGPT Live（/v1/live 与
+	// /backend-api/codex/realtime/calls）。默认关闭。
+	AllowLive bool `json:"allow_live,omitempty"`
 	// UpstreamChannel 限定该 Key 的请求只调度到指定上游渠道的账号：
 	//   - ""/auto: 不限（默认，按模型路由）
 	//   - codex:   仅非 Grok 账号（Codex OAuth / OpenAI Responses 中转）
@@ -1684,6 +1709,7 @@ func (l APIKeyLimits) IsZero() bool {
 		len(l.ScopeLimits) == 0 &&
 		!l.DisableImageGeneration &&
 		!l.AutoCompactOnOverflow &&
+		!l.AllowLive &&
 		l.ResolveImageGenerationPolicy() == ImageGenerationPolicyAllow &&
 		l.ResolveUpstreamChannel() == UpstreamChannelAuto
 }
@@ -2049,89 +2075,89 @@ func NormalizeSiteName(value string) string {
 
 // SystemSettings 运行时设置项
 type SystemSettings struct {
-	SiteName                            string
-	SiteLogo                            string
-	BackgroundConfig                    string // JSON: {"image":"...","opacity":18,"blur":0}
-	GrokConfig                          string // JSON: {"affinity_mode":"strict"}
-	MaxConcurrency                      int
-	GlobalRPM                           int
-	TestModel                           string
-	TestContent                         string
-	TestConcurrency                     int
-	ProxyURL                            string
-	PgMaxConns                          int
-	RedisPoolSize                       int
-	AutoCleanUnauthorized               bool
-	AutoCleanRateLimited                bool
-	AdminSecret                         string
-	AutoCleanFullUsage                  bool
-	AutoCleanError                      bool
-	AutoCleanExpired                    bool
-	LazyMode                            bool
-	ProxyPoolEnabled                    bool
-	FastSchedulerEnabled                bool
-	MaxRetries                          int
-	MaxRateLimitRetries                 int
-	AllowRemoteMigration                bool
-	ModelMapping                        string // JSON: {"anthropic_model": "codex_model", ...}
-	CodexModelMapping                   string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
-	PayloadRules                        string // JSON: 请求体重写规则（default/override/append/filter 等规则组）
-	ReasoningEffortModels               string // JSON: [{"model":"gpt-5.5","effort":"xhigh"}, ...]
-	BackgroundRefreshIntervalMinutes    int
-	UsageProbeMaxAgeMinutes             int
-	UsageProbeConcurrency               int
-	UsageProbeResponsesFallbackEnabled  bool
-	RecoveryProbeIntervalMinutes        int
-	SchedulerMode                       string
-	AffinityMode                        string // session 粘性模式: bounded / off / strict
-	SessionAffinitySpread               bool   // 新亲和键按 HRW 哈希散列选号(issue #484)
-	ResinURL                            string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
-	ResinPlatformName                   string // Resin 平台标识，例如 codex2api
-	PromptFilterEnabled                 bool
-	PromptFilterMode                    string
-	PromptFilterThreshold               int
-	PromptFilterStrictThreshold         int
-	PromptFilterStrictTerminalEnabled   bool
-	PromptFilterAdvancedConfig          string
-	PromptFilterLogMatches              bool
-	PromptFilterMaxTextLength           int
-	PromptFilterSensitiveWords          string
-	PromptFilterCustomPatterns          string
-	PromptFilterDisabledPatterns        string
-	PromptFilterReviewEnabled           bool
-	PromptFilterReviewAPIKey            string
-	PromptFilterReviewBaseURL           string
-	PromptFilterReviewModel             string
-	PromptFilterReviewTimeoutSeconds    int
-	PromptFilterReviewFailClosed        bool
-	ClientCompatMode                    string
-	CodexMinCLIVersion                  string
-	CodexUserAgentConfig                string
-	UsageLogMode                        string
-	UsageLogBatchSize                   int
-	UsageLogFlushIntervalSeconds        int
-	StreamFlushPolicy                   string
-	StreamFlushIntervalMS               int
-	FirstTokenMode                      string
-	FirstTokenTimeoutSeconds            int
-	BillingTierPolicy                   string
-	ImageStorageConfig                  string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
-	ShowFullUsageNumbers                bool
-	PublicKeyUsagePageEnabled           bool
-	PublicImageStudioPageEnabled        bool
-	PublicAccountPortalPageEnabled      bool // 账号自助添加公开门户开关，默认 false
-	CodexForceWebsocket                 bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
-	CodexWSWeakNetworkMode              bool // WS 弱网保守复用模式，默认 false
-	CodexWSKeepaliveEnabled             bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
-	CodexWSKeepaliveIntervalSec         int  // WS 保活 Ping 间隔（秒），默认 60
-	CodexWSHideUpstreamErrors           bool // 隐藏上游 WS 原始错误，默认 true
-	CodexWSSilentRetryEnabled           bool // 首包前 WS 上游错误静默换号重试，默认 true
-	CodexWSSilentMaxRetries             int  // WS 静默换号最大重试次数，默认 2
-	CodexWSSizeRouterEnabled            bool // 1009 自学习体积路由：超大请求直接首发 HTTP，默认 true
-	CodexWSBusyAcquireMaxWaitSec        int  // busy session/容量等待的累计上限（秒），默认 30（issue #413）
-	CodexWSBusyOverflowEnabled          bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
-	CodexWSBusyPatienceSec              int  // 触发溢出前的短等待（秒），默认 2（issue #413）
-	CodexWSStatelessSlots               int  // 无状态请求每 (账号, cacheKey) 的持久连接槽位数，默认 8，范围 1-32（issue #522）
+	SiteName                           string
+	SiteLogo                           string
+	BackgroundConfig                   string // JSON: {"image":"...","opacity":18,"blur":0}
+	GrokConfig                         string // JSON: {"affinity_mode":"strict"}
+	MaxConcurrency                     int
+	GlobalRPM                          int
+	TestModel                          string
+	TestContent                        string
+	TestConcurrency                    int
+	ProxyURL                           string
+	PgMaxConns                         int
+	RedisPoolSize                      int
+	AutoCleanUnauthorized              bool
+	AutoCleanRateLimited               bool
+	AdminSecret                        string
+	AutoCleanFullUsage                 bool
+	AutoCleanError                     bool
+	AutoCleanExpired                   bool
+	LazyMode                           bool
+	ProxyPoolEnabled                   bool
+	FastSchedulerEnabled               bool
+	MaxRetries                         int
+	MaxRateLimitRetries                int
+	AllowRemoteMigration               bool
+	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
+	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
+	PayloadRules                       string // JSON: 请求体重写规则（default/override/append/filter 等规则组）
+	ReasoningEffortModels              string // JSON: [{"model":"gpt-5.5","effort":"xhigh"}, ...]
+	BackgroundRefreshIntervalMinutes   int
+	UsageProbeMaxAgeMinutes            int
+	UsageProbeConcurrency              int
+	UsageProbeResponsesFallbackEnabled bool
+	RecoveryProbeIntervalMinutes       int
+	SchedulerMode                      string
+	AffinityMode                       string // session 粘性模式: bounded / off / strict
+	SessionAffinitySpread              bool   // 新亲和键按 HRW 哈希散列选号(issue #484)
+	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
+	ResinPlatformName                  string // Resin 平台标识，例如 codex2api
+	PromptFilterEnabled                bool
+	PromptFilterMode                   string
+	PromptFilterThreshold              int
+	PromptFilterStrictThreshold        int
+	PromptFilterStrictTerminalEnabled  bool
+	PromptFilterAdvancedConfig         string
+	PromptFilterLogMatches             bool
+	PromptFilterMaxTextLength          int
+	PromptFilterSensitiveWords         string
+	PromptFilterCustomPatterns         string
+	PromptFilterDisabledPatterns       string
+	PromptFilterReviewEnabled          bool
+	PromptFilterReviewAPIKey           string
+	PromptFilterReviewBaseURL          string
+	PromptFilterReviewModel            string
+	PromptFilterReviewTimeoutSeconds   int
+	PromptFilterReviewFailClosed       bool
+	ClientCompatMode                   string
+	CodexMinCLIVersion                 string
+	CodexUserAgentConfig               string
+	UsageLogMode                       string
+	UsageLogBatchSize                  int
+	UsageLogFlushIntervalSeconds       int
+	StreamFlushPolicy                  string
+	StreamFlushIntervalMS              int
+	FirstTokenMode                     string
+	FirstTokenTimeoutSeconds           int
+	BillingTierPolicy                  string
+	ImageStorageConfig                 string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
+	ShowFullUsageNumbers               bool
+	PublicKeyUsagePageEnabled          bool
+	PublicImageStudioPageEnabled       bool
+	PublicAccountPortalPageEnabled     bool // 账号自助添加公开门户开关，默认 false
+	CodexForceWebsocket                bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
+	CodexWSWeakNetworkMode             bool // WS 弱网保守复用模式，默认 false
+	CodexWSKeepaliveEnabled            bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
+	CodexWSKeepaliveIntervalSec        int  // WS 保活 Ping 间隔（秒），默认 60
+	CodexWSHideUpstreamErrors          bool // 隐藏上游 WS 原始错误，默认 true
+	CodexWSSilentRetryEnabled          bool // 首包前 WS 上游错误静默换号重试，默认 true
+	CodexWSSilentMaxRetries            int  // WS 静默换号最大重试次数，默认 2
+	CodexWSSizeRouterEnabled           bool // 1009 自学习体积路由：超大请求直接首发 HTTP，默认 true
+	CodexWSBusyAcquireMaxWaitSec       int  // busy session/容量等待的累计上限（秒），默认 30（issue #413）
+	CodexWSBusyOverflowEnabled         bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
+	CodexWSBusyPatienceSec             int  // 触发溢出前的短等待（秒），默认 2（issue #413）
+	CodexWSStatelessSlots              int  // 无状态请求每 (账号, cacheKey) 的持久连接槽位数，默认 8，范围 1-32（issue #522）
 	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升限流配额，
 	// 只发给 api.github.com，绝不发给镜像/其他主机；空表示未配置，issue #522）。
 	GithubToken string
@@ -2140,10 +2166,10 @@ type SystemSettings struct {
 	GithubProxyURL string
 	// Codex 过载熔断：单账号滑动窗口内 server_is_overloaded 占比达到阈值时
 	// 自动暂停调度一段时间（默认关闭）。
-	CodexOverloadPauseEnabled     bool
-	CodexOverloadThresholdPercent int // 触发比例（%），默认 20，范围 1-100
-	CodexOverloadPauseMinutes     int // 暂停时长（分钟），默认 30，范围 1-1440
-	CodexOverloadWindowMinutes    int // 统计窗口（分钟），默认 5，范围 1-120
+	CodexOverloadPauseEnabled           bool
+	CodexOverloadThresholdPercent       int  // 触发比例（%），默认 20，范围 1-100
+	CodexOverloadPauseMinutes           int  // 暂停时长（分钟），默认 30，范围 1-1440
+	CodexOverloadWindowMinutes          int  // 统计窗口（分钟），默认 5，范围 1-120
 	OverflowAutoCompactEnabled          bool // 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）
 	CompactViaResponsesEnabled          bool // /v1/responses/compact 改写为 /responses body-signal 压缩（上游已下线专用端点，默认 false）
 	CodexPreflightSSEPassthroughEnabled bool // 前置元数据 SSE 事件立即透传下游（旧版兼容，默认 false，issue #425）
@@ -2304,8 +2330,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_disabled_patterns, '[]'),
 		       COALESCE(prompt_filter_review_enabled, false),
 		       COALESCE(prompt_filter_review_api_key, ''),
-		       COALESCE(prompt_filter_review_base_url, 'https://api.openai.com'),
-		       COALESCE(prompt_filter_review_model, 'omni-moderation-latest'),
+		       COALESCE(prompt_filter_review_base_url, 'https://api.deepseek.com'),
+		       COALESCE(prompt_filter_review_model, 'deepseek-v4-flash'),
 		       COALESCE(prompt_filter_review_timeout_seconds, 10),
 		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
@@ -4027,7 +4053,9 @@ func (db *DB) flushLogBatch(drain bool) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
-	if err := db.insertUsageLogBatch(ctx, batch); err != nil {
+	if err := db.withSQLiteWriteLock(ctx, func() error {
+		return db.insertUsageLogBatch(ctx, batch)
+	}); err != nil {
 		// 瞬时故障（连接断开、超时、死锁）原样放回缓冲区重试，一条都不能丢。
 		if !isUsageLogDataError(err) {
 			log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
@@ -4077,11 +4105,11 @@ func isUsageLogDataError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var pqErr *pq.Error
-	if !errors.As(err, &pqErr) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || len(pgErr.Code) < 2 {
 		return false
 	}
-	switch pqErr.Code.Class() {
+	switch pgErr.Code[:2] {
 	case "22", "23":
 		return true
 	}
@@ -5765,6 +5793,13 @@ type AccountRequestCount struct {
 	ErrorCount            int64
 	RetryErrorCount       int64
 	RateLimitAttemptCount int64
+	// ErrorStatusCounts is the 7-day non-retry 4xx/5xx breakdown keyed by
+	// HTTP status. It matches ErrorCount so the list tooltip can show each
+	// code's share of the red capsule.
+	ErrorStatusCounts map[int]int64
+	// SuccessModelCounts is the matching 7-day non-retry 2xx/3xx breakdown
+	// keyed by effective model (falling back to inbound model).
+	SuccessModelCounts map[string]int64
 }
 
 // AccountTimeRangeUsage 每个账号在指定时间窗口内的真实请求/token 统计。
@@ -5774,6 +5809,12 @@ type AccountTimeRangeUsage struct {
 	Tokens        int64
 	AccountBilled float64
 	UserBilled    float64
+}
+
+// AccountModelCount 某个模型在指定窗口内的请求数与成功数。
+type AccountModelCount struct {
+	Requests int64
+	Success  int64
 }
 
 // nonRetryUsageLogPredicate keeps transport retry attempts out of end-user
@@ -5836,7 +5877,16 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 		}
 		result[rc.AccountID] = rc
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := db.attachErrorStatusCounts(ctx, result, nil); err != nil {
+		return nil, err
+	}
+	if err := db.attachSuccessModelCounts(ctx, result, nil); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // GetAccountTimeRangeUsage 按 account_id 聚合 since 之后的请求数和 token 数。
@@ -6940,6 +6990,16 @@ func grokIdentityCredentialChanged(before, after map[string]interface{}) bool {
 	return false
 }
 
+func openAIResponsesIdentityCredentialChanged(before, after map[string]interface{}) bool {
+	if !strings.EqualFold(strings.TrimSpace(credentialStringFromMap(after, "upstream_type")), "openai_responses") {
+		return false
+	}
+	return strings.TrimRight(strings.TrimSpace(credentialStringFromMap(before, "base_url")), "/") !=
+		strings.TrimRight(strings.TrimSpace(credentialStringFromMap(after, "base_url")), "/") ||
+		strings.TrimSpace(credentialStringFromMap(before, "api_key")) !=
+			strings.TrimSpace(credentialStringFromMap(after, "api_key"))
+}
+
 func sqliteJSONSetKeySupported(key string) bool {
 	if key == "" {
 		return false
@@ -6970,15 +7030,21 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 		return err
 	}
 
-	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
+	current := decodeCredentials(currentRaw)
+	merged := mergeCredentialMaps(cloneCredentialUpdates(current), credentials)
+	identityChanged := openAIResponsesIdentityCredentialChanged(current, merged)
 	credJSON, err := json.Marshal(merged)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
 
-	updateQuery := `UPDATE accounts SET name = $1, credentials = $2, proxy_url = $3, platform = 'openai', type = 'responses_api', updated_at = CURRENT_TIMESTAMP WHERE id = $4`
+	identityUpdate := ""
+	if identityChanged {
+		identityUpdate = ", credential_generation = credential_generation + 1, status = 'active', error_message = '', cooldown_reason = '', cooldown_until = NULL"
+	}
+	updateQuery := `UPDATE accounts SET name = $1, credentials = $2, proxy_url = $3, platform = 'openai', type = 'responses_api'` + identityUpdate + `, updated_at = CURRENT_TIMESTAMP WHERE id = $4`
 	if !db.isSQLite() {
-		updateQuery = `UPDATE accounts SET name = $1, credentials = $2::jsonb, proxy_url = $3, platform = 'openai', type = 'responses_api', updated_at = CURRENT_TIMESTAMP WHERE id = $4`
+		updateQuery = `UPDATE accounts SET name = $1, credentials = $2::jsonb, proxy_url = $3, platform = 'openai', type = 'responses_api'` + identityUpdate + `, updated_at = CURRENT_TIMESTAMP WHERE id = $4`
 	}
 	res, err := tx.ExecContext(ctx, updateQuery, name, credJSON, proxyURL, id)
 	if err != nil {
@@ -6990,6 +7056,11 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	}
 	if affected == 0 {
 		return sql.ErrNoRows
+	}
+	if identityChanged {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM account_model_cooldowns WHERE account_id = $1`, id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -7097,38 +7168,40 @@ func (db *DB) BatchSetError(ctx context.Context, ids []int64, errorMsg string) e
 
 // SoftDeleteAccount 将账号标记为 deleted，保留数据用于审计和事件追溯。
 func (db *DB) SoftDeleteAccount(ctx context.Context, id int64) error {
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	return db.withSQLiteWriteLock(ctx, func() error {
+		tx, err := db.conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
 
-	query := `
-		UPDATE accounts
-		SET status = 'deleted',
-			error_message = '',
-			cooldown_reason = '',
-			cooldown_until = NULL,
-			deleted_at = CURRENT_TIMESTAMP,
-			updated_at = CURRENT_TIMESTAMP
-		WHERE id = $1 AND status <> 'deleted'
-	`
-	res, err := tx.ExecContext(ctx, query, id)
-	if err != nil {
-		return err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return sql.ErrNoRows
-	}
-	// Keep the last group membership snapshot on the soft-deleted account.
-	// Usage reports need it to attribute historical requests after an account
-	// moves to the recycle bin. Active-account queries already exclude deleted
-	// accounts, while restoring the account reuses the retained memberships.
-	return tx.Commit()
+		query := `
+			UPDATE accounts
+			SET status = 'deleted',
+				error_message = '',
+				cooldown_reason = '',
+				cooldown_until = NULL,
+				deleted_at = CURRENT_TIMESTAMP,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE id = $1 AND status <> 'deleted'
+		`
+		res, err := tx.ExecContext(ctx, query, id)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return sql.ErrNoRows
+		}
+		// Keep the last group membership snapshot on the soft-deleted account.
+		// Usage reports need it to attribute historical requests after an account
+		// moves to the recycle bin. Active-account queries already exclude deleted
+		// accounts, while restoring the account reuses the retained memberships.
+		return tx.Commit()
+	})
 }
 
 // ListDeleted 获取回收站中的账号（被软删除、尚未彻底清除的账号）。
@@ -7294,37 +7367,39 @@ func (db *DB) PurgeDeletedAccounts(ctx context.Context) (int64, error) {
 
 // BatchSoftDeleteAccounts 批量软删除账号，分批执行避免 SQL 参数过多。
 func (db *DB) BatchSoftDeleteAccounts(ctx context.Context, ids []int64) error {
-	const batchSize = 500
-	for i := 0; i < len(ids); i += batchSize {
-		end := i + batchSize
-		if end > len(ids) {
-			end = len(ids)
-		}
-		batch := ids[i:end]
+	return db.withSQLiteWriteLock(ctx, func() error {
+		const batchSize = 500
+		for i := 0; i < len(ids); i += batchSize {
+			end := i + batchSize
+			if end > len(ids) {
+				end = len(ids)
+			}
+			batch := ids[i:end]
 
-		placeholders := make([]string, len(batch))
-		args := make([]interface{}, 0, len(batch))
-		for j, id := range batch {
-			placeholders[j] = fmt.Sprintf("$%d", j+1)
-			args = append(args, id)
-		}
+			placeholders := make([]string, len(batch))
+			args := make([]interface{}, 0, len(batch))
+			for j, id := range batch {
+				placeholders[j] = fmt.Sprintf("$%d", j+1)
+				args = append(args, id)
+			}
 
-		query := fmt.Sprintf(
-			`UPDATE accounts
-			SET status = 'deleted',
-				error_message = '',
-				cooldown_reason = '',
-				cooldown_until = NULL,
-				deleted_at = CURRENT_TIMESTAMP,
-				updated_at = CURRENT_TIMESTAMP
-			WHERE status <> 'deleted' AND id IN (%s)`,
-			strings.Join(placeholders, ","),
-		)
-		if _, err := db.conn.ExecContext(ctx, query, args...); err != nil {
-			return fmt.Errorf("batch %d-%d failed: %w", i, end, err)
+			query := fmt.Sprintf(
+				`UPDATE accounts
+				SET status = 'deleted',
+					error_message = '',
+					cooldown_reason = '',
+					cooldown_until = NULL,
+					deleted_at = CURRENT_TIMESTAMP,
+					updated_at = CURRENT_TIMESTAMP
+				WHERE status <> 'deleted' AND id IN (%s)`,
+				strings.Join(placeholders, ","),
+			)
+			if _, err := db.conn.ExecContext(ctx, query, args...); err != nil {
+				return fmt.Errorf("batch %d-%d failed: %w", i, end, err)
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 // BatchInsertAccountEvents 批量插入账号事件。

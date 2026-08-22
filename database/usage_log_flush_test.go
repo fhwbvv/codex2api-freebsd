@@ -7,8 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/lib/pq"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // insertUsageLogs 往缓冲里塞 count 条最简用量日志。
@@ -64,6 +65,44 @@ func TestFlushUsageLogsDrainsBeyondOneBatch(t *testing.T) {
 	}
 	if stats := db.GetUsageLogRuntimeStats(); stats.BufferLength != 0 {
 		t.Fatalf("BufferLength = %d，want 0", stats.BufferLength)
+	}
+}
+
+func TestSQLiteUsageLogFlushWaitsForUnifiedWriteLock(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	close(db.logStop)
+	db.logWg.Wait()
+	defer db.conn.Close()
+
+	db.SetUsageLogConfig(UsageLogModeFull, 10, maxUsageLogFlushIntervalSeconds)
+	insertUsageLogs(t, db, 1)
+	db.sqliteWriteSem <- struct{}{}
+	flushed := make(chan struct{})
+	go func() {
+		db.FlushUsageLogs()
+		close(flushed)
+	}()
+	select {
+	case <-flushed:
+		t.Fatal("FlushUsageLogs bypassed SQLite write lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-db.sqliteWriteSem
+	select {
+	case <-flushed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("FlushUsageLogs did not resume after SQLite write lock release")
+	}
+	logs, err := db.ListRecentUsageLogs(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("ListRecentUsageLogs 返回错误: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("flushed logs = %d, want 1", len(logs))
 	}
 }
 
@@ -192,12 +231,12 @@ func TestUsageLogInsertRowsStayUnderPostgresBindLimit(t *testing.T) {
 
 // dataError 构造一个 PostgreSQL 数据类错误（class 22：超长、非法字节、数值溢出这类）。
 func dataError() error {
-	return &pq.Error{Code: "22001", Message: "value too long for type character varying(100)"}
+	return &pgconn.PgError{Code: "22001", Message: "value too long for type character varying(100)"}
 }
 
 // transientError 构造一个瞬时故障（class 08：连接异常）。
 func transientError() error {
-	return &pq.Error{Code: "08006", Message: "connection failure"}
+	return &pgconn.PgError{Code: "08006", Message: "connection failure"}
 }
 
 func TestIsUsageLogDataError(t *testing.T) {
@@ -208,12 +247,13 @@ func TestIsUsageLogDataError(t *testing.T) {
 	}{
 		{"nil 不是数据错误", nil, false},
 		{"class 22 数据异常", dataError(), true},
-		{"class 23 约束冲突", &pq.Error{Code: "23505"}, true},
+		{"class 23 约束冲突", &pgconn.PgError{Code: "23505"}, true},
 		{"class 08 连接异常要重试", transientError(), false},
-		{"class 40 死锁要重试", &pq.Error{Code: "40P01"}, false},
-		{"class 53 资源不足要重试", &pq.Error{Code: "53100"}, false},
+		{"class 40 死锁要重试", &pgconn.PgError{Code: "40P01"}, false},
+		{"class 53 资源不足要重试", &pgconn.PgError{Code: "53100"}, false},
 		{"包装后的数据错误仍能识别", fmt.Errorf("执行插入: %w", dataError()), true},
-		{"非 pq 错误按瞬时处理", context.DeadlineExceeded, false},
+		{"非 PostgreSQL SQLSTATE 错误按瞬时处理", context.DeadlineExceeded, false},
+		{"SQLSTATE 过短不按数据错误处理", &pgconn.PgError{Code: "2"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

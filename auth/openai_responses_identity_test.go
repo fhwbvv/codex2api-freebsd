@@ -1,0 +1,162 @@
+package auth
+
+import (
+	"context"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/codex2api/database"
+)
+
+func TestApplyOpenAIResponsesIdentityChangeRecoversRuntimeAccount(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})
+	acc := &Account{
+		DBID:                 1,
+		CredentialGeneration: 1,
+		UpstreamType:         UpstreamOpenAIResponses,
+		BaseURL:              "https://relay.example",
+		APIKey:               "sk-old",
+		Models:               []string{"gpt-5.6"},
+		PlanType:             "api",
+		Status:               StatusError,
+		ErrorMsg:             "old credential rejected",
+		HealthTier:           HealthTierBanned,
+		FailureStreak:        3,
+		LastUnauthorizedAt:   time.Now(),
+	}
+	atomic.StoreInt32(&acc.Disabled, 1)
+	store.AddAccount(acc)
+	store.MarkModelCooldown(acc, "gpt-5.6", time.Hour, "rate_limited")
+
+	if !store.ApplyOpenAIResponsesConfig(acc.DBID, acc.BaseURL, "", []string{"gpt-5.6", "gpt-5.6-mini"}, "", "auto", "") {
+		t.Fatal("config-only ApplyOpenAIResponsesConfig returned false")
+	}
+	if atomic.LoadInt32(&acc.Disabled) == 0 || acc.IsAvailable() {
+		t.Fatal("config-only update unexpectedly cleared old identity failure state")
+	}
+
+	if !store.ApplyOpenAIResponsesConfig(acc.DBID, acc.BaseURL, "sk-new", acc.Models, "", "auto", "") {
+		t.Fatal("identity ApplyOpenAIResponsesConfig returned false")
+	}
+	if atomic.LoadInt32(&acc.Disabled) != 0 || !acc.IsAvailable() {
+		t.Fatal("identity update did not restore runtime availability")
+	}
+	if got := len(acc.ActiveModelCooldowns()); got != 0 {
+		t.Fatalf("active model cooldown count = %d, want 0", got)
+	}
+	baseURL, apiKey := acc.OpenAIResponsesCredentials()
+	if baseURL != "https://relay.example" || apiKey != "sk-new" {
+		t.Fatalf("runtime credentials = (%q, %q), want corrected endpoint", baseURL, apiKey)
+	}
+	selected := store.Next()
+	if selected == nil || selected.ID() != acc.DBID {
+		t.Fatal("corrected endpoint was not immediately schedulable")
+	}
+	store.Release(selected)
+}
+
+func TestReconcileDispatchStateReloadsChangedResponsesIdentity(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "responses-reconcile.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	accountID, err := db.InsertOpenAIResponsesAccount(ctx, "relay", map[string]interface{}{
+		"upstream_type": UpstreamOpenAIResponses,
+		"base_url":      "https://relay.example",
+		"api_key":       "sk-old",
+		"models":        []string{"gpt-5.6"},
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount: %v", err)
+	}
+	store := NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("Store.Init: %v", err)
+	}
+	acc := store.FindByID(accountID)
+	if acc == nil {
+		t.Fatal("runtime account missing after Init")
+	}
+	store.MarkCooldownWithError(acc, time.Hour, "unauthorized", "old credential rejected")
+	atomic.StoreInt32(&acc.Disabled, 1)
+	if err := db.UpdateOpenAIResponsesAccount(ctx, accountID, "relay", map[string]interface{}{"api_key": "sk-new"}, ""); err != nil {
+		t.Fatalf("UpdateOpenAIResponsesAccount: %v", err)
+	}
+
+	changed, err := store.ReconcileDispatchState(ctx)
+	if err != nil {
+		t.Fatalf("ReconcileDispatchState: %v", err)
+	}
+	if !changed {
+		t.Fatal("ReconcileDispatchState reported no change for corrected endpoint identity")
+	}
+	baseURL, apiKey := acc.OpenAIResponsesCredentials()
+	if baseURL != "https://relay.example" || apiKey != "sk-new" {
+		t.Fatalf("reconciled credentials = (%q, %q), want corrected endpoint", baseURL, apiKey)
+	}
+	selected := store.Next()
+	if selected == nil || selected.ID() != accountID {
+		t.Fatal("reconciled endpoint was not schedulable")
+	}
+	store.Release(selected)
+}
+
+func TestApplyOpenAIResponsesConfigUsesPersistedAPIKeySemantics(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "responses-empty-key.db"))
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	accountID, err := db.InsertOpenAIResponsesAccount(ctx, "relay", map[string]interface{}{
+		"upstream_type": UpstreamOpenAIResponses,
+		"base_url":      "https://relay.example",
+		"api_key":       "sk-old",
+		"models":        []string{"gpt-5.6"},
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount: %v", err)
+	}
+	store := NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("Store.Init: %v", err)
+	}
+	if err := db.UpdateOpenAIResponsesAccount(ctx, accountID, "relay", map[string]interface{}{
+		"models": []string{"gpt-5.6", "gpt-5.6-mini"},
+	}, ""); err != nil {
+		t.Fatalf("config-only UpdateOpenAIResponsesAccount: %v", err)
+	}
+	if !store.ApplyOpenAIResponsesConfig(accountID, "https://relay.example", "", []string{"gpt-5.6", "gpt-5.6-mini"}, "", "auto", "") {
+		t.Fatal("config-only ApplyOpenAIResponsesConfig returned false")
+	}
+	acc := store.FindByID(accountID)
+	if acc == nil {
+		t.Fatal("runtime account missing")
+	}
+	_, apiKey := acc.OpenAIResponsesCredentials()
+	if apiKey != "sk-old" {
+		t.Fatalf("runtime API key after omitted-key update = %q, want sk-old", apiKey)
+	}
+
+	if err := db.UpdateOpenAIResponsesAccount(ctx, accountID, "relay", map[string]interface{}{"api_key": ""}, ""); err != nil {
+		t.Fatalf("UpdateOpenAIResponsesAccount: %v", err)
+	}
+	if !store.ApplyOpenAIResponsesConfig(accountID, "https://relay.example", "", []string{"gpt-5.6"}, "", "auto", "") {
+		t.Fatal("ApplyOpenAIResponsesConfig returned false")
+	}
+
+	_, apiKey = acc.OpenAIResponsesCredentials()
+	if apiKey != "" {
+		t.Fatalf("runtime API key = %q, want empty persisted value", apiKey)
+	}
+	if got := store.Next(); got != nil {
+		store.Release(got)
+		t.Fatalf("account with cleared API key remained schedulable: %d", got.ID())
+	}
+}

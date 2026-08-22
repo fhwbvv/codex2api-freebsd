@@ -378,15 +378,16 @@ func TestUsingCreditsCoversFreeUsageExhausted(t *testing.T) {
 	}
 }
 
-// ignore_usage_limit_status 是另一条独立开关，它抹平限流但不该显示成「使用积分」。
-func TestIgnoreUsageLimitStatusDoesNotReportUsingCredits(t *testing.T) {
+// ignore_usage_limit_status 是另一条独立开关：它只放行已绑定活跃轮次，
+// 新轮次仍被阻止，因此后台继续显示限流，但不能显示成「使用积分」。
+func TestIgnoreUsageLimitStatusKeepsFreshDispatchRateLimitedWithoutCredits(t *testing.T) {
 	acc := plus5hExhausted()
 	ignore := true
 	acc.IgnoreUsageLimitStatusOverride = &ignore
 	acc.recomputeEffectiveIgnoreUsageLimitStatus(false)
 
-	if got := acc.RuntimeStatus(); got != "active" {
-		t.Fatalf("RuntimeStatus() = %q, want active for the ignore-usage-limit path", got)
+	if got := acc.RuntimeStatus(); got != "rate_limited" {
+		t.Fatalf("RuntimeStatus() = %q, want rate_limited while fresh dispatch remains blocked", got)
 	}
 	if acc.UsingCredits() {
 		t.Error("UsingCredits() = true, want false — ignore-usage-limit is a separate switch, not credits")

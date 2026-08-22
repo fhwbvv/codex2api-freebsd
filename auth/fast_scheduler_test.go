@@ -412,12 +412,12 @@ func TestFastSchedulerUpdateMovesAccountBetweenBuckets(t *testing.T) {
 		t.Fatalf("healthy bucket size = %d, want 1", sizes[HealthTierHealthy])
 	}
 
-	acc.SetCooldownUntil(time.Now().Add(10*time.Minute), "rate_limited")
+	acc.SetCooldownUntil(time.Now().Add(10*time.Minute), "unauthorized")
 	scheduler.Update(acc)
 
 	sizes = scheduler.BucketSizes()
 	if sizes[HealthTierHealthy] != 0 || sizes[HealthTierWarm] != 0 || sizes[HealthTierRisky] != 0 {
-		t.Fatalf("expected cooldown account to be removed from all buckets, got %#v", sizes)
+		t.Fatalf("expected unauthorized cooldown account to be removed from all buckets, got %#v", sizes)
 	}
 
 	acc.mu.Lock()
@@ -683,8 +683,8 @@ func TestFastSchedulerPremium5hRateLimitIsFencedAndRecoversAfterReset(t *testing
 	scheduler.Rebuild([]*Account{acc})
 
 	sizes := scheduler.BucketSizes()
-	if sizes[HealthTierRisky] != 0 {
-		t.Fatalf("risky bucket size = %d, want 0 while premium 5h rate limit is active", sizes[HealthTierRisky])
+	if sizes[HealthTierRisky] != 1 {
+		t.Fatalf("risky bucket size = %d, want 1 so spark requests can still find a 5h-exhausted account", sizes[HealthTierRisky])
 	}
 
 	first := scheduler.Acquire()

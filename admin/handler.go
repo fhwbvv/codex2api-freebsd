@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -53,6 +54,7 @@ type Handler struct {
 	systemUpdateOnce       sync.Once
 	refreshAccount         func(context.Context, int64) error
 	probeUsage             func(context.Context, *auth.Account) error
+	executeUsageProbe      usageProbeRequestFunc
 	syncAccountPlanOnReset func(context.Context, *auth.Account) error
 	queryResetCredits      func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error)
 	consumeResetCredit     func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error)
@@ -83,6 +85,21 @@ type Handler struct {
 	adminSecretEnv            string
 	imageProxy                *proxy.Handler
 
+	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
+	// 在大文件导入时堆出成千上万个阻塞协程。
+	importProbeQueueMu sync.Mutex
+	importProbeQueue   []func(context.Context)
+	importProbeWorkers int
+	importProbeActive  atomic.Int32
+	importLoadMu       sync.Mutex
+	importLoadTier     importLoadTier
+	importLoadReady    bool
+	importLoadDBWait   int64
+	importLoadChanged  time.Time
+	importLoadBusyTill time.Time
+	importLoadNow      func() time.Time
+	importLoadSnapshot func() importRuntimeLoadSnapshot
+
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
 	chartCacheData map[string]*chartCacheEntry
@@ -93,6 +110,9 @@ type Handler struct {
 	reqCountCache      map[string]*requestCountCacheEntry
 	reqCountRefreshMu  sync.Mutex
 	reqCountRefreshing map[string]bool
+	// 大池分批聚合的断点续跑半成品,见 requestCountStaging。
+	reqCountStagingMu sync.Mutex
+	reqCountStaging   map[string]*requestCountStaging
 
 	// 管理后台账号分页使用的轻量快照。快照按渠道缓存，只保存筛选、排序和
 	// 当前页定位所需的信息；完整账号响应仍只为当前页构建。
@@ -210,8 +230,8 @@ const (
 	adminUsageRangeCacheTTL        = 35 * time.Second
 	adminChartCacheTTL             = 10 * time.Second
 	adminAccountWindowsCacheTTL    = 30 * time.Second
-	importFileSizeLimitBytes       = 20 * 1024 * 1024
-	importFileSizeLimitLabel       = "20MB"
+	importFileSizeLimitBytes       = 200 * 1024 * 1024
+	importFileSizeLimitLabel       = "200MB"
 	accountRefreshBatchConcurrency = 4
 )
 
@@ -332,10 +352,308 @@ func (h *Handler) startDBBackgroundTaskWithParent(parent context.Context, task f
 	})
 }
 
+type importLoadTier uint8
+
+const (
+	importLoadLow importLoadTier = iota
+	importLoadMedium
+	importLoadHigh
+)
+
+const (
+	maxImportDBConcurrency    = 12
+	maxImportProbeConcurrency = 8
+	importPermitPollInterval  = 25 * time.Millisecond
+	importTierRecoveryDelay   = 5 * time.Second
+	importDBWaitBackoff       = 10 * time.Second
+)
+
+type importRuntimeLoadSnapshot struct {
+	RPM         int64
+	Active      int64
+	DBInUse     int
+	DBMaxOpen   int
+	DBWaitCount int64
+}
+
+type importConcurrencyLimits struct {
+	db    int
+	probe int
+}
+
+func (h *Handler) currentImportRuntimeLoad() importRuntimeLoadSnapshot {
+	if h == nil {
+		return importRuntimeLoadSnapshot{}
+	}
+	if h.importLoadSnapshot != nil {
+		return h.importLoadSnapshot()
+	}
+	var snapshot importRuntimeLoadSnapshot
+	if h.rateLimiter != nil {
+		snapshot.RPM = h.rateLimiter.GetCurrentRPM()
+		snapshot.Active = h.rateLimiter.GetActiveRequests()
+	}
+	if h.db != nil {
+		stats := h.db.Stats()
+		snapshot.DBInUse = stats.InUse
+		snapshot.DBMaxOpen = stats.MaxOpenConnections
+		snapshot.DBWaitCount = stats.WaitCount
+	}
+	return snapshot
+}
+
+func importDBUsagePercent(snapshot importRuntimeLoadSnapshot) int {
+	if snapshot.DBMaxOpen <= 0 || snapshot.DBInUse <= 0 {
+		return 0
+	}
+	return snapshot.DBInUse * 100 / snapshot.DBMaxOpen
+}
+
+// nextImportLoadTier 使用不同的升/降档阈值形成滞回：负载升高立即收紧，
+// 回落则必须越过更低阈值，避免临界 RPM 附近反复增减 worker。
+func nextImportLoadTier(current importLoadTier, initialized bool, snapshot importRuntimeLoadSnapshot, dbWaitIncreased bool) importLoadTier {
+	dbUsage := importDBUsagePercent(snapshot)
+	enterHigh := dbWaitIncreased || snapshot.RPM >= 600 || snapshot.Active >= 64 || dbUsage >= 70
+	enterMedium := snapshot.RPM >= 180 || snapshot.Active >= 16 || dbUsage >= 40
+	if !initialized {
+		if enterHigh {
+			return importLoadHigh
+		}
+		if enterMedium {
+			return importLoadMedium
+		}
+		return importLoadLow
+	}
+
+	switch current {
+	case importLoadHigh:
+		if dbWaitIncreased || snapshot.RPM >= 400 || snapshot.Active >= 32 || dbUsage >= 50 {
+			return importLoadHigh
+		}
+		// 每次最多降一档，让恢复过程保持平滑。
+		return importLoadMedium
+	case importLoadMedium:
+		if enterHigh {
+			return importLoadHigh
+		}
+		if snapshot.RPM < 120 && snapshot.Active < 8 && dbUsage < 25 {
+			return importLoadLow
+		}
+		return importLoadMedium
+	default:
+		if enterHigh {
+			return importLoadHigh
+		}
+		if enterMedium {
+			return importLoadMedium
+		}
+		return importLoadLow
+	}
+}
+
+func importLimitsForTier(tier importLoadTier, snapshot importRuntimeLoadSnapshot) importConcurrencyLimits {
+	limits := importConcurrencyLimits{db: maxImportDBConcurrency, probe: maxImportProbeConcurrency}
+	switch tier {
+	case importLoadHigh:
+		limits.db, limits.probe = 4, 4
+	case importLoadMedium:
+		limits.db, limits.probe = 8, 6
+	}
+	// 导入最多使用连接池的约四分之一；SQLite 小连接池也不会被导入独占。
+	if snapshot.DBMaxOpen > 0 {
+		poolShare := snapshot.DBMaxOpen / 4
+		if poolShare < 1 {
+			poolShare = 1
+		}
+		if limits.db > poolShare {
+			limits.db = poolShare
+		}
+	}
+	return limits
+}
+
+func (h *Handler) adaptiveImportLimits() importConcurrencyLimits {
+	if h == nil {
+		return importConcurrencyLimits{db: 4, probe: 4}
+	}
+	snapshot := h.currentImportRuntimeLoad()
+	now := time.Now()
+	if h.importLoadNow != nil {
+		now = h.importLoadNow()
+	}
+	h.importLoadMu.Lock()
+	defer h.importLoadMu.Unlock()
+
+	waitIncreased := h.importLoadReady && snapshot.DBWaitCount > h.importLoadDBWait
+	if waitIncreased {
+		h.importLoadBusyTill = now.Add(importDBWaitBackoff)
+	}
+	if now.Before(h.importLoadBusyTill) {
+		waitIncreased = true
+	}
+	nextTier := nextImportLoadTier(h.importLoadTier, h.importLoadReady, snapshot, waitIncreased)
+	if h.importLoadReady && nextTier < h.importLoadTier && now.Sub(h.importLoadChanged) < importTierRecoveryDelay {
+		nextTier = h.importLoadTier
+	}
+	if !h.importLoadReady || nextTier != h.importLoadTier {
+		h.importLoadChanged = now
+	}
+	h.importLoadTier = nextTier
+	h.importLoadReady = true
+	h.importLoadDBWait = snapshot.DBWaitCount
+	return importLimitsForTier(h.importLoadTier, snapshot)
+}
+
+func (h *Handler) importProbeWorkerCapacity() int {
+	capacity := maxImportProbeConcurrency
+	if h != nil && h.store != nil {
+		if configured := h.store.GetUsageProbeConcurrency(); configured > 0 && configured < capacity {
+			capacity = configured
+		}
+	}
+	return capacity
+}
+
+func (h *Handler) importProbeConcurrency() int {
+	limit := h.adaptiveImportLimits().probe
+	if capacity := h.importProbeWorkerCapacity(); limit > capacity {
+		limit = capacity
+	}
+	return limit
+}
+
+func acquireAdaptivePermit(ctx context.Context, active *atomic.Int32, limit func() int) bool {
+	ticker := time.NewTicker(importPermitPollInterval)
+	defer ticker.Stop()
+	for {
+		maxActive := limit()
+		if maxActive < 1 {
+			maxActive = 1
+		}
+		current := active.Load()
+		if current < int32(maxActive) && active.CompareAndSwap(current, current+1) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// runImportProbeTask 把导入预热放进进程内队列，并按当前导入并发上限启动 worker。
+// 排队任务只占一个函数引用，不会各自创建 goroutine；worker 在队列清空后退出。
+func (h *Handler) runImportProbeTask(fn func(context.Context)) {
+	if h == nil || fn == nil {
+		return
+	}
+	h.importProbeQueueMu.Lock()
+	h.importProbeQueue = append(h.importProbeQueue, fn)
+	if h.importProbeWorkers >= h.importProbeWorkerCapacity() {
+		h.importProbeQueueMu.Unlock()
+		return
+	}
+	h.importProbeWorkers++
+	h.importProbeQueueMu.Unlock()
+
+	if h.startDBBackgroundTask(h.runImportProbeWorker) {
+		return
+	}
+	h.importProbeQueueMu.Lock()
+	h.importProbeWorkers--
+	h.importProbeQueue = nil
+	h.importProbeQueueMu.Unlock()
+}
+
+func (h *Handler) runImportProbeWorker(ctx context.Context) {
+	for {
+		if ctx.Err() != nil {
+			h.importProbeQueueMu.Lock()
+			h.importProbeQueue = nil
+			h.importProbeWorkers--
+			h.importProbeQueueMu.Unlock()
+			return
+		}
+
+		h.importProbeQueueMu.Lock()
+		if len(h.importProbeQueue) == 0 {
+			h.importProbeWorkers--
+			h.importProbeQueueMu.Unlock()
+			return
+		}
+		fn := h.importProbeQueue[0]
+		h.importProbeQueue[0] = nil
+		h.importProbeQueue = h.importProbeQueue[1:]
+		h.importProbeQueueMu.Unlock()
+
+		if !acquireAdaptivePermit(ctx, &h.importProbeActive, h.importProbeConcurrency) {
+			continue
+		}
+		fn(ctx)
+		h.importProbeActive.Add(-1)
+	}
+}
+
+type adaptiveImportDBLimiter struct {
+	handler *Handler
+	active  atomic.Int32
+}
+
+func (l *adaptiveImportDBLimiter) acquire(ctx context.Context) bool {
+	if l == nil || l.handler == nil {
+		return false
+	}
+	return acquireAdaptivePermit(ctx, &l.active, func() int {
+		return l.handler.adaptiveImportLimits().db
+	})
+}
+
+func (l *adaptiveImportDBLimiter) release() {
+	if l != nil {
+		l.active.Add(-1)
+	}
+}
+
 func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
-	h.startDBBackgroundTask(func(ctx context.Context) {
+	h.runImportProbeTask(func(ctx context.Context) {
 		h.probeImportedAccountUsage(ctx, accountID, source)
 	})
+}
+
+// scheduleImportedAccountWarmup 导入后的换 AT / 用量探测。脚本批量加号和文件导入
+// 必须走同一道并发闸：裸 RT 换 AT 也会打上游，不限流会把网关和鉴权接口一起打满。
+func (h *Handler) scheduleImportedAccountWarmup(acc *auth.Account, id int64, source string) {
+	if h == nil || acc == nil || id <= 0 {
+		return
+	}
+	if acc.GetAccessToken() != "" {
+		h.triggerImportedAccountUsageProbe(id, source)
+		return
+	}
+	if h.store != nil && !h.store.GetLazyMode() {
+		h.runImportProbeTask(func(ctx context.Context) {
+			h.refreshImportedAccountAndProbe(ctx, id, source+"_refresh")
+		})
+	}
+}
+
+// commitImportedRuntimeAccounts 一次写入内存池，再按需排队预热。逐条 AddAccount
+// 会反复抢号池写锁；预热必须在入池之后，refreshAccountByID 靠 DBID 回查运行时账号。
+func (h *Handler) commitImportedRuntimeAccounts(accounts []*auth.Account, source string, skipRefresh bool) {
+	if h == nil || h.store == nil || len(accounts) == 0 {
+		return
+	}
+	h.store.AddAccounts(accounts)
+	if skipRefresh {
+		return
+	}
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		h.scheduleImportedAccountWarmup(acc, acc.DBID, source)
+	}
 }
 
 func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source string) {
@@ -347,15 +665,34 @@ func (h *Handler) applyImportedAccountUsageState(account *auth.Account, source s
 	}
 }
 
+// importRefreshTransientRetryLimit 是导入换 AT 瞬时失败(超时/代理抖动/上游
+// 5xx/刷新锁竞争)的额外重试次数。瞬时失败不能一次就标粘性 error——error 没有
+// 任何自动重试,语义反而比 RT 死透(有冷却自愈)更重;批量导入撞上代理抖动
+// 会把一批好号永久标死。
+const importRefreshTransientRetryLimit = 3
+
+// importRefreshTransientRetryDelay 是两次导入刷新重试的间隔。var 便于测试缩短。
+var importRefreshTransientRetryDelay = 2 * time.Minute
+
 func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID int64, source string) {
+	h.refreshImportedAccountWithRetry(ctx, accountID, source, 0)
+}
+
+func (h *Handler) refreshImportedAccountWithRetry(ctx context.Context, accountID int64, source string, attempt int) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	err := h.refreshAccountByID(refreshCtx, accountID)
+	// 导入路径在身份合并后会统一 probe；刷新内部不再先 probe 一次，避免每个
+	// 裸 RT 成功换票后连续打两次 wham/subscription 上游。
+	err := h.refreshAccountByIDWithProbe(refreshCtx, accountID, false)
 	cancel()
 	if err != nil {
-		log.Printf("导入账号 %d 刷新失败: %v", accountID, err)
+		log.Printf("导入账号 %d 刷新失败(第 %d 次): %v", accountID, attempt+1, err)
+		if h.scheduleImportedRefreshRetry(accountID, source, attempt, err) {
+			return
+		}
+		h.markImportedRefreshFailure(accountID, err)
 		return
 	}
 	log.Printf("导入账号 %d 刷新成功", accountID)
@@ -365,6 +702,53 @@ func (h *Handler) refreshImportedAccountAndProbe(ctx context.Context, accountID 
 		return
 	}
 	h.probeImportedAccountUsage(ctx, accountID, source)
+}
+
+// scheduleImportedRefreshRetry 对瞬时刷新失败安排一次延迟重试:到点后重新走
+// 导入并发闸,不在闸内睡眠占槽。重试窗口内账号保持「刷新中」——这是真实状态
+// 且有界(最多 limit+1 次尝试)。永久失败或重试耗尽返回 false,交给调用方落状态。
+func (h *Handler) scheduleImportedRefreshRetry(accountID int64, source string, attempt int, err error) bool {
+	if h == nil || h.store == nil || err == nil {
+		return false
+	}
+	if auth.IsPermanentRefreshFailure(err) || attempt >= importRefreshTransientRetryLimit {
+		return false
+	}
+	acc := h.store.FindByID(accountID)
+	if acc == nil || acc.GetAccessToken() != "" {
+		return false
+	}
+	time.AfterFunc(importRefreshTransientRetryDelay, func() {
+		h.runImportProbeTask(func(ctx context.Context) {
+			h.refreshImportedAccountWithRetry(ctx, accountID, source, attempt+1)
+		})
+	})
+	return true
+}
+
+// markImportedRefreshFailure 导入后换 AT 失败(瞬时失败已重试耗尽)时落状态，
+// 避免裸 RT 一直停在「刷新中」。会话作废 / RT 失效标未授权（时长由 unauthorized
+// 自适应 6/24h 策略决定，入参只是兜底）；其它失败标错误。
+func (h *Handler) markImportedRefreshFailure(accountID int64, err error) {
+	if h == nil || h.store == nil || err == nil {
+		return
+	}
+	acc := h.store.FindByID(accountID)
+	if acc == nil || acc.GetAccessToken() != "" {
+		return
+	}
+	// store 的刷新路径对不可重试错误已经标过未授权冷却；再标一次会让
+	// FailureStreak 翻倍、自适应冷却直接跳 24h 档，并重复落库。
+	switch acc.RuntimeStatus() {
+	case "unauthorized", "error":
+		return
+	}
+	msg := err.Error()
+	if auth.IsPermanentRefreshFailure(err) {
+		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", msg)
+		return
+	}
+	h.store.MarkError(acc, msg)
 }
 
 // mergeRefreshedDuplicateIntoExisting 检查刚刷新完的新导入账号是否与已有账号
@@ -556,6 +940,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
 	}
+	store.SetUsageProbeCompletionFunc(handler.invalidateAccountSnapshotCaches)
 	handler.refreshAccount = handler.refreshSingleAccount
 	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
@@ -749,7 +1134,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
 	api.GET("/prompt-filter/review/keys", h.ListPromptReviewAPIKeys)
 	api.DELETE("/prompt-filter/review/keys/:key_id", h.DeletePromptReviewAPIKey)
+	api.GET("/prompt-filter/review/profiles", h.ListPromptReviewProfiles)
+	api.POST("/prompt-filter/review/profiles", h.SavePromptReviewProfile)
+	api.POST("/prompt-filter/review/profiles/:profile_id/activate", h.ActivatePromptReviewProfile)
+	api.DELETE("/prompt-filter/review/profiles/:profile_id", h.DeletePromptReviewProfile)
 	api.POST("/prompt-filter/review/test", h.TestPromptReviewConnection)
+	api.POST("/prompt-filter/review/models", h.ListPromptReviewModels)
 	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/prompt-filter/newapi-bindings", h.ListPromptFilterNewAPIBindings)
@@ -884,7 +1274,9 @@ func (h *Handler) hasConfiguredAdminSecret(ctx context.Context) bool {
 
 // GetStats 获取仪表盘统计
 func (h *Handler) GetStats(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	// Large installations may need more than five seconds to aggregate the
+	// dashboard inputs. Keep the request bounded without failing normal loads.
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
 	accounts, err := h.db.ListActive(ctx)
@@ -957,7 +1349,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			channel = database.UpstreamChannelGrok
 		}
 		usingCredits := false
-		if acc, ok := runtimeByID[row.ID]; ok {
+		acc := runtimeByID[row.ID]
+		if acc != nil {
 			status = strings.ToLower(strings.TrimSpace(acc.RuntimeStatus()))
 			cooldownReason = ""
 			// 积分顶替限流：状态仍报限流（窗口客观打满），但账号照常参与调度，按可用计。
@@ -980,6 +1373,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		case !usingCredits && isDashboardRateLimitedAccount(status, cooldownReason):
 			counts.rateLimited++
 			perChannel.rateLimited++
+		case isDashboardUnsampledAccount(row, acc):
+			// 未采样不当作可用：仪表盘「可用」与账号页正常/调度中对齐。
 		default:
 			counts.normal++
 			perChannel.normal++
@@ -993,13 +1388,39 @@ func isDashboardAbnormalAccount(status string) bool {
 	return status == "unauthorized" || status == "error"
 }
 
+func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bool {
+	if acc != nil {
+		if acc.IsGrokAPI() || acc.IsOpenAIResponsesAPI() {
+			return false
+		}
+		snapshot := acc.GetAccountListRuntimeSnapshot()
+		status := strings.ToLower(strings.TrimSpace(snapshot.Status))
+		if status == "unauthorized" || status == "error" {
+			return false
+		}
+		return !snapshot.UsagePercent5hValid && !snapshot.UsagePercent7dValid
+	}
+	if row == nil {
+		return false
+	}
+	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+	if strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(row.Status))
+	if status == "unauthorized" || status == "error" {
+		return false
+	}
+	return true
+}
+
 func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 	switch status {
-	case "rate_limited", "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "usage_exhausted", "usage_limited", "quota_paused", "rate_limited_5h", "rate_limited_7d":
 		return true
 	}
 	switch cooldownReason {
-	case "rate_limited", "rate_limited_5h", "rate_limited_7d", "usage_limited":
+	case "rate_limited", auth.ResponsesRateLimitedCooldownReason, "rate_limited_5h", "rate_limited_7d", "usage_limited":
 		return true
 	}
 	return false
@@ -1064,8 +1485,11 @@ type accountResponse struct {
 	ErrorRequests                 int64                       `json:"error_requests"`
 	RetryErrorRequests            int64                       `json:"retry_error_requests"`
 	RateLimitAttempts             int64                       `json:"rate_limit_attempts"`
+	ErrorStatusCounts             map[string]int64            `json:"error_status_counts,omitempty"`
+	SuccessModelCounts            map[string]int64            `json:"success_model_counts,omitempty"`
 	UsagePercent7d                *float64                    `json:"usage_percent_7d"`
 	UsagePercent5h                *float64                    `json:"usage_percent_5h"`
+	UsagePercentSpark             *float64                    `json:"usage_percent_spark"`
 	RateLimitResetCredits         *int                        `json:"rate_limit_reset_credits"`
 	ApplicableResetCredits        *int                        `json:"applicable_reset_credits"`
 	CreditsBalance                *string                     `json:"credits_balance"`
@@ -1087,6 +1511,7 @@ type accountResponse struct {
 	Usage7dDetail                 *accountUsageWindow         `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                     string                      `json:"reset_5h_at,omitempty"`
 	Reset7dAt                     string                      `json:"reset_7d_at,omitempty"`
+	ResetSparkAt                  string                      `json:"reset_spark_at,omitempty"`
 	Window7dKind                  string                      `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
 	Window7dSeconds               *int64                      `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
 	Billed5h                      *float64                    `json:"billed_5h"`
@@ -1126,10 +1551,12 @@ type modelCooldownResponse struct {
 }
 
 type accountUsageWindow struct {
-	Requests      int64   `json:"requests"`
-	Tokens        int64   `json:"tokens"`
-	AccountBilled float64 `json:"account_billed"`
-	UserBilled    float64 `json:"user_billed"`
+	Requests           int64            `json:"requests"`
+	Tokens             int64            `json:"tokens"`
+	AccountBilled      float64          `json:"account_billed"`
+	UserBilled         float64          `json:"user_billed"`
+	ModelCounts        map[string]int64 `json:"model_counts,omitempty"`
+	ModelSuccessCounts map[string]int64 `json:"model_success_counts,omitempty"`
 }
 
 func accountEmailDomain(email string) string {
@@ -1317,6 +1744,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Page:     pageSelection.Page, PageSize: pageSelection.PageSize, Total: pageSelection.Total,
 			Summary: pageSelection.Summary, Facets: pageSelection.Facets,
 			SnapshotAt: pageSelection.SnapshotAt.Format(time.RFC3339), StatsState: pageSelection.StatsState,
+			DisabledSorts: pageSelection.DisabledSorts,
 		})
 		return
 	}
@@ -2499,7 +2927,7 @@ func (h *Handler) getCachedRequestCounts() map[int64]*database.AccountRequestCou
 		log.Printf("获取账号请求统计失败: %v", err)
 		return make(map[int64]*database.AccountRequestCount)
 	}
-	h.storeRequestCountCache(cacheKey, counts)
+	h.storeRequestCountCache(cacheKey, counts, nil, time.Time{})
 	return counts
 }
 
@@ -2531,6 +2959,9 @@ type addAccountReq struct {
 	ProxyURL       string            `json:"proxy_url"`
 	CustomHeaders  map[string]string `json:"custom_headers"`
 	AllowDuplicate bool              `json:"allow_duplicate"`
+	// SkipRefresh 只入库、不换 AT、不打用量探测。大批量脚本导入时应打开，
+	// 避免每批 50 个裸 RT 立刻拉起无上限的上游刷新把网关打卡。
+	SkipRefresh bool `json:"skip_refresh"`
 	// GroupIDs 让添加时就把新账号绑进指定分组；重复跳过的账号不受影响。
 	GroupIDs json.RawMessage `json:"group_ids"`
 }
@@ -2690,6 +3121,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	failCount := 0
 	duplicateCount := 0
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(seeds))
 
 	var dedup *accountCredentialDedup
 	if !req.AllowDuplicate || openaiidentity.WorkspaceOverrideFromHeaders(customHeaders) != "" {
@@ -2719,21 +3151,10 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual")
-
-		// 热加载：直接加入内存池
-		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		if newAcc.GetAccessToken() != "" {
-			h.triggerImportedAccountUsageProbe(id, "manual_add")
-		} else if !h.store.GetLazyMode() {
-			// 异步刷新 AT，刷新成功后立即做 wham 用量采样。
-			h.startDBBackgroundTask(func(ctx context.Context) {
-				h.refreshImportedAccountAndProbe(ctx, id, "manual_add_refresh")
-			})
-		}
+		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual")
+	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
 
 	// 记录安全审计日志
 	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
@@ -2782,6 +3203,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 		dedup = h.newAccountCredentialDedup(ctx)
 	}
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(seeds))
 
 	for i, seed := range seeds {
 		name := req.Name
@@ -2813,24 +3235,15 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual")
-
-		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		if newAcc.GetAccessToken() != "" {
-			h.triggerImportedAccountUsageProbe(id, "manual_add")
-		} else if !h.store.GetLazyMode() {
-			h.startDBBackgroundTask(func(ctx context.Context) {
-				h.refreshImportedAccountAndProbe(ctx, id, "manual_add_refresh")
-			})
-		}
+		pending = append(pending, h.newCodexAccountFromSeed(id, req.ProxyURL, seed))
 
 		sendImportEvent(c, importEvent{
 			Type: "progress", Current: i + 1, Total: total,
 			Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 		})
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual")
+	h.commitImportedRuntimeAccounts(pending, "manual_add", req.SkipRefresh)
 
 	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 	// 绑定必须在 complete 事件之前完成：前端收到 complete 就会刷新列表。
@@ -2936,6 +3349,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 	updatedCount := 0
 	duplicateCount := 0
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(tokens))
 
 	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + 有效工作区，如 codex_at）
 	// 按 access_token 原文去重；身份型 AT 由 upsertOAuthIdentityAccount 按 OAuth 身份
@@ -2966,7 +3380,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			customHeaders:  customHeaders,
 		})
 		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
-			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
@@ -2979,6 +3393,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 			} else {
 				successCount++
 				createdIDs.add(id)
+				pending = append(pending, newAcc)
 				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
 			}
 			continue
@@ -3003,18 +3418,15 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 
 		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
 		// 身份信息后续由 wham 用量查询补齐。
 		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-
-		// 触发 wham 用量探针：codex_at 的身份此刻未知，探针补齐身份后会回查
-		// 并合并同身份的已有账号（见 probeImportedAccountUsage）。
-		h.triggerImportedAccountUsageProbe(id, "manual_at")
+		pending = append(pending, newAcc)
 		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual_at")
+	h.commitImportedRuntimeAccounts(pending, "manual_at", false)
 
 	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
 
@@ -3080,6 +3492,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 		})
 	}
 	createdIDs := &importedAccountIDs{}
+	pending := make([]*auth.Account, 0, len(tokens))
 
 	for i, at := range tokens {
 		name := req.Name
@@ -3091,7 +3504,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate, customHeaders: req.CustomHeaders})
 		if seed.email != "" && effectiveWorkspaceIDFromSeed(seed) != "" {
-			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+			id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
@@ -3102,6 +3515,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 			} else {
 				successCount++
 				createdIDs.add(id)
+				pending = append(pending, newAcc)
 				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
 			}
 			progress(i + 1)
@@ -3128,13 +3542,12 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 
 		successCount++
 		createdIDs.add(id)
-		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 		newAcc := h.newCodexAccountFromSeed(id, req.ProxyURL, seed)
-		h.store.AddAccount(newAcc)
-		// 与非流式路径一致：探针补齐 codex_at 身份后回查合并同身份的已有账号。
-		h.triggerImportedAccountUsageProbe(id, "manual_at")
+		pending = append(pending, newAcc)
 		progress(i + 1)
 	}
+	h.db.BatchInsertAccountEventsAsync(createdIDs.snapshot(), "added", "manual_at")
+	h.commitImportedRuntimeAccounts(pending, "manual_at", false)
 
 	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
 	// 绑定必须在 complete 事件之前完成：前端收到 complete 就会刷新列表。
@@ -3163,10 +3576,11 @@ type addOpenAIResponsesAccountReq struct {
 }
 
 type fetchOpenAIResponsesModelsReq struct {
-	AccountID int64  `json:"account_id"`
-	BaseURL   string `json:"base_url"`
-	APIKey    string `json:"api_key"`
-	ProxyURL  string `json:"proxy_url"`
+	AccountID     int64             `json:"account_id"`
+	BaseURL       string            `json:"base_url"`
+	APIKey        string            `json:"api_key"`
+	ProxyURL      string            `json:"proxy_url"`
+	CustomHeaders map[string]string `json:"custom_headers"`
 }
 
 func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
@@ -3320,6 +3734,9 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 		if strings.TrimSpace(req.ProxyURL) == "" {
 			req.ProxyURL = row.ProxyURL
 		}
+		if len(req.CustomHeaders) == 0 {
+			req.CustomHeaders = row.GetCredentialStringMap("custom_headers")
+		}
 	}
 	baseURL, err := auth.NormalizeOpenAIResponsesBaseURL(req.BaseURL)
 	if err != nil {
@@ -3334,10 +3751,15 @@ func (h *Handler) FetchOpenAIResponsesModels(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "代理URL无效")
 		return
 	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
 	defer cancel()
-	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL)
+	models, err := fetchOpenAIResponsesModelIDs(ctx, baseURL, req.APIKey, req.ProxyURL, customHeaders)
 	if err != nil {
 		writeError(c, http.StatusBadGateway, err.Error())
 		return
@@ -3470,7 +3892,7 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
 }
 
-func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {
+func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string, customHeaders map[string]string) ([]string, error) {
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/models")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
@@ -3488,6 +3910,14 @@ func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
+	proxy.ApplyCodexModelDiscoveryHeaders(req.Header, baseURL+"|"+apiKey)
+	for name, value := range customHeaders {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		req.Header.Set(name, value)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -3859,6 +4289,107 @@ func parseImportJSONTokens(data []byte) ([]importToken, error) {
 	return nil, nil
 }
 
+// parseUploadedImportJSONFile 打开上传的 JSON 文件并流式解析,不把整个文件读进
+// 内存。multipart 大文件(>32MB)由 ParseMultipartForm 落在临时文件,fh.Open()
+// 返回的 reader 直接喂给流式解析器。
+func parseUploadedImportJSONFile(fh *multipart.FileHeader) ([]importToken, error) {
+	f, err := fh.Open()
+	if err != nil {
+		return nil, fmt.Errorf("打开文件 %s 失败", fh.Filename)
+	}
+	defer f.Close()
+	return parseImportJSONTokensStream(f)
+}
+
+// parseImportJSONTokensStream 流式解析导入 JSON,避免把整个文件(可达 200MB)
+// 一次性读进内存 + 整体 Unmarshal。逐个数组元素解码,内存峰值降到单条账号量级。
+// 覆盖三种形态:顶层数组 [ {...} ]、sub2api 顶层对象 { "accounts": [ {...} ] }、
+// 单个平铺对象 { ... };无法流式判定时回退到全量 parseImportJSONTokens。
+func parseImportJSONTokensStream(r io.Reader) ([]importToken, error) {
+	// json.Decoder 不剥 UTF-8 BOM,而部分导出文件带 BOM(与全量路径的
+	// trimUTF8BOM 对齐):peek 前 3 字节,是 BOM 就丢弃。
+	br := bufio.NewReader(r)
+	if prefix, err := br.Peek(3); err == nil && prefix[0] == 0xef && prefix[1] == 0xbb && prefix[2] == 0xbf {
+		_, _ = br.Discard(3)
+	}
+	dec := json.NewDecoder(br)
+	first, err := dec.Token()
+	if err != nil {
+		return nil, fmt.Errorf("invalid import json")
+	}
+	delim, ok := first.(json.Delim)
+	if !ok {
+		return nil, fmt.Errorf("invalid import json")
+	}
+
+	switch delim {
+	case '[':
+		// 顶层数组:逐个 jsonAccountEntry 解码。
+		var tokens []importToken
+		for dec.More() {
+			var entry jsonAccountEntry
+			if err := dec.Decode(&entry); err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			tokens = append(tokens, jsonAccountEntriesToTokens([]jsonAccountEntry{entry})...)
+		}
+		return tokens, nil
+
+	case '{':
+		// 顶层对象:可能是 sub2api {accounts:[...]} 或单个平铺账号对象。
+		// 遍历顶层字段,accounts 数组逐元素流式解码;其余字段(通常很小)收集
+		// 成 RawMessage,遍历完若未见 accounts 则按单个平铺对象重建解析。
+		var tokens []importToken
+		sawAccounts := false
+		other := map[string]json.RawMessage{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			key, _ := keyTok.(string)
+			if key == "accounts" {
+				sawAccounts = true
+				arrTok, err := dec.Token()
+				if err != nil {
+					return nil, fmt.Errorf("invalid import json")
+				}
+				if d, ok := arrTok.(json.Delim); !ok || d != '[' {
+					return nil, fmt.Errorf("invalid import json")
+				}
+				for dec.More() {
+					var account sub2apiAccountEntry
+					if err := dec.Decode(&account); err != nil {
+						return nil, fmt.Errorf("invalid import json")
+					}
+					tokens = append(tokens, sub2apiAccountEntryToTokens(account)...)
+				}
+				if _, err := dec.Token(); err != nil { // consume ']'
+					return nil, fmt.Errorf("invalid import json")
+				}
+				continue
+			}
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				return nil, fmt.Errorf("invalid import json")
+			}
+			other[key] = raw
+		}
+		if sawAccounts {
+			return tokens, nil
+		}
+		// 没有 accounts 字段:这是单个平铺账号对象,用收集到的字段重建后按
+		// 平铺形态解析(单对象很小,无内存压力)。
+		objBytes, err := json.Marshal(other)
+		if err != nil {
+			return nil, fmt.Errorf("invalid import json")
+		}
+		return parseFlatJSONImportTokens(objBytes), nil
+	}
+
+	return nil, fmt.Errorf("invalid import json")
+}
+
 func parseFlatJSONImportTokens(data []byte) []importToken {
 	var entries []jsonAccountEntry
 	if err := json.Unmarshal(data, &entries); err == nil {
@@ -3929,6 +4460,16 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 
 	tokens := make([]importToken, 0, len(payload.Accounts))
 	for _, account := range payload.Accounts {
+		tokens = append(tokens, sub2apiAccountEntryToTokens(account)...)
+	}
+	return tokens
+}
+
+// sub2apiAccountEntryToTokens 把单个 sub2api 账号条目转换成 importToken(0 或 1 个)。
+// 从 parseSub2APIJSONImportTokens 抽出,供流式解析逐元素复用,避免两份逻辑漂移。
+func sub2apiAccountEntryToTokens(account sub2apiAccountEntry) []importToken {
+	var tokens []importToken
+	{
 		c := account.Credentials
 		rt := strings.TrimSpace(c.RefreshToken)
 		st := firstNonEmpty(c.SessionToken, c.SessionTokenCamel)
@@ -3951,8 +4492,7 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 			agentNode = agentIdentityNodeFromFlatCredentials(c.AuthMode, c.AgentRuntimeID, c.AgentPrivateKey, c.AgentTaskID, accID, c.ChatGPTUserID, email, planType, c.AgentFedRAMP)
 		}
 		if tok, ok := agentIdentityImportTokenFromNode(agentNode, name); ok {
-			tokens = append(tokens, tok)
-			continue
+			return append(tokens, tok)
 		}
 
 		if rt != "" || st != "" || at != "" {
@@ -4240,19 +4780,7 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDupli
 			return
 		}
 
-		f, err := fh.Open()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("打开文件 %s 失败", fh.Filename))
-			return
-		}
-		data, err := io.ReadAll(f)
-		f.Close()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("读取文件 %s 失败", fh.Filename))
-			return
-		}
-
-		tokens, err := parseImportJSONTokens(data)
+		tokens, err := parseUploadedImportJSONFile(fh)
 		if err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
 			return
@@ -4291,19 +4819,7 @@ func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, al
 			return
 		}
 
-		f, err := fh.Open()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("打开文件 %s 失败", fh.Filename))
-			return
-		}
-		data, err := io.ReadAll(f)
-		f.Close()
-		if err != nil {
-			writeError(c, http.StatusBadRequest, fmt.Sprintf("读取文件 %s 失败", fh.Filename))
-			return
-		}
-
-		tokens, err := parseImportJSONTokens(data)
+		tokens, err := parseUploadedImportJSONFile(fh)
 		if err != nil {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("文件 %s 不是有效的 JSON 格式", fh.Filename))
 			return
@@ -4348,8 +4864,46 @@ type importEvent struct {
 	Warning string `json:"warning,omitempty"`
 }
 
-func sendImportEvent(c *gin.Context, e importEvent) {
-	sendSSEJSON(c, e)
+// sendImportEvent 推送一条导入进度事件；返回 false 表示下游连接已经写不进去了。
+func sendImportEvent(c *gin.Context, e importEvent) bool {
+	return sendSSEJSON(c, e)
+}
+
+// importProgressInterval 是导入进度事件的推送间隔。
+const importProgressInterval = 200 * time.Millisecond
+
+// runImportProgressPusher 按固定间隔推送导入进度，返回一个在推送协程退出后关闭的
+// channel。三种情况会停：导入结束（done 关闭）、下游断开（reqCtx 取消）、或者写
+// 失败。后两种必须停——导入本身还要继续跑完，但连接已经死了，继续写只会每个
+// 间隔刷一条 broken pipe 日志直到导入结束。
+//
+// 调用方在 close(done) 之后必须等返回的 channel 关闭再写收尾事件：gin 的
+// ResponseWriter 不支持并发写，两边同时写会让事件交错，前端解析不到 complete，
+// 进度条永远停在最后一个百分比。
+func runImportProgressPusher(reqCtx context.Context, done <-chan struct{}, interval time.Duration, snapshot func() importEvent, send func(importEvent) bool) <-chan struct{} {
+	stopped := make(chan struct{})
+	var clientGone <-chan struct{}
+	if reqCtx != nil {
+		clientGone = reqCtx.Done()
+	}
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !send(snapshot()) {
+					return
+				}
+			case <-clientGone:
+				return
+			case <-done:
+				return
+			}
+		}
+	}()
+	return stopped
 }
 
 func setupSSE(c *gin.Context) {
@@ -4604,37 +5158,53 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	var current int64
 	// 本次真正新建的账号，收尾时统一绑分组（命中已有账号的分组不动）。
 	createdIDs := &importedAccountIDs{}
-	sem := make(chan struct{}, 20) // 并发插入上限
+	createdATIDs := &importedAccountIDs{}
+	createdRTIDs := &importedAccountIDs{}
+	type pendingRuntimeAccount struct {
+		account *auth.Account
+		source  string
+	}
+	var pendingMu sync.Mutex
+	pendingRuntime := make([]pendingRuntimeAccount, 0, len(newTokens))
+	addPendingRuntime := func(account *auth.Account, source string) {
+		if account == nil {
+			return
+		}
+		pendingMu.Lock()
+		pendingRuntime = append(pendingRuntime, pendingRuntimeAccount{account: account, source: source})
+		pendingMu.Unlock()
+	}
+	// 写库并发根据近一分钟代理流量与连接池压力动态调整。生产者在启动 goroutine
+	// 前先拿 permit，因此无论目标并发如何变化，都不会堆积等待中的 goroutine。
+	dbLimiter := &adaptiveImportDBLimiter{handler: h}
 	var wg sync.WaitGroup
 
-	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈
+	// 进度推送 goroutine：定时发送，避免每条都写造成 IO 瓶颈。
 	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				cur := int(atomic.LoadInt64(&current))
-				suc := int(atomic.LoadInt64(&successCount))
-				upd := int(atomic.LoadInt64(&updatedCount))
-				fai := int(atomic.LoadInt64(&failCount))
-				sendImportEvent(c, importEvent{
-					Type: "progress", Current: cur + duplicateCount, Total: total,
-					Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
-				})
-			case <-done:
-				return
+	progressStopped := runImportProgressPusher(
+		c.Request.Context(), done, importProgressInterval,
+		func() importEvent {
+			return importEvent{
+				Type:      "progress",
+				Current:   int(atomic.LoadInt64(&current)) + duplicateCount,
+				Total:     total,
+				Success:   int(atomic.LoadInt64(&successCount)),
+				Updated:   int(atomic.LoadInt64(&updatedCount)),
+				Failed:    int(atomic.LoadInt64(&failCount)),
+				Duplicate: duplicateCount,
 			}
-		}
-	}()
+		},
+		func(e importEvent) bool { return sendImportEvent(c, e) },
+	)
 
 	for i, t := range newTokens {
-		sem <- struct{}{}
+		if !dbLimiter.acquire(context.Background()) {
+			break
+		}
 		wg.Add(1)
 		go func(idx int, tok importToken) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer dbLimiter.release()
 
 			name := tok.name
 
@@ -4655,7 +5225,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				upsertCtx, upsertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, updated, err := h.upsertOAuthIdentityAccount(upsertCtx, name, proxyURL, seed, importSource)
+				id, updated, newAcc, err := h.upsertOAuthIdentityAccountDeferred(upsertCtx, name, proxyURL, seed, importSource)
 				upsertCancel()
 				if err != nil {
 					log.Printf("导入账号 %d/%d 更新或写入失败: %v", idx+1, len(newTokens), err)
@@ -4667,21 +5237,27 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				if updated {
 					// 已有账号只更新凭证，不计入"新增"，分组也保持原样。
 					atomic.AddInt64(&updatedCount, 1)
+					if h.store != nil {
+						if acc := h.store.FindByID(id); acc != nil {
+							h.applyImportedAccountUsageState(acc, importSource)
+							if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
+								h.runImportProbeTask(func(ctx context.Context) {
+									h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
+								})
+							}
+						}
+					}
 				} else {
 					atomic.AddInt64(&successCount, 1)
 					createdIDs.add(id)
+					if importSource == "import_at" {
+						createdATIDs.add(id)
+					} else {
+						createdRTIDs.add(id)
+					}
+					addPendingRuntime(newAcc, importSource)
 				}
 				atomic.AddInt64(&current, 1)
-				if h.store != nil {
-					if acc := h.store.FindByID(id); acc != nil {
-						h.applyImportedAccountUsageState(acc, importSource)
-						if acc.GetAccessToken() == "" && !h.store.GetLazyMode() {
-							h.startDBBackgroundTask(func(ctx context.Context) {
-								h.refreshImportedAccountAndProbe(ctx, id, importSource+"_refresh")
-							})
-						}
-					}
-				}
 				return
 			}
 
@@ -4704,15 +5280,11 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 				atomic.AddInt64(&successCount, 1)
 				createdIDs.add(id)
+				createdATIDs.add(id)
 				atomic.AddInt64(&current, 1)
-				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
 				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
-				h.store.AddAccount(newAcc)
-				h.applyImportedAccountUsageState(newAcc, "import_at")
-				if newAcc.GetAccessToken() != "" {
-					h.triggerImportedAccountUsageProbe(id, "import_at")
-				}
+				addPendingRuntime(newAcc, "import_at")
 			} else {
 				// RT 导入路径；如果导入文件里同时带 AT，则先沿用它，后台调度到期前再刷新。
 				if name == "" {
@@ -4732,27 +5304,36 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 				atomic.AddInt64(&successCount, 1)
 				createdIDs.add(id)
+				createdRTIDs.add(id)
 				atomic.AddInt64(&current, 1)
-				h.db.InsertAccountEventAsync(id, "added", "import")
 
 				newAcc := h.newCodexAccountFromSeed(id, proxyURL, seed)
-				h.store.AddAccount(newAcc)
-				h.applyImportedAccountUsageState(newAcc, "import")
-
-				if newAcc.GetAccessToken() != "" {
-					h.triggerImportedAccountUsageProbe(id, "import")
-				} else if !h.store.GetLazyMode() {
-					// 后台异步刷新，不阻塞导入流程；刷新成功后立即做 wham 用量采样。
-					h.startDBBackgroundTask(func(ctx context.Context) {
-						h.refreshImportedAccountAndProbe(ctx, id, "import_refresh")
-					})
-				}
+				addPendingRuntime(newAcc, "import")
 			}
 		}(i, t)
 	}
 
 	wg.Wait()
+	h.db.BatchInsertAccountEventsAsync(createdATIDs.snapshot(), "added", "import_at")
+	h.db.BatchInsertAccountEventsAsync(createdRTIDs.snapshot(), "added", "import")
+	if len(pendingRuntime) > 0 && h.store != nil {
+		accounts := make([]*auth.Account, 0, len(pendingRuntime))
+		for _, pending := range pendingRuntime {
+			accounts = append(accounts, pending.account)
+		}
+		// 一个 Store 锁 + 一个 FastScheduler 锁提交整个批次，避免高 RPM 的 Acquire
+		// 在两个账号之间反复触发全桶排序。
+		h.store.AddAccounts(accounts)
+		for _, pending := range pendingRuntime {
+			h.applyImportedAccountUsageState(pending.account, pending.source)
+			h.scheduleImportedAccountWarmup(pending.account, pending.account.DBID, pending.source)
+		}
+	}
 	close(done)
+	// 等推送 goroutine 真正退出再写收尾事件：gin 的 ResponseWriter 不支持并发写，
+	// 只 close(done) 不等待的话，收尾事件可能和最后一帧进度事件交错，
+	// 前端解析不到 complete，进度条永远停在最后一个百分比。
+	<-progressStopped
 
 	// 发送完成事件（并入 Agent Identity 计数）
 	suc := int(atomic.LoadInt64(&successCount)) + agentSuccess
@@ -4855,11 +5436,17 @@ func (h *Handler) RefreshAccountUsage(c *gin.Context) {
 	if pct, ok := account.GetUsagePercent7d(); ok {
 		resp["usage_percent_7d"] = pct
 	}
+	if pct, ok := account.GetUsagePercentSpark(); ok {
+		resp["usage_percent_spark"] = pct
+	}
 	if t := account.GetReset5hAt(); !t.IsZero() {
 		resp["reset_5h_at"] = t.Format(time.RFC3339)
 	}
 	if t := account.GetReset7dAt(); !t.IsZero() {
 		resp["reset_7d_at"] = t.Format(time.RFC3339)
+	}
+	if t := account.GetResetSparkAt(); !t.IsZero() {
+		resp["reset_spark_at"] = t.Format(time.RFC3339)
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -4923,6 +5510,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+	h.pruneAccountsFromSnapshotCaches([]int64{id})
 
 	writeMessage(c, http.StatusOK, "账号已删除")
 }
@@ -5243,6 +5831,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 	total := len(ids)
 	var success int64
 	var fail int64
+	deleted := make([]int64, 0, len(ids))
 
 	for i, id := range ids {
 		if ctx.Err() != nil {
@@ -5269,6 +5858,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 			}
 		} else {
 			success++
+			deleted = append(deleted, id)
 			event.Deleted = success
 			event.Message = "账号已删除"
 		}
@@ -5279,6 +5869,7 @@ func (h *Handler) runBatchDeleteAccounts(ctx context.Context, ids []int64, onPro
 		}
 	}
 
+	h.pruneAccountsFromSnapshotCaches(deleted)
 	return success, fail
 }
 
@@ -5403,7 +5994,11 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 	if h.store != nil {
 		for _, id := range updatedIDs {
 			if enabled.Set {
-				h.store.ApplyAccountEnabled(id, enabled.Value)
+				if !h.store.ApplyAccountEnabled(id, enabled.Value) && enabled.Value {
+					if err := h.store.LoadAccountByID(ctx, id); err != nil {
+						log.Printf("批量启用账号 %d 后加载进调度池失败: %v", id, err)
+					}
+				}
 			}
 			if locked.Set {
 				if acc := h.store.FindByID(id); acc != nil {
@@ -5493,6 +6088,10 @@ func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
 }
 
 func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	return h.refreshAccountByIDWithProbe(ctx, id, true)
+}
+
+func (h *Handler) refreshAccountByIDWithProbe(ctx context.Context, id int64, probeAfterRefresh bool) error {
 	refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -5508,7 +6107,11 @@ func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
 	// 续费后 access/id token 里的 chatgpt_subscription_active_until 不一定立即更新（会滞后），
 	// 仅靠 token 刷新会让"有效期"长期停留在旧值；wham/usage 返回的是服务端当前订阅到期时间。
 	// （issue #300）
-	if probe := h.usageProbeFunc(); probe != nil && h.store != nil {
+	if probeAfterRefresh {
+		probe := h.usageProbeFunc()
+		if probe == nil || h.store == nil {
+			return nil
+		}
 		if acc := h.store.FindByID(id); acc != nil {
 			probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
 			if err := probe(probeCtx, acc); err != nil {
@@ -7387,6 +7990,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
 		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
+		AllowLive:              in.AllowLive,
 		UpstreamChannel:        in.ResolveUpstreamChannel(),
 		ScopeLimits:            database.NormalizeAPIKeyScopeLimits(in.ScopeLimits),
 	}
@@ -7712,6 +8316,9 @@ type settingsResponse struct {
 	GrokProbeEnabled                    bool   `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            int    `json:"grok_probe_interval_minutes"`
 	GrokMaxRateLimitRetries             int    `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           bool   `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              string `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             string `json:"grok_follow_up_small_effort"`
 	GrokOAuthClientID                   string `json:"grok_oauth_client_id"`
 	// GrokOAuthClientIDEnvOverride 为 true 时，环境变量 GROK_OAUTH_CLIENT_ID 正压着上面这个设置，
 	// 前端据此提示「当前以环境变量为准」。GrokOAuthClientIDEffective 是实际生效值。
@@ -7864,6 +8471,9 @@ type updateSettingsReq struct {
 	GrokProbeEnabled                    *bool    `json:"grok_probe_enabled"`
 	GrokProbeIntervalMinutes            *int     `json:"grok_probe_interval_minutes"`
 	GrokMaxRateLimitRetries             *int     `json:"grok_max_rate_limit_retries"`
+	GrokFollowUpEffortEnabled           *bool    `json:"grok_follow_up_effort_enabled"`
+	GrokFollowUpToolEffort              *string  `json:"grok_follow_up_tool_effort"`
+	GrokFollowUpSmallEffort             *string  `json:"grok_follow_up_small_effort"`
 	GrokOAuthClientID                   *string  `json:"grok_oauth_client_id"`
 	MaxRetries                          *int     `json:"max_retries"`
 	MaxRateLimitRetries                 *int     `json:"max_rate_limit_retries"`
@@ -8381,8 +8991,8 @@ func decodeBackgroundConfig(raw string) brandingBackgroundConfig {
 	return normalizeBackgroundConfig(cfg)
 }
 
-// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试配置编码成 grok_config JSON 落库。
-func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string) string {
+// encodeGrokConfig 把 Grok 会话粘性模式 + 定期探测 + 限流重试 + 续轮思考配置编码成 grok_config JSON 落库。
+func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinutes int, maxRateLimitRetries int, oauthClientID string, followUp auth.GrokFollowUpEffortConfig) string {
 	mode := strings.TrimSpace(affinityMode)
 	switch mode {
 	case auth.AffinityModeFollow, auth.AffinityModeBounded, auth.AffinityModeOff, auth.AffinityModeStrict:
@@ -8398,12 +9008,16 @@ func encodeGrokConfig(affinityMode string, probeEnabled bool, probeIntervalMinut
 	if maxRateLimitRetries < 0 {
 		maxRateLimitRetries = 0
 	}
+	followUp = auth.NormalizeGrokFollowUpEffortConfig(followUp)
 	b, err := json.Marshal(map[string]any{
-		"affinity_mode":          mode,
-		"probe_enabled":          probeEnabled,
-		"probe_interval_minutes": probeIntervalMinutes,
-		"max_rate_limit_retries": maxRateLimitRetries,
-		"oauth_client_id":        auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"affinity_mode":            mode,
+		"probe_enabled":            probeEnabled,
+		"probe_interval_minutes":   probeIntervalMinutes,
+		"max_rate_limit_retries":   maxRateLimitRetries,
+		"oauth_client_id":          auth.NormalizeGrokOAuthClientID(oauthClientID),
+		"follow_up_effort_enabled": followUp.Enabled,
+		"follow_up_tool_effort":    followUp.ToolEffort,
+		"follow_up_small_effort":   followUp.SmallEffort,
 	})
 	if err != nil {
 		return `{"affinity_mode":"strict"}`
@@ -8595,6 +9209,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
 		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
+		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
+		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
 		GrokOAuthClientID:                   auth.ConfiguredGrokOAuthClientID(),
 		GrokOAuthClientIDEnvOverride:        auth.GrokOAuthClientIDFromEnv() != "",
 		GrokOAuthClientIDEffective:          auth.EffectiveGrokOAuthClientID(),
@@ -9132,8 +9749,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 5 {
 			v = 5
 		}
-		if v > 500 {
-			v = 500
+		if v > 5000 {
+			v = 5000
 		}
 		h.db.SetMaxOpenConns(v)
 		h.pgMaxConns = v
@@ -9145,8 +9762,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 5 {
 			v = 5
 		}
-		if v > 500 {
-			v = 500
+		if v > 5000 {
+			v = 5000
 		}
 		h.cache.SetPoolSize(v)
 		h.redisPoolSize = v
@@ -9406,6 +10023,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.GrokMaxRateLimitRetries != nil {
 		h.store.SetGrokMaxRateLimitRetries(*req.GrokMaxRateLimitRetries)
 		log.Printf("设置已更新: grok_max_rate_limit_retries = %d", h.store.GrokMaxRateLimitRetries())
+	}
+
+	if req.GrokFollowUpEffortEnabled != nil || req.GrokFollowUpToolEffort != nil || req.GrokFollowUpSmallEffort != nil {
+		cfg := h.store.GrokFollowUpEffortConfig()
+		if req.GrokFollowUpEffortEnabled != nil {
+			cfg.Enabled = *req.GrokFollowUpEffortEnabled
+		}
+		if req.GrokFollowUpToolEffort != nil {
+			cfg.ToolEffort = *req.GrokFollowUpToolEffort
+		}
+		if req.GrokFollowUpSmallEffort != nil {
+			cfg.SmallEffort = *req.GrokFollowUpSmallEffort
+		}
+		h.store.SetGrokFollowUpEffortConfig(cfg)
+		proxy.SetGrokFollowUpEffortConfig(h.store.GrokFollowUpEffortConfig())
+		log.Printf("设置已更新: grok_follow_up_effort enabled=%v tool=%s small=%s", cfg.Enabled, cfg.ToolEffort, cfg.SmallEffort)
 	}
 
 	// client_id 会拼进授权 URL 与 token 表单，含空白/控制字符或超长的直接拒绝，
@@ -9951,7 +10584,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PublicAccountPortalPageEnabled:      publicAccountPortalPageEnabled,
 		ImageStorageConfig:                  imgConfigJSON,
 		BackgroundConfig:                    encodeBackgroundConfig(bgCfg),
-		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID()),
+		GrokConfig:                          encodeGrokConfig(h.store.GetGrokAffinityMode(), h.store.GrokProbeEnabled(), h.store.GrokProbeIntervalMinutes(), h.store.GrokMaxRateLimitRetries(), auth.ConfiguredGrokOAuthClientID(), h.store.GrokFollowUpEffortConfig()),
 		AutoPause5hThreshold:                h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:                h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:         h.store.GetAutoPause5hGuardBandPercent(),
@@ -10152,6 +10785,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		GrokProbeEnabled:                    h.store.GrokProbeEnabled(),
 		GrokProbeIntervalMinutes:            h.store.GrokProbeIntervalMinutes(),
 		GrokMaxRateLimitRetries:             h.store.GrokMaxRateLimitRetries(),
+		GrokFollowUpEffortEnabled:           h.store.GrokFollowUpEffortConfig().Enabled,
+		GrokFollowUpToolEffort:              h.store.GrokFollowUpEffortConfig().ToolEffort,
+		GrokFollowUpSmallEffort:             h.store.GrokFollowUpEffortConfig().SmallEffort,
 		MaxRetries:                          h.store.GetMaxRetries(),
 		MaxRateLimitRetries:                 h.store.GetMaxRateLimitRetries(),
 		RetryIntervalMS:                     h.store.GetRetryIntervalMS(),
@@ -10723,12 +11359,7 @@ func (h *Handler) CleanBanned(c *gin.Context) {
 
 // CleanRateLimited 一键清理所有限流账号（含 premium 5h、free 7d、usage_exhausted）
 func (h *Handler) CleanRateLimited(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	cleaned := h.store.CleanRateLimitedManual(ctx)
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+	h.cleanAccountTargets(c, h.store.CollectRateLimitedManualTargets(), "manual_clean")
 }
 
 // CleanError 清理错误（error）账号
@@ -10748,22 +11379,100 @@ func (h *Handler) CleanGrokError(c *gin.Context) {
 
 // cleanGrokByStatus 按运行时状态清理 Grok 账号，不影响其它平台
 func (h *Handler) cleanGrokByStatus(c *gin.Context, targetStatus string) {
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	cleaned := h.store.CleanGrokByRuntimeStatus(ctx, targetStatus)
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, (*auth.Account).IsGrokAPI), "auto_clean")
 }
 
 // cleanByStatus 按运行时状态清理账号
 func (h *Handler) cleanByStatus(c *gin.Context, targetStatus string) {
+	h.cleanAccountTargets(c, h.store.CollectCleanTargets(targetStatus, nil), "auto_clean")
+}
+
+func (h *Handler) cleanAccountTargets(c *gin.Context, targets []*auth.Account, eventReason string) {
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamCleanAccounts(c, targets, eventReason)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+	success, _ := h.runCleanAccounts(ctx, targets, eventReason, nil)
+	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", success), "cleaned": success})
+}
 
-	cleaned := h.store.CleanByRuntimeStatus(ctx, targetStatus)
+func (h *Handler) streamCleanAccounts(c *gin.Context, targets []*auth.Account, eventReason string) {
+	setupSSE(c)
+	total := len(targets)
+	sendSSEJSON(c, batchOperationEvent{Type: "start", Action: "clean", Total: total})
+	success, fail := h.runCleanAccounts(c.Request.Context(), targets, eventReason, func(event batchOperationEvent) {
+		sendSSEJSON(c, event)
+	})
+	sendSSEJSON(c, batchOperationEvent{
+		Type:    "complete",
+		Action:  "clean",
+		Current: total,
+		Total:   total,
+		Success: success,
+		Failed:  fail,
+		Deleted: success,
+		Message: fmt.Sprintf("已清理 %d 个账号", success),
+	})
+}
 
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("已清理 %d 个账号", cleaned), "cleaned": cleaned})
+func (h *Handler) runCleanAccounts(ctx context.Context, targets []*auth.Account, eventReason string, onProgress func(batchOperationEvent)) (int64, int64) {
+	total := len(targets)
+	var success int64
+	var fail int64
+	deleted := make([]int64, 0, len(targets))
+
+	for i, acc := range targets {
+		if ctx.Err() != nil {
+			fail += int64(total - i)
+			break
+		}
+		if acc == nil {
+			fail++
+			if onProgress != nil {
+				onProgress(batchOperationEvent{
+					Type:    "progress",
+					Action:  "clean",
+					Current: i + 1,
+					Total:   total,
+					Success: success,
+					Failed:  fail,
+					Error:   "账号不存在",
+				})
+			}
+			continue
+		}
+
+		name, email := runtimeAccountOperationIdentity(acc)
+		err := h.store.SoftDeleteForClean(ctx, acc, eventReason)
+		event := batchOperationEvent{
+			Type:         "progress",
+			Action:       "clean",
+			Current:      i + 1,
+			Total:        total,
+			AccountID:    acc.DBID,
+			AccountName:  name,
+			AccountEmail: email,
+		}
+		if err != nil {
+			fail++
+			event.Error = err.Error()
+		} else {
+			success++
+			deleted = append(deleted, acc.DBID)
+			event.Deleted = success
+		}
+		event.Success = success
+		event.Failed = fail
+		if onProgress != nil {
+			onProgress(event)
+		}
+	}
+
+	h.pruneAccountsFromSnapshotCaches(deleted)
+	return success, fail
 }
 
 // ==================== Proxies ====================

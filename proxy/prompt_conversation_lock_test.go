@@ -16,6 +16,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -103,6 +104,9 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 	if got := gjson.GetBytes(repeatRecorder.Body.Bytes(), "error.details.retry_after_seconds").Int(); got <= 0 {
 		t.Fatalf("locked retry remaining=%d body=%s", got, repeatRecorder.Body.String())
 	}
+	if got := gjson.GetBytes(repeatRecorder.Body.Bytes(), "error.details.audit_reference").String(); got == "" || got != lock.IncidentID {
+		t.Fatalf("locked retry audit reference=%q incident=%q body=%s", got, lock.IncidentID, repeatRecorder.Body.String())
+	}
 	if retryAfter := repeat.Writer.Header().Get("Retry-After"); retryAfter == "" {
 		t.Fatalf("locked retry missing Retry-After header: %v", repeat.Writer.Header())
 	}
@@ -119,6 +123,28 @@ func TestExplicitUpstreamCYBLocksOnlyTheSignedConversation(t *testing.T) {
 	setIngressRequestBodyIfAbsent(other, body)
 	if blocked := handler.inspectPromptFilterOpenAI(other, body, "/v1/responses", "gpt-5.5"); blocked {
 		t.Fatal("different user was blocked by another user's CYB lock")
+	}
+}
+
+func TestPromptCyberRestrictionDerivesAuditReferenceForLegacyLocalLock(t *testing.T) {
+	requestID := "298ee1bb-ad0f-4e96-8924-d34066def71e"
+	restriction := promptCyberRestrictionDecision(&database.PromptConversationLock{
+		DecisionID: "local-block:" + requestID,
+		ReasonCode: "terminal_policy_match",
+		LockedAt:   time.Now().UTC(),
+	}, promptfilter.DefaultConfig())
+	if restriction.AuditReference != requestID {
+		t.Fatalf("audit reference = %q, want %q", restriction.AuditReference, requestID)
+	}
+	if !strings.Contains(restriction.Message, "审计编号："+requestID) {
+		t.Fatalf("restriction message lacks audit reference: %q", restriction.Message)
+	}
+	if !strings.Contains(restriction.Message, "本地高风险规则") || strings.Contains(restriction.Message, "因上游 CYB 已锁定") {
+		t.Fatalf("local restriction origin is misleading: %q", restriction.Message)
+	}
+	details := promptCyberRestrictionDetails(restriction, nil)
+	if details["audit_reference"] != requestID || details["decision_id"] != "local-block:"+requestID || details["trigger_reason_code"] != "terminal_policy_match" {
+		t.Fatalf("restriction details = %#v", details)
 	}
 }
 
@@ -349,5 +375,68 @@ func TestExpiredConversationLockDoesNotBlockSignedConversation(t *testing.T) {
 	}
 	if _, err := db.GetActivePromptConversationLockWithTTL(t.Context(), identity.LockKey, time.Hour); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("expired conversation lock remained active: %v", err)
+	}
+}
+
+// 纯外部审核命中(如 moderation 分类阈值越线)与 fail-closed 审核失败没有本地
+// 检测证据,只应拒绝当次请求;本地规则命中才升级为会话锁(issue #527)。
+func TestReviewOnlyBlockDoesNotLockConversation(t *testing.T) {
+	handler, db := newPromptConversationLockTestHandler(t)
+	body := []byte(`{"model":"gpt-5.5","input":"ordinary request"}`)
+	fingerprint := "fedcba9876543210fedcba9876543210"
+	identity := newAPIIdentity{UserID: "42", ClientIP: "203.0.113.8"}
+
+	reviewOnlyVerdict := promptfilter.Verdict{
+		Enabled: true, Action: promptfilter.ActionBlock,
+		Reviewed: true, ReviewFlagged: true, ReviewModel: "omni-moderation-latest",
+	}
+	reviewOnlyDecision := finalizePromptGuardDecision(promptfilter.Decision{
+		Enabled: true, Mode: promptfilter.GuardModeEnforce, Action: promptfilter.ActionBlock,
+	}, reviewOnlyVerdict)
+	if reviewOnlyDecision.PrimaryDetector != promptGuardDetectorExternalReview {
+		t.Fatalf("review-only decision detector = %q", reviewOnlyDecision.PrimaryDetector)
+	}
+	reviewOnly := signedBoundNewAPIPolicyContext(t, "review-only-block", identity, body, 101, "gateway-a", "gateway-a-secret", fingerprint)
+	setIngressRequestBodyIfAbsent(reviewOnly, body)
+	cfg := handler.promptFilterConfigForRequest(reviewOnly)
+	if handler.lockPromptConversationOnLocalBlock(reviewOnly, cfg, body, "/v1/responses", "gpt-5.5", reviewOnlyDecision, reviewOnlyVerdict) {
+		t.Fatal("review-only block claimed to lock the conversation")
+	}
+	if _, err := db.GetActivePromptConversationLockBySessionHash(t.Context(), hashRiskIdentity(fingerprint)); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("review-only block created a conversation lock: %v", err)
+	}
+
+	failClosedVerdict := promptfilter.Verdict{
+		Enabled: true, Action: promptfilter.ActionBlock,
+		Reviewed: true, ReviewError: "review request failed: status 500",
+	}
+	failClosed := signedBoundNewAPIPolicyContext(t, "review-fail-closed", identity, body, 101, "gateway-a", "gateway-a-secret", fingerprint)
+	setIngressRequestBodyIfAbsent(failClosed, body)
+	if handler.lockPromptConversationOnLocalBlock(failClosed, cfg, body, "/v1/responses", "gpt-5.5", promptfilter.Decision{Enabled: true}, failClosedVerdict) {
+		t.Fatal("fail-closed review error claimed to lock the conversation")
+	}
+	if _, err := db.GetActivePromptConversationLockBySessionHash(t.Context(), hashRiskIdentity(fingerprint)); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("fail-closed review error created a conversation lock: %v", err)
+	}
+
+	localVerdict := promptfilter.Verdict{
+		Enabled: true, Action: promptfilter.ActionBlock,
+		Matched: []promptfilter.Match{{Name: "terminal-rule", Weight: 100, Category: "intrusion"}},
+	}
+	localDecision := finalizePromptGuardDecision(promptfilter.Decision{
+		Enabled: true, Mode: promptfilter.GuardModeEnforce, Action: promptfilter.ActionBlock,
+		ReasonCode: "prompt_policy_match",
+	}, localVerdict)
+	local := signedBoundNewAPIPolicyContext(t, "local-rule-block", identity, body, 101, "gateway-a", "gateway-a-secret", fingerprint)
+	setIngressRequestBodyIfAbsent(local, body)
+	if !handler.lockPromptConversationOnLocalBlock(local, cfg, body, "/v1/responses", "gpt-5.5", localDecision, localVerdict) {
+		t.Fatal("local rule block failed to lock the conversation")
+	}
+	item, err := db.GetActivePromptConversationLockBySessionHash(t.Context(), hashRiskIdentity(fingerprint))
+	if err != nil {
+		t.Fatalf("local rule block did not persist a conversation lock: %v", err)
+	}
+	if item.ReasonCode != "prompt_policy_match" {
+		t.Fatalf("lock reason = %q", item.ReasonCode)
 	}
 }
